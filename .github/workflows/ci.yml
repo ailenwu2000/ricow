@@ -3,6 +3,7 @@ name: CI
 on:
   # 所有分支推送都跑(项目组成员会把分支推到本仓库, 需要分支级反馈)
   push:
+    branches: ["**"] # 任意分支推送都跑(分支级反馈); tag 走 release.yml
   pull_request:
   workflow_dispatch:
 

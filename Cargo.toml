@@ -42,3 +42,8 @@ rig = "0.42"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
