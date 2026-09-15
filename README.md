@@ -4,6 +4,8 @@
 
 A fully local, multi-platform quantitative strategy engine (backtest / Dry Run / live trading). Pure local CLI — no cloud, no telemetry, no auto-update.
 
+**No backtest, no trade.**
+
 > Formerly named **locus**; renamed to **ricow** in 2026-09. The Git history was not carried over (this repository starts fresh at `v0.7.0`).
 
 ## Quick start

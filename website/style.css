@@ -20,6 +20,7 @@ a:hover { text-decoration: underline; }
 header.top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 h1 { font-size: 2rem; margin: 0 0 .2em; letter-spacing: .5px; }
 .tagline { color: var(--muted); margin: 0 0 8px; }
+.motto { color: var(--accent); font-weight: 600; letter-spacing: .3px; margin: 10px 0 0; }
 .lang { font-size: .9rem; color: var(--muted); }
 .lang a { color: var(--muted); }
 .lang strong { color: var(--accent); }

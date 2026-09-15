@@ -2,7 +2,7 @@
 
 [English](README.md) | **中文**
 
-> 中文名:**富牛**(ricow 的中文称呼)。
+> 中文名:**富牛** · 座右铭:**回测不过,一单不下。**(English: *No backtest, no trade.*)
 
 完全本地运行的多平台量化策略引擎(回测 / Dry Run / 实盘), 纯本地 CLI 客户端工具。
 
