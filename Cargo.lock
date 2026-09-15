@@ -5686,7 +5686,7 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
 name = "ricow"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "clap",
@@ -5710,7 +5710,7 @@ dependencies = [
 
 [[package]]
 name = "ricow_binance"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5735,7 +5735,7 @@ dependencies = [
 
 [[package]]
 name = "ricow_core"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5751,7 +5751,7 @@ dependencies = [
 
 [[package]]
 name = "ricow_engine"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5772,7 +5772,7 @@ dependencies = [
 
 [[package]]
 name = "ricow_strategy"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",

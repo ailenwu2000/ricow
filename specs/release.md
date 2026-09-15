@@ -6,7 +6,7 @@
 ## 一、版本规则
 
 - 遵循语义化版本(SemVer): `MAJOR.MINOR.PATCH`, tag 形式 `vX.Y.Z`。
-- 0.x 期间: 破坏性/行为变更升 **minor**(`0.1.0 → 0.2.0`), 修复升 patch。达到稳定后再谈 1.0。
+- 0.x 期间: 破坏性/行为变更升 **minor**(`0.7.0 → 0.8.0`), 修复升 patch。达到稳定后再谈 1.0。
 - **单一版本源**: 根 `Cargo.toml` 的 `[workspace.package] version`; 5 个 crate 均 `version.workspace = true`, 改一处即全仓一致。
 - **禁止移动或改写已发布的 tag**(及 Release 资产)。发现缺陷一律发新版本(`vX.Y.(Z+1)`), 不改历史。
 
