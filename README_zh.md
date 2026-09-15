@@ -1,8 +1,10 @@
 # ricow
 
+[English](README.md) | **中文**
+
 完全本地运行的多平台量化策略引擎(回测 / Dry Run / 实盘), 纯本地 CLI 客户端工具。
 
-> 本项目原名 **locus**, 2026-09 正式更名 **ricow**; Git 历史不继承(本仓库从 `v0.1.0` 重新开始)。
+> 本项目原名 **locus**, 2026-09 正式更名 **ricow**; Git 历史不继承(本仓库从 `v0.7.0` 重新开始)。
 
 ## 快速开始
 
@@ -21,12 +23,14 @@ cargo build --release        # 产物: target/release/ricow
 ```toml
 [ai]                     # 可选: 只用 AI 助手时才需要
 provider = "deepseek"    # 内置预设名(deepseek/moonshot/zhipu/qwen/openrouter/openai/ollama), 或任意自定义名(此时须写 base_url)
-model = "deepseek-chat"  # 换自建/中转端点: 再写一行 base_url = "..."
+model = "deepseek-flash" # 换自建/中转端点: 再写一行 base_url = "..."
 api_key=***              # 该供应商的密钥(与 provider 同段)
 
 [exchange]               # 可选: 只在 demo / 实盘下单时才需要
-demo_key=***  demo_secret=***            # 币安测试网(demo)凭据
-binance_key=***  binance_secret=***      # 币安主网凭据(真实资金)
+demo_key=***                  # 币安测试网(demo)凭据
+demo_secret=***
+binance_key=***               # 币安主网凭据(真实资金)
+binance_secret=***
 ```
 
 **怎么拿 demo key**: 币安模拟交易(demo)平台 <https://demo.binance.com/> 有独立账号体系(与主网账号无关), 登录后在平台内创建 API Key(具体入口以官网为准; 官方说明见 <https://www.binance.com/zh-CN/support/faq/detail/ab78f9a1b8824cf0a106b4229c76496d>)。只勾**交易**权限、**不要**勾提现; 注意 demo 的 key 与旧现货测试网 `testnet.binance.vision` **不互通**。主网 key 在 <https://www.binance.com> 同样路径创建(同样建议关闭提现并限制 IP)。
@@ -76,7 +80,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_P
 
 ### 7. 安全须知
 
-- 凭据以**明文**存放于 `ricow.toml`(0600, 本机私有, 不入 git): 加密需要回答"解密密钥放哪"(绕回本文件=安全剧场, 绑机器指纹=换机即废), 竞品(freqtrade / jesse / Claude Code)同样明文。
+- 凭据以**明文**存放于 `ricow.toml`(0600, 本机私有, 不入 git): 加密需要回答"解密密钥放哪"(绕回本文件=安全剧场, 绑机器指纹=换机即废)。
 - 不要把密钥发给任何人(包括 AI 助手), 不要提交进仓库。
 - 实盘先小额, 先跑 Dry Run 与 demo。
 - 写实确认(部署 `确认部署 <名字>` / 实盘 `确认实盘 <名字>`)**只能在交互终端手动输入**: 管道、脚本、AI agent 工具调用喂入的短语一律被拒绝。
@@ -96,12 +100,6 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_P
 | Linux x86_64 | 实机验证(构建、回测、demo 测试网真实下单流程) |
 | Windows x86_64 | 编译与全量单元测试已由 CI 实测通过(`test (windows-latest)`, 2026-09-15); **尚未实机跑过交易流程** |
 | macOS | 未验证 —— 无实机且暂无 CI 覆盖; 代码走与 Linux 同源的 `cfg(unix)` 分支 |
-
-## 竞品调研结论摘要
-
-- 商业端 MCP 全是云端账号侧 — "本地私钥 + 本地回测门禁 + Dry Run 默认" 是差异化位置
-- 2026 年无 star>200 新竞品, 格局稳定
-- 详见 [specs/research/competitors.md](specs/research/competitors.md)
 
 ## 免责声明
 

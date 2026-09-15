@@ -1,8 +1,10 @@
 # ricow
 
+**English** | [中文文档](README_zh.md)
+
 A fully local, multi-platform quantitative strategy engine (backtest / Dry Run / live trading). Pure local CLI — no cloud, no telemetry, no auto-update.
 
-> Formerly named **locus**; renamed to **ricow** in 2026-09. The Git history was not carried over (this repository starts fresh at `v0.1.0`).
+> Formerly named **locus**; renamed to **ricow** in 2026-09. The Git history was not carried over (this repository starts fresh at `v0.7.0`).
 
 ## Quick start
 
@@ -21,12 +23,14 @@ All config and credentials live in `$RICOW_ROOT/ricow.toml` (mode `0600`, alread
 ```toml
 [ai]                     # optional: only needed for the built-in AI assistant
 provider = "deepseek"    # built-in preset (deepseek/moonshot/zhipu/qwen/openrouter/openai/ollama), or any custom name (then base_url is required)
-model = "deepseek-chat"  # for a self-hosted/proxy endpoint, add: base_url = "..."
+model = "deepseek-flash" # for a self-hosted/proxy endpoint, add: base_url = "..."
 api_key=***              # key of that provider (same section as provider)
 
 [exchange]               # optional: only needed for demo / live order placement
-demo_key=***  demo_secret=***            # Binance demo (testnet) credentials
-binance_key=***  binance_secret=***      # Binance mainnet credentials (real money)
+demo_key=***                  # Binance demo (testnet) credentials
+demo_secret=***
+binance_key=***               # Binance mainnet credentials (real money)
+binance_secret=***
 ```
 
 **How to get a demo key**: Binance's simulated-trading (demo) platform <https://demo.binance.com/> has its own account system (separate from mainnet). Create an API key there — enable **trading only**, **never** withdrawals. Note that demo keys are **not** interchangeable with the legacy spot testnet `testnet.binance.vision`. Mainnet keys are created the same way at <https://www.binance.com> (also recommended: disable withdrawals and restrict by IP).
@@ -73,7 +77,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # your proxy (or HTTP_PROXY / ALL_PRO
 
 ### 7. Security notes
 
-- Credentials are stored in **plaintext** in `ricow.toml` (0600, local-only, never committed): encryption only moves the problem ("where do you keep the decryption key?" — same file = security theatre, machine fingerprint = breaks on hardware change), and comparable tools (freqtrade / jesse / Claude Code) also store plaintext.
+- Credentials are stored in **plaintext** in `ricow.toml` (0600, local-only, never committed): encryption only moves the problem ("where do you keep the decryption key?" — same file = security theatre, machine fingerprint = breaks on hardware change).
 - Never share your keys with anyone (including AI assistants) and never commit them.
 - Go live small, and only after Dry Run and demo.
 - Write confirmations (deploy `确认部署 <name>` / live `确认实盘 <name>`) **can only be typed in an interactive terminal**: phrases fed through pipes, scripts, or AI-agent tool calls are always rejected.
