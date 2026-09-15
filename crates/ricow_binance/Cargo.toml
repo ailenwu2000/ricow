@@ -1,0 +1,39 @@
+[package]
+name = "ricow_binance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+ricow_core = { path = "../ricow_core" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tokio-stream = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+hex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+rust_decimal_macros = "1"
+
+[lints]
+workspace = true

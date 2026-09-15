@@ -1,0 +1,46 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo: build (debug)",
+            "type": "shell",
+            "command": "cargo build",
+            "args": [],
+            "problemMatcher": ["$rustc"],
+            "group": "build"
+        },
+        {
+            "label": "cargo: build (release)",
+            "type": "shell",
+            "command": "cargo build --release",
+            "args": [],
+            "problemMatcher": ["$rustc"],
+            "group": "build"
+        },
+        {
+            "label": "cargo: test",
+            "type": "shell",
+            "command": "cargo test --workspace",
+            "args": [],
+            "problemMatcher": ["$rustc"],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "cargo: check",
+            "type": "shell",
+            "command": "cargo check --workspace",
+            "args": [],
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "cargo: clippy",
+            "type": "shell",
+            "command": "cargo clippy --workspace",
+            "args": [],
+            "problemMatcher": ["$rustc"]
+        }
+    ]
+}

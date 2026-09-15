@@ -1,0 +1,10 @@
+[package]
+name = "proc-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sysinfo = "0.39"
+
+[lints.rust]
+unsafe_code = "forbid"

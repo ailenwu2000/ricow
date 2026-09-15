@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "presets": {
+    "zh": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:9f6d098b0a552c79c6a4aa89ca15cd957a775e8615440955c9c41ba06e5a432a",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {},
+      "registered_skills": {},
+      "installed_at": "2026-09-01T15:05:17.519764+00:00"
+    }
+  }
+}

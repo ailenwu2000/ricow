@@ -1,0 +1,38 @@
+[package]
+name = "ricow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "ricow"
+path = "src/main.rs"
+
+[dependencies]
+ricow_core = { path = "../ricow_core" }
+ricow_engine = { path = "../ricow_engine" }
+ricow_binance = { path = "../ricow_binance" }
+ricow_strategy = { path = "../ricow_strategy" }
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+futures.workspace = true
+rig.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros = "1"
+
+[lints]
+workspace = true

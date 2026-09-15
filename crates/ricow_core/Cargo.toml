@@ -1,0 +1,29 @@
+[package]
+name = "ricow_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros = "1"
+
+[lints]
+workspace = true

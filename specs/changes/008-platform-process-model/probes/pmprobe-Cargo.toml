@@ -1,0 +1,13 @@
+[package]
+name = "pmprobe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+
+[dependencies]
+process-wrap = { version = "8.2.1", features = ["tokio1", "std"] }
+sysinfo = "0.36"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,49 @@
+schema_version: "1.0"
+
+preset:
+  id: "zh"
+  name: "中文产物模板"
+  version: "1.0.0"
+  description: "全中文产物模板: spec / plan / tasks / checklist / constitution 一律中文; 命令逻辑保持官方原版"
+  author: "ricow"
+  license: "MIT"
+
+requires:
+  speckit_version: ">=0.6.0"
+
+provides:
+  templates:
+    - type: "template"
+      name: "spec-template"
+      file: "templates/spec-template.md"
+      description: "中文 spec 产物模板"
+      replaces: "spec-template"
+
+    - type: "template"
+      name: "plan-template"
+      file: "templates/plan-template.md"
+      description: "中文 plan 产物模板"
+      replaces: "plan-template"
+
+    - type: "template"
+      name: "tasks-template"
+      file: "templates/tasks-template.md"
+      description: "中文 tasks 产物模板"
+      replaces: "tasks-template"
+
+    - type: "template"
+      name: "checklist-template"
+      file: "templates/checklist-template.md"
+      description: "中文 checklist 产物模板"
+      replaces: "checklist-template"
+
+    - type: "template"
+      name: "constitution-template"
+      file: "templates/constitution-template.md"
+      description: "中文 constitution 产物模板 (含'产物一律中文'约定)"
+      replaces: "constitution-template"
+
+tags:
+  - "zh"
+  - "chinese"
+  - "i18n"
