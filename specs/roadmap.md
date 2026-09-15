@@ -27,7 +27,8 @@
 - **首个公开发布 (2026-09-15)**: **v0.7.0**(项目进度约 70%)—— 用 dist(cargo-dist 0.32.0)发布 5 平台产物(linux x64/arm64、macOS x64/arm64、windows x64)+ SHA256 + shell/powershell 安装脚本 + source 包, 共 16 个资产; 已实测下载 linux x64 产物、校验 sha256、运行得 `ricow 0.7.0`。产物平台 ≠ 宣称支持: 除 Linux x86_64 外均未实机跑交易流程。
 - **官网**: 落地页源码 `website/`(中英双语纯静态页,含 OG/Twitter 卡片元信息),由 `.github/workflows/pages.yml` 部署。
   **已上线**: <https://ailenwu2000.github.io/ricow/>(2026-09-15 实测 HTTP 200,中英文页均正常);自定义域名已配置为 **ricow.xyz**(裸域,2026-09-15):`https://ricow.xyz` 实测 200 且内容正确(证书 SAN 同时覆盖 `ricow.xyz` 与 `www.ricow.xyz`),`www.ricow.xyz` 由 GitHub 自动 301 → 裸域(方向由 custom domain 决定)。
-  **待收尾一项**:裸域 IPv4 的 `A` 记录仍是 GoDaddy `160.153.0.181`(实测 IPv4 访问 https://ricow.xyz 返回 Cloudflare 404,IPv6 走 AAAA 则 200),GitHub Pages 因此报 `NotServedByPagesError` —— 需把该 A 换成 `185.199.108.153 / 109 / 110 / 111`(AAAA 四条已正确指向 GitHub)。改完后 Pages 点 Check again,再勾 Enforce HTTPS。
+  **DNS 已配置正确**(2026-09-15 实测):权威 NS(ns71/ns72.domaincontrol.com)返回 `185.199.108–111.153` 四条,Google/阿里/114 解析器一致;`curl --resolve` 直连 GitHub Pages 实测 **HTTPS 200 且证书校验通过**(SAN 含 ricow.xyz 与 www.ricow.xyz),访问 www 得 301 → 裸域。
+  遗留仅为**缓存与开关**:①部分解析器(Cloudflare 1.1.1.1、本机)仍缓存旧停放 IP,TTL 过期后自动纠正;②Pages 的 **Enforce HTTPS 尚未勾选**(实测 http://ricow.xyz 返回 200 而非 301),证书已就绪可勾选;③GitHub 侧 `NotServedByPagesError` 待其解析缓存过期后点 Check again 即消失。
   Pages 的 Source 已设为 "GitHub Actions"(仓库管理员已启用);Actions 发布方式下**不需要 CNAME 文件**。
 - **历史变更档案**: `specs/changes/**` 正文保留旧名不回改(宪法「定稿不回改」)。
 - 发布流程唯一权威: `specs/release.md`。
