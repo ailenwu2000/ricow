@@ -2,7 +2,7 @@
 
 > 状态: ✅ 已定稿(2026-08-16 PM 定稿; 2026-08-24 复核通过并收敛入口为纯 CLI, 见 D12; 2026-09-11 复核对齐代码: D3 功能范围口径修正, 内置策略现状以 specs/roadmap.md 为准; 2026-09-12 决策 D14: 移除 Hyperliquid)。
 > 依据: 原重构方案 v2(`.hermes/plans/2026-08-15_215255-ai-first-refactor-v2.md`)、竞品调研(`specs/research/competitors.md` + `specs/research/competitor-features-2026.md`)、旧产品文档(重构前基线已归档)。
-> 名称与座右铭(2026-09-15 定): **ricow**(中文名 **富牛**);座右铭 **回测不过,一单不下。** / *No backtest, no trade.*(用户选定;体现项目工程纪律, 不承诺收益)。
+> 名称与座右铭(2026-09-15 定): **ricow**(中文名 **富牛**);座右铭 **从灵感，到规则，到实盘。** / *From idea, to rule, to live.*(用户选定;涵盖产品流程: 灵感 → 规则(可回测的门禁) → 实盘)。
 
 ---
 
