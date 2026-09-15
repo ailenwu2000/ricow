@@ -161,13 +161,10 @@ async fn user_data_session(
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                    match v.get("e").and_then(|e| e.as_str()) {
-                        Some("listenKeyExpired") => {
-                            return Err(CoreError::Exchange(
-                                "listenKey 已过期 (需重新订阅用户流)".into(),
-                            ))
-                        }
-                        _ => {}
+                    if let Some("listenKeyExpired") = v.get("e").and_then(|e| e.as_str()) {
+                        return Err(CoreError::Exchange(
+                            "listenKey 已过期 (需重新订阅用户流)".into(),
+                        ))
                     }
                     if let Some(event) = parse_futures_user_event(&v) {
                         if tx.send(event).await.is_err() {

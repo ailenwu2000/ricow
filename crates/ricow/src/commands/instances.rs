@@ -283,7 +283,7 @@ pub async fn format_info(args: InfoArgs) -> CoreResult<String> {
             "成交: {} 笔, 手续费合计 {}, 最近成交 {}",
             n,
             fees,
-            last.map(|t| fmt_ts(t)).unwrap_or_else(|| "无".into())
+            last.map(fmt_ts).unwrap_or_else(|| "无".into())
         ),
         Err(e) => line!(out, "成交: 查询失败 ({e})"),
     }

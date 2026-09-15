@@ -202,6 +202,9 @@ pub struct BacktestContext {
     first_cash_after_build: Option<Decimal>,
 }
 
+/// 拆单结果: `(平仓动作, 开仓动作)`, 每项为 `(方向, 数量)`(仅为表达 `split_fill` 的返回类型)。
+type FillSplit = (Option<(OrderSide, Decimal)>, Option<(OrderSide, Decimal)>);
+
 impl BacktestContext {
     pub fn new(mut config: StrategyConfig, initial_balance: Balance) -> Self {
         let quote_asset = initial_balance.asset.clone();
@@ -1348,10 +1351,7 @@ impl BacktestContext {
 
     /// 拆单: 把一次请求按当前持仓拆成 (平仓动作, 开仓动作), 不改状态。
     /// reduce_only / 现货卖出 → 无开仓 (余量丢弃; 资金校验保证正常路径不出现余量)。
-    fn split_fill(
-        &self,
-        req: &OrderRequest,
-    ) -> (Option<(OrderSide, Decimal)>, Option<(OrderSide, Decimal)>) {
+    fn split_fill(&self, req: &OrderRequest) -> FillSplit {
         let (close_side, open_side) = self.fill_effect(req);
         let mut remain = req.size;
         let mut close = None;

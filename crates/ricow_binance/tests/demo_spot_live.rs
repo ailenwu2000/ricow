@@ -32,7 +32,7 @@ fn demo_client() -> BinanceClient {
 }
 
 /// 固定 seed 伪随机 (LCG, 不引依赖): 从候选池选 n 个不同 symbol。
-fn pick_symbols<'a>(pool: &'a [String], n: usize) -> Vec<&'a String> {
+fn pick_symbols(pool: &[String], n: usize) -> Vec<&String> {
     let mut state: u64 = 0x9E3779B97F4A7C15;
     let mut next = move || {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);

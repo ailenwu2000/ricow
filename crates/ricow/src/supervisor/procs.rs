@@ -35,6 +35,7 @@ impl ChildHandle {
 /// 启动 `ricow run <name>` 子进程: stdin 管道 (停机指令), stdout/stderr 追加到日志文件。
 ///
 /// `live=true` 时透传 `--live` (实盘仍由子进程侧的门禁双条件复核, 见 011 FR-013)。
+#[allow(clippy::too_many_arguments)] // 参数聚合重构另行立项(021 只清存量告警, 不改结构)
 pub fn spawn_strategy(
     root: &Path,
     exe: &Path,

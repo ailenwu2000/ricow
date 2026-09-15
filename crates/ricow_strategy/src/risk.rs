@@ -472,29 +472,29 @@ mod tests {
 
     #[test]
     fn test_min_order_size() {
-        let mut ctx = TestCtx::new();
+        let ctx = TestCtx::new();
         let mut rule = MinOrderSize { min_notional: dec!(100) };
         // notional = 30 < 100
-        assert!(rule.check(&buy(), &mut ctx).is_err());
+        assert!(rule.check(&buy(), &ctx).is_err());
     }
 
     #[test]
     fn test_max_slippage() {
-        let mut ctx = TestCtx::new();
+        let ctx = TestCtx::new();
         let mut rule = MaxSlippage { max_bps: 10 };
         // 挂单 3030 vs 最优 3000 = 1% = 100bps > 10bps
         let req = OrderRequest::new_limit("ETH", OrderSide::Buy, dec!(3030), dec!(0.01));
-        assert!(rule.check(&req, &mut ctx).is_err());
+        assert!(rule.check(&req, &ctx).is_err());
     }
 
     // ---- 004: 频率上限 ----
 
     #[test]
     fn test_rate_limit_rejects_past_limit_within_window() {
-        let mut ctx = TestCtx::at(1_000);
+        let ctx = TestCtx::at(1_000);
         let mut rule = OrderRateLimit::new(1);
-        assert!(rule.check(&buy(), &mut ctx).is_ok(), "第 1 单放行");
-        let err = rule.check(&buy(), &mut ctx).unwrap_err();
+        assert!(rule.check(&buy(), &ctx).is_ok(), "第 1 单放行");
+        let err = rule.check(&buy(), &ctx).unwrap_err();
         assert_eq!(
             err,
             RiskError::OrderRateLimited { limit: 1, count: 2, window_ms: RATE_WINDOW_MS },
@@ -506,30 +506,30 @@ mod tests {
     #[test]
     fn test_rate_limit_window_expires() {
         let mut rule = OrderRateLimit::new(1);
-        let mut ctx = TestCtx::at(1_000);
-        assert!(rule.check(&buy(), &mut ctx).is_ok());
+        let ctx = TestCtx::at(1_000);
+        assert!(rule.check(&buy(), &ctx).is_ok());
         // 1.1s 后窗口内旧记录过期 → 放行。
-        let mut later = TestCtx::at(2_100);
-        assert!(rule.check(&buy(), &mut later).is_ok(), "窗口过期后应恢复放行");
+        let later = TestCtx::at(2_100);
+        assert!(rule.check(&buy(), &later).is_ok(), "窗口过期后应恢复放行");
         assert_eq!(rule.window_len(), 1, "过期记录应被清理");
     }
 
     #[test]
     fn test_rate_limit_default_is_generous() {
         let mut rule = OrderRateLimit::new(DEFAULT_MAX_ORDERS_PER_SEC);
-        let mut ctx = TestCtx::at(1_000);
+        let ctx = TestCtx::at(1_000);
         for i in 0..DEFAULT_MAX_ORDERS_PER_SEC {
-            assert!(rule.check(&buy(), &mut ctx).is_ok(), "第 {i} 单不应被拒");
+            assert!(rule.check(&buy(), &ctx).is_ok(), "第 {i} 单不应被拒");
         }
-        assert!(rule.check(&buy(), &mut ctx).is_err(), "超过默认上限应被拒");
+        assert!(rule.check(&buy(), &ctx).is_err(), "超过默认上限应被拒");
     }
 
     #[test]
     fn test_rate_limit_zero_clamped_to_one() {
         let mut rule = OrderRateLimit::new(0);
-        let mut ctx = TestCtx::at(1_000);
-        assert!(rule.check(&buy(), &mut ctx).is_ok());
-        assert!(rule.check(&buy(), &mut ctx).is_err(), "0 收敛为 1: 第 2 单被拒");
+        let ctx = TestCtx::at(1_000);
+        assert!(rule.check(&buy(), &ctx).is_ok());
+        assert!(rule.check(&buy(), &ctx).is_err(), "0 收敛为 1: 第 2 单被拒");
     }
 
     // ---- 004: 引擎装配 ----
@@ -579,8 +579,8 @@ mod tests {
         let mut engine = RiskEngine::new();
         engine.add_rule(Box::new(MinOrderSize { min_notional: dec!(1000) }));
         engine.add_rule(Box::new(OrderRateLimit::new(5)));
-        let mut ctx = TestCtx::at(1_000);
-        assert!(engine.check(&buy(), &mut ctx).is_err());
+        let ctx = TestCtx::at(1_000);
+        assert!(engine.check(&buy(), &ctx).is_err());
         assert_eq!(engine.rejection_count(), 1);
         assert_eq!(engine.rejection_stats(), vec![("min_order_size", 1)]);
         assert!(engine.last_reason().unwrap().contains("min_order_size"));

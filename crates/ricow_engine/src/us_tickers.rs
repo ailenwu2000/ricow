@@ -127,6 +127,7 @@ pub fn us_ticker_of(bstock_base: &str) -> Option<(&'static str, AssetClass)> {
 /// - MUU/MVLL/INTW (2024-25 上市新杠杆 ETF, 名称含 daily/leveraged 语义; 数据特征
 ///   单日 +38%/+65%/+47%, vol 145%/152%/149%)
 /// - DRAM 保留 (单日 ±17% = 1x 常态); SNXX 数据异常但 <253 根永不入选, 不在此列。
+///
 /// 池每周扩容时须核查新 ETF 名称 (含 Daily/3x/Bull/Bear/UltraPro 等词) 或数据特征后增补。
 pub fn is_leveraged(us_ticker: &str) -> bool {
     matches!(us_ticker, "TQQQ" | "SQQQ" | "SOXL" | "SOXS" | "KORU" | "MUU" | "MVLL" | "INTW")

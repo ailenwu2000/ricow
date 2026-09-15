@@ -401,9 +401,7 @@ fn cleanup_hint_for(name: &str, live: bool, close_all: bool) -> String {
             Ok(strategy) if strategy.has_on_stop() => format!(
                 "该策略实现了清理 (on_stop); 执行结果以 logs/{name}.log 为准 (引擎未代策略臆测清理结果)"
             ),
-            Ok(_) => format!(
-                "该策略未实现清理 (on_stop); 如仍有挂单或持仓需手工处理 (请以交易所实际状态为准)"
-            ),
+            Ok(_) => "该策略未实现清理 (on_stop); 如仍有挂单或持仓需手工处理 (请以交易所实际状态为准)".to_string(),
             Err(e) => format!("无法判定清理实现 (策略装载失败: {e}); 请手工核对挂单与持仓"),
         },
         Err(e) => format!("无法判定清理实现 ({e}); 请手工核对挂单与持仓"),

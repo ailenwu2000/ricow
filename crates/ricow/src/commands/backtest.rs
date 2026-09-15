@@ -366,6 +366,9 @@ mod tests {
     use crate::commands::test_util::ENV_LOCK;
 
     #[tokio::test]
+    // 测试专用: ENV_LOCK 串行化 RICOW_ROOT 的读写; 这里**有意**跨 await 持有整个测试体,
+    // 否则并行测试会读到彼此的环境变量(见 mod.rs 的 ENV_LOCK 说明)。
+    #[allow(clippy::await_holding_lock)]
     async fn test_resolve_config_toml_priority() {
         // strategies/<name>.toml 命中 → TOML 加载; --param 透传覆盖 TOML 参数。
         let _guard = ENV_LOCK.lock().unwrap();
@@ -416,6 +419,9 @@ order_size = 0.02
     }
 
     #[tokio::test]
+    // 测试专用: ENV_LOCK 串行化 RICOW_ROOT 的读写; 这里**有意**跨 await 持有整个测试体,
+    // 否则并行测试会读到彼此的环境变量(见 mod.rs 的 ENV_LOCK 说明)。
+    #[allow(clippy::await_holding_lock)]
     async fn test_resolve_config_missing_pair_falls_back_to_args() {
         // TOML 无 pair → run 阶段用 --pair 兜底 (resolve_config 本身不报错)。
         let _guard = ENV_LOCK.lock().unwrap();

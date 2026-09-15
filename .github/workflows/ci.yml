@@ -30,9 +30,8 @@ jobs:
       # 全仓尚未与 rustfmt 对齐(约 38 个文件有差异, 见 CONTRIBUTING 第五节): 对齐完成后再打开下面一行
       # - run: cargo fmt --all -- --check
       - name: clippy
-        # 存量告警约 28 条(0 error)。清理完成后改为:
-        #   cargo clippy --workspace --all-targets --locked -- -D warnings
-        run: cargo clippy --workspace --all-targets --locked
+        # 存量告警已于 021 清零(2026-09-15); 门禁为硬失败, 新告警一律挡住
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: test (${{ matrix.os }})

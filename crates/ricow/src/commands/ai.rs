@@ -107,7 +107,7 @@ pub async fn run(args: AiArgs) -> CoreResult<()> {
         max_turns: file
             .ai
             .max_turns
-            .map(|n| config::check_max_turns(n))
+            .map(config::check_max_turns)
             .transpose()?
             .unwrap_or(config::DEFAULT_MAX_TURNS),
     };
@@ -177,9 +177,8 @@ pub async fn run(args: AiArgs) -> CoreResult<()> {
             }
             Input::Ask(q) => {
                 let reply = if args.plain {
-                    llm.ask(&q).await.map(|a| {
+                    llm.ask(&q).await.inspect(|a| {
                         println!("{}", a.text);
-                        a
                     })
                 } else {
                     llm.ask_stream(&q, &history).await

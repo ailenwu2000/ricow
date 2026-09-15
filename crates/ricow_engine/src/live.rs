@@ -288,6 +288,7 @@ pub fn liquidation_distance(mark: Decimal, liq: Decimal, side: OrderSide) -> Opt
 /// - `positions`: **定向**持仓 (现货 = base 余额包装单条; 合约 one-way 一条; hedge 多空各一条);
 /// - `hedge`: 合约双向模式 → 平仓带 `positionSide` 且不带 `reduceOnly`(fapi 拒绝两者同带);
 /// - 平仓数量按 `step_size` 向下取整, 不足最小数量 → 不平仓并如实说明。
+#[allow(clippy::too_many_arguments)] // 参数聚合重构另行立项(021 只清存量告警, 不改结构)
 pub fn plan_cleanup(
     orders: &[OrderInfo],
     prefix: &str,
@@ -615,7 +616,7 @@ mod tests {
             leverage: None,
         };
         let plan =
-            plan_cleanup(&[], &prefix, &[pos.clone()], "ETHUSDT", true, &m, "grid-close", false);
+            plan_cleanup(&[], &prefix, std::slice::from_ref(&pos), "ETHUSDT", true, &m, "grid-close", false);
         assert_eq!(plan.closes.len(), 1, "现货单条持仓 → 一笔平仓单");
         let close = &plan.closes[0];
         assert_eq!(close.side, OrderSide::Sell, "现货平仓 = 卖出");
@@ -658,7 +659,7 @@ mod tests {
         let short = Position { side: OrderSide::Sell, size: dec!(0.02), ..long.clone() };
 
         // one-way: 单条净仓 → 一笔 reverse 单 + reduceOnly (不开反向仓)
-        let one = plan_cleanup(&[], &prefix, &[long.clone()], "ETHUSDT", true, &m, "c", false);
+        let one = plan_cleanup(&[], &prefix, std::slice::from_ref(&long), "ETHUSDT", true, &m, "c", false);
         assert_eq!(one.closes.len(), 1);
         assert_eq!(one.closes[0].side, OrderSide::Sell);
         assert!(one.closes[0].reduce_only, "one-way 平仓必须 reduceOnly");

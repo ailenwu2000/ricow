@@ -171,6 +171,7 @@ fn warn_near_liquidation(
 /// 停机清理后短暂消费用户流: 把清理期间产生的成交 (兜底平仓) 回写上下文并落库。
 ///
 /// 返回吸干到的**本实例**成交笔数。窗口内无事件即提前结束 (撤单不产生成交, 不会被白等满)。
+#[allow(clippy::too_many_arguments)] // 参数聚合重构另行立项(021 只清存量告警, 不改结构)
 async fn drain_user_events(
     stream: &mut Pin<Box<dyn Stream<Item = UserEvent> + Send>>,
     ctx: &mut LiveContext,
@@ -238,6 +239,7 @@ fn describe_positions(positions: &[Position]) -> String {
 }
 
 /// 成交后刷新持仓: 合约走定向持仓覆盖; 现货走 base 可用余额包装 (空余额 = 清仓, 不留陈旧仓)。
+#[allow(clippy::too_many_arguments)] // 参数聚合重构另行立项(021 只清存量告警, 不改结构)
 async fn refresh_positions(
     exchange: &Arc<dyn Exchange>,
     market: &Market,

@@ -573,7 +573,7 @@ impl Strategy for LuaStrategy {
     /// 脚本里定义了 `on_stop` 才算实现了清理 (未定义 → 引擎提示手工处理)。
     fn has_on_stop(&self) -> bool {
         let globals = self.lua.globals();
-        matches!(globals.get::<Function>("on_stop"), Ok(_))
+        globals.get::<Function>("on_stop").is_ok()
     }
 }
 

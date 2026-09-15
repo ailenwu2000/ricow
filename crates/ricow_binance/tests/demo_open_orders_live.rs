@@ -56,11 +56,10 @@ fn qty_for_notional(
     step: Option<Decimal>,
 ) -> Decimal {
     let raw = (notional / price).max(min_qty);
-    let aligned = match step {
+    match step {
         Some(s) if !s.is_zero() => ((raw / s).floor() * s).max(min_qty),
         _ => raw,
-    };
-    aligned
+    }
 }
 
 /// 现货: 挂远离市价的限价买单 → `get_open_orders` 必须能看到 → 撤单 → 必须看不到了。
