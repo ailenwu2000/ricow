@@ -1,8 +1,8 @@
 name: CI
 
 on:
+  # 所有分支推送都跑(项目组成员会把分支推到本仓库, 需要分支级反馈)
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
