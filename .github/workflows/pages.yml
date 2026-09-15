@@ -1,5 +1,6 @@
 # 官网(ricow.xyz)部署: 纯静态站点, 源 = 仓库 website/ 目录
-# 只在 website/ 或本文件变化时触发(不干扰 Rust CI); 首次运行会自动启用 Pages
+# 只在 website/ 或本文件变化时触发(不干扰 Rust CI)
+# 前置(仓库管理员做一次): Settings → Pages → Build and deployment → Source 选 "GitHub Actions"
 name: Pages
 
 on:
@@ -26,10 +27,10 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
-      - name: 配置 Pages(未启用时自动启用)
+      # 不能用 enablement: true 自动启用 —— 官方 action.yml 要求该选项必须提供非 GITHUB_TOKEN 的凭据
+      # (PAT 需 repo scope 或 Pages write; GitHub App 需 administration:write + pages:write)。
+      - name: 配置 Pages
         uses: actions/configure-pages@v6
-        with:
-          enablement: true
       - name: 打包站点目录
         uses: actions/upload-pages-artifact@v5
         with:
