@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ricow —— 完全本地运行的量化策略引擎</title>
+<meta name="description" content="ricow:完全本地运行的多平台量化策略引擎(回测 / Dry Run / 实盘),纯本地 CLI,无云端依赖、无遥测、无自动更新。">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div>
+    <h1>ricow</h1>
+    <p class="tagline">完全本地运行的多平台量化策略引擎 —— 回测 / Dry Run / 实盘。</p>
+  </div>
+  <div class="lang"><a href="index.html">English</a> · <strong>中文</strong></div>
+</header>
+
+<section>
+  <div class="card">
+    <p style="margin:0 0 10px"><strong>纯本地 CLI。</strong>无云端依赖、无遥测、无自动更新。密钥与数据不出你的机器。</p>
+    <ul style="margin:0">
+      <li><strong>单一二进制</strong> —— <code>ricow</code>,由 5 个 crate 的 Rust workspace 构建。</li>
+      <li><strong>策略用 Lua 写</strong>,跑在沙箱里(无 <code>os</code>/<code>io</code>/<code>require</code>/<code>loadstring</code>/<code>pcall</code>;每 tick 指令预算 100 万,内存 64&nbsp;MB)。</li>
+      <li><strong>只有一个配置文件</strong>:<code>ricow.toml</code>(权限 <code>0600</code>,明文,永不入 git)。</li>
+      <li><strong>四档运行</strong>:回测 → Dry Run → demo(币安测试网真实下单) → 实盘(真实资金)。</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2>安装</h2>
+<pre><code># Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ailenwu2000/ricow/releases/latest/download/ricow-installer.sh | sh</code></pre>
+<pre><code># Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/ailenwu2000/ricow/releases/latest/download/ricow-installer.ps1 | iex"</code></pre>
+  <p class="note">想用压缩包?所有平台产物(Linux x64/arm64、macOS x64/arm64、Windows x64)与 SHA256 校验和都在
+  <a href="https://github.com/ailenwu2000/ricow/releases">Releases 页</a>。也可以源码构建:<code>cargo build --release</code>。</p>
+</section>
+
+<section>
+  <h2>四档运行</h2>
+  <table>
+    <thead><tr><th>档位</th><th>命令</th><th>资金</th><th>前置</th></tr></thead>
+    <tbody>
+      <tr><td>回测</td><td><code>ricow backtest --strategy shannon_grid --pair ETHUSDT --days 30</code></td><td>无</td><td>零配置</td></tr>
+      <tr><td>Dry Run(本地虚拟撮合)</td><td><code>ricow start &lt;名字&gt;</code></td><td>无</td><td>零配置</td></tr>
+      <tr><td>demo(币安测试网真实下单)</td><td><code>ricow start &lt;名字&gt; --demo</code></td><td>模拟资金</td><td><code>[exchange].demo_*</code></td></tr>
+      <tr><td>实盘(主网真实资金)</td><td><code>live_enabled = true</code> + <code>ricow start &lt;名字&gt; --live --accept-risk</code></td><td>真实</td><td><code>[exchange].binance_*</code> + 首次风险确认 + Dry Run 时长门禁</td></tr>
+    </tbody>
+  </table>
+  <p class="note">demo 与实盘都真实调用交易所接口,差别只在域名(<code>demo-api</code>/<code>demo-fapi</code> vs 主网)与凭据,两套凭据互不回落。</p>
+</section>
+
+<section>
+  <h2>写你自己的策略</h2>
+  <p>策略是 Lua 脚本,通过引擎提供的接口驱动(<code>ctx</code>、<code>exec.*</code>)。推荐路径在落盘前先编译门禁 + 真实 K 线沙箱回测:</p>
+<pre><code>ricow create --name my_strategy --pair ETHUSDT --script my_strategy.lua   # 编译门禁 + 真实 K 线沙箱回测
+ricow approve                                                             # 由你在交互终端逐字确认
+ricow deploy &lt;preview_id&gt; --token &lt;token&gt;                                 # 落盘到 strategies/</code></pre>
+  <p class="note">唯一的策略样板是 <code>strategies/builtin/shannon_grid.lua</code>,照它写即可。
+  完整 API 见 <a href="https://github.com/ailenwu2000/ricow/blob/main/specs/lua-api.md">specs/lua-api.md</a>。</p>
+</section>
+
+<section>
+  <h2>安全模型</h2>
+  <ul>
+    <li><strong>密钥只在本机。</strong>只有一个 <code>ricow.toml</code>(权限 <code>0600</code>,已被 git 忽略);产品不代写密钥,也从不上传。</li>
+    <li><strong>实盘有多道门。</strong>策略必须声明 <code>live_enabled = true</code>;命令行须 <code>--live --accept-risk</code>,并有首次风险确认与 Dry Run 时长门禁。</li>
+    <li><strong>写实操作只能人来做。</strong>确认短语(部署 / 实盘)只接受在交互终端逐字输入 —— 管道、脚本、AI 工具调用喂入的一律拒绝。</li>
+    <li><strong>内置 AI 助手是只读的。</strong>能问答、跑回测、查文档;不能下单、部署或转移资金。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>平台支持</h2>
+  <table>
+    <thead><tr><th>平台</th><th>状态</th></tr></thead>
+    <tbody>
+      <tr><td>Linux x86_64</td><td>实机验证(构建、回测、demo 测试网真实下单流程)</td></tr>
+      <tr><td>Linux arm64</td><td>由 CI 构建并发布;尚未实机跑过交易流程</td></tr>
+      <tr><td>Windows x86_64</td><td>编译与全量单元测试已由 CI 通过;尚未实机跑过交易流程</td></tr>
+      <tr><td>macOS(x86_64 / arm64)</td><td>由 CI 构建并发布;未实机验证</td></tr>
+    </tbody>
+  </table>
+  <p class="note">发布产物 ≠ 宣称支持:除 Linux x86_64 外,各平台尚未端到端跑过真实交易所流程。</p>
+</section>
+
+<section>
+  <h2>文档</h2>
+  <div class="grid">
+    <div class="card"><a href="https://github.com/ailenwu2000/ricow/blob/main/README_zh.md">README(中文)</a><br><span class="note">构建 / 配置 / 四档运行 / 网络</span></div>
+    <div class="card"><a href="https://github.com/ailenwu2000/ricow/blob/main/README.md">README (English)</a><br><span class="note">build, config, run modes, network</span></div>
+    <div class="card"><a href="https://github.com/ailenwu2000/ricow/blob/main/specs/lua-api.md">策略 API(Lua)</a><br><span class="note">ctx / exec.* / 执行模式</span></div>
+    <div class="card"><a href="https://github.com/ailenwu2000/ricow/blob/main/CONTRIBUTING.md">贡献指南</a><br><span class="note">构建、测试纪律、PR 流程</span></div>
+  </div>
+  <p class="note" style="margin-top:12px">问题与建议:<a href="https://github.com/ailenwu2000/ricow/issues">GitHub Issues</a>。
+  安全漏洞请走 <a href="https://github.com/ailenwu2000/ricow/blob/main/SECURITY.md">SECURITY.md</a> 的私有渠道,不要开公开 issue。</p>
+</section>
+
+<footer>
+  <p><strong>免责声明。</strong>本软件仅供学习与研究,不构成投资建议。加密货币交易风险极高,真实资金的任何后果由使用者自负。</p>
+  <p>Apache-2.0 · <a href="https://github.com/ailenwu2000/ricow">github.com/ailenwu2000/ricow</a> · <a href="index.html">English</a></p>
+</footer>
+
+</div>
+</body>
+</html>

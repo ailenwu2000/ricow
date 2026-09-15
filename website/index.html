@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ricow — a fully local quantitative strategy engine</title>
+<meta name="description" content="ricow: a fully local, multi-platform quantitative strategy engine (backtest / Dry Run / live). Pure local CLI — no cloud, no telemetry, no auto-update.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div>
+    <h1>ricow</h1>
+    <p class="tagline">A fully local, multi-platform quantitative strategy engine for crypto — backtest, Dry Run, and live trading.</p>
+  </div>
+  <div class="lang"><strong>English</strong> · <a href="zh.html">中文</a></div>
+</header>
+
+<section>
+  <div class="card">
+    <p style="margin:0 0 10px"><strong>Pure local CLI.</strong> No cloud, no telemetry, no auto-update. Your keys and your data never leave your machine.</p>
+    <ul style="margin:0">
+      <li><strong>One binary</strong> — <code>ricow</code>, built from a 5-crate Rust workspace.</li>
+      <li><strong>Strategies in Lua</strong>, sandboxed (no <code>os</code>/<code>io</code>/<code>require</code>/<code>loadstring</code>/<code>pcall</code>, 1M instructions per tick, 64&nbsp;MB memory).</li>
+      <li><strong>One config file</strong>: <code>ricow.toml</code> (mode <code>0600</code>, plaintext, never committed).</li>
+      <li><strong>Four run modes</strong>: backtest → Dry Run → demo (Binance testnet, real orders) → live (real money).</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2>Install</h2>
+<pre><code># Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ailenwu2000/ricow/releases/latest/download/ricow-installer.sh | sh</code></pre>
+<pre><code># Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/ailenwu2000/ricow/releases/latest/download/ricow-installer.ps1 | iex"</code></pre>
+  <p class="note">Prefer a tarball? All platform archives (Linux x64/arm64, macOS x64/arm64, Windows x64) plus SHA256 checksums are on the
+  <a href="https://github.com/ailenwu2000/ricow/releases">Releases page</a>. Build from source with <code>cargo build --release</code>.</p>
+</section>
+
+<section>
+  <h2>Four run modes</h2>
+  <table>
+    <thead><tr><th>Mode</th><th>Command</th><th>Capital</th><th>Prerequisites</th></tr></thead>
+    <tbody>
+      <tr><td>Backtest</td><td><code>ricow backtest --strategy shannon_grid --pair ETHUSDT --days 30</code></td><td>none</td><td>zero config</td></tr>
+      <tr><td>Dry Run (local virtual matching)</td><td><code>ricow start &lt;name&gt;</code></td><td>none</td><td>zero config</td></tr>
+      <tr><td>demo (Binance testnet, real orders)</td><td><code>ricow start &lt;name&gt; --demo</code></td><td>simulated</td><td><code>[exchange].demo_*</code></td></tr>
+      <tr><td>Live (mainnet, real money)</td><td><code>live_enabled = true</code> + <code>ricow start &lt;name&gt; --live --accept-risk</code></td><td>real</td><td><code>[exchange].binance_*</code> + first-use risk acknowledgement + Dry Run duration gate</td></tr>
+    </tbody>
+  </table>
+  <p class="note">demo and live both call the real exchange API — they differ only in domain (<code>demo-api</code>/<code>demo-fapi</code> vs mainnet) and credentials, and the two credential sets never fall back to each other.</p>
+</section>
+
+<section>
+  <h2>Writing your own strategy</h2>
+  <p>Strategies are Lua scripts driven by a small engine API (<code>ctx</code>, <code>exec.*</code>). The guided path compiles and backtests before anything touches your disk:</p>
+<pre><code>ricow create --name my_strategy --pair ETHUSDT --script my_strategy.lua   # compile gate + real-K-line sandbox backtest
+ricow approve                                                             # you type the confirmation in your terminal
+ricow deploy &lt;preview_id&gt; --token &lt;token&gt;                                 # lands in strategies/</code></pre>
+  <p class="note">The only built-in strategy template is <code>strategies/builtin/shannon_grid.lua</code> — read it as a starting point.
+  Full API reference: <a href="https://github.com/ailenwu2000/ricow/blob/main/specs/lua-api.md">specs/lua-api.md</a>.</p>
+</section>
+
+<section>
+  <h2>Safety model</h2>
+  <ul>
+    <li><strong>Keys stay local.</strong> One <code>ricow.toml</code> on your machine (<code>0600</code>, git-ignored). The tool never writes keys for you and never sends them anywhere.</li>
+    <li><strong>Live trading is gated.</strong> A strategy must declare <code>live_enabled = true</code>; the CLI requires <code>--live --accept-risk</code>, a first-use risk acknowledgement, and a minimum Dry Run duration before it will go live.</li>
+    <li><strong>Write actions are human-only.</strong> The confirmation phrases (deploy / go live) can only be typed in an interactive terminal — anything fed through pipes, scripts, or AI tool calls is rejected.</li>
+    <li><strong>The built-in AI assistant is read-only.</strong> It can answer questions, run backtests, and read the docs — it cannot place orders, deploy, or move money.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Platform support</h2>
+  <table>
+    <thead><tr><th>Platform</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Linux x86_64</td><td>Verified on a real machine (build, backtests, demo/testnet order flows)</td></tr>
+      <tr><td>Linux arm64</td><td>Built and published by CI; live/Dry Run flows not yet exercised on real hardware</td></tr>
+      <tr><td>Windows x86_64</td><td>Builds and the full unit-test suite pass in CI; live/Dry Run flows not yet exercised on real hardware</td></tr>
+      <tr><td>macOS (x86_64 / arm64)</td><td>Built and published by CI; not exercised on real hardware</td></tr>
+    </tbody>
+  </table>
+  <p class="note">A published artifact is not a support claim: platforms other than Linux x86_64 have not been run end-to-end against a real exchange yet.</p>
+</section>
+
+<section>
+  <h2>Documentation</h2>
+  <div class="grid">
+    <div class="card"><a href="https://github.com/ailenwu2000/ricow/blob/main/README.md">README (English)</a><br><span class="note">build, config, run modes, network</span></div>
+    <div class="card"><a href="https://github.com/ailenwu2000/ricow/blob/main/README_zh.md">README(中文)</a><br><span class="note">构建 / 配置 / 四档运行 / 网络</span></div>
+    <div class="card"><a href="https://github.com/ailenwu2000/ricow/blob/main/specs/lua-api.md">Strategy API (Lua)</a><br><span class="note">ctx / exec.* / 执行模式</span></div>
+    <div class="card"><a href="https://github.com/ailenwu2000/ricow/blob/main/CONTRIBUTING.md">Contributing</a><br><span class="note">build, test discipline, PR flow</span></div>
+  </div>
+  <p class="note" style="margin-top:12px">Bugs and questions: <a href="https://github.com/ailenwu2000/ricow/issues">GitHub Issues</a>.
+  Security reports: please use <a href="https://github.com/ailenwu2000/ricow/blob/main/SECURITY.md">SECURITY.md</a> instead of a public issue.</p>
+</section>
+
+<footer>
+  <p><strong>Disclaimer.</strong> This software is for learning and research only and is not investment advice. Cryptocurrency trading carries extreme risk. You are solely responsible for any use of it with real funds.</p>
+  <p>Apache-2.0 · <a href="https://github.com/ailenwu2000/ricow">github.com/ailenwu2000/ricow</a> · <a href="zh.html">中文</a></p>
+</footer>
+
+</div>
+</body>
+</html>

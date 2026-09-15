@@ -25,6 +25,7 @@
 - **开源落地**: 仓库 <https://github.com/ailenwu2000/ricow>(public, Apache-2.0); 已落地 LICENSE / 双语 README(含语言切换)/ CONTRIBUTING / CODE_OF_CONDUCT / SECURITY / issue+PR 模板 / CODEOWNERS / dependabot(仅自动提 patch/minor)。
 - **CI 硬门禁 (2026-09-15)**: `rustfmt --check` + `clippy -D warnings` + `test (ubuntu-latest)` + `test (windows-latest)`, 任意分支推送与 PR 均触发; 工具链由 `rust-toolchain.toml` 钉死 **1.96.1**(CI 以该文件为唯一版本来源, 避免 stable 浮动导致"本地绿、CI 红"); 217→221 告警清零与全仓格式对齐见 `specs/changes/021` / `022`。
 - **首个公开发布 (2026-09-15)**: **v0.7.0**(项目进度约 70%)—— 用 dist(cargo-dist 0.32.0)发布 5 平台产物(linux x64/arm64、macOS x64/arm64、windows x64)+ SHA256 + shell/powershell 安装脚本 + source 包, 共 16 个资产; 已实测下载 linux x64 产物、校验 sha256、运行得 `ricow 0.7.0`。产物平台 ≠ 宣称支持: 除 Linux x86_64 外均未实机跑交易流程。
+- **官网**: 落地页源码 `website/`(中英双语纯静态页),由 `.github/workflows/pages.yml` 部署到 GitHub Pages;自定义域名 **ricow.xyz** 待 GoDaddy DNS 指向 GitHub Pages 后生效(DNS 由维护者操作)。
 - **历史变更档案**: `specs/changes/**` 正文保留旧名不回改(宪法「定稿不回改」)。
 - 发布流程唯一权威: `specs/release.md`。
 
