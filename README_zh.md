@@ -94,7 +94,8 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_P
 | 平台 | 状态 |
 |---|---|
 | Linux x86_64 | 实机验证(构建、回测、demo 测试网真实下单流程) |
-| macOS / Windows | 已有跨平台代码分支(`cfg(unix)` / `cfg(windows)`), 由 CI 覆盖编译与单元测试; **尚未实机跑过交易流程** |
+| Windows x86_64 | 编译与全量单元测试已由 CI 实测通过(`test (windows-latest)`, 2026-09-15); **尚未实机跑过交易流程** |
+| macOS | 未验证 —— 无实机且暂无 CI 覆盖; 代码走与 Linux 同源的 `cfg(unix)` 分支 |
 
 ## 竞品调研结论摘要
 

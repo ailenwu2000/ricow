@@ -91,7 +91,8 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # your proxy (or HTTP_PROXY / ALL_PRO
 | Platform | Status |
 |---|---|
 | Linux x86_64 | Verified on a real machine (build, backtests, demo/testnet flows) |
-| macOS / Windows | Cross-platform code paths exist (`cfg(unix)` / `cfg(windows)`) and are covered by CI build + unit tests; live/Dry Run flows have **not** been exercised on real hardware yet |
+| Windows x86_64 | Builds and the full unit-test suite pass in CI (`test (windows-latest)`, 2026-09-15); live/Dry Run flows have **not** been exercised on real hardware yet |
+| macOS | Not verified — no hardware available and no CI coverage yet; the code takes the `cfg(unix)` path shared with Linux |
 
 ## Disclaimer
 

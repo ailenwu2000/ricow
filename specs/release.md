@@ -56,8 +56,8 @@ dist plan                            # 本地核对将构建的平台与产物�
 | 平台 | 构建 | 交易流程实机验证 | 是否发布产物 |
 |---|---|---|---|
 | Linux x86_64 (`x86_64-unknown-linux-gnu`) | ✅ 本地实测 | ✅ 已实测(回测 / demo 现货与合约) | ✅ |
-| Windows x86_64 (`x86_64-pc-windows-msvc`) | 以 CI `test (windows-latest)` 结果为准 | ❌ 未实机 | 待 CI 转绿后决定 |
-| macOS (`x86_64-apple-darwin` / `aarch64-apple-darwin`) | 未验证(无实机; 代码走 `cfg(unix)` 分支) | ❌ 未实机 | 待验证后决定 |
+| Windows x86_64 (`x86_64-pc-windows-msvc`) | ✅ CI 实测(2026-09-15 `test (windows-latest)` 全绿: 编译 + 全量单元测试) | ❌ 未实机 | 可纳入(产物平台待 dist 接入后一并决定) |
+| macOS (`x86_64-apple-darwin` / `aarch64-apple-darwin`) | 未验证(无实机; 代码走 `cfg(unix)` 分支, 无 CI 覆盖) | ❌ 未实机 | 待验证后决定 |
 
 > 规则: **未经验证的平台不得在 README / Release 说明中宣称支持**。状态变化时, 本表与 README「平台支持」表必须同步更新。
 
