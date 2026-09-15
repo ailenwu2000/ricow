@@ -26,7 +26,8 @@
 - **CI 硬门禁 (2026-09-15)**: `rustfmt --check` + `clippy -D warnings` + `test (ubuntu-latest)` + `test (windows-latest)`, 任意分支推送与 PR 均触发; 工具链由 `rust-toolchain.toml` 钉死 **1.96.1**(CI 以该文件为唯一版本来源, 避免 stable 浮动导致"本地绿、CI 红"); 217→221 告警清零与全仓格式对齐见 `specs/changes/021` / `022`。
 - **首个公开发布 (2026-09-15)**: **v0.7.0**(项目进度约 70%)—— 用 dist(cargo-dist 0.32.0)发布 5 平台产物(linux x64/arm64、macOS x64/arm64、windows x64)+ SHA256 + shell/powershell 安装脚本 + source 包, 共 16 个资产; 已实测下载 linux x64 产物、校验 sha256、运行得 `ricow 0.7.0`。产物平台 ≠ 宣称支持: 除 Linux x86_64 外均未实机跑交易流程。
 - **官网**: 落地页源码 `website/`(中英双语纯静态页,含 OG/Twitter 卡片元信息),由 `.github/workflows/pages.yml` 部署。
-  **已上线**: <https://ailenwu2000.github.io/ricow/>(2026-09-15 实测 HTTP 200,中英文页均正常);自定义域名 **ricow.xyz** 尚未绑定 —— 需维护者在 Settings → Pages 填 Custom domain 并在 GoDaddy 改 DNS(A `@` → 185.199.108–111.153 四条;CNAME `www` → `ailenwu2000.github.io`),之后勾选 Enforce HTTPS(该选项最多 24 小时后才出现)。
+  **已上线**: <https://ailenwu2000.github.io/ricow/>(2026-09-15 实测 HTTP 200,中英文页均正常);自定义域名已配置为 **www.ricow.xyz**(2026-09-15):`http://www.ricow.xyz` 实测 200 且内容正确,裸域 `ricow.xyz` 由 GitHub 自动 301 → www(方向由 custom domain 决定)。
+  **待收尾两项**:①HTTPS 证书 GitHub 自动签发中(当前 www 仍返回默认 `*.github.io` 证书,签发后 Pages 才会出现 Enforce HTTPS,官方说明最多 24 小时);②裸域 IPv4 的 `A` 记录仍是 GoDaddy 停放 IP `160.153.0.181`,需换成 `185.199.108–111.153` 四条(IPv6 的 AAAA 已指向 GitHub)。
   Pages 的 Source 已设为 "GitHub Actions"(仓库管理员已启用);Actions 发布方式下**不需要 CNAME 文件**。
 - **历史变更档案**: `specs/changes/**` 正文保留旧名不回改(宪法「定稿不回改」)。
 - 发布流程唯一权威: `specs/release.md`。
