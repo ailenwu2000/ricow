@@ -1,12 +1,16 @@
 version: 2
 updates:
+  # Rust 依赖: 只自动提 patch/minor; major 升级会破坏构建, 一律人工评估后再做(宪法原则五"少而精")
   - package-ecosystem: cargo
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
