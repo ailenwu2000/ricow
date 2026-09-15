@@ -133,3 +133,9 @@
   管道/脚本/AI agent 工具调用喂入短语不再能过门。代码符合 spec §七 R2 原文("逐字确认仅交互终端")。
   真机验证(4 例): 管道 approve → 拒绝且 preview 仍 pending、零副作用; pty 下 approve → 正常通过并发 token;
   管道 `start --live` → 同一门禁拒绝; pty 下错短语 → 走既有"未确认+零动作"分支。单测两条分支; 测试 337 → 339。
+
+## 追加(2026-09-15): T075 `examples/` 收敛
+
+用户最终判断"examples 目录甚至没必要" → **整个目录删除**, 建策略入口统一为 `create` / `approve` / `deploy` 闭环,
+样板统一为内置 `strategies/builtin/shannon_grid.lua`。同步修改 `specs/lua-api.md` §九、两份 README、`specs/backtest.md` 历史注记。
+T076(数据目录 vs 源码树职责分离)仍挂起, 建议排在 v0.1.0 发布之后。

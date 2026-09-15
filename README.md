@@ -82,8 +82,8 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # your proxy (or HTTP_PROXY / ALL_PRO
 
 - `specs/` — the single documentation tree: constitution / product / architecture / lua-api / roadmap / research / changes (SDD artefacts)
 - `crates/` — 5-crate workspace: core / binance / strategy / engine / cli
-- `strategies/builtin/` — built-in references: `shannon_grid.lua` (strategy template) + `executors/{dca,twap,vwap,pullback,ladder}` (execution-pattern examples, not strategies); the `exec` components are built into the engine (Rust) and called from Lua via `exec.*`
-- `examples/` — user strategy template and examples (`strategy_template.toml` / `ema_cross.lua`)
+- `strategies/builtin/` — built-in references, compiled into the binary: `shannon_grid.lua` (**the only strategy template** — read it as your starting point) + `executors/{dca,twap,vwap,pullback,ladder}` (execution-pattern examples, not strategies); the `exec` components live in the engine (Rust) and are called from Lua via `exec.*`
+- Writing your own strategy: `ricow create --name <name> --pair <pair> --script <file.lua>` → `ricow approve` → `ricow deploy <preview_id> --token <token>` (compile gate + real-K-line sandbox backtest; nothing is written to disk until you confirm in an interactive terminal) — see [specs/lua-api.md](specs/lua-api.md) §九
 - `crates/ricow/src/supervisor/` — strategy process manager (resident daemon + local control channel + instance ledger; see [specs/architecture.md §三](specs/architecture.md))
 
 ## Platform support

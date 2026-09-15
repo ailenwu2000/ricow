@@ -281,14 +281,18 @@ end
 <项目根>/ricow.db                      # 运行时数据 (行情缓存/成交/盈亏快照)
 ```
 
-新建步骤:
+新建步骤(**推荐路径** = `create` 闭环, 全程带编译门禁 + 真实 K 线沙箱回测):
 
-1. 复制模板:`cp examples/strategy_template.toml strategies/<name>.toml`
-2. 写脚本:`strategies/scripts/<name>.lua`(参考 `examples/ema_cross.lua`,API 见本文档)
-3. TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝对路径);
-   旧部署(TOML 内嵌 `script` 代码字符串)依然兼容
-4. 回测:`ricow backtest --strategy <name>`(TOML 已含 pair 时可省 `--pair`;缺省用 `--pair` 补)
-5. 启动:`ricow run <name>`(Dry Run;TOML 里 `enabled = false` 会被拒绝启动)
+1. `ricow create --name <name> --pair <pair> --script <你的.lua>`(省略 `--script` 或写 `-` = 从 stdin 读全文)
+   —— 引擎先做编译门禁, 再用真实 K 线沙箱回测, 通过则生成**不落盘**的 preview;
+2. `ricow approve`(必须在**你自己的交互终端**里逐字确认)拿到一次性 token;
+3. `ricow deploy <preview_id> --token <token>` 落盘 `strategies/<name>.toml` + `strategies/scripts/<name>.lua`(同名拒绝覆盖);
+4. 回测:`ricow backtest --strategy <name>`(TOML 已含 pair 时可省 `--pair`);
+5. 启动:`ricow run <name>`(Dry Run;TOML 里 `enabled = false` 会被拒绝启动)。
+
+**没有独立的"策略模板文件"**: 样板就是下节的 `strategies/builtin/shannon_grid.lua`, 直接读它照写。
+手工建策略(不走 create 闭环)同样支持: 自己写 `strategies/<name>.toml` + `strategies/scripts/<name>.lua`,
+TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝对路径);旧部署(TOML 内嵌 `script` 代码字符串)依然兼容。
 
 目录定位:默认取**当前工作目录**(在项目根运行 `ricow`);从其他目录运行可设
 `RICOW_ROOT=<项目根>`;数据库路径可单独用 `RICOW_DB=<path>` 覆盖。

@@ -131,7 +131,7 @@
 > ✅ 全部通过(2026-09-04 重构落地当日核对;测试数于 2026-09-11 复核更新):
 > 1. `cargo test --workspace` 全绿(重构当日 173 测试: 10+15+19+20+16+93;新增 余额不足拒单 / 手续费实扣 / 现货禁空 / 合约开平仓 / 强平组合触发与先平浮亏仓 / 资金费 8h 结算 / hedge 方向仓查询 / 前视回归不变)。
 >    **2026-09-12 复核对齐**: 当前基线 = 216 passed / 0 failed / 9 ignored(见 specs/roadmap.md "测试基线")。
-> 2. 真数据冒烟通过(BN fapi 可达): 现货 dca 60d 现金耗尽场景总价值自洽(总价值 ≈ 现金 + 持仓市值,费用已扣);合约做多 14d(dca/futures_long.lua)与 hedge 14d(futures_hedge.lua 双向 82 笔,资金费净额 ≈0 证明多空对冲自洽)。
+> 2. 真数据冒烟通过(BN fapi 可达): 现货 dca 60d 现金耗尽场景总价值自洽(总价值 ≈ 现金 + 持仓市值,费用已扣);合约做多 14d(dca/futures_long.lua)与 hedge 14d(futures_hedge.lua 双向 82 笔,资金费净额 ≈0 证明多空对冲自洽)。(注: 该次冒烟用的 `examples/futures_long.lua` / `examples/futures_hedge.lua` 已于 2026-09-15 随 T075 收敛删除 —— `examples/` 目录整体移除, 需要时从 git 历史取回)
 > 3. Bug A 复现用例(60d dca, order_size=0.05)修复后: 1440 根中 1066 成交、现金耗尽后 374 笔拒单如实计数、持仓停在 53.3 ETH 不再增长。
 > 4. 报告含 §六 全部字段;合约报告含 杠杆/资金费净额/强平次数/名义敞口;hedge 模式经 pos_size/pos_entry 方向查询分列。
 > 5. specs/backtest.md 状态已改为 ✅ 已实施;constitution 文档树已登记(backtest)。

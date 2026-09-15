@@ -85,8 +85,8 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_P
 
 - `specs/` — 唯一文档体系: constitution(项目宪法)/ product(产品方案)/ architecture(架构)/ lua-api(Lua API 规范)/ roadmap(里程碑进度)/ research(调研资料)/ changes(变更档案, SDD 流程产物)
 - `crates/` — 5 crate workspace: core / binance / strategy / engine / cli
-- `strategies/builtin/` — 内置参考实现: shannon_grid.lua(策略样板)+ executors/{dca,twap,vwap,pullback,ladder}(执行模式示例, 非策略); exec 执行组件为引擎内置(Rust 实现, Lua 策略直接调用 exec.*)
-- `examples/` — 用户策略模板与示例(strategy_template.toml / ema_cross.lua)
+- `strategies/builtin/` — 内置参考实现(编译期嵌入二进制): shannon_grid.lua(**唯一策略样板**, 照它写你的策略)+ executors/{dca,twap,vwap,pullback,ladder}(执行模式示例, 非策略); exec 执行组件为引擎内置(Rust 实现, Lua 策略直接调用 exec.*)
+- 自建策略走 `create` 闭环:`ricow create --name <名字> --pair <交易对> --script <你的.lua>` → `ricow approve` → `ricow deploy <preview_id> --token <token>`(带编译门禁 + 真实 K 线沙箱回测, **确认前不落盘**;样板 = 内置 `strategies/builtin/shannon_grid.lua`,见 [specs/lua-api.md](specs/lua-api.md) 第九节)
 - `crates/ricow/src/supervisor/` — 策略进程管理器(常驻 daemon + 本机控制通道 + 实例台账, 见 [specs/architecture.md §三](specs/architecture.md))
 
 ## 平台支持

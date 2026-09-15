@@ -269,9 +269,11 @@
 
 ## 阶段十二 — 用户提出的目录职责问题(2026-09-14, 用户要求"放到后面做")
 
-- [ ] **T075** `examples/` 收敛: 现为 4 个历史演示文件(`ema_cross.lua` 0600 权限 / `futures_hedge.lua` / `futures_long.lua` / `strategy_template.toml`),
-      与"当前只有一个内置策略 `strategies/builtin/shannon_grid.lua`"的现状不符, 且 README 只提了其中 2 个(过时)。
-      待定: 只保留 `strategy_template.toml` 并把示例并入 `strategies/builtin/`(或整体删除); 同步 README。
+- [x] **T075**(2026-09-15 用户最终判断: **`examples/` 整个目录不必要, 直接删除**): 已 `git rm -r examples/`(4 个文件: `ema_cross.lua` / `futures_hedge.lua` / `futures_long.lua` / `strategy_template.toml`)。
+      理由: 建策略的官方路径已是 `create`(编译门禁 + 真实 K 线沙箱回测 → 不落盘 preview)→ `approve` → `deploy` 落盘;
+      唯一样板 = 编译期嵌入的 `strategies/builtin/shannon_grid.lua`;`examples/` 属 002/019 之前"手工 cp 模板"路径的遗留, 与"只有一个内置策略"的现状不符。
+      文档同步: `specs/lua-api.md` §九 新建步骤改为 create 闭环(去掉两处 `examples/` 引用)、README 中/英 删除 `examples/` 条目并给出建策略闭环、
+      `specs/backtest.md` 历史冒烟记录加注(被删文件可从 git 历史取回)。
 - [ ] **T076** 目录职责分离: 用户自建策略与配置属于**数据目录**, 内置策略属于**源码树**; 当前仓库根同时充当两者
       (仓库根有 `locus.db`+`strategies/`, 导致 `<name>.toml/.lua` 这类运行时产物与随仓库走的 `strategies/builtin/` 混在一起)。
       待定: 明确目录约定 + 数据目录默认值(如 `~/.locus`)+ git 边界; 涉及 README/architecture 与 `.gitignore`。
