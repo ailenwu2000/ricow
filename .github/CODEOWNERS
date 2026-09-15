@@ -1,13 +1,14 @@
-# CODEOWNERS — 默认由仓库所有者负责所有改动
+# CODEOWNERS — 默认代码负责人(走 PR 时生效)
 #
 # 说明: 本项目允许项目组成员直接向 main 推提交; 本文件在**走 PR 时**生效 ——
-# 开启 "Require review from Code Owners" 后, 任何 PR 都必须由下面的人批准。
-# CODEOWNERS 文件本身也指定所有者, 防止有人通过改本文件给自己加权限来绕过评审。
+# 若开启 "Require review from Code Owners", 任何 PR 都需由下面的人批准(列出的任一人即可)。
+# CODEOWNERS 文件本身只由仓库所有者掌握, 防止有人通过改本文件给自己加权限来绕过评审。
 #
-# 需要把某目录交给其他人负责时, 在此追加, 例如:
-#   /crates/ricow_binance/   @somebody
+# 成员: @ailenwu2000(维护者) · @amoonsky(项目组成员, 2026-09-15 加入)
+# 需要把某目录交给专人负责时, 在此追加, 例如:
+#   /crates/ricow_binance/   @amoonsky
 
-*                      @ailenwu2000
+*                      @ailenwu2000 @amoonsky
 
 /.github/CODEOWNERS    @ailenwu2000
 /.github/              @ailenwu2000
