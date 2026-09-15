@@ -110,7 +110,7 @@
 2. ~~**CLI 残留清理**~~: ✅ 已随 008 一并处理(`backtest --market` 帮助文本、`--dump-dir` 删除、`scan` 帮助文本) —— 见 `specs/architecture.md` §十一。
 3. **backlog 变更**: ~~003-notifications~~(2026-09-13 实施) → ~~002-ai-quant-researcher~~(2026-09-13 实施); backlog 已清空; **019-ai-assistant 已定稿(2026-09-14)进入实施**, P4 dogfood 仍待执行。
 4. **P4 dogfood**: 上述前置已完成, 以真实小资金跑通"回测 → Dry Run → 实盘"闭环 —— **执行清单见 [`specs/research/p4-dogfood-runbook-2026-09.md`](research/p4-dogfood-runbook-2026-09.md)**(含一次性准备、四阶段命令与判据、立即停手条件、回滚、实测坑清单、结果留档表)。
-5. **全仓 rustfmt 对齐 (暂缓; 2026-09-14 记录)**: 实测 `cargo fmt --all` 会改动 **34 个文件 / 约 +6069 −1139 行**, 且**非纯空白差异**(结构体字段换行、长表达式换行等), 即现有代码与当前 `rustfmt.toml`(`max_width = 100`, `use_small_heuristics = "Max"`)的输出不一致。**已全部回退, 未纳入 019**。开工前需先确认团队基准 rustfmt 版本/配置; 单独立项(否则 review 无法区分语义改动与格式噪声), 不与其他变更混做。
+5. ~~**全仓 rustfmt 对齐**~~ ✅ 已随 **022**(2026-09-15)完成: 工具链钉死 1.96.1 后一次性对齐 41 个文件(+612 −518), CI 已开 `cargo fmt --all -- --check` 硬门禁。原记录(2026-09-14):: 实测 `cargo fmt --all` 会改动 **34 个文件 / 约 +6069 −1139 行**, 且**非纯空白差异**(结构体字段换行、长表达式换行等), 即现有代码与当前 `rustfmt.toml`(`max_width = 100`, `use_small_heuristics = "Max"`)的输出不一致。**已全部回退, 未纳入 019**。开工前需先确认团队基准 rustfmt 版本/配置; 单独立项(否则 review 无法区分语义改动与格式噪声), 不与其他变更混做。
 
 ## 文档-实现缺口 (2026-09-11 审计)
 

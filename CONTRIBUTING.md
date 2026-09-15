@@ -62,9 +62,9 @@ cargo test -p ricow_binance -- --ignored --test-threads=1
 
 ## 五、代码风格
 
-- 格式:遵循 `rustfmt.toml`(`max_width = 100`,`use_small_heuristics = "Max"`)。
-  **注意:全仓尚未与 rustfmt 对齐(约 38 个文件有差异)**,因此 CI 暂未开启 `cargo fmt --check`;请至少让你**改动过的文件**保持格式化,别扩大差异面。「全仓对齐」是独立待办。
-- 静态检查:`cargo clippy --workspace --all-targets`。当前存量告警约 28 条(0 error),**CI 暂未开 `-D warnings`**;新代码请勿引入新告警。
+- 格式:`cargo fmt --all`(遵循 `rustfmt.toml`:`max_width = 100`,`use_small_heuristics = "Max"`),**CI 已强制 `cargo fmt --all -- --check`**(2026-09-15 全仓对齐)。
+  提交前跑一次 `cargo fmt --all` 即可;工具链版本由 `rust-toolchain.toml` 钉死,保证格式化结果可复现。
+- 静态检查:`cargo clippy --workspace --all-targets -- -D warnings` —— **CI 为硬失败**(2026-09-15 存量告警已清零),任何新告警都会挡住合并。
 - 注释:中文(技术名词与命令保留英文)。
 - 依赖:新增依赖前先说明理由(宪法原则五「少而精」);能用现有接口/数据结构解决的,不引入新机制。
 

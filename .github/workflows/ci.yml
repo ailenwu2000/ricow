@@ -27,8 +27,9 @@ jobs:
       - name: Install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      # 全仓尚未与 rustfmt 对齐(约 38 个文件有差异, 见 CONTRIBUTING 第五节): 对齐完成后再打开下面一行
-      # - run: cargo fmt --all -- --check
+      - name: rustfmt
+        # 全仓已于 022 对齐(2026-09-15); 格式门禁自此为硬失败
+        run: cargo fmt --all -- --check
       - name: clippy
         # 存量告警已于 021 清零(2026-09-15); 门禁为硬失败, 新告警一律挡住
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
