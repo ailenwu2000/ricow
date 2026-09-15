@@ -81,7 +81,7 @@ pub fn template_text() -> String {
          #   本机端点(ollama)免密钥。也支持环境变量 RICOW_AI_API_KEY 临时覆盖。\n\
          [ai]\n\
          provider = \"deepseek\"\n\
-         model = \"deepseek-chat\"\n\
+         model = \"deepseek-flash\"\n\
          api_key = \"\"\n\
          max_turns = 8\n\
          # base_url = \"https://api.deepseek.com/v1\"   # 仅自定义/自建端点才需要\n\
@@ -281,7 +281,7 @@ mod tests {
         write(&root, &template_text());
         let f = load(&root).unwrap();
         assert_eq!(f.ai.provider, "deepseek");
-        assert_eq!(f.ai.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(f.ai.model.as_deref(), Some("deepseek-flash"));
         assert_eq!(f.ai.max_turns, Some(8));
         assert_eq!(f.ai.api_key, None, "模板里 api_key 为空 = 未填写");
         let _ = std::fs::remove_dir_all(&root);

@@ -4,7 +4,7 @@
 //!
 //! ```bash
 //! # 推荐: 指向你配置好的正式通道(例如 DeepSeek; key 由 env 提供, 不落盘)
-//! RICOW_AI_BASE_URL=https://api.deepseek.com/v1 RICOW_AI_MODEL=deepseek-chat \
+//! RICOW_AI_BASE_URL=https://api.deepseek.com/v1 RICOW_AI_MODEL=deepseek-flash \
 //!   RICOW_AI_API_KEY=sk-xxx cargo test -p ricow --test ai_ollama_smoke -- --ignored
 //! # 可选: 本机 Ollama(需自己先 `ollama pull <支持工具调用的模型>`; 无 API key)
 //! RICOW_AI_BASE_URL=http://127.0.0.1:11434/v1 RICOW_AI_MODEL=<模型名> \

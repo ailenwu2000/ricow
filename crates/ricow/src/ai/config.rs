@@ -45,7 +45,7 @@ pub const PRESETS: &[Preset] = &[
         id: "deepseek",
         label: "DeepSeek 推荐",
         base_url: "https://api.deepseek.com/v1",
-        model: "deepseek-chat",
+        model: "deepseek-flash",
     },
     Preset {
         id: "moonshot",
@@ -216,12 +216,12 @@ mod tests {
     fn test_resolve_uses_preset_defaults() {
         let r = resolve(&cfg("deepseek", ""), None, None).unwrap();
         assert_eq!(r.base_url, "https://api.deepseek.com/v1");
-        assert_eq!(r.model, "deepseek-chat", "空模型应取预设推荐值");
+        assert_eq!(r.model, "deepseek-flash", "空模型应取预设推荐值");
     }
 
     #[test]
     fn test_resolve_env_overrides_file_and_preset() {
-        let mut c = cfg("deepseek", "deepseek-chat");
+        let mut c = cfg("deepseek", "deepseek-flash");
         c.base_url = Some("https://my-proxy.local/v1".into());
         let r = resolve(&c, Some("http://127.0.0.1:11434/v1".into()), Some("qwen3:0.6b".into()))
             .unwrap();
