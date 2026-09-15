@@ -35,7 +35,7 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "rust_decimal"] }
-mlua = { version = "0.11", features = ["lua54", "send", "vendored"] }
+mlua = { version = "0.12", features = ["lua54", "send", "vendored"] }
 ta = "0.5"
 # 019: AI 助手 LLM 编排 (工具循环 / 审批门 / 流式 / 多供应商)。0.42 线锁定; 走 OpenAI 兼容通道
 rig = "0.42"
