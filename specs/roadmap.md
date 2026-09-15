@@ -28,7 +28,7 @@
 - **官网**: 落地页源码 `website/`(中英双语纯静态页,含 OG/Twitter 卡片元信息),由 `.github/workflows/pages.yml` 部署。
   **已上线**: <https://ailenwu2000.github.io/ricow/>(2026-09-15 实测 HTTP 200,中英文页均正常);自定义域名已配置为 **ricow.xyz**(裸域,2026-09-15):`https://ricow.xyz` 实测 200 且内容正确(证书 SAN 同时覆盖 `ricow.xyz` 与 `www.ricow.xyz`),`www.ricow.xyz` 由 GitHub 自动 301 → 裸域(方向由 custom domain 决定)。
   **DNS 已配置正确**(2026-09-15 实测):权威 NS(ns71/ns72.domaincontrol.com)返回 `185.199.108–111.153` 四条,Google/阿里/114 解析器一致;`curl --resolve` 直连 GitHub Pages 实测 **HTTPS 200 且证书校验通过**(SAN 含 ricow.xyz 与 www.ricow.xyz),访问 www 得 301 → 裸域。
-  遗留仅为**缓存与开关**:①部分解析器(Cloudflare 1.1.1.1、本机)仍缓存旧停放 IP,TTL 过期后自动纠正;②Pages 的 **Enforce HTTPS 尚未勾选**(实测 http://ricow.xyz 返回 200 而非 301),证书已就绪可勾选;③GitHub 侧 `NotServedByPagesError` 待其解析缓存过期后点 Check again 即消失。
+  遗留仅为**缓存与开关**:①公开解析器(Google/Cloudflare/阿里/114)与权威 NS 现已全部返回四条 GitHub IP;仅本机 WSL/Windows 路径仍解析到旧停放 IP(`ipconfig /flushdns` 后仍在,须 `wsl --shutdown` 重启或等上游缓存过期),浏览器如仍见停放页请开无痕/换网络验证;②Pages 的 **Enforce HTTPS 已可用但尚未勾选**(实测 `http://ricow.xyz` 仍 200 而非 301);③GitHub 侧 `NotServedByPagesError` 为其自身检查结果缓存,在 Settings → Pages 点 **Check again** 即应消失(证书已签发说明校验曾通过)。
   Pages 的 Source 已设为 "GitHub Actions"(仓库管理员已启用);Actions 发布方式下**不需要 CNAME 文件**。
 - **历史变更档案**: `specs/changes/**` 正文保留旧名不回改(宪法「定稿不回改」)。
 - 发布流程唯一权威: `specs/release.md`。
