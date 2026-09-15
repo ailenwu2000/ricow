@@ -1,5 +1,7 @@
 # ricow · 富牛
 
+<img src="website/logo.svg" alt="ricow 富牛" width="96">
+
 [English](README.md) | **中文**
 
 > 中文名:**富牛**。

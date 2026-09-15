@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="ricow 富牛">
+  <defs>
+    <linearGradient id="gs" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#FFF3C4"/><stop offset="0.4" stop-color="#EFC047"/><stop offset="1" stop-color="#9B6C10"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0f1319"/>
+  <path d="M40 52 C24 42 22 22 36 14" fill="none" stroke="url(#gs)" stroke-width="16" stroke-linecap="round"/>
+  <path d="M88 52 C104 42 106 22 92 14" fill="none" stroke="url(#gs)" stroke-width="16" stroke-linecap="round"/>
+  <path d="M40 46 h48 a16 16 0 0 1 16 16 v10 a40 40 0 0 1 -80 0 v-10 a16 16 0 0 1 16 -16 z" fill="none" stroke="url(#gs)" stroke-width="16" stroke-linejoin="round"/>
+  <circle cx="52" cy="76" r="7" fill="#33240A"/>
+  <circle cx="76" cy="76" r="7" fill="#33240A"/>
+</svg>

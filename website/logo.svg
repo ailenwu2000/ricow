@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="ricow 富牛">
+  <defs>
+    <radialGradient id="bgF" cx="0.32" cy="0.2" r="1.05">
+      <stop offset="0" stop-color="#1c2430"/><stop offset="1" stop-color="#0a0d12"/>
+    </radialGradient>
+    <linearGradient id="goldF" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#FFF6D5"/><stop offset="0.38" stop-color="#F0C247"/><stop offset="1" stop-color="#9B6C10"/>
+    </linearGradient>
+    <linearGradient id="goldEar" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#F7DC8E"/><stop offset="1" stop-color="#8A5F0E"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="30" fill="url(#bgF)"/>
+  <g opacity="0.4" transform="translate(1.8,2.6)">
+    <path d="M38 50 C25 40 24 24 36 16" fill="none" stroke="#6b4c0c" stroke-width="12" stroke-linecap="round"/>
+    <path d="M90 50 C103 40 104 24 92 16" fill="none" stroke="#6b4c0c" stroke-width="12" stroke-linecap="round"/>
+    <path d="M42 48 C30 52 22 50 18 44" fill="none" stroke="#6b4c0c" stroke-width="9" stroke-linecap="round"/>
+    <path d="M86 48 C98 52 106 50 110 44" fill="none" stroke="#6b4c0c" stroke-width="9" stroke-linecap="round"/>
+    <path d="M42 48 h44 a13 13 0 0 1 13 13 v12 a36 36 0 0 1 -70 0 v-12 a13 13 0 0 1 13 -13 z" fill="none" stroke="#6b4c0c" stroke-width="12" stroke-linejoin="round"/>
+  </g>
+  <path d="M42 48 C30 52 22 50 18 44" fill="none" stroke="url(#goldEar)" stroke-width="8" stroke-linecap="round"/>
+  <path d="M86 48 C98 52 106 50 110 44" fill="none" stroke="url(#goldEar)" stroke-width="8" stroke-linecap="round"/>
+  <path d="M38 50 C25 40 24 24 36 16" fill="none" stroke="url(#goldF)" stroke-width="11" stroke-linecap="round"/>
+  <path d="M90 50 C103 40 104 24 92 16" fill="none" stroke="url(#goldF)" stroke-width="11" stroke-linecap="round"/>
+  <path d="M42 48 h44 a13 13 0 0 1 13 13 v12 a36 36 0 0 1 -70 0 v-12 a13 13 0 0 1 13 -13 z" fill="none" stroke="url(#goldF)" stroke-width="11" stroke-linejoin="round"/>
+  <circle cx="52" cy="72" r="5.5" fill="#33240A"/>
+  <circle cx="76" cy="72" r="5.5" fill="#33240A"/>
+  <path d="M57 89 h14" stroke="#33240A" stroke-width="7" stroke-linecap="round"/>
+</svg>

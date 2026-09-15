@@ -1,5 +1,7 @@
 # ricow
 
+<img src="website/logo.svg" alt="ricow" width="96">
+
 **English** | [中文文档](README_zh.md)
 
 A fully local, multi-platform quantitative strategy engine (backtest / Dry Run / live trading). Pure local CLI — no cloud, no telemetry, no auto-update.
