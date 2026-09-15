@@ -22,7 +22,9 @@
 - **更名**: 项目由 **locus** 正式更名 **ricow** —— 仓库名 / 二进制 / crate 名 / 环境变量(`RICOW_ROOT` / `RICOW_DB` / `RICOW_*`)/ 配置与数据文件名(`ricow.toml` / `ricow.db`)/ `clientOrderId` 前缀(`ricow-*`)全部同步;
   刻意保留的历史名: `locus_hl`(009 已删除的 crate)、`packaging/locus@.service`(008 已删除的单元)仅作为史实出现在文档中。
 - **历史**: git 历史不继承 —— 旧 60 次提交留在 gitee 与本地归档(`/mnt/d/mywork/ricow-old-git-history-20260915.tar.gz`), GitHub 仓库从 `v0.7.0` 重新开始。
-- **开源落地**: 仓库 <https://github.com/ailenwu2000/ricow>(public, Apache-2.0); 已落地 LICENSE / 双语 README / CONTRIBUTING / CODE_OF_CONDUCT / SECURITY / issue+PR 模板 / CODEOWNERS / dependabot / CI(clippy + Linux&Windows 测试)。
+- **开源落地**: 仓库 <https://github.com/ailenwu2000/ricow>(public, Apache-2.0); 已落地 LICENSE / 双语 README(含语言切换)/ CONTRIBUTING / CODE_OF_CONDUCT / SECURITY / issue+PR 模板 / CODEOWNERS / dependabot(仅自动提 patch/minor)。
+- **CI 硬门禁 (2026-09-15)**: `rustfmt --check` + `clippy -D warnings` + `test (ubuntu-latest)` + `test (windows-latest)`, 任意分支推送与 PR 均触发; 工具链由 `rust-toolchain.toml` 钉死 **1.96.1**(CI 以该文件为唯一版本来源, 避免 stable 浮动导致"本地绿、CI 红"); 217→221 告警清零与全仓格式对齐见 `specs/changes/021` / `022`。
+- **首个公开发布 (2026-09-15)**: **v0.7.0**(项目进度约 70%)—— 用 dist(cargo-dist 0.32.0)发布 5 平台产物(linux x64/arm64、macOS x64/arm64、windows x64)+ SHA256 + shell/powershell 安装脚本 + source 包, 共 16 个资产; 已实测下载 linux x64 产物、校验 sha256、运行得 `ricow 0.7.0`。产物平台 ≠ 宣称支持: 除 Linux x86_64 外均未实机跑交易流程。
 - **历史变更档案**: `specs/changes/**` 正文保留旧名不回改(宪法「定稿不回改」)。
 - 发布流程唯一权威: `specs/release.md`。
 
