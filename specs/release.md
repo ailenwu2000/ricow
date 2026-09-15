@@ -34,7 +34,7 @@ git push origin v0.7.0
 
 - 预发布演练可用 `vX.Y.Z-rc.N`(CI 会标为 prerelease), 确认资产齐全后再发正式版。
 - **变更记录策略(2026-09-15 决定)**: 只用 GitHub Release notes, 不建 `CHANGELOG.md`(宪法/决策 D7)。
-- 发布后同步镜像: `git push gitee main --tags`(gitee 为只读镜像, 发布与协作只在 GitHub)。
+- **gitee 镜像已停止维护**(2026-09-15 决定): 发布、协作、issue/PR 一律以 GitHub 为准;旧 locus 仓库留在 gitee 仅作历史存档, 不再推送。
 
 ## 四、多平台构建(dist, 2026-09-15 接入)
 

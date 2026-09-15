@@ -83,6 +83,33 @@ cargo test -p ricow_binance -- --ignored --test-threads=1
 | `README_zh.md` | 中文 |
 | 技术名词、命令、API 名 | 保留英文 |
 
-## 八、行为准则
+## 八、项目组成员(Write 权限)与上手清单
+
+**权限模型**(2026-09-15 决定):
+
+- 仓库 <https://github.com/ailenwu2000/ricow> 是个人仓库;**未加入的人**只能 fork 后提 PR,合并需维护者同意。
+- 项目组成员由维护者在 `Settings → Access → Add people` 加入(填 GitHub 用户名或已绑定该账号的邮箱),拿到 **Write** 权限。
+- **成员可直接推 `main`**(本项目当前约定)。但直推不等于免检:
+  - CI 四个门禁必须绿 —— `rustfmt` / `clippy -D warnings` / `test (ubuntu-latest)` / `test (windows-latest)`;推红了要立刻修(CI 在推送后依然会跑并如实报红);
+  - 不得推入任何密钥/凭据/个人数据(见第六节);
+  - 触及交易路径的改动,PR 描述或提交信息里写明 demo 实测结论;
+  - 影响 `specs/` 承诺的改动,同一提交内同步文档。
+- 与他人协作的功能改动**建议仍走 PR**(便于评审与回溯);直推适合小修、文档、紧急修复。合并方式 = Squash merge。
+
+**新成员上手清单**(约 10 分钟):
+
+```bash
+git clone git@github.com:ailenwu2000/ricow.git && cd ricow
+cargo test --workspace                                    # 纯逻辑测试, 零配置
+cargo build --release && ./target/release/ricow --help     # 产物与命令面
+./target/release/ricow backtest --strategy shannon_grid --pair ETHUSDT --days 20   # 需能访问币安(国内配 HTTPS_PROXY)
+```
+
+1. 读 [项目宪法](specs/constitution.md)(唯一权威)与本文;
+2. 工具链无需手动装 —— `rust-toolchain.toml` 钉死 `1.96.1`,首次 `cargo` 命令会自动安装;
+3. 要跑 demo/实盘联调:自备币安 demo 平台凭据(只勾交易权限),按第二节的 `#[ignore]` 用法本地跑,**不要**把密钥写进仓库或 CI;
+4. 改动走第四节的 GitHub Flow;不确定的先开 issue 讨论。
+
+## 九、行为准则
 
 参与本项目即表示你同意遵守 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
