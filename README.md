@@ -1,102 +1,102 @@
 # ricow
 
-完全本地运行的多平台量化策略引擎(回测 / Dry Run / 实盘), 纯本地 CLI 客户端工具。
+A fully local, multi-platform quantitative strategy engine (backtest / Dry Run / live trading). Pure local CLI — no cloud, no telemetry, no auto-update.
 
-## 快速开始
+> Formerly named **locus**; renamed to **ricow** in 2026-09. The Git history was not carried over (this repository starts fresh at `v0.1.0`).
 
-### 1. 构建
+## Quick start
+
+### 1. Build
 
 ```bash
-cargo build --release        # 产物: target/release/ricow
+cargo build --release        # artifact: target/release/ricow
 ```
 
-数据目录(`$RICOW_ROOT`)解析顺序: 环境变量 `RICOW_ROOT` → 当前目录(含 `ricow.db` / `strategies/`) → 平台默认数据目录。
+Data directory (`$RICOW_ROOT`) resolution order: env var `RICOW_ROOT` → current directory (if it contains `ricow.db` / `strategies/`) → platform default data directory.
 
-### 2. 配置: 只有一个文件
+### 2. Configuration: exactly one file
 
-配置与凭据都在 `$RICOW_ROOT/ricow.toml`(权限 `0600`, 已在 `.gitignore`)。**产品不代写密钥**: 文件不存在时, 首次需要它的命令会生成带注释的模板并把路径告诉你, 你用编辑器填值即可(密钥与其供应商写在同一个 `[ai]` 段里, 不会搞混属于谁)。
+All config and credentials live in `$RICOW_ROOT/ricow.toml` (mode `0600`, already in `.gitignore`). **The tool never writes your keys for you**: if the file is missing, the first command that needs it generates a commented template and tells you the path — you fill in the values with your editor (a key sits in the same `[ai]` section as its provider, so you can't mix them up).
 
 ```toml
-[ai]                     # 可选: 只用 AI 助手时才需要
-provider = "deepseek"    # 内置预设名(deepseek/moonshot/zhipu/qwen/openrouter/openai/ollama), 或任意自定义名(此时须写 base_url)
-model = "deepseek-chat"  # 换自建/中转端点: 再写一行 base_url = "..."
-api_key=***              # 该供应商的密钥(与 provider 同段)
+[ai]                     # optional: only needed for the built-in AI assistant
+provider = "deepseek"    # built-in preset (deepseek/moonshot/zhipu/qwen/openrouter/openai/ollama), or any custom name (then base_url is required)
+model = "deepseek-chat"  # for a self-hosted/proxy endpoint, add: base_url = "..."
+api_key=***              # key of that provider (same section as provider)
 
-[exchange]               # 可选: 只在 demo / 实盘下单时才需要
-demo_key=***  demo_secret=***            # 币安测试网(demo)凭据
-binance_key=***  binance_secret=***      # 币安主网凭据(真实资金)
+[exchange]               # optional: only needed for demo / live order placement
+demo_key=***  demo_secret=***            # Binance demo (testnet) credentials
+binance_key=***  binance_secret=***      # Binance mainnet credentials (real money)
 ```
 
-**怎么拿 demo key**: 币安模拟交易(demo)平台 <https://demo.binance.com/> 有独立账号体系(与主网账号无关), 登录后在平台内创建 API Key(具体入口以官网为准; 官方说明见 <https://www.binance.com/zh-CN/support/faq/detail/ab78f9a1b8824cf0a106b4229c76496d>)。只勾**交易**权限、**不要**勾提现; 注意 demo 的 key 与旧现货测试网 `testnet.binance.vision` **不互通**。主网 key 在 <https://www.binance.com> 同样路径创建(同样建议关闭提现并限制 IP)。
+**How to get a demo key**: Binance's simulated-trading (demo) platform <https://demo.binance.com/> has its own account system (separate from mainnet). Create an API key there — enable **trading only**, **never** withdrawals. Note that demo keys are **not** interchangeable with the legacy spot testnet `testnet.binance.vision`. Mainnet keys are created the same way at <https://www.binance.com> (also recommended: disable withdrawals and restrict by IP).
 
-### 3. 四档运行
+### 3. Four run modes
 
-| 档位 | 命令 | 资金 | 前置 |
+| Mode | Command | Capital | Prerequisites |
 |---|---|---|---|
-| 回测 | `ricow backtest --strategy shannon_grid --pair ETHUSDT --days 30` | 无 | 零配置 |
-| Dry Run(本地虚拟撮合) | `ricow start <名字>` | 无 | 零配置 |
-| demo(币安测试网**真实下单**) | `ricow start <名字> --demo` | 模拟资金 | `[exchange].demo_*` |
-| 实盘(主网真实资金) | 策略 TOML 声明 `live_enabled = true` + `ricow start <名字> --live --accept-risk` | 真实 | `[exchange].binance_*` + 首次风险确认 + Dry Run 时长门禁 |
+| Backtest | `ricow backtest --strategy shannon_grid --pair ETHUSDT --days 30` | none | zero config |
+| Dry Run (local virtual matching) | `ricow start <name>` | none | zero config |
+| demo (Binance testnet, **real orders**) | `ricow start <name> --demo` | simulated | `[exchange].demo_*` |
+| Live (mainnet, **real money**) | strategy TOML declares `live_enabled = true` + `ricow start <name> --live --accept-risk` | real | `[exchange].binance_*` + first-use risk acknowledgement + Dry Run duration gate |
 
-demo 与实盘都真实调用交易所接口, 差别只在域名(`demo-api`/`demo-fapi` vs 主网)与凭据, 两套凭据**互不回落**; demo 不适用实盘的两道门(风险确认 / 时长门禁), 因为那两道门保护的是真实资金。
+demo and live both hit the real exchange API — they differ only in domain (`demo-api`/`demo-fapi` vs mainnet) and credentials, and the two credential sets **never fall back to each other**. The two live-only gates (risk acknowledgement / minimum Dry Run duration) do not apply to demo, because they protect real money.
 
-查看状态: `ricow list` / `ricow info <名字>`; 停机: `ricow stop <名字> [--close-all]`(按交易所侧实际结果提示残留挂单/持仓)。
+Inspect: `ricow list` / `ricow info <name>`; stop: `ricow stop <name> [--close-all]` (residual open orders / positions are reported from the exchange's actual state).
 
-### 4. AI 助手(可选)
+### 4. Built-in AI assistant (optional)
 
-`ricow ai "我部署了哪些策略?"` —— 用自然语言查状态、跑回测、读权威文档(全是**只读**操作); 落盘部署、启停实盘、平仓等**写实操作不在工具面内**, 只能由你本人敲命令确认。`--plain` 关闭流式输出。
+`ricow ai "which strategies do I have deployed?"` — natural-language status queries, backtests, and authoritative doc lookups (all **read-only**). Anything that writes to disk, starts live trading, or closes a position is **not in the tool surface** — only you can confirm it by typing the command yourself. `--plain` disables streaming output.
 
-### 5. 用你自己的 AI agent(可选)
+### 5. Use your own AI agent (optional)
 
-你已经在用 Claude Code / Codex / Cursor 的话, 不需要 ricow 内置助手:
-
-```
-ricow agent-kit --install        # 在当前目录生成手册(也可指定目录)
-ricow agent-kit                  # 只在终端打印手册
-```
-
-生成 4 个文件: `AGENTS.md`(操作手册)/ `SKILL.md`(Agent Skills 标准)/ `CLAUDE.md`(一行导入)/ `lua-api.md`(策略 API 原文)。
-手册内容与内置 AI 的系统提示**同源**, 命令速查由 CLI 自己生成; 它写明写实动作(落盘/实盘/平仓/改参)**只能由你本人在终端执行**。
-已存在且内容不同的文件会被**拒绝覆盖**(一个都不写), 免得冲掉你自己的 `AGENTS.md`。
-
-### 6. 网络与数据源
-
-ricow **全程需要访问币安**(公开行情 + 签名端点)。国内网络通常不可直连, 请自备代理/VPN —— CLI 走 `reqwest`, 认标准代理环境变量:
+If you already use Claude Code / Codex / Cursor, you don't need the built-in assistant:
 
 ```
-export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_PROXY / ALL_PROXY)
+ricow agent-kit --install        # generate the manual in the current directory (a directory can be given too)
+ricow agent-kit                  # just print the manual to the terminal
 ```
 
-- 报 `network error` 时先确认代理是否生效: `curl https://api.binance.com/api/v3/time` 应返回 JSON。
-- `RICOW_BN_BASE_URL` / `RICOW_FAPI_BASE_URL` 可整体替换 REST 域名(现货 / 合约): **公开数据与签名下单都跟着变**;
-  币安官方公开数据域名 `https://data-api.binance.vision` **只提供公开数据**, 适合纯回测/看行情, **下单会失败** —— 别把它当常规解法。
-- demo(`--demo`)无需手配域名: CLI 自动走 `demo-api.binance.com` / `demo-fapi.binance.com`。
+It writes 4 files: `AGENTS.md` (operating manual) / `SKILL.md` (Agent Skills format) / `CLAUDE.md` (one-line import) / `lua-api.md` (strategy API reference). The manual shares its source with the built-in assistant's system prompt and states that write actions (deploy / go live / close positions / change params) **must be executed by you in a terminal**. Existing files with different content are **refused**, writing nothing, so your own `AGENTS.md` is never clobbered.
 
-### 7. 安全须知
+### 6. Network and data sources
 
-- 凭据以**明文**存放于 `ricow.toml`(0600, 本机私有, 不入 git): 加密需要回答"解密密钥放哪"(绕回本文件=安全剧场, 绑机器指纹=换机即废), 竞品(freqtrade / jesse / Claude Code)同样明文。
-- 不要把密钥发给任何人(包括 AI 助手), 不要提交进仓库。
-- 实盘先小额, 先跑 Dry Run 与 demo。
-- 写实确认(部署 `确认部署 <名字>` / 实盘 `确认实盘 <名字>`)**只能在交互终端手动输入**: 管道、脚本、AI agent 工具调用喂入的短语一律被拒绝。
+ricow **always needs to reach Binance** (public market data + signed endpoints). From mainland China use a proxy/VPN — the CLI uses `reqwest` and honours the standard proxy env vars:
 
-## 当前内容
+```
+export HTTPS_PROXY=http://127.0.0.1:7890   # your proxy (or HTTP_PROXY / ALL_PROXY)
+```
 
-- `specs/` — 唯一文档体系: constitution(项目宪法)/ product(产品方案)/ architecture(架构)/ lua-api(Lua API 规范)/ roadmap(里程碑进度)/ research(调研资料)/ changes(变更档案, SDD 流程产物)
-- `crates/` — 5 crate workspace: core / binance / strategy / engine / cli
-- `strategies/builtin/` — 内置参考实现: shannon_grid.lua(策略样板)+ executors/{dca,twap,vwap,pullback,ladder}(执行模式示例, 非策略); exec 执行组件为引擎内置(Rust 实现, Lua 策略直接调用 exec.*)
-- `examples/` — 用户策略模板与示例(strategy_template.toml / ema_cross.lua)
-- `crates/ricow/src/supervisor/` — 策略进程管理器(常驻 daemon + 本机控制通道 + 实例台账, 见 [specs/architecture.md §三](specs/architecture.md))
+- On `network error`, first check the proxy: `curl https://api.binance.com/api/v3/time` should return JSON.
+- `RICOW_BN_BASE_URL` / `RICOW_FAPI_BASE_URL` replace the whole REST domain (spot / futures): **public data and signed orders both move with it**; Binance's public-data-only domain `https://data-api.binance.vision` has **no trading endpoints** — fine for pure backtests, but orders will fail there.
+- demo (`--demo`) needs no domain config: the CLI uses `demo-api.binance.com` / `demo-fapi.binance.com`.
 
-## 竞品调研结论摘要
+### 7. Security notes
 
-- 商业端 MCP 全是云端账号侧 — "本地私钥 + 本地回测门禁 + Dry Run 默认" 是差异化位置
-- 2026 年无 star>200 新竞品, 格局稳定
-- 详见 [specs/research/competitors.md](specs/research/competitors.md)
+- Credentials are stored in **plaintext** in `ricow.toml` (0600, local-only, never committed): encryption only moves the problem ("where do you keep the decryption key?" — same file = security theatre, machine fingerprint = breaks on hardware change), and comparable tools (freqtrade / jesse / Claude Code) also store plaintext.
+- Never share your keys with anyone (including AI assistants) and never commit them.
+- Go live small, and only after Dry Run and demo.
+- Write confirmations (deploy `确认部署 <name>` / live `确认实盘 <name>`) **can only be typed in an interactive terminal**: phrases fed through pipes, scripts, or AI-agent tool calls are always rejected.
 
-## 免责声明
+## Repository layout
 
-本软件仅供学习与研究, 不构成投资建议。加密货币交易风险极高。
+- `specs/` — the single documentation tree: constitution / product / architecture / lua-api / roadmap / research / changes (SDD artefacts)
+- `crates/` — 5-crate workspace: core / binance / strategy / engine / cli
+- `strategies/builtin/` — built-in references: `shannon_grid.lua` (strategy template) + `executors/{dca,twap,vwap,pullback,ladder}` (execution-pattern examples, not strategies); the `exec` components are built into the engine (Rust) and called from Lua via `exec.*`
+- `examples/` — user strategy template and examples (`strategy_template.toml` / `ema_cross.lua`)
+- `crates/ricow/src/supervisor/` — strategy process manager (resident daemon + local control channel + instance ledger; see [specs/architecture.md §三](specs/architecture.md))
+
+## Platform support
+
+| Platform | Status |
+|---|---|
+| Linux x86_64 | Verified on a real machine (build, backtests, demo/testnet flows) |
+| macOS / Windows | Cross-platform code paths exist (`cfg(unix)` / `cfg(windows)`) and are covered by CI build + unit tests; live/Dry Run flows have **not** been exercised on real hardware yet |
+
+## Disclaimer
+
+This software is for learning and research only and is not investment advice. Cryptocurrency trading carries extreme risk. You are solely responsible for any use of it with real funds.
 
 ---
 
-[中文文档](README_zh.md) · [项目宪法](specs/constitution.md)
+[中文文档](README_zh.md) · [项目宪法 / constitution](specs/constitution.md) · [贡献指南 / Contributing](CONTRIBUTING.md)

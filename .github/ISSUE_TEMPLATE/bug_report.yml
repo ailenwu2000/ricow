@@ -1,0 +1,69 @@
+name: "缺陷报告 / Bug report"
+description: 报告一个可复现的缺陷(请不要粘贴任何密钥)
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        注意: 不要粘贴任何密钥/凭据(ricow.toml、API key、secret)。安全问题请走 SECURITY.md 的私有渠道。
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: release tag 或 commit hash(ricow --version 或 git rev-parse --short HEAD)
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - Linux x86_64
+        - macOS
+        - Windows
+        - 其他(在描述里写明)
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 运行档位
+      options:
+        - 回测 backtest
+        - Dry Run(start, 本地虚拟撮合)
+        - demo(币安测试网真实下单)
+        - 实盘(主网真实资金)
+        - 其他(CLI / 文档 / AI 助手)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 具体命令与参数;若是策略问题, 请附策略 TOML/Lua(去掉密钥)
+      placeholder: |
+        1. ricow backtest --strategy ... --pair ... --days ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+      description: 完整错误信息 / 日志片段(ricow logs <名字>);如有报告输出请附上
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 代理是否生效、demo 还是主网、是否首次运行等
+    validations:
+      required: false

@@ -1,0 +1,43 @@
+name: "功能建议 / Feature request"
+description: 提出一个功能或改进建议
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先读 README 的定位说明与 specs/constitution.md 的项目原则(完全本地化 / Lua 策略 / 少而精)。
+        与"完全本地化 + 不引入云端"冲突的需求会被拒绝, 请先说明如何守住该原则。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你要解决的问题
+      description: 描述场景与痛点, 而不是直接给实现方案
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你的建议方案
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的替代方案
+      description: 现有接口/命令能否解决?为什么不合适?
+    validations:
+      required: false
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响范围
+      options:
+        - 交易路径(下单/撤单/持仓/风控)
+        - 回测引擎
+        - 策略 API(Lua)
+        - CLI / 进程管理
+        - AI 助手
+        - 文档
+    validations:
+      required: false

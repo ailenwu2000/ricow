@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 文档 / Documentation
+    url: https://github.com/ailenwu2000/ricow/blob/main/README.md
+    about: 先看 README 与 specs/ 文档树(constitution / architecture / lua-api / roadmap)
+  - name: 安全问题 / Security
+    url: https://github.com/ailenwu2000/ricow/security
+    about: 漏洞请走私有的 Report a vulnerability 渠道, 不要开公开 issue
