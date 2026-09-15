@@ -9,7 +9,7 @@
 
 | 项 | 要求 |
 |---|---|
-| Rust | stable(仓库有 `rust-toolchain.toml` 固定 channel, 含 rustfmt/clippy 组件);`Cargo.toml` 声明 MSRV `rust-version = 1.88` |
+| Rust | **版本由 `rust-toolchain.toml` 钉死**(当前 `1.96.1`, 含 rustfmt/clippy 组件) —— 本地与 CI 必须一致, 否则 clippy 门禁会因 upstream 发版而随机变红;升级工具链是**独立变更**(改 `rust-toolchain.toml` + 清掉新告警 + 实测);`Cargo.toml` 声明 MSRV `rust-version = 1.88` |
 | 系统 | Linux / macOS / Windows 均可构建;Linux x86_64 是唯一实机验证过的平台 |
 | 网络 | 回测/demo/实盘**都要访问币安**;国内需自备代理(`HTTPS_PROXY`) |
 

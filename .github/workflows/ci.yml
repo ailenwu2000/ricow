@@ -23,9 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # 工具链版本唯一来源 = rust-toolchain.toml(钉死版本, 避免 stable 浮动导致门禁随机变红)
+      - name: Install pinned toolchain
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
       # 全仓尚未与 rustfmt 对齐(约 38 个文件有差异, 见 CONTRIBUTING 第五节): 对齐完成后再打开下面一行
       # - run: cargo fmt --all -- --check
@@ -42,7 +42,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}

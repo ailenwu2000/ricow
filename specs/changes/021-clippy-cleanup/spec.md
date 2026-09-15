@@ -26,3 +26,13 @@ CI 已接入(`.github/workflows/ci.yml`),但 lint 作业只跑 `cargo clippy`(�
 | 告警清零 | `cargo clippy --workspace --all-targets --locked -- -D warnings` 无输出 |
 | 测试不回归 | `cargo test --workspace` = 339 passed / 0 failed / 12 ignored |
 | CI 生效 | lint 作业含 `-D warnings`;PR/推送后 CI 绿;并验证过"引入告警会红" |
+
+## 五、实施中发现并一并处理的问题(2026-09-15)
+
+打开 `-D warnings` 后 CI 立即红, 而本地同命令零告警 —— 根因不是新 lint, 而是**工具链版本漂移**:
+本地 `stable` = 1.96.1, 而 CI 的 `stable` 当时已是 **1.98.1**(`rust-toolchain.toml` 写的是浮动的 `stable`, CI 又用 `dtolnay/rust-toolchain@stable`)。
+
+处置(并入本变更):
+- `rust-toolchain.toml` 由浮动 `stable` 改为**钉死 `1.96.1`**(附升级流程注释);
+- CI 两个作业去掉 `dtolnay/rust-toolchain@stable`, 改为 `rustup show` —— 工具链版本**唯一来源 = `rust-toolchain.toml`**;
+- 升级到 1.98.1 单独立项(需本地装 1.98.1 + 清掉新告警), 不在本变更内顺手做。
