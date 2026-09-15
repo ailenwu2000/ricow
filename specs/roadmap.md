@@ -28,7 +28,7 @@
 
 ## 测试基线
 
-- **当前基线 (2026-09-13, 016 实施后)**: `cargo test --workspace` = **306 passed / 0 failed / 11 ignored**。
+- **当前基线 (2026-09-15, 021 clippy 清零后实跑)**: `cargo test --workspace` = **339 passed / 0 failed / 12 ignored**(文档此前记 306/308 均已过时, 以本次实跑为准)。
   ignored 全部为需真实外部环境的用例 (BN demo 现货 4 + 合约 5 + Nasdaq 冒烟 2), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
   220 → 204 的差额 = 009 移除 `locus_hl`(16 个内联测试); 204 → 216 = 008 新增 supervisor / CLI 命令面用例; 216 → 233 = 004 风控用例(频率窗口/两级熔断/装配与参数校验/接线); 233 → 270 = 011 用例(下单参数对齐 / 时钟预检判定 / 归属与停机清理编排 / 门禁 / proto 往返 / 现货事件解析 / 交易所过滤器解析 / 归属前缀长度约束)。
 - 验证方式: `cargo test --workspace`(纯逻辑) + 带 env key 的 `#[ignore]` 真实联调 (见 `specs/testnet.md`)。

@@ -159,7 +159,8 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-09-13, 018 实施后)**: `cargo test --workspace` = **308 passed / 0 failed / 11 ignored**(ignored = 需真实外部环境的联调用例, 不 mock 替代; 构成: BN demo 现货 4 + 合约 5 + Nasdaq 冒烟 2)
+- **基线(2026-09-15, 021 clippy 清零后实跑)**: `cargo test --workspace` = **339 passed / 0 failed / 12 ignored**(ignored 仍为需真实外部环境的联调用例; 021 只做机械清理, 用例数不变)
+- 历史基线(2026-09-13, 018 实施后): 308 passed / 0 failed / 11 ignored(ignored = 需真实外部环境的联调用例, 不 mock 替代; 构成: BN demo 现货 4 + 合约 5 + Nasdaq 冒烟 2)
 - 实盘链路真实验证(011 demo 现货 / 012 demo 合约): 用户流订阅 → 真实下单 → 成交回写落库 → 停机撤单兜底/平仓 → 交易所侧零残留(合约含 one-way 与 hedge 双向); 记录见 `specs/testnet.md`
 - 账目类数字(SQLite `SUM`)须在 Rust 侧用 `Decimal` 聚合: SQL 的 INTEGER 兜底可击穿 f64 解码(崩溃), REAL 往返会污染小数(012 实测)
 
