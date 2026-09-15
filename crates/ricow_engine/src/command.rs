@@ -22,7 +22,7 @@ use crate::confirm::create_preview;
 use crate::live::{plan_cleanup, residual_owned, CleanupOutcome, OnceGate};
 use crate::loader::load_strategy;
 use crate::market;
-use crate::notify::{NotifyEvent, Notifier};
+use crate::notify::{Notifier, NotifyEvent};
 
 /// 引擎入口 — 无状态命令分发。
 pub struct Engine;
@@ -111,7 +111,9 @@ async fn poll_funding_income(
         match db.insert_funding_fee(strategy_name, r).await {
             Ok(true) => inserted += 1,
             Ok(false) => {}
-            Err(e) => tracing::warn!(target: "engine", name = %strategy_name, "资金费落库失败: {e}"),
+            Err(e) => {
+                tracing::warn!(target: "engine", name = %strategy_name, "资金费落库失败: {e}")
+            }
         }
     }
     inserted
@@ -737,7 +739,7 @@ impl Engine {
                                 fee: fill.fee,
                             });
                         }
-                strategy.on_fill(&mut ctx, fill);
+                        strategy.on_fill(&mut ctx, fill);
                         // 成交后刷新持仓 (P3: 不做高频轮询, 只在成交后刷; 覆盖式避免陈旧仓位)
                         refresh_positions(
                             &exchange,
@@ -974,7 +976,7 @@ impl Engine {
         config: StrategyConfig,
         klines: &[Kline],
     ) -> CoreResult<(ricow_strategy::BacktestReport, String)> {
-        // 计价资产: 全项目口径 USDT (bStocks 现货 quote 亦为 USDT, 见 specs/backtest.md §十一) —— 
+        // 计价资产: 全项目口径 USDT (bStocks 现货 quote 亦为 USDT, 见 specs/backtest.md §十一) ——
         // 原先硬编码 "USDC" 会让报告打错币种。
         let balance =
             Balance { asset: "USDT".into(), free: Decimal::from(100_000), locked: Decimal::ZERO };

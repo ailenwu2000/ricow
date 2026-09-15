@@ -30,9 +30,7 @@ fn demo_client() -> BinanceClient {
         .expect("RICOW_BN_API_KEY 未设置 (demo 测试网 key, 见 specs/testnet.md)");
     let secret = std::env::var("RICOW_BN_SECRET_KEY")
         .expect("RICOW_BN_SECRET_KEY 未设置 (demo 测试网 key, 见 specs/testnet.md)");
-    BinanceClient::new()
-        .expect("BinanceClient 构造失败")
-        .with_credentials(api_key, secret)
+    BinanceClient::new().expect("BinanceClient 构造失败").with_credentials(api_key, secret)
 }
 
 /// 按目标名义价值算合法数量 (对齐 step, 且 ≥ min_qty)。
@@ -58,19 +56,16 @@ async fn demo_spot_user_stream_delivers_fill() {
     let markets = c.get_exchange_info().await.expect("现货 exchangeInfo 失败");
     let m = markets.iter().find(|m| m.symbol == symbol).expect("现货应有 ETHUSDT");
     // T001 数据面真实核对: 现货最小名义过滤器已解析
-    println!("== {symbol} min_qty={} step={:?} min_notional={:?}", m.min_size, m.step_size, m.min_notional);
+    println!(
+        "== {symbol} min_qty={} step={:?} min_notional={:?}",
+        m.min_size, m.step_size, m.min_notional
+    );
     assert!(
         m.min_notional.is_some(),
         "现货 MIN_NOTIONAL/NOTIONAL 过滤器未解析 (T001 不达标): {m:?}"
     );
 
-    let ask = c
-        .get_depth(symbol, 1)
-        .await
-        .expect("depth 失败")
-        .best_ask()
-        .expect("无卖一价")
-        .price;
+    let ask = c.get_depth(symbol, 1).await.expect("depth 失败").best_ask().expect("无卖一价").price;
     let notional = Decimal::from(10).max(m.min_notional.unwrap_or(Decimal::from(5)));
     let qty = qty_for_notional(ask, notional, m.min_size, m.step_size);
     println!("== 计划市价买入 {qty} {symbol} (ask≈{ask}, 目标名义≈{notional})");
@@ -133,10 +128,7 @@ async fn demo_spot_user_stream_delivers_fill() {
     assert!(fill.fill_size <= qty, "成交量不应超过下单量: {} > {qty}", fill.fill_size);
 
     // 清理: 按账户实际可用余额对齐卖出 (手续费按 base 扣, 直接卖成交额会超余额 → -2010)
-    let free = c
-        .get_account()
-        .await
-        .expect("account 查询失败")["balances"]
+    let free = c.get_account().await.expect("account 查询失败")["balances"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
@@ -186,9 +178,7 @@ async fn demo_spot_user_stream_events_carry_client_order_id() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let cid = format!("ricow-cid-{}", chrono::Utc::now().timestamp_millis());
-    c.place_order(symbol, "BUY", "MARKET", &qty.to_string(), None, &cid)
-        .await
-        .expect("下单失败");
+    c.place_order(symbol, "BUY", "MARKET", &qty.to_string(), None, &cid).await.expect("下单失败");
 
     let mut seen = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);

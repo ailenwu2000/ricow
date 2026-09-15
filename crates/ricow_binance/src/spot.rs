@@ -49,8 +49,10 @@ pub(crate) fn parse_open_orders(resp: &Value, pair: &str) -> Vec<OrderInfo> {
                     } else {
                         OrderSide::Buy
                     },
-                    price: Decimal::from_str(o["price"].as_str().unwrap_or("0")).unwrap_or_default(),
-                    size: Decimal::from_str(o["origQty"].as_str().unwrap_or("0")).unwrap_or_default(),
+                    price: Decimal::from_str(o["price"].as_str().unwrap_or("0"))
+                        .unwrap_or_default(),
+                    size: Decimal::from_str(o["origQty"].as_str().unwrap_or("0"))
+                        .unwrap_or_default(),
                     filled_size: Decimal::from_str(o["executedQty"].as_str().unwrap_or("0"))
                         .unwrap_or_default(),
                     status: status_from_bn(o["status"].as_str().unwrap_or("NEW")),
@@ -174,8 +176,8 @@ impl Exchange for BnSpotExchange {
 
 #[cfg(test)]
 mod tests {
-    use ricow_core::OrderStatus;
     use super::*;
+    use ricow_core::OrderStatus;
 
     #[test]
     fn test_status_from_bn() {

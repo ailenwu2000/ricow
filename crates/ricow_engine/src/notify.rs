@@ -168,8 +168,7 @@ impl NotifyConfig {
 }
 
 /// 四类事件 (白名单缺省值)。
-pub const ALL_EVENTS: [EventKind; 3] =
-    [EventKind::Fill, EventKind::LiqWarn, EventKind::Residual];
+pub const ALL_EVENTS: [EventKind; 3] = [EventKind::Fill, EventKind::LiqWarn, EventKind::Residual];
 
 /// 限速器 (FR-003): 同类事件最小间隔; 被压制的**计数**在下次放行时附带 —— 不静默丢。
 #[derive(Debug, Default)]

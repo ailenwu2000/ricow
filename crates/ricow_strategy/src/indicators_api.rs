@@ -7,8 +7,8 @@
 //! 注: ta 0.5 无 WMA/ADX/MOM, 此三项在模块内自实现 (简单/标准定义, 附公式);
 //! stoch 用 FastStochastic (ta 0.5 仅单值输出, 无 k/d 双线结构)。
 
-use ricow_core::Kline;
 use mlua::Lua;
+use ricow_core::Kline;
 use rust_decimal::prelude::ToPrimitive;
 use ta::indicators::{
     AverageTrueRange, BollingerBands, CommodityChannelIndex, ExponentialMovingAverage,
@@ -181,9 +181,7 @@ fn adx_value(candles: &[CandleView], period: usize) -> Option<f64> {
     };
     for c in candles {
         if let (Some(ph), Some(pl), Some(pc)) = (s.prev_high, s.prev_low, s.prev_close) {
-            let tr = (c.high - c.low)
-                .max((c.high - pc).abs())
-                .max((c.low - pc).abs());
+            let tr = (c.high - c.low).max((c.high - pc).abs()).max((c.low - pc).abs());
             let up_move = c.high - ph;
             let down_move = pl - c.low;
             let plus_dm = if up_move > down_move && up_move > 0.0 { up_move } else { 0.0 };

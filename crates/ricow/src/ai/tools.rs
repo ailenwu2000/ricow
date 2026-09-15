@@ -123,7 +123,12 @@ impl AgentHook for ToolGuard {
             ToolCallAction::skip(format!(
                 "工具 '{}' 不在 019 工具白名单内(L0 只读 + L1 虚拟), 已拒绝执行。可用工具: {}",
                 event.tool_name,
-                READ_ONLY_TOOLS.iter().chain(VIRTUAL_TOOLS.iter()).copied().collect::<Vec<_>>().join(", ")
+                READ_ONLY_TOOLS
+                    .iter()
+                    .chain(VIRTUAL_TOOLS.iter())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))
         }
     }

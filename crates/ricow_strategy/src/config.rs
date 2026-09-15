@@ -269,7 +269,10 @@ impl Default for BacktestParams {
 impl BacktestParams {
     /// 校验最终生效的杠杆 (方案 A: 默认上限 10, 超限须显式放宽; L3: ≤0 拒绝, 防除零)。
     /// 调用点: CLI 参数解析后 + Engine::backtest 入口 (params 池为三层合并最终源)。
-    pub fn validate_leverage(leverage: f64, max_leverage: f64) -> Result<(), ricow_core::CoreError> {
+    pub fn validate_leverage(
+        leverage: f64,
+        max_leverage: f64,
+    ) -> Result<(), ricow_core::CoreError> {
         if !leverage.is_finite() || leverage < 1.0 {
             return Err(ricow_core::CoreError::InvalidArgument(format!(
                 "杠杆 {leverage} 非法: 必须 ≥ 1 (0/负值会导致保证金除零)"

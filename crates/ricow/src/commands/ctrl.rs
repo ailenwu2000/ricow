@@ -140,15 +140,18 @@ pub(crate) async fn stop_daemon(name: &str, close_all: bool) -> CoreResult<Strin
     use std::fmt::Write as _;
     let root = crate::commands::project_root();
     let client = Client::connect(&root).await?;
-    let data =
-        client.call_ok(Request::Stop { name: name.to_string(), close_all }).await?;
+    let data = client.call_ok(Request::Stop { name: name.to_string(), close_all }).await?;
     let report: StopReport = serde_json::from_value(data)
         .map_err(|e| CoreError::Parse(format!("停机结果解析失败: {e}")))?;
     let mut out = String::new();
     if report.exited {
         match report.exit_code {
             Some(0) => {
-                let _ = writeln!(out, "策略 {} 已停止 (exit=0, 用时 {}ms)", report.name, report.waited_ms);
+                let _ = writeln!(
+                    out,
+                    "策略 {} 已停止 (exit=0, 用时 {}ms)",
+                    report.name, report.waited_ms
+                );
             }
             Some(code) => {
                 let _ = writeln!(

@@ -168,16 +168,18 @@ pub(crate) fn apply_depth_frame(book: &mut OrderBook, symbol: &str, v: &Value) -
     }
     merge_levels(&mut book.bids, &bids, true);
     merge_levels(&mut book.asks, &asks, false);
-    book.timestamp = ts
-        .map(|ms| ms as i64)
-        .and_then(DateTime::from_timestamp_millis)
-        .unwrap_or_else(Utc::now);
+    book.timestamp =
+        ts.map(|ms| ms as i64).and_then(DateTime::from_timestamp_millis).unwrap_or_else(Utc::now);
     let _ = symbol;
     !book.bids.is_empty() || !book.asks.is_empty()
 }
 
 /// 按价格合并档位 (`size=0` 删除该档), 保持排序并截断到 `MAX_DEPTH_LEVELS`。
-fn merge_levels(levels: &mut Vec<ricow_core::PriceLevel>, updates: &[ricow_core::PriceLevel], descending: bool) {
+fn merge_levels(
+    levels: &mut Vec<ricow_core::PriceLevel>,
+    updates: &[ricow_core::PriceLevel],
+    descending: bool,
+) {
     for u in updates {
         match levels.iter().position(|l| l.price == u.price) {
             Some(i) => {
@@ -346,10 +348,8 @@ enum WsApiFrame {
 
 /// 构造 WS-API 订阅请求帧 `{"id":..,"method":"userDataStream.subscribe.signature","params":{..}}`。
 fn build_subscribe_request(params: &[(String, String)]) -> String {
-    let map: serde_json::Map<String, Value> = params
-        .iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-        .collect();
+    let map: serde_json::Map<String, Value> =
+        params.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
     serde_json::json!({
         "id": "ricow-user-stream",
         "method": "userDataStream.subscribe.signature",
@@ -432,11 +432,15 @@ fn parse_spot_execution(v: &Value) -> Option<UserEvent> {
     if v.get("x").and_then(|x| x.as_str()) == Some("TRADE") {
         let fill_price = Decimal::from_str(v.get("L")?.as_str()?).ok()?;
         let fill_size = Decimal::from_str(v.get("l")?.as_str()?).ok()?;
-        let fee =
-            Decimal::from_str(v.get("n").and_then(|x| x.as_str()).unwrap_or("0")).unwrap_or_default();
+        let fee = Decimal::from_str(v.get("n").and_then(|x| x.as_str()).unwrap_or("0"))
+            .unwrap_or_default();
         Some(UserEvent::Fill(OrderFill {
             // 现货 tradeId 可能在撤单等事件里为 -1 → 视为无
-            trade_id: v.get("t").and_then(|x| x.as_i64()).filter(|t| *t >= 0).map(|t| t.to_string()),
+            trade_id: v
+                .get("t")
+                .and_then(|x| x.as_i64())
+                .filter(|t| *t >= 0)
+                .map(|t| t.to_string()),
             exchange_order_id,
             client_order_id,
             pair,
@@ -539,28 +543,40 @@ mod tests {
     fn test_apply_depth_frame_merges_deltas() {
         let mut book = ricow_core::OrderBook::default();
         // 首帧: 买 3000/1.5, 卖 3001/2.0
-        assert!(apply_depth_frame(&mut book, "ETHUSDT", &serde_json::json!({
-            "e": "depthUpdate", "E": 1_700_000_000_000_u64,
-            "b": [["3000.0", "1.5"]], "a": [["3001.0", "2.0"]]
-        })));
+        assert!(apply_depth_frame(
+            &mut book,
+            "ETHUSDT",
+            &serde_json::json!({
+                "e": "depthUpdate", "E": 1_700_000_000_000_u64,
+                "b": [["3000.0", "1.5"]], "a": [["3001.0", "2.0"]]
+            })
+        ));
         assert_eq!(book.bids[0].price, dec!(3000));
         assert_eq!(book.asks[0].price, dec!(3001));
         assert_eq!(book.mid_price(), Some(dec!(3000.5)));
 
         // 增量帧只有卖档变化: 买单侧必须保留 (覆盖式会丢档 → 价格变 None)
-        assert!(apply_depth_frame(&mut book, "ETHUSDT", &serde_json::json!({
-            "e": "depthUpdate", "E": 1_700_000_001_000_u64,
-            "b": [], "a": [["3001.0", "0"], ["3002.0", "3.0"]]
-        })));
+        assert!(apply_depth_frame(
+            &mut book,
+            "ETHUSDT",
+            &serde_json::json!({
+                "e": "depthUpdate", "E": 1_700_000_001_000_u64,
+                "b": [], "a": [["3001.0", "0"], ["3002.0", "3.0"]]
+            })
+        ));
         assert_eq!(book.bids.len(), 1, "买档不应被空增量清空");
         assert_eq!(book.asks.len(), 1, "size=0 的档应被删除");
         assert_eq!(book.asks[0].price, dec!(3002));
         assert_eq!(book.mid_price(), Some(dec!(3001)));
 
         // 空帧 (两侧都无变动) 不产生更新
-        assert!(!apply_depth_frame(&mut book, "ETHUSDT", &serde_json::json!({
-            "e": "depthUpdate", "E": 1_700_000_002_000_u64, "b": [], "a": []
-        })));
+        assert!(!apply_depth_frame(
+            &mut book,
+            "ETHUSDT",
+            &serde_json::json!({
+                "e": "depthUpdate", "E": 1_700_000_002_000_u64, "b": [], "a": []
+            })
+        ));
         // 无关帧
         assert!(!apply_depth_frame(&mut book, "ETHUSDT", &serde_json::json!({"foo": 1})));
     }
@@ -568,10 +584,15 @@ mod tests {
     #[test]
     fn test_apply_depth_frame_sorting_and_cap() {
         let mut book = ricow_core::OrderBook::default();
-        let bids: Vec<Vec<String>> = (0..80).map(|i| vec![format!("{}", 3000 + i), "1".into()]).collect();
-        apply_depth_frame(&mut book, "ETHUSDT", &serde_json::json!({
-            "e": "depthUpdate", "E": 1_u64, "b": bids, "a": []
-        }));
+        let bids: Vec<Vec<String>> =
+            (0..80).map(|i| vec![format!("{}", 3000 + i), "1".into()]).collect();
+        apply_depth_frame(
+            &mut book,
+            "ETHUSDT",
+            &serde_json::json!({
+                "e": "depthUpdate", "E": 1_u64, "b": bids, "a": []
+            }),
+        );
         assert_eq!(book.bids.len(), MAX_DEPTH_LEVELS, "超过上限应截断");
         assert_eq!(book.bids[0].price, dec!(3079), "买档应降序 (最优在前)");
     }

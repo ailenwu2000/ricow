@@ -128,10 +128,7 @@ mod tests {
         assert!(err.to_string().contains("指令预算超限"));
         // 预算已耗尽 (未 reset): 第二次死循环必须仍被拦截。
         let err2 = lua.load("while true do end").exec().unwrap_err();
-        assert!(
-            err2.to_string().contains("指令预算超限"),
-            "预算耗尽后应持续拦截, got: {err2}"
-        );
+        assert!(err2.to_string().contains("指令预算超限"), "预算耗尽后应持续拦截, got: {err2}");
         // reset 后恢复 (模拟下一 tick 开始)。
         budget.reset();
         let err3 = lua.load("while true do end").exec().unwrap_err();
@@ -167,10 +164,7 @@ mod tests {
     fn test_infinite_loop_not_swallowed_by_pcall() {
         // 回归: pcall 包裹的死循环也必须被预算拦截 (pcall 已禁用)。
         let lua = sandbox();
-        let err = lua
-            .load("pcall(function() while true do end end)")
-            .exec()
-            .unwrap_err();
+        let err = lua.load("pcall(function() while true do end end)").exec().unwrap_err();
         assert!(
             err.to_string().contains("nil") || err.to_string().contains("指令预算超限"),
             "pcall 包裹死循环应被拦截, got: {err}"

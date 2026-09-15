@@ -79,7 +79,8 @@ fn help_text() -> String {
 /// 打印运行信息(通道 + 只读工具数 + 数据外发一行提示)。
 fn print_session_banner(resolved: &config::Resolved, is_local: bool, tool_count: usize) {
     println!("ricow AI 助手 (供应商: {} / 模型: {})", resolved.provider, resolved.model);
-    let key_from_env = std::env::var(config::ENV_API_KEY).ok().is_some_and(|v| !v.trim().is_empty());
+    let key_from_env =
+        std::env::var(config::ENV_API_KEY).ok().is_some_and(|v| !v.trim().is_empty());
     println!(
         "  密钥: {} ([ai].api_key; 环境变量可覆盖)",
         if key_from_env { "来自环境变量" } else { "来自 ricow.toml" }
@@ -118,7 +119,8 @@ pub async fn run(args: AiArgs) -> CoreResult<()> {
     let resolved = config::resolve(&cfg, env_base_url, env_model)?;
 
     let is_local = provider::is_local_endpoint(&resolved.base_url);
-    let api_key = provider::resolve_key(&resolved.base_url, config::api_key(&root, &resolved.provider))?;
+    let api_key =
+        provider::resolve_key(&resolved.base_url, config::api_key(&root, &resolved.provider))?;
 
     // 配置文件权限提示(含密钥, 只提示不自动改)
     if let Some(w) = crate::commands::config_file::permission_warning(&root) {

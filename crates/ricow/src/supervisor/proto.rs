@@ -127,14 +127,20 @@ mod tests {
     #[test]
     fn test_start_demo_field_roundtrip_and_backward_compat() {
         // demo 字段需可序列化/反序列化
-        let e = Envelope { token: "t".into(), request: Request::Start { name: "g".into(), live: false, demo: true, confirmed: false } };
+        let e = Envelope {
+            token: "t".into(),
+            request: Request::Start { name: "g".into(), live: false, demo: true, confirmed: false },
+        };
         let js = serde_json::to_string(&e).expect("ser");
         assert!(js.contains("\"demo\":true"));
         assert_eq!(serde_json::from_str::<Envelope>(&js).expect("de"), e);
         // 兼容: 老版本 CLI 发来的请求不含 demo 字段 → 默认 false (不阻塞版本混跑)
         let old = r#"{"token":"t","cmd":"start","name":"g","live":false}"#;
         let parsed: Envelope = serde_json::from_str(old).expect("旧格式必须仍能解析");
-        assert_eq!(parsed.request, Request::Start { name: "g".into(), live: false, demo: false, confirmed: false });
+        assert_eq!(
+            parsed.request,
+            Request::Start { name: "g".into(), live: false, demo: false, confirmed: false }
+        );
     }
 
     #[test]
@@ -164,12 +170,16 @@ mod tests {
             Request::Start { name: "g".into(), live: false, demo: false, confirmed: false }
         );
         // 实盘确认字段: 旧请求缺省为 false(= 未确认 → daemon 拒绝实盘, 不静默降级)
-        let env_c = decode_envelope(r#"{"token":"t","cmd":"start","name":"g","live":true,"confirmed":true}"#).unwrap();
+        let env_c = decode_envelope(
+            r#"{"token":"t","cmd":"start","name":"g","live":true,"confirmed":true}"#,
+        )
+        .unwrap();
         assert_eq!(
             env_c.request,
             Request::Start { name: "g".into(), live: true, demo: false, confirmed: true }
         );
-        let env_old = decode_envelope(r#"{"token":"t","cmd":"start","name":"g","live":true}"#).unwrap();
+        let env_old =
+            decode_envelope(r#"{"token":"t","cmd":"start","name":"g","live":true}"#).unwrap();
         assert_eq!(
             env_old.request,
             Request::Start { name: "g".into(), live: true, demo: false, confirmed: false }

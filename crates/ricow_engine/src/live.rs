@@ -615,8 +615,16 @@ mod tests {
             unrealized_pnl: Decimal::ZERO,
             leverage: None,
         };
-        let plan =
-            plan_cleanup(&[], &prefix, std::slice::from_ref(&pos), "ETHUSDT", true, &m, "grid-close", false);
+        let plan = plan_cleanup(
+            &[],
+            &prefix,
+            std::slice::from_ref(&pos),
+            "ETHUSDT",
+            true,
+            &m,
+            "grid-close",
+            false,
+        );
         assert_eq!(plan.closes.len(), 1, "现货单条持仓 → 一笔平仓单");
         let close = &plan.closes[0];
         assert_eq!(close.side, OrderSide::Sell, "现货平仓 = 卖出");
@@ -659,7 +667,16 @@ mod tests {
         let short = Position { side: OrderSide::Sell, size: dec!(0.02), ..long.clone() };
 
         // one-way: 单条净仓 → 一笔 reverse 单 + reduceOnly (不开反向仓)
-        let one = plan_cleanup(&[], &prefix, std::slice::from_ref(&long), "ETHUSDT", true, &m, "c", false);
+        let one = plan_cleanup(
+            &[],
+            &prefix,
+            std::slice::from_ref(&long),
+            "ETHUSDT",
+            true,
+            &m,
+            "c",
+            false,
+        );
         assert_eq!(one.closes.len(), 1);
         assert_eq!(one.closes[0].side, OrderSide::Sell);
         assert!(one.closes[0].reduce_only, "one-way 平仓必须 reduceOnly");

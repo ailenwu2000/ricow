@@ -177,12 +177,8 @@ mod tests {
     fn daemon_info_roundtrip_and_permissions() {
         let root = tmp_root("daemon");
         ensure_dirs(&root).expect("ensure dirs");
-        let info = DaemonInfo {
-            pid: 1234,
-            port: 45678,
-            token: "tok-abc".into(),
-            started_at: now_str(),
-        };
+        let info =
+            DaemonInfo { pid: 1234, port: 45678, token: "tok-abc".into(), started_at: now_str() };
         write_daemon_info(&root, &info).expect("write");
         assert_eq!(read_daemon_info(&root), Some(info));
         #[cfg(unix)]

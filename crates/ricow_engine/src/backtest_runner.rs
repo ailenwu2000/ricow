@@ -60,11 +60,13 @@ pub fn build_daily_ticks(klines: &HashMap<String, Vec<Kline>>) -> Vec<Vec<(Strin
             by_day.entry(bar.open_time.date_naive()).or_default().insert(pair.clone(), bar.clone());
         }
     }
-    by_day.into_values().map(|m| {
-        let mut v: Vec<(String, Kline)> = m.into_iter().collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
-        v
-    })
+    by_day
+        .into_values()
+        .map(|m| {
+            let mut v: Vec<(String, Kline)> = m.into_iter().collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        })
         .collect()
 }
 
@@ -89,11 +91,13 @@ pub fn build_interval_ticks(
             by_bucket.entry(key).or_default().insert(pair.clone(), bar.clone());
         }
     }
-    by_bucket.into_values().map(|m| {
-        let mut v: Vec<(String, Kline)> = m.into_iter().collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
-        v
-    })
+    by_bucket
+        .into_values()
+        .map(|m| {
+            let mut v: Vec<(String, Kline)> = m.into_iter().collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        })
         .collect()
 }
 

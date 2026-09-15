@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 
 use chrono::{Datelike, Timelike};
-use ricow_core::{Kline, OrderFill, OrderRequest, OrderSide, OrderType, OrderUpdate};
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
+use ricow_core::{Kline, OrderFill, OrderRequest, OrderSide, OrderType, OrderUpdate};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
@@ -310,12 +310,7 @@ impl LuaStrategy {
         let universe: Vec<String> = ctx
             .config()
             .get_str("universe")
-            .map(|s| {
-                s.split(',')
-                    .map(|p| p.trim().to_string())
-                    .filter(|p| !p.is_empty())
-                    .collect()
-            })
+            .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
             .unwrap_or_default();
         data.full_klines = !universe.is_empty();
         data.now = ctx.now_utc();
@@ -356,16 +351,17 @@ impl LuaStrategy {
                 };
                 data.position_sides.insert(pair.clone(), side.to_string());
                 data.position_sizes.insert(pair.clone(), pos.size.to_f64().unwrap_or(0.0));
-                data.position_entries
-                    .insert(pair.clone(), pos.entry_price.to_f64().unwrap_or(0.0));
+                data.position_entries.insert(pair.clone(), pos.entry_price.to_f64().unwrap_or(0.0));
                 unrealized += pos.unrealized_pnl.to_f64().unwrap_or(0.0);
             }
             // 方向仓快照 (D9/hedge): 现货只填 long (= 净仓); 合约按 (pair, side) 各自方向仓。
             for (side, label) in [(OrderSide::Buy, "long"), (OrderSide::Sell, "short")] {
                 if let Some(p) = ctx.position_directional(&pair, side) {
                     let key = format!("{pair}|{label}");
-                    data.directionals
-                        .insert(key, (p.size.to_f64().unwrap_or(0.0), p.entry_price.to_f64().unwrap_or(0.0)));
+                    data.directionals.insert(
+                        key,
+                        (p.size.to_f64().unwrap_or(0.0), p.entry_price.to_f64().unwrap_or(0.0)),
+                    );
                 }
             }
             if let Some(k) = ctx.klines(&pair) {
@@ -848,10 +844,8 @@ mod tests {
         config.market = "futures".into();
         config.position_mode = "hedge".into();
         // 关资金费避免结算污染 (本测试只验方向仓语义)。
-        config.backtest = Some(crate::config::BacktestToml {
-            funding_rate_8h: Some(0.0),
-            ..Default::default()
-        });
+        config.backtest =
+            Some(crate::config::BacktestToml { funding_rate_8h: Some(0.0), ..Default::default() });
         let mut strategy = LuaStrategy::from_source(script, config).expect("编译应通过");
         let mut ctx = BacktestContext::new(
             strategy.config.clone(),
@@ -990,10 +984,9 @@ mod tests {
             end
         "#;
         let mut config = test_config(script);
-        config.params.insert(
-            "universe".into(),
-            ConfigValue::String("TSLABUSDT,NVDABUSDT,AAPLUSDT".into()),
-        );
+        config
+            .params
+            .insert("universe".into(), ConfigValue::String("TSLABUSDT,NVDABUSDT,AAPLUSDT".into()));
         let mut strategy = LuaStrategy::from_source(script, config).expect("编译应通过");
         let mut ctx = BacktestContext::new(
             strategy.config.clone(),
@@ -1014,10 +1007,7 @@ mod tests {
         let seen = strategy.lua.globals().get::<mlua::Table>("seen").expect("seen 表");
         for pair in ["TSLABUSDT", "NVDABUSDT", "AAPLUSDT"] {
             let n: i64 = seen.get(pair).expect("该只应有记录");
-            assert!(
-                n >= 253,
-                "{pair} 信号线应 ≥253 根 (full 模式, 不套 100 cap), got {n}"
-            );
+            assert!(n >= 253, "{pair} 信号线应 ≥253 根 (full 模式, 不套 100 cap), got {n}");
             assert_eq!(n, 300, "{pair} 300 根全段可见 (add_method full 分支)");
         }
     }
@@ -1033,7 +1023,8 @@ mod tests {
                 return {}
             end
         "#;
-        let mut strategy = LuaStrategy::from_source(script, test_config(script)).expect("编译应通过");
+        let mut strategy =
+            LuaStrategy::from_source(script, test_config(script)).expect("编译应通过");
         let mut ctx = BacktestContext::new(
             strategy.config.clone(),
             Balance { asset: "USDC".into(), free: dec!(100000), locked: Decimal::ZERO },

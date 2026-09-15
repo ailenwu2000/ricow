@@ -17,7 +17,7 @@
 //!
 //! 2026-09-12 建 (specs/changes/008-platform-process-model 验收 A3)。
 
-use ricow_binance::{BnSpotExchange, BinanceClient, FuturesClient};
+use ricow_binance::{BinanceClient, BnSpotExchange, FuturesClient};
 use ricow_core::{Exchange, OrderRequest, OrderSide, OrderStatus};
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -27,9 +27,7 @@ fn demo_spot_client() -> BinanceClient {
         .expect("RICOW_BN_API_KEY 未设置 (demo 测试网 key, 见 specs/testnet.md)");
     let secret = std::env::var("RICOW_BN_SECRET_KEY")
         .expect("RICOW_BN_SECRET_KEY 未设置 (demo 测试网 key, 见 specs/testnet.md)");
-    BinanceClient::new()
-        .expect("BinanceClient 构造失败")
-        .with_credentials(api_key, secret)
+    BinanceClient::new().expect("BinanceClient 构造失败").with_credentials(api_key, secret)
 }
 
 fn demo_futures_client() -> FuturesClient {
@@ -111,7 +109,10 @@ async fn demo_spot_open_orders_roundtrip() {
     assert_eq!(mine.price, limit_price, "解析价格应与提交一致");
     assert_eq!(mine.filled_size, Decimal::ZERO, "未成交单 filled 应为 0");
     assert!(!mine.exchange_order_id.is_empty(), "交易所订单号应存在");
-    println!("  字段校验通过: side={:?} price={} size={} status={:?}", mine.side, mine.price, mine.size, mine.status);
+    println!(
+        "  字段校验通过: side={:?} price={} size={} status={:?}",
+        mine.side, mine.price, mine.size, mine.status
+    );
 
     // ② 撤单后不再出现在挂单列表
     exchange.cancel_order(symbol, &ack.client_order_id).await.expect("撤单失败");
@@ -198,11 +199,7 @@ async fn demo_futures_open_orders_roundtrip() {
 
     c.cancel_order(symbol, &cid).await.expect("合约撤单失败");
     let after = c.get_open_orders(symbol).await.expect("fapi get_open_orders(撤后) 失败");
-    assert!(
-        !after.iter().any(|o| o.client_order_id == cid),
-        "撤单后仍出现在挂单列表: {:?}",
-        after
-    );
+    assert!(!after.iter().any(|o| o.client_order_id == cid), "撤单后仍出现在挂单列表: {:?}", after);
     println!("  撤单后挂单列表已不含该单 (剩余 {} 笔) —— 合约闭环 PASS", after.len());
 }
 
@@ -234,9 +231,8 @@ async fn demo_futures_rejected_order_surfaces_error() {
     let qty = qty_for_notional(mark, Decimal::from(200), m.min_size, m.step_size);
 
     // 故意违反对齐: 合法 tick 价格 + 0.001 个最小单位 → PRICE_FILTER 必然拒绝
-    let bad_price =
-        price_on_tick(mark * Decimal::from_str("0.90").unwrap(), m.tick_size)
-            + Decimal::from_str("0.001").unwrap();
+    let bad_price = price_on_tick(mark * Decimal::from_str("0.90").unwrap(), m.tick_size)
+        + Decimal::from_str("0.001").unwrap();
 
     let err = c
         .place_order(
@@ -262,10 +258,6 @@ async fn demo_futures_rejected_order_surfaces_error() {
     assert!(!msg.contains("timeout"), "错误是超时而非交易所拒绝: {msg}");
 
     let after = c.get_open_orders(symbol).await.expect("fapi get_open_orders(拒单后) 失败");
-    assert!(
-        after.iter().all(|o| o.price != bad_price),
-        "被拒的单竟出现在挂单列表: {:?}",
-        after
-    );
+    assert!(after.iter().all(|o| o.price != bad_price), "被拒的单竟出现在挂单列表: {:?}", after);
     println!("  交易所正常拒绝且无残单 (当前挂单 {} 笔) —— 错误上报 PASS", after.len());
 }

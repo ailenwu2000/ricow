@@ -169,8 +169,8 @@ mod tests {
 
     /// 绕过创建期名字门禁的夹具(直接改 config 再序列化): 用于验证**部署期**的第二道防线。
     async fn preview_of_raw_name(db: &Database, name: &str) -> String {
-        let mut cfg = create_strategy("ok-name", AI_CODE, "ETHUSDT", HashMap::new())
-            .expect("门禁应通过");
+        let mut cfg =
+            create_strategy("ok-name", AI_CODE, "ETHUSDT", HashMap::new()).expect("门禁应通过");
         cfg.name = name.to_string();
         let toml_str = cfg.to_toml().expect("序列化");
         crate::confirm::create_preview(db, "strategy", &toml_str).await.expect("建 preview")
@@ -181,7 +181,10 @@ mod tests {
         // 创建期第一道防线: 中文/空格/路径穿越名一律拒绝 (019 D18 / FR-043)
         for bad in ["网格A", "my grid", "../evil", "a/b", &"x".repeat(25)] {
             let err = create_strategy(bad, AI_CODE, "ETHUSDT", HashMap::new()).unwrap_err();
-            assert!(err.contains("策略名") || err.contains("非法字符") || err.contains("超过上限"), "{bad} → {err}");
+            assert!(
+                err.contains("策略名") || err.contains("非法字符") || err.contains("超过上限"),
+                "{bad} → {err}"
+            );
         }
     }
 

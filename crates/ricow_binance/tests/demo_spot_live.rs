@@ -26,9 +26,7 @@ fn demo_client() -> BinanceClient {
         .expect("RICOW_BN_API_KEY 未设置 (demo 测试网 key, 见 specs/testnet.md)");
     let secret = std::env::var("RICOW_BN_SECRET_KEY")
         .expect("RICOW_BN_SECRET_KEY 未设置 (demo 测试网 key, 见 specs/testnet.md)");
-    BinanceClient::new()
-        .expect("BinanceClient 构造失败")
-        .with_credentials(api_key, secret)
+    BinanceClient::new().expect("BinanceClient 构造失败").with_credentials(api_key, secret)
 }
 
 /// 固定 seed 伪随机 (LCG, 不引依赖): 从候选池选 n 个不同 symbol。
@@ -49,7 +47,12 @@ fn pick_symbols(pool: &[String], n: usize) -> Vec<&String> {
 }
 
 /// 按目标名义价值算合法数量: qty = 名义/价, 对齐 step_size 整数倍, 且 ≥ min_qty。
-fn qty_for_notional(price: Decimal, notional: Decimal, min_qty: Decimal, step: Option<Decimal>) -> Decimal {
+fn qty_for_notional(
+    price: Decimal,
+    notional: Decimal,
+    min_qty: Decimal,
+    step: Option<Decimal>,
+) -> Decimal {
     let raw = (notional / price).max(min_qty);
     let aligned = match step {
         Some(s) if !s.is_zero() => {
@@ -70,12 +73,9 @@ fn free_balance(balances: &serde_json::Value, asset: &str) -> Decimal {
     balances
         .as_array()
         .and_then(|arr| {
-            arr.iter()
-                .find(|b| b["asset"].as_str() == Some(asset))
-                .map(|b| {
-                    Decimal::from_str_exact(b["free"].as_str().unwrap_or("0"))
-                        .unwrap_or(Decimal::ZERO)
-                })
+            arr.iter().find(|b| b["asset"].as_str() == Some(asset)).map(|b| {
+                Decimal::from_str_exact(b["free"].as_str().unwrap_or("0")).unwrap_or(Decimal::ZERO)
+            })
         })
         .unwrap_or(Decimal::ZERO)
 }
@@ -94,8 +94,12 @@ async fn demo_spot_roundtrip_multiple_pairs() {
             b["free"].as_str().map(|f| f != "0").unwrap_or(false)
                 || b["locked"].as_str().map(|l| l != "0").unwrap_or(false)
         }) {
-            println!("  {} free={} locked={}", b["asset"].as_str().unwrap_or("?"),
-                b["free"].as_str().unwrap_or("0"), b["locked"].as_str().unwrap_or("0"));
+            println!(
+                "  {} free={} locked={}",
+                b["asset"].as_str().unwrap_or("?"),
+                b["free"].as_str().unwrap_or("0"),
+                b["locked"].as_str().unwrap_or("0")
+            );
         }
     }
 
@@ -138,7 +142,14 @@ async fn demo_spot_roundtrip_multiple_pairs() {
         let limit_price = (px * dec!(0.95)).round_dp(2);
         let cid = format!("ricow-demo-{symbol}-{}", std::process::id());
         let resp = client
-            .place_order(symbol, "BUY", "LIMIT", &qty.to_string(), Some(&limit_price.to_string()), &cid)
+            .place_order(
+                symbol,
+                "BUY",
+                "LIMIT",
+                &qty.to_string(),
+                Some(&limit_price.to_string()),
+                &cid,
+            )
             .await
             .expect("限价挂单失败");
         assert_eq!(resp["status"].as_str(), Some("NEW"), "限价单应 Open: {resp}");
@@ -205,9 +216,13 @@ async fn demo_spot_roundtrip_multiple_pairs() {
     let balances3 = &account3["balances"];
     let usdt_after = free_balance(balances3, "USDT");
     let delta = usdt_after - usdt_before;
-    println!("\n== 汇总: USDT {usdt_before} → {usdt_after} (Δ={delta}, 含手续费+滑点+历史残留变现) ==");
+    println!(
+        "\n== 汇总: USDT {usdt_before} → {usdt_after} (Δ={delta}, 含手续费+滑点+历史残留变现) =="
+    );
     if delta.abs() > dec!(5) {
-        println!("  提示: USDT 变化 > 5, 通常因 demo 账户存在历史残留仓位被本测试顺手平掉变现, 非异常。");
+        println!(
+            "  提示: USDT 变化 > 5, 通常因 demo 账户存在历史残留仓位被本测试顺手平掉变现, 非异常。"
+        );
     }
     println!("PASS: 多交易对现货真实下单闭环全部通过 (每对均完成 挂单→撤单→市价买→平仓归零)");
 }

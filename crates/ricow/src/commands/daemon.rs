@@ -79,7 +79,11 @@ async fn start() -> CoreResult<()> {
     let err = out.try_clone().map_err(|e| io_err("复制日志句柄失败", e))?;
 
     let mut cmd = Command::new(&exe);
-    cmd.arg("daemon").arg("run").stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(err));
+    cmd.arg("daemon")
+        .arg("run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
     detach(&mut cmd);
     let child = cmd.spawn().map_err(|e| io_err("启动 daemon 进程失败", e))?;
     let child_pid = child.id();
@@ -170,13 +174,9 @@ async fn run_foreground() -> CoreResult<()> {
         )));
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| io_err("绑定 127.0.0.1 失败", e))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| io_err("读取监听地址失败", e))?
-        .port();
+    let listener =
+        TcpListener::bind("127.0.0.1:0").await.map_err(|e| io_err("绑定 127.0.0.1 失败", e))?;
+    let port = listener.local_addr().map_err(|e| io_err("读取监听地址失败", e))?.port();
     let token = uuid::Uuid::new_v4().to_string();
     let info = ledger::DaemonInfo {
         pid: std::process::id(),

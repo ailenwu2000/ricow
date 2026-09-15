@@ -265,7 +265,8 @@ pub async fn format_info(args: InfoArgs) -> CoreResult<String> {
                 c.live_enabled
             );
             if c.live_enabled {
-                line!(out, 
+                line!(
+                    out,
                     "实盘声明: live_enabled=true (实际进实盘还需命令行开关: ricow run --live / ricow start --live)"
                 );
             }
@@ -301,7 +302,9 @@ pub async fn format_info(args: InfoArgs) -> CoreResult<String> {
     // 端点与凭据按**模式**取 —— 绝不把 demo key 用到主网、反之亦然; 查询失败如实标注, 不显示陈旧值。
     let snap_mode = match view.and_then(|v| v.mode.as_deref()) {
         Some("demo") => Some(crate::commands::Mode::Demo),
-        _ if cfg.as_ref().map(|c| c.live_enabled).unwrap_or(false) => Some(crate::commands::Mode::Live),
+        _ if cfg.as_ref().map(|c| c.live_enabled).unwrap_or(false) => {
+            Some(crate::commands::Mode::Live)
+        }
         _ => None,
     };
     if let Some(mode) = snap_mode {

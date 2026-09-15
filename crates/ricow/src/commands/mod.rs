@@ -7,12 +7,12 @@ macro_rules! line {
     }};
 }
 
-pub mod ai;
 pub mod agentkit;
+pub mod ai;
 pub mod approve;
 pub mod backtest;
-pub mod create;
 pub mod config_file;
+pub mod create;
 pub mod ctrl;
 pub mod daemon;
 pub mod db;
@@ -121,10 +121,8 @@ pub(crate) fn bn_signed_exchange_mode(
 /// 两处都没有时明确报错, 不静默用空凭据发起请求。
 pub(crate) fn load_live_credentials() -> ricow_core::CoreResult<(String, String)> {
     // 环境变量是**显式覆盖**(CI/临时/密钥管理器注入), 不是回落; 值不落盘。
-    let env_pair = (
-        std::env::var("RICOW_BN_API_KEY").ok(),
-        std::env::var("RICOW_BN_SECRET_KEY").ok(),
-    );
+    let env_pair =
+        (std::env::var("RICOW_BN_API_KEY").ok(), std::env::var("RICOW_BN_SECRET_KEY").ok());
     if let (Some(k), Some(s)) = env_pair {
         if !k.trim().is_empty() && !s.trim().is_empty() {
             return Ok((k.trim().to_string(), s.trim().to_string()));
@@ -141,7 +139,6 @@ pub(crate) fn load_live_credentials() -> ricow_core::CoreResult<(String, String)
         ))),
     }
 }
-
 
 /// 项目根 (数据目录, 决策 D4):
 /// 1) `RICOW_ROOT` 显式覆盖优先
@@ -728,7 +725,6 @@ pub(crate) fn format_backtest_report(
     }
     out
 }
-
 
 /// Dry Run 起点留痕 (002 FR-006): 首次以 Dry Run 运行时, 把起点写进策略 TOML 的 `dry_run_started_at`。
 ///

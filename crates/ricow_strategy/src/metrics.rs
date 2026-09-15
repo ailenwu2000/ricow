@@ -164,8 +164,12 @@ mod tests {
         assert!((b - 0.472).abs() < 0.005, "annual_return 90d = {b}");
         // 几何口径防回归: [100,110,99] 两年总收益 −1% → 年化 ≈ √0.99 − 1 = −0.50%
         // (旧算术均值口径: mean=(10%−10%)/2=0 → 年化 0%, 会漏报亏损年化)。
-        let c = annual_return(&eq(&[dec!(100), dec!(110), dec!(99)]), 2.0 * SECONDS_PER_YEAR).unwrap();
-        assert!((c - (0.99f64.sqrt() - 1.0)).abs() < 1e-9, "annual_return 几何 = {c} (应 ≈ −0.50%)");
+        let c =
+            annual_return(&eq(&[dec!(100), dec!(110), dec!(99)]), 2.0 * SECONDS_PER_YEAR).unwrap();
+        assert!(
+            (c - (0.99f64.sqrt() - 1.0)).abs() < 1e-9,
+            "annual_return 几何 = {c} (应 ≈ −0.50%)"
+        );
         // 曲线 <2 点 / 跨度 <=0 → None。
         assert!(annual_return(&eq(&[dec!(100)]), SECONDS_PER_YEAR).is_none());
         assert!(annual_return(&eq(&[dec!(100), dec!(110)]), 0.0).is_none());
@@ -179,7 +183,8 @@ mod tests {
         let v = annual_volatility(&e, SECONDS_PER_YEAR).unwrap();
         assert!((v - 0.02).abs() < 1e-9, "vol = {v}");
         // 等比序列 (收益率恒 1%) → 方差 0 → None。
-        assert!(annual_volatility(&eq(&[dec!(100), dec!(101), dec!(102.01)]), SECONDS_PER_YEAR).is_none());
+        assert!(annual_volatility(&eq(&[dec!(100), dec!(101), dec!(102.01)]), SECONDS_PER_YEAR)
+            .is_none());
         // 2 点曲线 (1 个收益率) → 样本方差无定义 → None。
         assert!(annual_volatility(&eq(&[dec!(100), dec!(110)]), SECONDS_PER_YEAR).is_none());
     }
@@ -205,7 +210,9 @@ mod tests {
         let so = sortino(&e, SECONDS_PER_YEAR, 0.0).unwrap();
         assert!((so + 0.5).abs() < 1e-6, "sortino = {so}");
         // 无下行 → None。
-        assert!(sortino(&eq(&[dec!(100), dec!(101), dec!(104.03)]), SECONDS_PER_YEAR, 0.0).is_none());
+        assert!(
+            sortino(&eq(&[dec!(100), dec!(101), dec!(104.03)]), SECONDS_PER_YEAR, 0.0).is_none()
+        );
     }
 
     #[test]

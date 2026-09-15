@@ -35,11 +35,15 @@ pub fn confirmation_block(preview_kind: &str, payload: &str) -> String {
     match cfg {
         Ok(c) => {
             let name = c.name.trim();
-            let market = if c.market.eq_ignore_ascii_case("futures") { "合约 USDT-M" } else { "现货" };
+            let market =
+                if c.market.eq_ignore_ascii_case("futures") { "合约 USDT-M" } else { "现货" };
             let pair = c.get_str("pair").unwrap_or("<未指定>");
             let script_len = c.get_str("script").map(|s| s.len()).unwrap_or(0);
             let _ = writeln!(out, "动作: 落盘部署 [{preview_kind}] —— 写 strategies/{name}.toml + strategies/{name}.lua");
-            let _ = writeln!(out, "目标: 策略名 {name} · 交易对 {pair} · 市场 {market} · 脚本 {script_len} 字节");
+            let _ = writeln!(
+                out,
+                "目标: 策略名 {name} · 交易对 {pair} · 市场 {market} · 脚本 {script_len} 字节"
+            );
             let _ = writeln!(out, "参数: {}", summarize_params(&c));
             let _ = writeln!(
                 out,
@@ -151,7 +155,17 @@ script = "function on_tick(ctx) return {} end"
     #[test]
     fn test_bare_y_rejected_explicit_phrase_accepted() {
         let exp = "确认部署 eth-simple-1";
-        for bad in ["y", "Y", "yes", "OK", "", "   ", "确认部署", "确认部署 eth-simple", "确认部署eth-simple-1"] {
+        for bad in [
+            "y",
+            "Y",
+            "yes",
+            "OK",
+            "",
+            "   ",
+            "确认部署",
+            "确认部署 eth-simple",
+            "确认部署eth-simple-1",
+        ] {
             assert!(!is_explicit_confirmation(bad, exp), "'{bad}' 不应被当作明确确认");
         }
         assert!(is_explicit_confirmation("确认部署 eth-simple-1", exp));
@@ -168,7 +182,9 @@ script = "function on_tick(ctx) return {} end"
     #[test]
     fn test_confirmation_block_covers_action_target_params_consequence() {
         let b = confirmation_block("strategy", PAYLOAD);
-        for must in ["动作:", "目标:", "参数:", "后果:", "确认块", "eth-simple-1", "ETH", "order_size=0.01"] {
+        for must in
+            ["动作:", "目标:", "参数:", "后果:", "确认块", "eth-simple-1", "ETH", "order_size=0.01"]
+        {
             assert!(b.contains(must), "确认块缺少 {must}:\n{b}");
         }
         // 脚本正文不应混进参数摘要(只报字节数)

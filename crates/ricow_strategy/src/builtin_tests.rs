@@ -338,10 +338,7 @@ fn test_shannon_grid_target_ratio_070() {
     // target_ratio=0.7 → 建仓 ≈ 70% 权益 (100000×0.7/100=700), 价涨后卖回 70:30。
     let cfg = config(
         SHANNON_GRID,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("target_ratio", ConfigValue::Float(0.7)),
-        ],
+        &[("pair", ConfigValue::String("ETH".into())), ("target_ratio", ConfigValue::Float(0.7))],
     );
     let bars = vec![kline(100, 105, 95, 104), kline(110, 115, 105, 114)];
     let orders = run_bars(cfg, &bars);
@@ -368,10 +365,7 @@ fn test_shannon_grid_atr_widens_band() {
     let cfg_on = config(SHANNON_GRID, &params_on);
     let cfg_off = config(
         SHANNON_GRID,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("atr_period", ConfigValue::Integer(0)),
-        ],
+        &[("pair", ConfigValue::String("ETH".into())), ("atr_period", ConfigValue::Integer(0))],
     );
     // bar0 建仓 @100; bar1-3 高波动 (high=110/low=90, close=100) 累计 TR≈20 → ATR/price≈0.2;
     // bar4 涨到 105 (+5%): 币市值 500×105=52500 vs 目标 51250, 偏离 ~1.2% 权益。
@@ -384,10 +378,7 @@ fn test_shannon_grid_atr_widens_band() {
     ];
     let orders_on = run_bars(cfg_on, &bars);
     assert_eq!(orders_on[0].len(), 1, "ATR 开: 首 tick 应建仓");
-    assert!(
-        orders_on[4].is_empty(),
-        "ATR 开: band 放大 (≈0.2) → 涨 5% 不应触发再平衡"
-    );
+    assert!(orders_on[4].is_empty(), "ATR 开: band 放大 (≈0.2) → 涨 5% 不应触发再平衡");
     let orders_off = run_bars(cfg_off, &bars);
     assert_eq!(orders_off[0].len(), 1, "ATR 关: 首 tick 应建仓");
     assert_eq!(orders_off[4].len(), 1, "ATR 关: 固定 band 0.5% → 涨 5% 应触发卖出");
@@ -415,5 +406,3 @@ fn test_shannon_grid_target_ratio_clamped() {
         );
     }
 }
-
-

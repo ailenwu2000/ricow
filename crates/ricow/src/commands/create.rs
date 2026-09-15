@@ -112,9 +112,7 @@ pub async fn create_preview(
         crate::commands::bn_exchange()?.get_klines(pair, interval, limit).await?
     };
     if klines.is_empty() {
-        return Err(CoreError::Exchange(format!(
-            "{pair} 无 K 线数据 (检查交易对是否存在/拼写)"
-        )));
+        return Err(CoreError::Exchange(format!("{pair} 无 K 线数据 (检查交易对是否存在/拼写)")));
     }
 
     // ⑤ 沙箱回测 (第二关) + preview (第三关的第一步)
@@ -185,15 +183,17 @@ pub async fn run(args: CreateArgs) -> CoreResult<()> {
     // ② 参数解析 (CLI 形态: key=value)
     let mut params: Vec<(String, ConfigValue)> = Vec::new();
     for p in &args.params {
-        let (k, v) = parse_param(p)
-            .ok_or_else(|| CoreError::InvalidArgument(format!("--param 需为 key=value, 收到 '{p}'")))?;
+        let (k, v) = parse_param(p).ok_or_else(|| {
+            CoreError::InvalidArgument(format!("--param 需为 key=value, 收到 '{p}'"))
+        })?;
         params.push((k, v));
     }
 
     // ③④⑤ 与 AI 工具共用的创建内核
     let days = args.days.unwrap_or(90);
     let interval = args.interval.clone().unwrap_or_else(|| "1h".to_string());
-    let out = create_preview(&args.name, &raw, &args.pair, &args.market, params, days, &interval).await?;
+    let out =
+        create_preview(&args.name, &raw, &args.pair, &args.market, params, days, &interval).await?;
 
     print!("{}", out.report_text);
     println!();

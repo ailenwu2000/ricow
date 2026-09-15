@@ -62,9 +62,7 @@ impl FuturesDataClient {
             "4h" => 14_400_000,
             "1d" => 86_400_000,
             other => {
-                return Err(CoreError::InvalidArgument(format!(
-                    "unsupported interval: {other}"
-                )))
+                return Err(CoreError::InvalidArgument(format!("unsupported interval: {other}")))
             }
         };
 
@@ -85,7 +83,8 @@ impl FuturesDataClient {
             if raw.is_empty() {
                 break;
             }
-            let page_klines: Vec<Kline> = raw.iter().filter_map(|row| parse_kline_row(row)).collect();
+            let page_klines: Vec<Kline> =
+                raw.iter().filter_map(|row| parse_kline_row(row)).collect();
             if page_klines.is_empty() {
                 break;
             }
@@ -115,12 +114,8 @@ impl FuturesDataClient {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> CoreResult<T> {
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| CoreError::Network(e.to_string()))?;
+        let resp =
+            self.http.get(url).send().await.map_err(|e| CoreError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -218,8 +213,18 @@ mod tests {
     #[test]
     fn test_parse_kline_row_ok() {
         let row = serde_json::json!([
-            1750000000000_i64, "100.0", "102.0", "99.5", "101.5", "12.3", 1750003599999_i64,
-            "0", "1", "0", "0", "0"
+            1750000000000_i64,
+            "100.0",
+            "102.0",
+            "99.5",
+            "101.5",
+            "12.3",
+            1750003599999_i64,
+            "0",
+            "1",
+            "0",
+            "0",
+            "0"
         ]);
         let k = parse_kline_row(row.as_array().unwrap()).expect("解析成功");
         assert_eq!(k.open, Decimal::from_str("100.0").unwrap());

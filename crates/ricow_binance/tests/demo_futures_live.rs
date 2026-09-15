@@ -82,10 +82,10 @@ async fn close_all_positions(c: &FuturesClient) {
                 true // one-way 必须 reduce_only 防反手
             };
             let ps_opt = if ps == "BOTH" { None } else { Some(ps.as_str()) };
-            println!("  清理残留仓: {sym} amt={amt_str} → {side} {size} ({ps}, reduce_only={reduce})");
-            let _ = c
-                .place_order(sym, side, "MARKET", &size, None, ps_opt, reduce, None)
-                .await;
+            println!(
+                "  清理残留仓: {sym} amt={amt_str} → {side} {size} ({ps}, reduce_only={reduce})"
+            );
+            let _ = c.place_order(sym, side, "MARKET", &size, None, ps_opt, reduce, None).await;
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
     }
@@ -111,14 +111,16 @@ fn pick_symbols(pool: &[String], n: usize) -> Vec<&String> {
 /// 标记价格 (premiumIndex.markPrice)。
 async fn mark_price(c: &FuturesClient, symbol: &str) -> Decimal {
     let v = c.get_premium_index(symbol).await.expect("premiumIndex 失败");
-    v["markPrice"]
-        .as_str()
-        .and_then(|s| Decimal::from_str_exact(s).ok())
-        .expect("markPrice 缺失")
+    v["markPrice"].as_str().and_then(|s| Decimal::from_str_exact(s).ok()).expect("markPrice 缺失")
 }
 
 /// 按目标名义价值算合法数量 (对齐 step, ≥ min_qty)。合约有 MIN_NOTIONAL (≈50-100 USDT)。
-fn qty_for_notional(price: Decimal, notional: Decimal, min_qty: Decimal, step: Option<Decimal>) -> Decimal {
+fn qty_for_notional(
+    price: Decimal,
+    notional: Decimal,
+    min_qty: Decimal,
+    step: Option<Decimal>,
+) -> Decimal {
     let raw = (notional / price).max(min_qty);
     match step {
         Some(s) if !s.is_zero() => {
@@ -146,11 +148,8 @@ async fn demo_futures_oneway_roundtrip_multiple_pairs() {
 
     // ② 候选池: PERPETUAL + quote=USDT。
     let markets = c.get_exchange_info().await.expect("exchangeInfo 失败");
-    let pool: Vec<String> = markets
-        .iter()
-        .filter(|m| m.quote_asset == "USDT")
-        .map(|m| m.symbol.clone())
-        .collect();
+    let pool: Vec<String> =
+        markets.iter().filter(|m| m.quote_asset == "USDT").map(|m| m.symbol.clone()).collect();
     assert!(pool.len() >= 3, "合约候选池不足 3 对: {}", pool.len());
 
     // 固定 seed 选 3 对不同对。
@@ -165,7 +164,10 @@ async fn demo_futures_oneway_roundtrip_multiple_pairs() {
         let px = mark_price(&c, symbol).await;
         // 目标名义 ~100 USDT (合约 MIN_NOTIONAL 50-100, 留余量)。
         let qty = qty_for_notional(px, dec!(100), m.min_size, m.step_size);
-        println!("\n--- {symbol}  mark={px} qty={qty} (min_qty={}, step={:?}) ---", m.min_size, m.step_size);
+        println!(
+            "\n--- {symbol}  mark={px} qty={qty} (min_qty={}, step={:?}) ---",
+            m.min_size, m.step_size
+        );
 
         // 杠杆 1x + 逐仓。
         c.set_leverage(symbol, 1).await.expect("set_leverage 失败");
@@ -210,7 +212,16 @@ async fn demo_futures_oneway_roundtrip_multiple_pairs() {
     let qty = qty_for_notional(px, dec!(100), m1.min_size, m1.step_size);
     let limit_price = (px * dec!(1.02)).round_dp(2); // 高于市价, 空单不立即成交
     let placed = c
-        .place_order(s1, "SELL", "LIMIT", &qty.to_string(), Some(&limit_price.to_string()), None, false, None)
+        .place_order(
+            s1,
+            "SELL",
+            "LIMIT",
+            &qty.to_string(),
+            Some(&limit_price.to_string()),
+            None,
+            false,
+            None,
+        )
         .await
         .expect("限价开空失败");
     let cid = placed["clientOrderId"].as_str().expect("clientOrderId 缺失").to_string();
@@ -252,11 +263,8 @@ async fn demo_futures_dual_position_both_sides() {
     println!("== 双向持仓模式 (dualSidePosition=true) 开启 OK ==");
 
     let markets = c.get_exchange_info().await.expect("exchangeInfo 失败");
-    let pool: Vec<String> = markets
-        .iter()
-        .filter(|m| m.quote_asset == "USDT")
-        .map(|m| m.symbol.clone())
-        .collect();
+    let pool: Vec<String> =
+        markets.iter().filter(|m| m.quote_asset == "USDT").map(|m| m.symbol.clone()).collect();
     // 随机 2 对。
     let pairs = pick_symbols(&pool, 2);
 
@@ -276,7 +284,16 @@ async fn demo_futures_dual_position_both_sides() {
             .expect("dual 开多失败");
         println!("  开多 (LONG) OK orderId={}", o1["orderId"]);
         let o2 = c
-            .place_order(symbol, "SELL", "MARKET", &qty.to_string(), None, Some("SHORT"), false, None)
+            .place_order(
+                symbol,
+                "SELL",
+                "MARKET",
+                &qty.to_string(),
+                None,
+                Some("SHORT"),
+                false,
+                None,
+            )
             .await
             .expect("dual 开空失败");
         println!("  开空 (SHORT) OK orderId={}", o2["orderId"]);
@@ -291,16 +308,37 @@ async fn demo_futures_dual_position_both_sides() {
 
         // 逐仓钱包语义观察: 双向各占独立逐仓保证金 → 可用余额变化打印 (对比 account)。
         let acct = c.get_account().await.expect("account 失败");
-        println!("  account availableBalance={}", parse_available_balance(&acct).unwrap_or_default());
+        println!(
+            "  account availableBalance={}",
+            parse_available_balance(&acct).unwrap_or_default()
+        );
 
         // 平仓: hedge 模式方向单天然平对应仓, 不带 reduceOnly (带 positionSide 时 fapi 拒绝 reduceonly)。
         let cl1 = c
-            .place_order(symbol, "SELL", "MARKET", &long.to_string(), None, Some("LONG"), false, None)
+            .place_order(
+                symbol,
+                "SELL",
+                "MARKET",
+                &long.to_string(),
+                None,
+                Some("LONG"),
+                false,
+                None,
+            )
             .await
             .expect("平 LONG 失败");
         println!("  平 LONG OK orderId={}", cl1["orderId"]);
         let cl2 = c
-            .place_order(symbol, "BUY", "MARKET", &short.abs().to_string(), None, Some("SHORT"), false, None)
+            .place_order(
+                symbol,
+                "BUY",
+                "MARKET",
+                &short.abs().to_string(),
+                None,
+                Some("SHORT"),
+                false,
+                None,
+            )
             .await
             .expect("平 SHORT 失败");
         println!("  平 SHORT OK orderId={}", cl2["orderId"]);
@@ -387,10 +425,16 @@ async fn demo_futures_liquidation_observation() {
         let short = position_amount(&pos, "SHORT");
         let now_px = mark_price(&c, symbol).await;
         last_px = now_px;
-        let lliq = position_liquidation_price(&pos, "LONG").map(|d| d.to_string()).unwrap_or_else(|| "?".into());
-        let sliq = position_liquidation_price(&pos, "SHORT").map(|d| d.to_string()).unwrap_or_else(|| "?".into());
-        println!("  [t={:.0}s] mark={now_px} LONG={long}(liq={lliq}) SHORT={short}(liq={sliq})",
-            start.elapsed().as_secs_f64());
+        let lliq = position_liquidation_price(&pos, "LONG")
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "?".into());
+        let sliq = position_liquidation_price(&pos, "SHORT")
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "?".into());
+        println!(
+            "  [t={:.0}s] mark={now_px} LONG={long}(liq={lliq}) SHORT={short}(liq={sliq})",
+            start.elapsed().as_secs_f64()
+        );
 
         if long == Decimal::ZERO && short == Decimal::ZERO {
             // 两侧同时归零 (理论不可能同时强平, 可能为双向平仓兜底前); 视为异常, 继续看。
@@ -418,7 +462,9 @@ async fn demo_futures_liquidation_observation() {
         println!("\n== 10 分钟未触发 (双向对冲仍无 0.6% 波动) ==");
         close_all_positions(&c).await;
         println!("  已人工平仓, 触发后 availableBalance={bal_after}");
-        println!("结论: 双向对冲 10 分钟仍未触发 — 记录理论强平价 vs 现价差距, 供回测对照 (不视为失败)");
+        println!(
+            "结论: 双向对冲 10 分钟仍未触发 — 记录理论强平价 vs 现价差距, 供回测对照 (不视为失败)"
+        );
     }
 
     // 收尾: 恢复 one-way + 清仓。

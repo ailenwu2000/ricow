@@ -12,9 +12,9 @@ mod exec;
 mod fee;
 mod indicators_api;
 pub mod lua;
-mod name;
 mod lua_sandbox;
 mod metrics;
+mod name;
 mod pnl;
 mod risk;
 mod scheduler;
@@ -30,11 +30,13 @@ pub use context::{Context, DryRunContext, LiveContext};
 pub use db::{Database, FillRecord, PreviewRecord};
 pub use fee::FeeModel;
 pub use lua::{validate_lua, validate_script_source, LuaStrategy};
-pub use name::{prefix_conflict, suggest_strategy_name, validate_strategy_name, MAX_STRATEGY_NAME_LEN};
+pub use name::{
+    prefix_conflict, suggest_strategy_name, validate_strategy_name, MAX_STRATEGY_NAME_LEN,
+};
 pub use pnl::PnlTracker;
 pub use risk::{
-    MaxDailyLoss, MaxPositionLimit, MaxSlippage, MinOrderSize,
-    OrderRateLimit, RiskEngine, RiskError, RiskRule, RiskSettings,
+    MaxDailyLoss, MaxPositionLimit, MaxSlippage, MinOrderSize, OrderRateLimit, RiskEngine,
+    RiskError, RiskRule, RiskSettings,
 };
 pub use scheduler::StrategyScheduler;
 pub use strategy::Strategy;

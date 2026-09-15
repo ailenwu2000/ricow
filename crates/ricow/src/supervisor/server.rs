@@ -29,7 +29,12 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(root: PathBuf, exe: PathBuf, token: String, shutdown_tx: watch::Sender<bool>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        exe: PathBuf,
+        token: String,
+        shutdown_tx: watch::Sender<bool>,
+    ) -> Self {
         let state = Arc::new(Mutex::new(State { root, exe, children: HashMap::new() }));
         Self { state, token, shutdown_tx }
     }
@@ -44,12 +49,16 @@ impl Server {
             Request::Ping => {
                 Response::ok(Some(serde_json::json!({ "pong": true, "pid": std::process::id() })))
             }
-            Request::List => Response::ok(Some(serde_json::json!({ "instances": self.list_views() }))),
+            Request::List => {
+                Response::ok(Some(serde_json::json!({ "instances": self.list_views() })))
+            }
             Request::Info { name } => match self.view_of(&name) {
                 Some(v) => Response::ok(Some(serde_json::json!(v))),
                 None => Response::err(format!("未找到实例 {name} (未在运行且无台账)")),
             },
-            Request::Start { name, live, demo, confirmed } => self.start(&name, live, demo, confirmed).await,
+            Request::Start { name, live, demo, confirmed } => {
+                self.start(&name, live, demo, confirmed).await
+            }
             Request::Stop { name, close_all } => self.stop(&name, close_all).await,
             Request::Shutdown => {
                 let _ = self.shutdown_tx.send(true);
@@ -199,7 +208,11 @@ impl Server {
 
         let root = self.state.lock().expect("state lock").root.clone();
         // 清理提示: 依据运行模式与脚本是否定义 on_stop 如实说明 (不臆测清理结果)
-        let cleanup_hint = cleanup_hint_for(name, matches!(handle.view.mode.as_deref(), Some("live") | Some("demo")), close_all);
+        let cleanup_hint = cleanup_hint_for(
+            name,
+            matches!(handle.view.mode.as_deref(), Some("live") | Some("demo")),
+            close_all,
+        );
         let note = if !exited {
             Some(format!(
                 "停机超时 ({}s) 未观测到退出; 未强制终止, 请手工核对 (pid {:?})",
@@ -411,11 +424,10 @@ fn cleanup_hint_for(name: &str, live: bool, close_all: bool) -> String {
 /// 计算运行时长 (基于 started_at)。
 pub fn with_uptime(view: &InstanceView) -> InstanceView {
     let mut v = view.clone();
-    v.uptime_secs = v
-        .started_at
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64);
+    v.uptime_secs =
+        v.started_at.as_deref().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(
+            |t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64,
+        );
     v
 }
 

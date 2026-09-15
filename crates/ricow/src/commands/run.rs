@@ -89,7 +89,9 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
         crate::commands::load_credentials(crate::commands::Mode::Demo)?;
         let skew = fetch_clock_skew(&config.market, crate::commands::Mode::Demo).await?;
         match check_clock_skew(skew) {
-            ClockVerdict::Reject { message, .. } => return Err(CoreError::InvalidArgument(message)),
+            ClockVerdict::Reject { message, .. } => {
+                return Err(CoreError::InvalidArgument(message))
+            }
             ClockVerdict::Ok { skew_ms } => {
                 println!("时钟预检通过(按 demo 服务器): 本机比服务器 {skew_ms:+} ms")
             }
@@ -116,7 +118,14 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
             println!("提示: 未带 --close-all, 停机时只做撤单兜底, 持仓保留");
         }
         let outcome = Engine::new()
-            .run_live(config, demo_exchange, Some(&db), Some(stop_rx), args.close_all, crate::commands::Mode::Demo.label())
+            .run_live(
+                config,
+                demo_exchange,
+                Some(&db),
+                Some(stop_rx),
+                args.close_all,
+                crate::commands::Mode::Demo.label(),
+            )
             .await?;
         print_run_outcome(&outcome);
         if outcome.stop_reason == Some(StopReason::StreamEnded) {
@@ -174,7 +183,14 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
             }
 
             let outcome = Engine::new()
-                .run_live(config, live_exchange, Some(&db), Some(stop_rx), args.close_all, crate::commands::Mode::Live.label())
+                .run_live(
+                    config,
+                    live_exchange,
+                    Some(&db),
+                    Some(stop_rx),
+                    args.close_all,
+                    crate::commands::Mode::Live.label(),
+                )
                 .await?;
             print_run_outcome(&outcome);
             if outcome.stop_reason == Some(StopReason::StreamEnded) {
@@ -196,11 +212,8 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
             // 金额可配 (016: params.initial_cash, 默认 100k) —— 小资金配置才能用同一套 [risk] 限额预演。
             let dry_run_cash = ricow_engine::dry_run_initial_cash(config.get_f64("initial_cash"))
                 .map_err(CoreError::InvalidArgument)?;
-            let initial_balance = Balance {
-                asset: quote_asset_of(&pair),
-                free: dry_run_cash,
-                locked: Decimal::ZERO,
-            };
+            let initial_balance =
+                Balance { asset: quote_asset_of(&pair), free: dry_run_cash, locked: Decimal::ZERO };
             println!("Dry Run 虚拟本金: {dry_run_cash} {}", quote_asset_of(&pair));
             println!(
                 "启动策略 {} (Dry Run, 前台)。停机方式: stdin 输入 stop / 管道关闭 / Ctrl-C",
@@ -212,9 +225,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
             print_run_outcome(&outcome);
             // 行情流中断属异常: 非零退出, 供管理器/用户识别 (不静默 Ok)
             if outcome.stop_reason == Some(StopReason::StreamEnded) {
-                return Err(CoreError::Network(
-                    "行情流中断 (WebSocket 断开), 策略已停止".into(),
-                ));
+                return Err(CoreError::Network("行情流中断 (WebSocket 断开), 策略已停止".into()));
             }
             Ok(())
         }
@@ -232,10 +243,8 @@ async fn build_exchange(
     if config.market.eq_ignore_ascii_case("futures") {
         let ex = crate::commands::bn_futures_signed_mode(mode)?;
         let leverage = config.get_f64("leverage").unwrap_or(1.0).max(1.0) as u32;
-        let isolated = config
-            .get_str("margin_type")
-            .map(|s| !s.eq_ignore_ascii_case("cross"))
-            .unwrap_or(true);
+        let isolated =
+            config.get_str("margin_type").map(|s| !s.eq_ignore_ascii_case("cross")).unwrap_or(true);
         let hedge = config.position_mode.eq_ignore_ascii_case("hedge");
         ex.prepare(&pair, leverage, hedge, isolated).await?;
         println!(
@@ -303,10 +312,8 @@ fn spawn_stdin_stop_watcher(tx: tokio::sync::watch::Sender<Option<StopRequest>>)
             }
         }
         // 读到 EOF: 管理器进程已不在
-        let _ = tx.send(Some(StopRequest {
-            reason: Some(StopReason::ManagerGone),
-            close_all: false,
-        }));
+        let _ =
+            tx.send(Some(StopRequest { reason: Some(StopReason::ManagerGone), close_all: false }));
     });
 }
 
@@ -431,18 +438,15 @@ async fn inline_config(
             params.insert("upper_price".into(), ConfigValue::String(upper.to_string()));
         }
         "lua" => {
-            let script = args.script.as_ref().ok_or_else(|| {
-                CoreError::InvalidArgument("lua 策略需要 --script <path>".into())
-            })?;
+            let script = args
+                .script
+                .as_ref()
+                .ok_or_else(|| CoreError::InvalidArgument("lua 策略需要 --script <path>".into()))?;
             let code = std::fs::read_to_string(script)
                 .map_err(|e| CoreError::InvalidArgument(format!("读取脚本失败: {e}")))?;
             params.insert("script".into(), ConfigValue::String(code));
         }
-        other => {
-            return Err(CoreError::InvalidArgument(format!(
-                "unsupported strategy: {other}"
-            )))
-        }
+        other => return Err(CoreError::InvalidArgument(format!("unsupported strategy: {other}"))),
     }
 
     crate::commands::resolve_builtin_script(StrategyConfig {
@@ -467,10 +471,7 @@ mod tests {
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         // 每测试独立子目录: 避免并行测试互相 remove/create 竞争。
-        let d = std::env::temp_dir().join(format!(
-            "ricow-run-test-{}-{tag}",
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("ricow-run-test-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).expect("create tmp dir");
         d
@@ -498,7 +499,8 @@ order_size = 1.0
         assert_eq!(plain.reason, Some(StopReason::Requested));
         assert!(!plain.close_all, "普通停机不带平仓意图");
 
-        let with_close = parse_stop_command("  STOP --Close-All  ").expect("应识别 stop --close-all");
+        let with_close =
+            parse_stop_command("  STOP --Close-All  ").expect("应识别 stop --close-all");
         assert_eq!(with_close.reason, Some(StopReason::Requested));
         assert!(with_close.close_all, "指令文本带 --close-all 时须置平仓意图");
 

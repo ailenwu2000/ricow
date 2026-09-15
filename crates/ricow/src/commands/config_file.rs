@@ -220,10 +220,7 @@ fn check_keys(p: &Path, section: &str, t: &toml::Table, allowed: &[&str]) -> Cor
 }
 
 fn str_opt(t: &toml::Table, key: &str) -> Option<String> {
-    t.get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    t.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// 权限提示(只提示不修改): 非 0600 时返回一句提醒。

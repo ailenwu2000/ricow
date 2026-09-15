@@ -204,8 +204,7 @@ impl FuturesClient {
                 asset: target,
                 free: Decimal::from_str(b["availableBalance"].as_str().unwrap_or("0"))
                     .unwrap_or_default(),
-                locked: Decimal::from_str(b["balance"].as_str().unwrap_or("0"))
-                    .unwrap_or_default(),
+                locked: Decimal::from_str(b["balance"].as_str().unwrap_or("0")).unwrap_or_default(),
             }),
             None => Ok(Balance { asset: target, free: Decimal::ZERO, locked: Decimal::ZERO }),
         }
@@ -340,8 +339,10 @@ impl FuturesClient {
     /// 双向持仓模式: dual=true → 同对可同时 LONG+SHORT; false → one-way (BOTH)。
     /// 账户级设置, 需先无持仓/无挂单。
     pub async fn set_position_side_dual(&self, dual: bool) -> CoreResult<Value> {
-        let params =
-            vec![("dualSidePosition".into(), if dual { "true".to_string() } else { "false".to_string() })];
+        let params = vec![(
+            "dualSidePosition".into(),
+            if dual { "true".to_string() } else { "false".to_string() },
+        )];
         self.signed_post("/fapi/v1/positionSide/dual", &params).await
     }
 
@@ -369,7 +370,9 @@ impl FuturesClient {
     /// 查询当前持仓模式: true = 双向 (hedge), false = one-way。
     pub async fn position_side_dual(&self) -> CoreResult<bool> {
         let v = self.signed_get("/fapi/v1/positionSide/dual", &[]).await?;
-        v["dualSidePosition"].as_bool().ok_or_else(|| CoreError::Parse("missing dualSidePosition".into()))
+        v["dualSidePosition"]
+            .as_bool()
+            .ok_or_else(|| CoreError::Parse("missing dualSidePosition".into()))
     }
 
     // ---- HTTP helpers (签名) ----
@@ -587,9 +590,7 @@ pub fn parse_available_balance(account: &Value) -> Option<Decimal> {
 /// 注意: one-way 模式 positionSide=BOTH (实测 demo-fapi 2026-09-04); 双向模式才是 LONG/SHORT。
 pub fn position_amount(raw: &Value, position_side: &str) -> Decimal {
     raw.as_array()
-        .and_then(|arr| {
-            arr.iter().find(|p| p["positionSide"].as_str() == Some(position_side))
-        })
+        .and_then(|arr| arr.iter().find(|p| p["positionSide"].as_str() == Some(position_side)))
         .and_then(|p| p["positionAmt"].as_str())
         .and_then(|s| Decimal::from_str(s).ok())
         .unwrap_or(Decimal::ZERO)
@@ -597,18 +598,17 @@ pub fn position_amount(raw: &Value, position_side: &str) -> Decimal {
 
 /// 从 positionRisk JSON 数组提取某侧强平价 (liquidationPrice, 无仓/无值时 None)。
 pub fn position_liquidation_price(raw: &Value, position_side: &str) -> Option<Decimal> {
-    raw.as_array().and_then(|arr| {
-        arr.iter().find(|p| p["positionSide"].as_str() == Some(position_side))
-    })?
-    .get("liquidationPrice")?
-    .as_str()
-    .and_then(|s| Decimal::from_str(s).ok())
+    raw.as_array()
+        .and_then(|arr| arr.iter().find(|p| p["positionSide"].as_str() == Some(position_side)))?
+        .get("liquidationPrice")?
+        .as_str()
+        .and_then(|s| Decimal::from_str(s).ok())
 }
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use super::*;
+    use rust_decimal_macros::dec;
 
     fn client_with_fake_keys() -> FuturesClient {
         // 仅拼装/解析测试, 不发网络请求; base_url 用不存在的域。
@@ -648,10 +648,7 @@ mod tests {
             { "positionSide": "SHORT", "positionAmt": "-0.002", "liquidationPrice": "82000.5" }
         ]);
         assert_eq!(position_amount(&raw, "LONG"), Decimal::ZERO);
-        assert_eq!(
-            position_amount(&raw, "SHORT"),
-            Decimal::from_str("-0.002").unwrap()
-        );
+        assert_eq!(position_amount(&raw, "SHORT"), Decimal::from_str("-0.002").unwrap());
         assert_eq!(
             position_liquidation_price(&raw, "SHORT"),
             Some(Decimal::from_str("82000.5").unwrap())
@@ -746,7 +743,10 @@ mod tests {
                 {"filterType": "MIN_NOTIONAL", "minNotional": "100"}
             ]
         });
-        assert_eq!(parse_futures_symbol(&with_min_notional).unwrap().min_notional, Some(Decimal::from(100)));
+        assert_eq!(
+            parse_futures_symbol(&with_min_notional).unwrap().min_notional,
+            Some(Decimal::from(100))
+        );
 
         let none = serde_json::json!({
             "symbol": "BTCUSDT", "status": "TRADING", "contractType": "PERPETUAL",
@@ -791,7 +791,8 @@ mod tests {
         assert!(get("positionSide").is_none());
         assert!(get("reduceOnly").is_none());
 
-        let empty = build_order_params("ETHUSDT", "SELL", "MARKET", "1", None, None, false, Some(""), 7);
+        let empty =
+            build_order_params("ETHUSDT", "SELL", "MARKET", "1", None, None, false, Some(""), 7);
         let cid = empty.iter().find(|(n, _)| n == "newClientOrderId").unwrap();
         assert_eq!(cid.1, "ricow-f-7", "空串按缺省处理");
     }

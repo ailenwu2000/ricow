@@ -232,11 +232,7 @@ impl Database {
     // ---- 美股日线 (us_klines, Nasdaq 信号数据源) ----
 
     /// 插入或忽略一条美股日线 (主键 = ticker+interval+open_time, 增量去重)。
-    pub async fn insert_us_kline(
-        &self,
-        ticker: &str,
-        k: &Kline,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn insert_us_kline(&self, ticker: &str, k: &Kline) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT OR IGNORE INTO us_klines (ticker, interval, open_time, open, high, low, close, volume, close_time)
              VALUES (?, '1d', ?, ?, ?, ?, ?, ?, ?)",
@@ -283,11 +279,7 @@ impl Database {
     }
 
     /// 查询美股日线 (升序, 最近 limit 条)。
-    pub async fn get_us_klines(
-        &self,
-        ticker: &str,
-        limit: u32,
-    ) -> Result<Vec<Kline>, sqlx::Error> {
+    pub async fn get_us_klines(&self, ticker: &str, limit: u32) -> Result<Vec<Kline>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT open_time, open, high, low, close, volume, close_time
              FROM us_klines WHERE ticker = ? AND interval = '1d'
@@ -513,7 +505,10 @@ impl Database {
         Ok(r.rows_affected())
     }
 
-    pub async fn get_preview(&self, preview_id: &str) -> Result<Option<PreviewRecord>, sqlx::Error> {
+    pub async fn get_preview(
+        &self,
+        preview_id: &str,
+    ) -> Result<Option<PreviewRecord>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT preview_id, kind, payload_json, status, token, created_at, expires_at
              FROM previews WHERE preview_id = ?",
@@ -655,10 +650,18 @@ mod tests {
         };
         assert!(db.insert_funding_fee("s1", &f).await.unwrap(), "首次插入");
         assert!(!db.insert_funding_fee("s1", &f).await.unwrap(), "重复 tran_id 幂等");
-        assert!(!db.insert_funding_fee("s2", &f).await.unwrap(), "跨策略同一流水同样去重(账户级唯一)");
+        assert!(
+            !db.insert_funding_fee("s2", &f).await.unwrap(),
+            "跨策略同一流水同样去重(账户级唯一)"
+        );
         assert_eq!(db.funding_total(None).await.unwrap(), (1, dec!(-0.12345678)));
         // 精确小数: 加分不再有 f64 尾差
-        let f2 = FundingIncome { tran_id: "t2".into(), income: dec!(0.000004), time_ms: 2000, ..f.clone() };
+        let f2 = FundingIncome {
+            tran_id: "t2".into(),
+            income: dec!(0.000004),
+            time_ms: 2000,
+            ..f.clone()
+        };
         db.insert_funding_fee("s1", &f2).await.unwrap();
         assert_eq!(db.funding_total(None).await.unwrap(), (2, dec!(-0.12345278)));
         assert_eq!(db.latest_funding_time().await.unwrap(), Some(2000));

@@ -132,7 +132,6 @@ impl LiveContext {
         self.markets.read().ok()?.get(&pair_base.to_uppercase()).cloned()
     }
 
-
     /// 风控前置检查 (004): 被拒 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
     fn risk_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {
         let verdict = self.risk.borrow_mut().check(req, self);
@@ -445,7 +444,6 @@ impl DryRunContext {
             fill_queue: Vec::new(),
         }
     }
-
 
     /// 风控前置检查 (004): 被拒 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
     fn risk_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {

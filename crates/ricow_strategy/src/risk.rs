@@ -30,12 +30,28 @@ pub const RATE_WINDOW_MS: i64 = 1_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RiskError {
-    MaxPositionExceeded { current: Decimal, limit: Decimal },
-    MaxDailyLossExceeded { loss: Decimal, limit: Decimal },
-    MinOrderSizeNotMet { notional: Decimal, min: Decimal },
-    MaxSlippageExceeded { slippage_bps: u32, max_bps: u32 },
+    MaxPositionExceeded {
+        current: Decimal,
+        limit: Decimal,
+    },
+    MaxDailyLossExceeded {
+        loss: Decimal,
+        limit: Decimal,
+    },
+    MinOrderSizeNotMet {
+        notional: Decimal,
+        min: Decimal,
+    },
+    MaxSlippageExceeded {
+        slippage_bps: u32,
+        max_bps: u32,
+    },
     /// 下单频率超限 (004): 滑动窗口内请求数超过上限。
-    OrderRateLimited { limit: u32, count: u32, window_ms: i64 },
+    OrderRateLimited {
+        limit: u32,
+        count: u32,
+        window_ms: i64,
+    },
 }
 
 impl fmt::Display for RiskError {
@@ -53,10 +69,9 @@ impl fmt::Display for RiskError {
             RiskError::MaxSlippageExceeded { slippage_bps, max_bps } => {
                 write!(f, "max slippage exceeded: slippage={slippage_bps}bps, max={max_bps}bps")
             }
-            RiskError::OrderRateLimited { limit, count, window_ms } => write!(
-                f,
-                "下单频率超限: {count} 单 / {window_ms}ms > 上限 {limit} 单/秒"
-            ),
+            RiskError::OrderRateLimited { limit, count, window_ms } => {
+                write!(f, "下单频率超限: {count} 单 / {window_ms}ms > 上限 {limit} 单/秒")
+            }
         }
     }
 }
@@ -313,10 +328,7 @@ impl RiskSettings {
 
     /// 防御性收敛 (绕过校验的构造路径): 保证规则不会因非法值而静默失效。
     fn sanitized(self) -> RiskSettings {
-        RiskSettings {
-            max_orders_per_sec: self.max_orders_per_sec.max(1),
-            ..self
-        }
+        RiskSettings { max_orders_per_sec: self.max_orders_per_sec.max(1), ..self }
     }
 }
 
@@ -388,7 +400,8 @@ impl RiskEngine {
 
     /// 各规则拒单次数 (按规则名排序, 便于对照与测试)。
     pub fn rejection_stats(&self) -> Vec<(&'static str, u64)> {
-        let mut v: Vec<(&'static str, u64)> = self.rejections.iter().map(|(k, c)| (*k, *c)).collect();
+        let mut v: Vec<(&'static str, u64)> =
+            self.rejections.iter().map(|(k, c)| (*k, *c)).collect();
         v.sort();
         v
     }
@@ -534,7 +547,10 @@ mod tests {
 
     // ---- 004: 引擎装配 ----
 
-    fn cfg_with(risk: Option<crate::config::RiskConfig>, params: Vec<(&str, crate::config::ConfigValue)>) -> StrategyConfig {
+    fn cfg_with(
+        risk: Option<crate::config::RiskConfig>,
+        params: Vec<(&str, crate::config::ConfigValue)>,
+    ) -> StrategyConfig {
         StrategyConfig {
             name: "t".into(),
             strategy_type: "simple".into(),
@@ -590,7 +606,10 @@ mod tests {
     fn test_settings_validate_rejects_illegal_values() {
         use crate::config::RiskConfig;
         // 频率 0
-        let cfg = cfg_with(Some(RiskConfig { max_orders_per_sec: Some(0), ..Default::default() }), vec![]);
+        let cfg = cfg_with(
+            Some(RiskConfig { max_orders_per_sec: Some(0), ..Default::default() }),
+            vec![],
+        );
         assert!(RiskSettings::validate(&cfg).unwrap_err().contains("risk_max_orders_per_sec"));
         // 合法值通过
         let cfg = cfg_with(None, vec![]);

@@ -364,15 +364,14 @@ pub(crate) async fn fetch_klines_paged(
         if let Some(st) = start_time {
             url.push_str(&format!("&startTime={st}"));
         }
-        let resp =
-            http.get(&url).send().await.map_err(|e| CoreError::Network(e.to_string()))?;
+        let resp = http.get(&url).send().await.map_err(|e| CoreError::Network(e.to_string()))?;
         let status = resp.status();
         let text = resp.text().await.map_err(|e| CoreError::Network(e.to_string()))?;
         if !status.is_success() {
             return Err(CoreError::Exchange(format!("BN {status}: {text}")));
         }
-        let raw: Vec<Vec<Value>> = serde_json::from_str(&text)
-            .map_err(|e| CoreError::Parse(format!("{e}: {text}")))?;
+        let raw: Vec<Vec<Value>> =
+            serde_json::from_str(&text).map_err(|e| CoreError::Parse(format!("{e}: {text}")))?;
         if raw.is_empty() {
             break; // 无更多历史
         }
@@ -428,9 +427,8 @@ pub(crate) fn sorted_query_string(params: &[(String, String)]) -> String {
 
 /// 解析 `/api/v3/time` 响应 `{"serverTime": 1699999999999}` (纯函数, 便于单测)。
 pub fn parse_server_time(v: &Value) -> CoreResult<DateTime<Utc>> {
-    let ms = v["serverTime"]
-        .as_i64()
-        .ok_or_else(|| CoreError::Parse("missing serverTime".into()))?;
+    let ms =
+        v["serverTime"].as_i64().ok_or_else(|| CoreError::Parse("missing serverTime".into()))?;
     DateTime::from_timestamp_millis(ms)
         .ok_or_else(|| CoreError::Parse(format!("invalid serverTime: {ms}")))
 }
@@ -550,7 +548,10 @@ mod tests {
         assert!(validate_quantity(min, step, Decimal::from_str("0.001").unwrap()));
         assert!(validate_quantity(min, step, Decimal::from_str("1.5").unwrap()));
         assert!(!validate_quantity(min, step, Decimal::from_str("0.0005").unwrap()), "低于 minQty");
-        assert!(!validate_quantity(min, step, Decimal::from_str("1.5005").unwrap()), "非 step 整数倍");
+        assert!(
+            !validate_quantity(min, step, Decimal::from_str("1.5005").unwrap()),
+            "非 step 整数倍"
+        );
         assert!(!validate_quantity(min, step, Decimal::ZERO), "零数量");
     }
 
