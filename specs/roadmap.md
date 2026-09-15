@@ -17,6 +17,15 @@
 
 图例: ✅ 完成 · 🔄 进行中 · ⏳ 未开始
 
+## 项目更名与开源(2026-09-15)
+
+- **更名**: 项目由 **locus** 正式更名 **ricow** —— 仓库名 / 二进制 / crate 名 / 环境变量(`RICOW_ROOT` / `RICOW_DB` / `RICOW_*`)/ 配置与数据文件名(`ricow.toml` / `ricow.db`)/ `clientOrderId` 前缀(`ricow-*`)全部同步;
+  刻意保留的历史名: `locus_hl`(009 已删除的 crate)、`packaging/locus@.service`(008 已删除的单元)仅作为史实出现在文档中。
+- **历史**: git 历史不继承 —— 旧 60 次提交留在 gitee 与本地归档(`/mnt/d/mywork/ricow-old-git-history-20260915.tar.gz`), GitHub 仓库从 `v0.1.0` 重新开始。
+- **开源落地**: 仓库 <https://github.com/ailenwu2000/ricow>(public, Apache-2.0); 已落地 LICENSE / 双语 README / CONTRIBUTING / CODE_OF_CONDUCT / SECURITY / issue+PR 模板 / CODEOWNERS / dependabot / CI(clippy + Linux&Windows 测试)。
+- **历史变更档案**: `specs/changes/**` 正文保留旧名不回改(宪法「定稿不回改」)。
+- 发布流程唯一权威: `specs/release.md`。
+
 ## 测试基线
 
 - **当前基线 (2026-09-13, 016 实施后)**: `cargo test --workspace` = **306 passed / 0 failed / 11 ignored**。

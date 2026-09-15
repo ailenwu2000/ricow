@@ -1,8 +1,11 @@
 # ricow 项目宪法
 
-**版本**: 1.0.1 | **批准日期**: 2026-09-01 | **最后修订**: 2026-09-12
+**版本**: 1.1.0 | **批准日期**: 2026-09-01 | **最后修订**: 2026-09-15
 
-> 修订记录: 1.0.1 (2026-09-12) — 原则三测试纪律去 HL(移除 Hyperliquid 适配, 见 `specs/changes/009-remove-hyperliquid/`)。
+> 修订记录:
+> - 1.0.1 (2026-09-12) — 原则三测试纪律去 HL(移除 Hyperliquid 适配, 见 `specs/changes/009-remove-hyperliquid/`)。
+> - 1.1.0 (2026-09-15) — **项目更名 locus -> ricow**(仓库/二进制/crate/环境变量/配置与数据文件名统一; git 历史不继承, 见 `specs/roadmap.md` 更名注记);
+>   原则四补充"根级对外文档"的语言分工; 文档体系承认仓根开源文件与 `.github/` 的职责; 新增「分支与发布」章。
 
 ## 核心原则
 
@@ -23,6 +26,8 @@ BN 币安 demo 测试网(`demo-api.binance.com` 现货 / `demo-fapi.binance.com`
 ### 四、产物一律中文
 本仓库所有 spec / plan / tasks / checklist / roadmap 文档一律中文。
 代码注释与提交信息中文; 英文仅保留技术名词与命令。
+**例外(2026-09-15 增补)**: 面向仓库外读者的根级文件可用英文或双语 —— `README.md` 英文(对外门面)、`README_zh.md` 中文;
+`CONTRIBUTING.md` / `SECURITY.md` / `CODE_OF_CONDUCT.md` / `.github/` 下的模板以中文为主(可附英文摘要)。
 spec-kit 命令模板保持官方英文逻辑, 产物由本宪法与 zh preset 保证中文。
 
 ### 五、少而精(YAGNI)
@@ -43,6 +48,8 @@ spec-kit 命令模板保持官方英文逻辑, 产物由本宪法与 zh preset �
 - 变更档案须齐 spec.md / plan.md / tasks.md, 收敛后加 converge.md; 计划产物不留在 `specs/` 之外的临时目录(2026-09-11 澄清, 因 005/006/007 计划曾只落在 `.hermes/plans/`)。
 - 系统级 spec 的"现状描述"必须与代码一致: 每次变更收尾(converge)时同步复核 architecture / lua-api / backtest 中受影响章节与测试基线数字。
 - `AGENTS.md` 仅为 Hermes 入口指针, 内容单一来源 = 本文件。
+- **仓根开源文件(2026-09-15 增补)**: `README.md` / `README_zh.md` / `CONTRIBUTING.md` / `SECURITY.md` / `CODE_OF_CONDUCT.md` / `LICENSE` / `.github/`(CI、issue/PR 模板、CODEOWNERS、dependabot)属协作与合规必需文件, 不归 `specs/` 管;
+  发布流程与平台矩阵的**唯一权威**是 `specs/release.md`。
 - 进度与里程碑唯一权威 = `specs/roadmap.md`; 改进度只改该文件一处。
 - 历史(CHANGELOG)后置到 P5 公开发布时再建, 发布前不建空壳。
 
@@ -58,6 +65,14 @@ spec-kit 命令模板保持官方英文逻辑, 产物由本宪法与 zh preset �
 - RiskEngine 硬检查(最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点)。
 - Dry Run 默认, 确认后切实盘。
 - Lua 沙箱: 无 os/io/require/loadstring/pcall; 指令预算 1M/tick; 内存 64MB。
+
+## 分支与发布(2026-09-15)
+
+- **分支模型**: GitHub Flow —— `main` 为唯一长期分支 + 短命功能分支(`feat/` `fix/` `docs/`)+ PR; 不引入 develop / release 分支。
+- **提交与合并**: 提交信息中文 `type(scope): 描述`; 合并用 squash。项目组成员可直接向 `main` 推送(2026-09-15 决定); 外部贡献者经 fork + PR, 由维护者批准后合并。
+- **版本与发布**: 语义化版本; 0.x 期间破坏性改动升 minor。发布 = 改 `[workspace.package] version` -> 提交 -> 推 `vX.Y.Z` tag -> CI 自动多平台构建并挂 GitHub Release; **禁止移动/改写已发布 tag**, 修正一律发新版本。
+- **产物平台**: 以 CI 实测结果为准, 未经验证的平台**不得**在 README / Release 说明里宣称支持; 详见 `specs/release.md`。
+- **历史**: 本仓库 git 历史自 2026-09-15 起全新开始(旧 locus 历史不继承); 历史变更档案保留旧名, 不回改。
 
 ## 治理
 
