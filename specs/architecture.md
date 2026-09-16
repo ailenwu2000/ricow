@@ -32,10 +32,11 @@ ricow_core: Exchange trait ─► ricow_binance
 | ricow_binance | Binance 现货 REST/HMAC/WS (place_order/cancel/account) + USDT-M 公共数据源 (`FuturesDataClient`: fapi K 线 / 首档 MMR 表) + **fapi 签名交易客户端 `FuturesClient`** (下单/账户/持仓/杠杆/双向持仓, 2026-09-04 testnet 联调新增; 域名 RICOW_BN_BASE_URL / RICOW_FAPI_BASE_URL 可配 demo 测试网) |
 | ricow_strategy | 策略引擎: Lua 沙箱 / ctx 与 exec 注册 / 指标(ta)/ 风控 / 回测 / PnL / SQLite |
 | ricow_engine | headless 核心: Engine 命令分发 / backtest_runner(单标的 + 组合) / confirm(preview+approve)/ loader / market / **美股层 `nasdaq`(Nasdaq 日线客户端) / `us_tickers`(bStock↔美股映射, 70 只快照) / `market_class`(bStock 现货池识别, 通用能力保留: 当前无内置消费者)** |
-| ricow | 二进制 `ricow`: clap 子命令分发 + **AI 助手 `ai/`(019: 提示词、工具白名单 L0 只读 + L1 虚拟、审批门 `ToolGuard`)** + 单一配置文件读写 `commands/config_file.rs` |
+| ricow | 二进制 `ricow`: clap 子命令分发 + **AI 助手 `ai/`(019: 提示词、工具白名单 L0 只读 + L1 虚拟、审批门 `ToolGuard`; R3 对话内确认状态机 `ai/confirm.rs`)** + 单一配置文件读写 `commands/config_file.rs` |
 
-> **内置 AI 助手已落地**(019-ai-assistant): `ricow ai` 调用用户自配的 LLM(`ricow.toml [ai]` provider+api_key; 亦可零成本指向本机 Ollama),
-> 写实动作**不作工具注册**(L2), 工具面只有只读(L0)与虚拟(L1)。
+> **内置 AI 助手已落地**(019-ai-assistant): `ricow ai` 调用用户自配的 LLM(`ricow.toml [ai]` provider+api_key)。
+> **LLM 接口统一为 rig 0.42 的 OpenAI 兼容通道**(2026-09-16 重审): 7 个预设(deepseek 首项, 默认模型 `deepseek-flash`; 其余为 OpenAI 兼容的主流厂商)+ custom 自定义 base_url, 供应商差异只收敛在 `ai/provider.rs` 一个文件, 无需 Anthropic 等第二通道; 不支持工具调用的模型如实报错, 不自动降级。
+> 写实动作**不作工具注册**(L2), 工具面只有只读(L0, 9 个)与虚拟(L1, 4 个)。**R3(2026-09-16)**: L1 新增 `request_write_confirmation` —— 它自身不落盘不起进程, 只渲染确认块并在会话内存登记一条 pending(`Arc<Mutex<Option<PendingAction>>>`, TTL 15min); 用户在**同一交互式 tty REPL** 逐字输入短语(`确认部署 <name>` / `确认启动测试网 <name>`, 裸 y/yes/ok 不认)后, 由**宿主**进程内直调既有引擎内核完成 deploy(`approve`→`execute_strategy`)或 demo 启动(`ctrl::start_daemon(demo=true)`)。模型输出永远不进入执行分支; 实盘启动/停机/平仓/改开关/改参数仍须本人终端; 单次模式/管道/外部 agent 只回终端命令。详见 `specs/changes/019-ai-assistant/spec.md` §七 R3。
 > **MCP 不做**(2026-09-15 定案, 修订 product.md D12 修订 2): 单机程序, 用户已有的 agent 可直接调用本机 CLI, 生态入口 = `ricow agent-kit` 手册(019 T045–T047)。
 > 原 2026-08-24 决策"无 MCP / 内置 LLM"中**内置 LLM 一项已由 019 修订**; MCP 一项维持不做(GUI 与 Telegram 仍不做)。
 > Hyperliquid 适配 crate(`locus_hl`)已于 2026-09-12 全量移除(从未落地, 暂不考虑) —— 见 `specs/changes/009-remove-hyperliquid/`。

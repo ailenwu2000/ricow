@@ -85,7 +85,9 @@ pub async fn start(args: StartArgs) -> CoreResult<()> {
         )?;
     }
 
-    let (pid, mode) = start_daemon(&args.name, args.live, args.demo, args.live).await?;
+    let (pid, mode) =
+        start_daemon(&crate::commands::project_root(), &args.name, args.live, args.demo, args.live)
+            .await?;
     println!(
         "已启动策略 {} (pid={pid}, 模式: {}, 日志: logs/{}.log)",
         args.name,
@@ -113,7 +115,7 @@ pub async fn start(args: StartArgs) -> CoreResult<()> {
 
 /// 停止策略: daemon 下发停机指令并等待清理; 超时如实报告 (不静默强杀)。
 pub async fn stop(args: StopArgs) -> CoreResult<()> {
-    print!("{}", stop_daemon(&args.name, args.close_all).await?);
+    print!("{}", stop_daemon(&crate::commands::project_root(), &args.name, args.close_all).await?);
     Ok(())
 }
 
@@ -121,13 +123,13 @@ pub async fn stop(args: StopArgs) -> CoreResult<()> {
 ///
 /// CLI `ricow start` 与 AI 的 L1 工具共用(019 T031); 门禁与打印留在各自调用方。
 pub(crate) async fn start_daemon(
+    root: &std::path::Path,
     name: &str,
     live: bool,
     demo: bool,
     confirmed: bool,
 ) -> CoreResult<(u64, String)> {
-    let root = crate::commands::project_root();
-    let client = Client::connect(&root).await?;
+    let client = Client::connect(root).await?;
     let data =
         client.call_ok(Request::Start { name: name.to_string(), live, demo, confirmed }).await?;
     let pid = data.get("pid").and_then(|v| v.as_u64()).unwrap_or_default();
@@ -136,10 +138,13 @@ pub(crate) async fn start_daemon(
 }
 
 /// 停机内核(**不打印**): 返回面向用户的说明文本(CLI 打印 / AI 工具返回同一份, FR-016 同口径)。
-pub(crate) async fn stop_daemon(name: &str, close_all: bool) -> CoreResult<String> {
+pub(crate) async fn stop_daemon(
+    root: &std::path::Path,
+    name: &str,
+    close_all: bool,
+) -> CoreResult<String> {
     use std::fmt::Write as _;
-    let root = crate::commands::project_root();
-    let client = Client::connect(&root).await?;
+    let client = Client::connect(root).await?;
     let data = client.call_ok(Request::Stop { name: name.to_string(), close_all }).await?;
     let report: StopReport = serde_json::from_value(data)
         .map_err(|e| CoreError::Parse(format!("停机结果解析失败: {e}")))?;

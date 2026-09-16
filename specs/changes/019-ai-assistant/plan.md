@@ -81,6 +81,16 @@
 | ~~D22~~ 已取代(D31) ✅ | 凭据统一入口: OS Keyring 优先 → 不可用回落 `$LOCUS_ROOT/credentials.toml`(0600 明文) | 架构承诺的 headless 回落此前**未实现**(只有 trait 声明), WSL/headless 下用户根本存不进凭据 |
 | ~~D23~~ 已取代(D31) ✅ | `locus setup` 三段式(演示/实盘/AI) + **粘贴即存**; 不再要求"临时文件 + keyring set" | 后者是开发者口味, 对目标用户过重(且实测在本机跑不通) |
 
+### 4.1 R3 批次(2026-09-16 v2, 对话内确认; 对应 spec.md §七 R3)
+
+| # | 决策 | 状态 |
+|:--|:--|:--|
+| D33 | LLM 侧只新增一个 L1 虚拟工具 `request_write_confirmation`: 仅做前提校验 + 渲染确认块 + 登记会话内 pending; **不落盘、不起进程、不发 token**; 白名单结构性断言同步禁止 deploy/start_demo/approve 等写实名 | ✅ 已实现 |
+| D34 | 对话内仅开放**落盘部署**与**启动测试网 demo**两种代行; 实盘启动/停机(含 close-all)/实盘开关/改参改风控不开放, 模型代请求必须拒绝并给终端命令 | ✅ 已实现 |
+| D35 | pending 状态机: 会话级 `Arc<Mutex<Option<PendingAction>>>` 单槽、TTL 15 分钟、过期优先拦截、新覆盖旧、错短语与普通提问保留; 短语判定复用 `is_explicit_confirmation`(裸 y/yes/ok 不认) | ✅ 已实现 |
+| D36 | 宿主执行进程内直调同一引擎内核(`engine::approve`→`execute_strategy`;`ctrl::start_daemon(demo=true)`), 不经 shell、无第二条路径; deploy 拒绝连带 `engine::reject` 终态 | ✅ 已实现 |
+| D37 | 仅交互式 tty REPL 开放对话内确认; 单次 prompt / 管道 / 非终端 stdin 一律只回终端命令(与 R2 同一 `IsTerminal` 门禁); demo 凭据新增 env 成对覆盖 `RICOW_DEMO_KEY/SECRET` | ✅ 已实现 |
+
 ## 五、改动清单(文件 → 改动)
 
 | 文件 | 改动 |

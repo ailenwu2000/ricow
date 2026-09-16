@@ -4,11 +4,13 @@
 //! 工具集(T009+)、确认块(T026+)、斜杠命令(实装)在后续阶段接入; 未实装的斜杠命令
 //! 如实回"未接入", 不做假动作。
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use clap::Args;
 use ricow_core::{CoreError, CoreResult};
+use ricow_strategy::Database;
 
+use crate::ai::confirm::{new_slot, ActionKind, PendingAction};
 use crate::ai::{config, prompt, provider};
 
 #[derive(Args)]
@@ -62,17 +64,17 @@ fn classify(line: &str) -> Input {
 ///
 /// 工具名取自白名单常量(019): 不再手抄, 避免白名单扩容后这里静默过期。
 fn help_text() -> String {
-    let read = crate::ai::tools::READ_ONLY_TOOLS.join(" / ");
-    let virt = crate::ai::tools::VIRTUAL_TOOLS.join(" / ");
     format!(
         "\
 命令: /help 帮助 · /exit 退出
 可用自然语言提问, 例如: \"我部署了哪些策略\"
 只读工具({} 个, 可直接调用): {read}
 虚拟工具({} 个, 可直接调用但要告知副作用): {virt}
-边界: 写操作(落盘部署 / 启停实盘 / 平仓 / 改参数)不属于工具, 永远需要你本人确认",
+边界: 落盘部署 / 启动测试网 demo 可在对话内逐字确认; 实盘启停 / 停 demo / 平仓 / 改参数仍须你本人在终端执行",
         crate::ai::tools::READ_ONLY_TOOLS.len(),
-        crate::ai::tools::VIRTUAL_TOOLS.len()
+        crate::ai::tools::VIRTUAL_TOOLS.len(),
+        read = crate::ai::tools::READ_ONLY_TOOLS.join(" / "),
+        virt = crate::ai::tools::VIRTUAL_TOOLS.join(" / ")
     )
 }
 
@@ -127,8 +129,17 @@ pub async fn run(args: AiArgs) -> CoreResult<()> {
         eprintln!("提示: {w}");
     }
 
-    // 工具集: 只读(L0)。写实动作不作为工具注册 —— 见 `crate::ai::tools` 模块头说明。
-    let tools = crate::ai::tools::build(crate::ai::tools::ToolCtx::from_cli());
+    // 工具集: L0 只读 + L1 虚拟。写实动作没有工具面 —— 对话内确认也只登记 pending,
+    // 由下面 REPL 宿主在用户逐字输入后执行(见 `crate::ai::confirm`)。
+    // 单次模式即便 stdin 是 tty 也不开放对话内确认(没有第二轮输入可承接短语)。
+    let pending = new_slot();
+    let is_repl = args.prompt.is_none();
+    let tool_ctx = crate::ai::tools::ToolCtx::new(
+        root.clone(),
+        is_repl && std::io::stdin().is_terminal(),
+        pending.clone(),
+    );
+    let tools = crate::ai::tools::build(tool_ctx);
     let tool_count = tools.len();
     print_session_banner(&resolved, is_local, tool_count);
     let llm = provider::connect(resolved.clone(), &api_key, &prompt::system_preamble(), tools)?;
@@ -178,30 +189,119 @@ pub async fn run(args: AiArgs) -> CoreResult<()> {
                 continue;
             }
             Input::Ask(q) => {
-                let reply = if args.plain {
-                    llm.ask(&q).await.inspect(|a| {
-                        println!("{}", a.text);
-                    })
-                } else {
-                    llm.ask_stream(&q, &history).await
-                };
-                match reply {
-                    Ok(ans) => {
-                        if let Some(u) = &ans.usage {
-                            println!("[用量] {u}");
+                // 对话内确认状态机优先: 有 pending 时, 这行先判 确认 / 拒绝 / 过期 / 普通提问。
+                // 短语只认真实用户输入行, 不经过模型 —— 模型输出永远无法走到执行分支。
+                match crate::ai::confirm::consume_line(&pending, &line).await {
+                    crate::ai::confirm::LineDisposition::Confirm(action) => {
+                        match execute_confirmed(&action, &root).await {
+                            Ok(msg) => println!("{msg}"),
+                            Err(e) => println!(
+                                "执行失败: {e}\n(确认块已消费; 若是落盘预览已被批准/消费, 请用 ricow status / 文件系统核对实际状态, 必要时重新发起)"
+                            ),
                         }
-                        history.push(rig::message::Message::user(q));
-                        history.push(rig::message::Message::assistant(ans.text));
                     }
-                    Err(e) => {
-                        // 如实报错, 不吞: 网络/鉴权/模型不支持工具调用都会走到这里
-                        println!("错误: {e}");
+                    crate::ai::confirm::LineDisposition::Reject(action) => {
+                        // deploy: 尽力把 preview 置 rejected 终态(失败也不影响本地作废语义)
+                        if let (ActionKind::Deploy, Some(id)) =
+                            (action.kind, action.preview_id.as_deref())
+                        {
+                            if let Ok(db) = Database::open(&root.join("ricow.db")).await {
+                                _ = ricow_engine::reject(&db, id).await;
+                            }
+                        }
+                        println!(
+                            "已放弃待确认动作「{} / {}」, 未执行任何写实操作。",
+                            action.kind.label(),
+                            action.name
+                        );
+                    }
+                    crate::ai::confirm::LineDisposition::Expired(action) => {
+                        println!(
+                            "待确认动作「{} / {}」已超过 15 分钟, 已作废; 如需继续请重新发起。",
+                            action.kind.label(),
+                            action.name
+                        );
+                        ask_llm(&llm, &args.plain, &q, &mut history).await;
+                    }
+                    crate::ai::confirm::LineDisposition::Other
+                    | crate::ai::confirm::LineDisposition::NoPending => {
+                        ask_llm(&llm, &args.plain, &q, &mut history).await;
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// 把一轮普通提问送模型(流式/非流式), 打印答复与用量, 维护历史; 错误如实打印不吞。
+async fn ask_llm(
+    llm: &crate::ai::provider::Llm,
+    plain: &bool,
+    q: &str,
+    history: &mut Vec<rig::message::Message>,
+) {
+    let reply = if *plain {
+        llm.ask(q).await.inspect(|a| {
+            println!("{}", a.text);
+        })
+    } else {
+        llm.ask_stream(q, history).await
+    };
+    match reply {
+        Ok(ans) => {
+            if let Some(u) = &ans.usage {
+                println!("[用量] {u}");
+            }
+            history.push(rig::message::Message::user(q.to_string()));
+            history.push(rig::message::Message::assistant(ans.text));
+        }
+        Err(e) => {
+            // 如实报错, 不吞: 网络/鉴权/模型不支持工具调用都会走到这里
+            println!("错误: {e}");
+        }
+    }
+}
+
+/// 宿主执行已确认动作(019 R3): 复用与终端完全相同的引擎内核, 不经 shell。
+///
+/// - Deploy = `engine::approve` 取一次性 token → `engine::execute_strategy` 落盘(与 deploy.rs 同函数);
+/// - StartDemo = `ctrl::start_daemon(demo=true)`(daemon 对 demo 不校验 confirmed/live_enabled)。
+pub(crate) async fn execute_confirmed(
+    action: &PendingAction,
+    root: &std::path::Path,
+) -> CoreResult<String> {
+    match action.kind {
+        ActionKind::Deploy => {
+            let id = action.preview_id.as_deref().ok_or_else(|| {
+                CoreError::InvalidArgument("内部状态错误: deploy 待办缺 preview_id".into())
+            })?;
+            let db = Database::open(&root.join("ricow.db"))
+                .await
+                .map_err(|e| CoreError::Exchange(e.to_string()))?;
+            let dir = crate::commands::ensure_strategies_dir_in(root)?;
+            let token = ricow_engine::approve(&db, id).await?;
+            let (toml_path, lua_path) =
+                ricow_engine::execute_strategy(&db, id, &token, &dir).await?;
+            Ok(format!(
+                "已确认并完成落盘:\n  {}\n  {}\n\
+                 下一步:\n  Dry Run: ricow run {name}\n  测试网: ricow start {name} --demo",
+                toml_path.display(),
+                lua_path.display(),
+                name = action.name
+            ))
+        }
+        ActionKind::StartDemo => {
+            let (pid, mode) =
+                crate::commands::ctrl::start_daemon(root, &action.name, false, true, false).await?;
+            Ok(format!(
+                "已确认: {} 正在以测试网 demo 启动, pid={pid}(无真实资金; 会真实向测试网下单/撤单)。\n\
+                 停机须你本人执行: ricow stop {name}",
+                crate::commands::instances::mode_text(&mode),
+                name = action.name
+            ))
+        }
+    }
 }
 
 /// 读一行(阻塞读放 spawn_blocking, 不阻塞 tokio runtime; EOF/读失败 → None)。

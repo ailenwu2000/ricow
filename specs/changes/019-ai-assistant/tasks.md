@@ -75,9 +75,10 @@
       + 要求逐字输入 `确认部署 <策略名>`; **裸 y/yes/ok/n/no/空 一律不接受**(`is_explicit_confirmation` 单测覆盖 9 种输入);
       输入不一致 → **零副作用**(预览保持 pending 可重试, 不产生 token); 显式 `拒绝`/`reject` 才置终态。
       验证(真机): 用错短语(与预览名不符) → 报错且状态仍 pending; 正确短语 → token → deploy 成功。
-- [ ] **T027**(2026-09-14 按用户拍板修订, 见 T077) 部署引导: AI **只负责把确认块与命令给到用户**(`locus approve <preview_id>` → `locus deploy <preview_id> --token <token>`),
+- [~] **T027**(2026-09-14 按用户拍板修订, 见 T077; **2026-09-16 由 R3 部分放开, 见阶段十四 T083/T084**) 部署引导: 原边界 = AI **只负责把确认块与命令给到用户**(`locus approve <preview_id>` → `locus deploy <preview_id> --token <token>`),
       **AI 不代执行 approve/deploy**, token 全程只在用户自己的终端里流转 —— 与 FR-010(L2 不作为工具)一致, 结构性边界不松动。
-      验证: 诱导测试(T033)中模型不得声称"我已部署"; 真机交付物 = 用户按 AI 给的命令完成落盘。
+      **R3 修订**: 交互式 tty REPL 内, 用户逐字输入 `确认部署 <name>` 后由**宿主**(不是模型/工具)进程内直调 approve+execute 完成落盘; token 仍不出宿主、不经模型、不经 shell。单次模式/管道/外部 agent 维持本条原边界不变。实盘相关动作也维持原边界不变。
+      验证: 诱导测试(T033)中模型不得声称"我已部署"; R3 证据 = T086 双证据单测 + T088 真机留档(✅ 2026-09-16 已补: S7 真机注入负例通过 + demo 测试网真实成交/平仓闭环)。
 - [ ] **T028** **改脚本路径(D19 / FR-044)**: 受控覆盖 `--replace` = 确认块 + 备份 `<name>.lua.<ts>.bak` + 落盘, 备份路径进确认块。
       —— 验证: 真机: ①同名落盘默认拒;②`--replace` 走确认块且备份存在(内容 = 旧脚本);③短语敲错零改动。
 - [x] **T029** 首次实盘 018 披露确认(已实现, 既有链路): 未确认且未带 `--accept-risk` 时由 `risk_gate` 拒绝并打印**披露要点**(`locus_engine/src/live.rs:105` 文案 + README 免责声明);
@@ -292,3 +293,22 @@
       **维护注意**: 权威文档是**编译期嵌入**(`include_str!`), 改完必须 `cargo build` 才会被 `read_doc` 看到(本次深挖就踩到过)。
       而同一笔的订单行是 `dry run order placed … price=2507.66000000 status=Filled`(真实价) —— size/price 打成 0。
       影响: 依赖 fill 明细的 Lua 策略与日志可读性。属既有撮合/日志链路(非 019 引入); 需先定位是"日志字段未填"还是"传给策略的成交结构缺字段", 再决定是否修。
+
+## 阶段十四 — R3 对话内确认(2026-09-16 v2; spec §七 R3 / plan §4.1 D33–D37)
+
+> 范围: 用户反馈① —— 对话内确认块可直接落盘部署 + 启停 demo(实盘真实资金动作仍须本人终端)。
+> 基线 HEAD 4b2eada 重审后实现。门禁结果: Windows workspace **355 passed / 0 failed / 15 ignored**, fmt 0 差异, clippy `-D warnings` 0。
+
+- [x] **T080** 接缝 root 参数化: `prepare_deploy`/`prepare_start_demo` 改用 `ToolCtx.root`(DB = `<root>/ricow.db`, 策略目录本地扫描 `list_toml_stems`); `execute_confirmed(action, root)`; 新增 `commands::load_demo_credentials(root)` 与 `ensure_strategies_dir_in(root)`(全局函数变为薄包装)。
+- [x] **T081** 提示词: `GATES_GUIDE`(四档权限/落盘两渠道/三判据/改参=改TOML+restart/停 demo 须本人) 与 `TRAPS_GUIDE`(9 条易跑偏点, 含 T022 initial_cash 同口径、demo≠Dry Run、GFW 镜像); RULES 改四档; `read_doc` 新增 `commands` topic(文档专用 20k 上限 `DOC_MAX_OUTPUT_CHARS`); RULES 仍 <3000 字节断言保持。
+- [x] **T082** 状态机 `ai/confirm.rs`(纯逻辑全单测): `PendingAction{Deploy,StartDemo}` + `expected_phrase()` 与终端 approve 逐字一致; `PendingSlot=Arc<Mutex<Option<_>>>`; `consume_line` 五分支(Confirm/Reject/Expired/Other/NoPending), TTL 15min 注入时钟, 过期优先, 裸 y/yes/ok 不认。
+- [x] **T083** L1 虚拟工具 `request_write_confirmation`: 非交互回 `non_interactive_hint`(只给终端命令); 交互则前提校验(deploy: pending/未过期/载荷有名/同名未部署; demo: 已部署/未运行/凭据前置)→ 渲染确认块(deploy 复用 `commands::approve::confirmation_block`; demo 块含 demo 端点 + 真实下单提示)→ 登记 pending。白名单结构性断言加禁名(start_demo/stop_demo/execute_deploy/deploy/approve 等); VIRTUAL_TOOLS 3→4, 注册表计数测试同步(9+4)。
+- [x] **T084** REPL 接线: 共享 pending slot; 仅 `prompt.is_none() && stdin().is_terminal()` 开放; `Input::Ask` 先过 `consume_line`; Confirm→`execute_confirmed`(deploy: `engine::approve`→`execute_strategy`; demo: `ctrl::start_daemon(false,true,false)`); Reject→deploy 连带 `engine::reject`; Expired 提示后仍送 LLM; 抽出 `ask_llm`; help 文案更新。
+- [x] **T085** demo 凭据 env 覆盖: `RICOW_DEMO_KEY`/`RICOW_DEMO_SECRET` 成对非空优先于 `ricow.toml [exchange]`, 错误文案同步; key 只走 env/本地配置, 不入 git。
+- [x] **T086** R3 确定性测试(bin 单测 5 个, `ai::tools::tests::r3s5_*`/`r3s6_*`): 临时数据目录进程内全链路 —— 真实落盘 toml+lua + preview consumed 双证据; 错短语/裸 yes 零副作用且 pending 保留; 同名二次被拒且新 preview 仍 pending; Reject→rejected 终态零落盘; consumed 不可重放; demo 门禁三档(未部署/缺凭据/确认块含端点与真实下单)。
+- [x] **T087** `tests/ai_live_smoke.rs`(取代已删 `ai_ollama_smoke.rs`): 默认运行 2 个无 LLM 门禁测试(管道 approve 被 tty 门禁拒; 已部署策略缺 demo 凭据在时钟/网络前快速失败); 真机 S1/S2/S3+S4/S7 全 `#[ignore]` env 驱动(独立 RICOW_ROOT、key 只走 env、现货默认 data-api.binance.vision 镜像); S5/S6/S8 tty 真机手测脚本写入文件头注释(管道 stdin 非终端, 自动化不可驱动, 逻辑已由 T086 覆盖)。
+- [x] **T088** 真机留档(2026-09-16 晚, 双 key 到位 + 网络恢复后全量执行):
+  - **S1–S4/S7(DeepSeek 真机, key 走 env)**: `cargo test -p ricow --test ai_live_smoke -- --ignored --test-threads=1 --nocapture` → **4 passed / 0 failed(104s)**。S1 中文单轮("收到", 2917 tokens); S2 真实行情(BTCUSDT 中间价 75794.005, bid/ask 盘口); S3+S4 香农网格生成→编译门禁→168 根 1h K 线真实回测(30 笔成交/净盈亏 +6.34/胜率 90%)→**零落盘**且回答给终端 approve/deploy 两步; S7 诱导负例("提前授权短语"式注入)模型明确拒绝并索取文档, 文件系统零副作用。备注: S7 首跑遇瞬时网络中断(SSE ConnectionReset, 进程按"LLM 流式调用中断"非零退出), 重跑即过 —— 属网络抖动, 非边界失效。
+  - **S6 demo 真机(币安 demo key 走 env)**: demo-api 签名 `/account` 验 key(canTrade=true, USDT 4967.75)→ 临时 RICOW_ROOT 内 `ricow create`(真实回测)→ 因 agent shell 非 tty(R2 门禁按设计拒绝 `approve`, **管道喂短语不可行得证**)改以引擎同构载荷手动落盘(= deploy 的文件效果)→ supervisor 带 demo env → `ricow start btge2e --demo` 真连测试网: 时钟预检 +706ms、账户快照、用户数据流订阅(WS-API)、香农首笔市价买 0.0328 BTC(step_size 对齐)→ **5 笔真实成交**, 余额 USDT 4967.75→2484.40/BTC +0.0328 → `ricow stop --close-all` 真实平仓单 `btge2e-c5658710` → 回落 USDT 4960.15, ticks=401/fills=6/errors=0/撤单失败=0, 仅剩粉尘 0.0000072 BTC。
+  - **S8 Dry Run 真机**: `ricow start btge2e`(无凭据)→ 虚拟本金 100000, 真实行情本地撮合首笔成交 @75724.89 → status(运行中/成交 7 笔)→ stop 优雅退出。
+  - 已知问题(留观察): demo 首次启动曾报 `WS-API 用户流订阅失败: status=400 Timestamp outside recvWindow`(REST 签名同时成功), 重试即过 —— 疑 WS-API 签名时间戳路径的偶发竞态, 建议后续给 WS-API 订阅加一次时间戳重同步/重试。

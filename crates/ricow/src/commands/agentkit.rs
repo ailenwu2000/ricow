@@ -68,35 +68,12 @@ pub fn manual() -> String {
 具体参数一律以 `ricow <命令> --help` 为准, 不要凭猜测拼参数。\n\
 \n\
 ## 三、写实动作与门禁(**不可绕过**)\n\
-1. `ricow create` **不落盘**: 编译门禁 → 真实 K 线沙箱回测 → 返回 `preview_id` + 报告。落盘要三步:\n\
-   用户执行 `ricow approve <preview_id>`(**逐字**输入 `确认部署 <名字>`; 裸 `y`/回车不接受; **且必须在他自己的交互终端输入** ——
-   本命令拒绝管道/脚本喂入的短语, 你用工具调用喂进去只会得到「确认必须在交互终端输入」的报错) → 得到一次性 token\n\
-   → 用户执行 `ricow deploy <preview_id> --token <t>`。**你不要代跑 approve/deploy**, 只把这两条命令告诉用户。\n\
-2. 同名策略已存在即**拒绝**(不覆盖、不静默改名); 要替换需先由用户移除旧文件或换个名字。\n\
-3. 实盘三判据(顺序固定): ① 首次实盘风险确认(`ricow start --accept-risk <名字>`, 一次) → ② Dry Run 时长门禁\n\
-   (`[strategy.params] min_dry_run_hours`, 默认 24 小时, 可设 0 关闭) → ③ 下单前时钟预检。\n\
-   每次实盘启动还需用户**逐字**输入 `确认实盘 <名字>`。Dry Run 与回测不受这三条影响。\n\
-4. `--live` 需策略 TOML 里 `live_enabled = true`(双条件, 缺一即按 Dry Run 启动); `--demo` 走币安测试网, 不适用实盘三判据。
-   实盘启动的 `确认实盘 <名字>` 同样**只能在交互终端**输入(管道无效)。\n\
-5. Dry Run 首次启动会写 `dry_run_started_at` —— **这是计时开始**(实盘时长门禁的依据), 不是\"无副作用\"。\n\
-\n\
+**你的行动规则(外部 agent)**: 下面的「对话渠道」只存在于内置 `ricow ai`, 你没有这个渠道 —— \
+approve/deploy、demo 与实盘启停、平仓、改参一律**不得代跑**, 只能把终端命令交给用户本人执行; \
+向终端管道喂确认短语会被交互门禁拒绝, 不要尝试。\n\
+{gates}\n\
 ## 四、最容易跑偏的点(逐条核对)\n\
-1. **交易对必须带报价币**: 现货写 `ETHUSDT`, 不是 `ETH`(否则交易所返回 `Invalid symbol`);\n\
-   bStock 美股代币形如 `<代码>BUSDT`。\n\
-2. **策略名规范**: 只允许 `[A-Za-z0-9_-]`, 长度 ≤ 24(中文名会被系统拒绝), 且不得与既有策略名**互为前缀**(如 `abc` 与 `abc-x`)。\n\
-   原因: 名字会派生订单归属前缀, 塌缩或互为前缀会导致停机清理误撤他人挂单。建议 `eth-grid-300` 这类英文短名。\n\
-3. **内置脚本是编译期嵌入**: 改 `strategies/builtin/*.lua` 文件**不重编译不生效**; 自定义请复制到 `strategies/scripts/` 再改。\n\
-4. **回测与预览用的是交易所真实 K 线**(需联网); 本地 K 线库是另一套(`ricow db sync|stats|export`)。\n\
-5. **资金口径**: Dry Run 虚拟本金 = `[strategy.params] initial_cash`(缺省 100000); `ricow backtest` 用 `--cash`。\n\
-   它与 `[risk]` 限额必须**同一口径** —— 小资金配大限额会被风控大量拒单。\n\
-6. **数据目录**: 默认取当前工作目录(在项目根跑 `ricow`); 在别处运行请设 `RICOW_ROOT=<项目根>`。\n\
-7. 不确定就问用户: 缺交易对/天数/资金量等关键参数时先确认, 不要自己猜; 工具或命令报错时**照实转述原文**, 不要润色。
-8. **网络**: ricow 全程需要访问币安(公开行情 + 签名端点)。国内需代理 —— CLI 认 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`。
-   报 `network error` 时先确认代理(或 `RICOW_BN_BASE_URL` 指向可用域名), 不要把失败当「策略有问题」。
-   `RICOW_BN_BASE_URL`/`RICOW_FAPI_BASE_URL` 是**整体域名替换**(公开数据 + 签名下单都变); 公开数据镜像域(如 `data-api.binance.vision`)只能回测看行情, 下单会失败。
-9. **盈亏政策属于策略**(2026-09-15 起): 平台**不再**代做亏损熔断/峰值回撤; 策略用 `ctx:net_pnl()` / `ctx:equity()` 自己实现回撤与止损
-   (内置 `shannon_grid` 的 `dd_stop_pct` 是参考写法)。平台只保留工程护栏(下单频率上限)与你显式配置的静态限额。\n\
-\n\
+{traps}\n\
 ## 五、准则(与内置 AI 系统提示同源, 逐字)\n\
 {rules}\n\
 \n\
@@ -106,6 +83,8 @@ pub fn manual() -> String {
 - `SKILL.md` Agent Skills 标准(Claude Code / Codex 支持, 按需加载)\n\
 - `lua-api.md` 权威策略 API 原文(与 `ricow ai` 的 `read_doc(\"lua-api\")` 同一常量) —— 写策略前先读它\n",
         quickref = quickref(),
+        gates = prompt::GATES_GUIDE,
+        traps = prompt::TRAPS_GUIDE,
         rules = prompt::RULES
     )
 }

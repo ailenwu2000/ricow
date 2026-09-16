@@ -35,7 +35,9 @@
 
 ## 测试基线
 
-- **当前基线 (2026-09-15, 021 clippy 清零后实跑)**: `cargo test --workspace` = **339 passed / 0 failed / 12 ignored**(文档此前记 306/308 均已过时, 以本次实跑为准)。
+- **当前基线 (2026-09-16, Windows, 019 R3 对话内确认落地后实跑)**: `cargo test --workspace` = **355 passed / 0 failed / 15 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
+  较 2026-09-15 的 348/12(Windows): +7 通过 = R3 对话内确认 bin 单测 5(`r3s5_*`×4 真实落盘/preview consumed/同名拒绝/reject 终态, `r3s6_*`×1 demo 三档门禁)+ `tests/ai_live_smoke.rs` 默认门禁 2(管道 approve 被 tty 门禁拒、缺 demo 凭据先于网络失败); +3 ignored = 真机 S1/S2/S3+S4/S7(DeepSeek, 已于 2026-09-16 全量跑绿; 旧 ollama smoke 1 ignored 已被该文件取代)。
+- **前基线 (2026-09-15, 021 clippy 清零后实跑)**: `cargo test --workspace` = **339 passed / 0 failed / 12 ignored**(Linux; 文档此前记 306/308 均已过时, 以本次实跑为准)。
   ignored 全部为需真实外部环境的用例 (BN demo 现货 4 + 合约 5 + Nasdaq 冒烟 2), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
   220 → 204 的差额 = 009 移除 `locus_hl`(16 个内联测试); 204 → 216 = 008 新增 supervisor / CLI 命令面用例; 216 → 233 = 004 风控用例(频率窗口/两级熔断/装配与参数校验/接线); 233 → 270 = 011 用例(下单参数对齐 / 时钟预检判定 / 归属与停机清理编排 / 门禁 / proto 往返 / 现货事件解析 / 交易所过滤器解析 / 归属前缀长度约束)。
 - 验证方式: `cargo test --workspace`(纯逻辑) + 带 env key 的 `#[ignore]` 真实联调 (见 `specs/testnet.md`)。

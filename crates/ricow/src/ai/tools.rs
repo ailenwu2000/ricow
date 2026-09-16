@@ -1,10 +1,13 @@
 //! 工具注册表 (019): L0 只读 + L1 虚拟。
 //!
-//! **结构边界**(spec FR-008 / FR-009): 本模块只注册 **L0 只读**与 **L1 虚拟**工具 ——
-//! L1 虚拟可直调但**不落盘、不碰资金**(当前仅 `preview_strategy`: 生成预览, 落盘仍需用户本人 approve/deploy)。写实动作
-//! (落盘部署 / Dry Run 或实盘启停 / 平仓 / 改参数 / 改 `live_enabled`) **不作为工具注册给模型**
-//! —— 模型连调用面都没有, 只能由用户在聊天里敲确认、由 CLI 自己执行。
-//! 审批门 `ToolGuard` 再按本表白名单 fail-closed 放行一次, 是第二道同向保证。
+//! **结构边界**(spec FR-008 / FR-009, 2026-09-16 R3 修订): 本模块只注册 **L0 只读**与 **L1 虚拟**工具 ——
+//! L1 虚拟可直调但**自身不产生写实结果**。写实动作分两类:
+//! - `preview_strategy`: 生成预览(写一条预览记录), 落盘需确认;
+//! - `request_write_confirmation`(R3): 只校验前提 + 渲染确认块 + 在会话内**登记**一条待确认动作,
+//!   **不落盘、不起进程**; 真正执行由 REPL 宿主在用户当场逐字输入短语后调用引擎内核(见 `ai::confirm`)。
+//!
+//! 模型因此**始终没有写实工具调用面**(注册表里没有 deploy/start_demo/stop_live/close_all),
+//! 连"直接调用"的入口都不存在。审批门 `ToolGuard` 再按本表白名单 fail-closed 放行一次, 是第二道同向保证。
 //!
 //! **与框架解耦**: 工具的 `name` / `description` / 参数 schema 与本模块的实现函数是唯一事实;
 //! `dynamic_tools()` 只做 rig 构造。Phase 7 的 `ricow mcp`(rmcp) 复用同一份定义,
@@ -19,18 +22,23 @@ use rig::agent::{AgentHook, HookContext, ToolCall as ToolCallEvent, ToolCallActi
 use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
 
+use crate::ai::confirm::{ActionKind, PendingAction, PendingSlot};
 use crate::commands;
 use crate::supervisor::ledger;
 
-/// 工具运行上下文(只读): 数据目录与 DB 路径。不含任何凭据。
+/// 工具运行上下文(只读事实 + 会话 pending 句柄)。不含任何凭据。
 #[derive(Clone)]
 pub struct ToolCtx {
     pub root: PathBuf,
+    /// 是否处于可对话内确认的交互会话(stdin 是 tty 且为 REPL)。
+    pub interactive: bool,
+    /// 与 REPL 共享的待确认动作句柄(非交互/单次模式下永不被登记)。
+    pub pending: PendingSlot,
 }
 
 impl ToolCtx {
-    pub fn from_cli() -> Self {
-        Self { root: commands::project_root() }
+    pub fn new(root: PathBuf, interactive: bool, pending: PendingSlot) -> Self {
+        Self { root, interactive, pending }
     }
 }
 
@@ -47,8 +55,13 @@ pub const READ_ONLY_TOOLS: [&str; 9] = [
     "market_orderbook",
 ];
 
-/// L1 虚拟工具白名单 —— 可直调, 但**不产生真实资金动作、不落盘**(只写预览记录)。
-pub const VIRTUAL_TOOLS: [&str; 3] = ["preview_strategy", "start_dry_run", "stop_run"];
+/// L1 虚拟工具白名单 —— 可直调, 但**自身不产生写实结果**。
+///
+/// - `preview_strategy` 写一条预览记录(不落盘);
+/// - `request_write_confirmation` 只登记会话待确认(执行权在 REPL 宿主, 见 `ai::confirm`);
+/// - `start_dry_run`/`stop_run` 仅作用于本地虚拟撮合档。
+pub const VIRTUAL_TOOLS: [&str; 4] =
+    ["preview_strategy", "request_write_confirmation", "start_dry_run", "stop_run"];
 
 /// 工具是否被允许执行(L0 ∪ L1)。未列入一律拒绝(fail-closed)。
 pub fn is_allowed(name: &str) -> bool {
@@ -58,15 +71,24 @@ pub fn is_allowed(name: &str) -> bool {
 /// 单个工具输出的字符上限(超出即截断并标记)。
 pub const MAX_OUTPUT_CHARS: usize = 8_000;
 
+/// 文档类输出(read_doc)的字符上限: 权威文档(lua-api.md≈14k / backtest.md≈13k)必须能整篇读到,
+/// 否则模型只能拿到前 60%, exec 组件与完整示例丢失(019 G1)。仍有界 + 显式截断标记。
+pub const DOC_MAX_OUTPUT_CHARS: usize = 20_000;
+
 /// 截断输出: 字符级(不切坏多字节), 且必须显式标记被截掉的部分。
 pub fn clamp_output(text: impl Into<String>) -> String {
+    clamp_output_limited(text, MAX_OUTPUT_CHARS)
+}
+
+/// 按指定上限截断(read_doc 用 [DOC_MAX_OUTPUT_CHARS], 其余用 [MAX_OUTPUT_CHARS])。
+pub fn clamp_output_limited(text: impl Into<String>, limit: usize) -> String {
     let text = text.into();
     let total = text.chars().count();
-    if total <= MAX_OUTPUT_CHARS {
+    if total <= limit {
         return text;
     }
-    let kept: String = text.chars().take(MAX_OUTPUT_CHARS).collect();
-    format!("{kept}\n\n[输出已截断: 共 {total} 字符, 只显示前 {MAX_OUTPUT_CHARS} 字符]")
+    let kept: String = text.chars().take(limit).collect();
+    format!("{kept}\n\n[输出已截断: 共 {total} 字符, 只显示前 {limit} 字符]")
 }
 
 /// 凭据打码: 工具输出(尤其日志原文)可能夹带密钥, 出模型上下文前再过一遍。
@@ -152,6 +174,26 @@ fn safe_strategy_name(name: &str) -> Result<(), ToolExecutionError> {
         return Err(ToolExecutionError::invalid_args("策略名不能包含路径分隔符或 .."));
     }
     Ok(())
+}
+
+/// 列出某 strategies 目录下全部 *.toml 策略名(不存在 → 空)。会话数据目录用, 不走全局 ROOT。
+fn list_toml_stems(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("toml") {
+                p.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 fn render_param(v: &ricow_strategy::ConfigValue) -> String {
@@ -265,14 +307,14 @@ fn tool_strategy_read(_ctx: ToolCtx) -> DynamicTool {
 fn tool_read_doc(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "read_doc",
-        "读取本产品的权威说明(策略 Lua API / 回测口径 / 风险披露)。写策略或解释指标语义前先读。只读。",
+        "读取本产品的权威说明(策略 Lua API / 回测口径 / 风险披露 / 命令与门禁)。写策略或谈部署运行前先读。只读。",
         json!({
             "type": "object",
             "properties": {
                 "topic": {
                     "type": "string",
-                    "enum": ["lua-api", "backtest", "risk"],
-                    "description": "lua-api=策略可用的回调/指标/exec 组件; backtest=回测撮合与口径; risk=风险披露与限额"
+                    "enum": ["lua-api", "backtest", "risk", "commands"],
+                    "description": "lua-api=策略可用的回调/指标/exec 组件; backtest=回测撮合与口径; risk=风险披露与限额; commands=四档运行/落盘与实盘门禁/命令速查/易跑偏点"
                 }
             },
             "required": ["topic"],
@@ -282,16 +324,23 @@ fn tool_read_doc(_ctx: ToolCtx) -> DynamicTool {
             Box::pin(async move {
                 let topic = arg_str(&args, "topic")?;
                 let text = match topic.as_str() {
-                    "lua-api" => crate::ai::prompt::STRATEGY_API_DOC,
-                    "backtest" => include_str!("../../../../specs/backtest.md"),
-                    "risk" => ricow_engine::RISK_DISCLOSURE,
+                    "lua-api" => crate::ai::prompt::STRATEGY_API_DOC.to_string(),
+                    "backtest" => include_str!("../../../../specs/backtest.md").to_string(),
+                    "risk" => ricow_engine::RISK_DISCLOSURE.to_string(),
+                    // G2: 命令与门禁/易跑偏点与 `ricow agent-kit` 手册同源(同一份编译期常量)
+                    "commands" => format!(
+                        "{}\n{}",
+                        crate::ai::prompt::GATES_GUIDE,
+                        crate::ai::prompt::TRAPS_GUIDE
+                    ),
                     other => {
                         return Err(ToolExecutionError::invalid_args(format!(
-                            "未知 topic '{other}'; 可用: lua-api, backtest, risk"
+                            "未知 topic '{other}'; 可用: lua-api, backtest, risk, commands"
                         )))
                     }
                 };
-                Ok(ToolOutput::text(clamp_output(text)))
+                // G1: 文档给专用上限(20k), 保证 lua-api/backtest 整篇可取; 仍有界并标记截断
+                Ok(ToolOutput::text(clamp_output_limited(text, DOC_MAX_OUTPUT_CHARS)))
             })
         },
     )
@@ -595,6 +644,180 @@ fn tool_preview_strategy(_ctx: ToolCtx) -> DynamicTool {
     )
 }
 
+/// L1 虚拟工具(019 R3): 发起对话内确认块 —— **只校验前提 + 渲染确认块 + 登记会话待办, 不落盘、不起进程**。
+///
+/// 真正执行由 REPL 宿主在用户当场逐字输入短语后调用引擎内核(`ai::confirm` 状态机)。
+/// 实盘启动/停机永不由此开放; 单次模式与管道(stdin 非 tty)回退为终端命令指引。
+fn tool_request_write_confirmation(ctx: ToolCtx) -> DynamicTool {
+    DynamicTool::new(
+        "request_write_confirmation",
+        "当用户要求\"落盘部署\"或\"用测试网(demo)跑起来\"时调用: 生成一块确认信息并在本对话登记待确认动作(虚拟操作, 不执行任何写实动作)。\
+成功后必须把确认块原文与期望短语转告用户, 请其**本人逐字输入**; 不要替用户输入短语。action=\"deploy\" 需 preview_id(来自 preview_strategy); \
+action=\"start_demo\" 需已部署的策略名(会真实向币安测试网下单/撤单, 无真实资金)。实盘启动没有此渠道(应给终端命令)。",
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["deploy", "start_demo"],
+                    "description": "deploy=落盘部署某个 preview; start_demo=以测试网 demo 模式启动已部署策略"
+                },
+                "preview_id": { "type": "string", "description": "action=deploy 时必填: preview_strategy 返回的 preview_id" },
+                "name": { "type": "string", "description": "action=start_demo 时必填: 已部署策略名" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }),
+        move |_c, args| {
+            let ctx = ctx.clone();
+            Box::pin(async move {
+                let action = arg_str(&args, "action")?;
+                let kind = match action.as_str() {
+                    "deploy" => ActionKind::Deploy,
+                    "start_demo" => ActionKind::StartDemo,
+                    other => {
+                        return Err(ToolExecutionError::invalid_args(format!(
+                            "未知 action '{other}'; 仅支持 deploy / start_demo(实盘不开放对话内确认)"
+                        )))
+                    }
+                };
+
+                // D5: 非交互(单次提问/管道)不登记 pending, 直接给终端命令
+                if !ctx.interactive {
+                    return Ok(ToolOutput::text(non_interactive_hint(kind, &args)));
+                }
+
+                let action_entry = match kind {
+                    ActionKind::Deploy => prepare_deploy(&ctx, &args).await?,
+                    ActionKind::StartDemo => prepare_start_demo(&ctx, &args).await?,
+                };
+
+                let phrase = action_entry.action.expected_phrase();
+                let mut slot = ctx.pending.lock().await;
+                // 新请求覆盖旧 pending(旧的 deploy preview 未批准, 15 分钟后自然过期)
+                *slot = Some(action_entry.action.clone());
+                drop(slot);
+
+                Ok(ToolOutput::text(format!(
+                    "{block}\n\
+                     ———— 请在本对话逐字输入(复制即可): {phrase}\n\
+                     放弃请输入: 拒绝\n\
+                     注意: 确认短语只能由你本人输入, 我不会代填; 该待确认 15 分钟内有效。",
+                    block = action_entry.block
+                )))
+            })
+        },
+    )
+}
+
+/// 工具校验后生成的待确认动作 + 要展示给用户的确认块。
+#[derive(Debug)]
+struct PreparedAction {
+    action: PendingAction,
+    block: String,
+}
+
+/// deploy 前提校验: preview 存在 / pending / 未过期 / 同名未部署。DB 取会话数据目录(ctx.root)。
+async fn prepare_deploy(ctx: &ToolCtx, args: &Value) -> Result<PreparedAction, ToolExecutionError> {
+    let preview_id = arg_str(args, "preview_id")?;
+    let db = ricow_strategy::Database::open(&ctx.root.join("ricow.db"))
+        .await
+        .map_err(|e| ToolExecutionError::other(format!("打开本地库失败: {e}")))?;
+    let preview = ricow_engine::get_preview(&db, &preview_id)
+        .await
+        .map_err(|e| ToolExecutionError::other(format!("取预览失败: {e}")))?;
+    if preview.kind != "strategy" {
+        return Err(ToolExecutionError::other(format!(
+            "preview {preview_id} 的类型是 {} 不是 strategy, 不能用于部署",
+            preview.kind
+        )));
+    }
+    if preview.status != "pending" {
+        return Err(ToolExecutionError::other(format!(
+            "preview {preview_id} 当前状态是 {}, 不是 pending(已批准/已消费/已拒绝均不能再次确认)",
+            preview.status
+        )));
+    }
+    if chrono::Utc::now().timestamp() > preview.expires_at {
+        return Err(ToolExecutionError::other(format!(
+            "preview {preview_id} 已过期(15 分钟一次性), 请重新生成预览"
+        )));
+    }
+    let cfg = ricow_strategy::StrategyConfig::from_toml(&preview.payload_json)
+        .map_err(|e| ToolExecutionError::other(format!("预览载荷解析失败: {e}")))?;
+    let name = cfg.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ToolExecutionError::other("预览载荷缺少策略名".to_string()));
+    }
+    if list_toml_stems(&ctx.root.join("strategies")).iter().any(|n| n == &name) {
+        return Err(ToolExecutionError::other(format!(
+            "策略 {name} 已存在: 同名部署会被拒绝(不覆盖、不静默改名); 请换名或让用户先移除旧文件"
+        )));
+    }
+    let block = crate::commands::approve::confirmation_block(&preview.kind, &preview.payload_json);
+    Ok(PreparedAction { action: PendingAction::new_deploy(name, preview_id), block })
+}
+
+/// start_demo 前提校验: 已部署 / 当前未运行 / demo 凭据已配置(缺则如实点名)。
+async fn prepare_start_demo(
+    ctx: &ToolCtx,
+    args: &Value,
+) -> Result<PreparedAction, ToolExecutionError> {
+    let name = arg_str(args, "name")?;
+    safe_strategy_name(&name)?;
+    if !list_toml_stems(&ctx.root.join("strategies")).iter().any(|n| n == &name) {
+        return Err(ToolExecutionError::other(format!(
+            "策略 {name} 尚未部署(strategies/ 下找不到 {name}.toml); 请先完成生成预览与落盘部署"
+        )));
+    }
+    if let Some(v) = crate::commands::instances::views(&ctx.root)
+        .await
+        .iter()
+        .find(|v| v.name == name && v.running)
+    {
+        return Err(ToolExecutionError::other(format!(
+            "策略 {name} 已在运行(模式={}, pid={:?}); 请先停机再启动, 不要重复拉起",
+            v.mode.as_deref().unwrap_or("?"),
+            v.pid
+        )));
+    }
+    // 凭据前置: 缺 demo_key/demo_secret 时, 确认块都不应发出(避免用户白输短语)
+    if let Err(e) = crate::commands::load_demo_credentials(&ctx.root) {
+        return Err(ToolExecutionError::other(format!("测试网凭据未就绪, 无法启动 demo: {e}")));
+    }
+    let block = format!(
+        "———— 确认块 ————\n\
+         动作: 启动测试网 demo [start_demo]\n\
+         目标: 策略 {name}\n\
+         端点: 现货 {spot} / 合约 {fapi}(币安测试网, 与主网完全隔离)\n\
+         后果: 会**真实向测试网下单/撤单**(用于验证下单链路), **不涉及真实资金**; \
+         不需要 live_enabled, 不适用实盘三判据。停机仍须你本人执行 `ricow stop {name}`(涉及撤单清理)。",
+        spot = crate::commands::DEMO_SPOT_URL,
+        fapi = crate::commands::DEMO_FAPI_URL
+    );
+    Ok(PreparedAction { action: PendingAction::new_start_demo(name), block })
+}
+
+/// 非交互环境(单次 `ricow ai "..."` / 管道)的回退指引: 不登记、不执行, 只给终端命令。
+fn non_interactive_hint(kind: ActionKind, args: &Value) -> String {
+    match kind {
+        ActionKind::Deploy => {
+            let id = args.get("preview_id").and_then(|v| v.as_str()).unwrap_or("<preview_id>");
+            format!(
+                "当前是非交互环境(单次提问或管道), 对话内确认不开放。请在你自己的终端依次执行:\n  \
+                 ricow approve {id}\n  ricow deploy {id} --token <approve 返回的一次性 token>"
+            )
+        }
+        ActionKind::StartDemo => {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("<策略名>");
+            format!(
+                "当前是非交互环境(单次提问或管道), 对话内确认不开放。请在你自己的终端执行:\n  \
+                 ricow start {name} --demo"
+            )
+        }
+    }
+}
+
 /// 代停实盘/demo 时给用户的拒绝文案(纯函数, 便于单测): 这两类停机涉及交易所侧清理, 不在 AI 权限内。
 fn stop_refusal(mode: &str, name: &str) -> Option<String> {
     match mode {
@@ -610,7 +833,7 @@ fn stop_refusal(mode: &str, name: &str) -> Option<String> {
 /// L1 虚拟工具: 启动 Dry Run(本地虚拟撮合; 不碰资金、不需要凭据)。
 ///
 /// 必须告知用户"首次启动会写 dry_run_started_at = 实盘时长门禁开始计时"(FR-024)。
-fn tool_start_dry_run(_ctx: ToolCtx) -> DynamicTool {
+fn tool_start_dry_run(ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "start_dry_run",
         "把某个已部署策略以 **Dry Run**(本地虚拟撮合, 用真实行情但不动真钱)后台跑起来。需要该策略已在 strategies/ 下部署。返回 pid 与模式。",
@@ -623,9 +846,10 @@ fn tool_start_dry_run(_ctx: ToolCtx) -> DynamicTool {
             "additionalProperties": false
         }),
         move |_c, args| {
+            let ctx = ctx.clone();
             Box::pin(async move {
                 let name = arg_str(&args, "name")?;
-                let (pid, mode) = commands::ctrl::start_daemon(&name, false, false, false)
+                let (pid, mode) = commands::ctrl::start_daemon(&ctx.root, &name, false, false, false)
                     .await
                     .map_err(|e| ToolExecutionError::other(format!("启动 Dry Run 失败: {e}")))?;
                 let text = format!(
@@ -664,7 +888,7 @@ fn tool_stop_run(ctx: ToolCtx) -> DynamicTool {
                 if let Some(msg) = stop_refusal(&mode, &name) {
                     return Ok(ToolOutput::text(msg));
                 }
-                let text = commands::ctrl::stop_daemon(&name, false)
+                let text = commands::ctrl::stop_daemon(&ctx.root, &name, false)
                     .await
                     .map_err(|e| ToolExecutionError::other(format!("停机失败: {e}")))?;
                 Ok(ToolOutput::text(clamp_output(redact(&text))))
@@ -685,6 +909,7 @@ pub fn build(ctx: ToolCtx) -> Vec<DynamicTool> {
         tool_logs_tail(ctx.clone()),
         tool_market_ticker(ctx.clone()),
         tool_preview_strategy(ctx.clone()),
+        tool_request_write_confirmation(ctx.clone()),
         tool_start_dry_run(ctx.clone()),
         tool_stop_run(ctx.clone()),
         tool_market_orderbook(ctx),
@@ -700,8 +925,9 @@ mod tests {
         for name in READ_ONLY_TOOLS {
             assert!(is_allowed(name), "{name} 应在白名单内");
         }
-        // L1 虚拟工具可直调(不落盘/不碰资金), 写实动作仍一律拒绝
+        // L1 虚拟工具可直调(自身不产生写实结果), 写实动作仍一律拒绝
         assert!(is_allowed("preview_strategy"));
+        assert!(is_allowed("request_write_confirmation"));
         assert!(is_allowed("start_dry_run"));
         assert!(is_allowed("stop_run"));
         // 代停实盘/demo 必须被拒绝(给用户命令, 不代劳)
@@ -726,6 +952,9 @@ mod tests {
             "start_strategy",
             "stop_strategy",
             "start_live",
+            "start_demo",
+            "stop_demo",
+            "execute_deploy",
             "close_all",
             "set_params",
             "set_live_enabled",
@@ -751,6 +980,27 @@ mod tests {
         // 首个片段字符数恰为上限(中文字符按字符计, 不按字节)
         let first = out.split("\n\n[").next().unwrap();
         assert_eq!(first.chars().count(), MAX_OUTPUT_CHARS);
+    }
+
+    #[test]
+    fn test_doc_limit_covers_full_embedded_docs() {
+        // G1 回归: read_doc 专用上限必须容得下整篇 lua-api / backtest, 否则后半(exec 组件/示例)丢失
+        let lua_chars = crate::ai::prompt::STRATEGY_API_DOC.chars().count();
+        let backtest_chars = include_str!("../../../../specs/backtest.md").chars().count();
+        assert!(
+            lua_chars < DOC_MAX_OUTPUT_CHARS,
+            "lua-api {lua_chars} 字符超出文档上限 {DOC_MAX_OUTPUT_CHARS} —— 模型读不到全文"
+        );
+        assert!(
+            backtest_chars < DOC_MAX_OUTPUT_CHARS,
+            "backtest {backtest_chars} 字符超出文档上限 {DOC_MAX_OUTPUT_CHARS}"
+        );
+        // 通用上限仍会截断 14k 文档(证明两个上限确实不同, 而非误调)
+        assert!(lua_chars > MAX_OUTPUT_CHARS);
+        // 自定义上限截断行为正确
+        let out = clamp_output_limited("x".repeat(100), 10);
+        assert_eq!(out.split("\n\n[").next().unwrap().chars().count(), 10);
+        assert!(out.contains("共 100 字符"));
     }
 
     #[test]
@@ -787,5 +1037,231 @@ mod tests {
         let lua = crate::ai::prompt::STRATEGY_API_DOC;
         assert!(lua.contains("on_tick"));
         assert!(lua.len() > 10_000);
+    }
+
+    #[test]
+    fn test_non_interactive_hint_gives_terminal_commands_only() {
+        // D5: 非交互环境只能拿到终端命令, 文案里不得出现"已登记/请输入短语后我会执行"等暗示
+        let deploy = non_interactive_hint(
+            ActionKind::Deploy,
+            &json!({ "action": "deploy", "preview_id": "pv-9" }),
+        );
+        assert!(deploy.contains("ricow approve pv-9"), "{deploy}");
+        assert!(deploy.contains("ricow deploy pv-9"), "{deploy}");
+        assert!(deploy.contains("非交互环境"), "{deploy}");
+
+        let demo = non_interactive_hint(
+            ActionKind::StartDemo,
+            &json!({ "action": "start_demo", "name": "g1" }),
+        );
+        assert!(demo.contains("ricow start g1 --demo"), "{demo}");
+
+        // 缺参数时给占位符而非 panic
+        let deploy_blank = non_interactive_hint(ActionKind::Deploy, &json!({ "action": "deploy" }));
+        assert!(deploy_blank.contains("<preview_id>"), "{deploy_blank}");
+    }
+
+    #[test]
+    fn test_registry_count_and_write_tool_boundary() {
+        // 注册总数 = 9 只读 + 4 虚拟; 对话内确认工具登记的是"请求确认"而非写实本身
+        assert_eq!(READ_ONLY_TOOLS.len(), 9);
+        assert_eq!(VIRTUAL_TOOLS.len(), 4);
+        assert!(is_allowed("request_write_confirmation"));
+        // 真正的写实名仍然一个都不在
+        for forbidden in
+            ["deploy", "execute_strategy", "start_demo", "stop_live", "stop_demo", "approve"]
+        {
+            assert!(!is_allowed(forbidden), "{forbidden} 不得是可调用工具");
+        }
+    }
+
+    // ── R3 对话内确认全链路(019 S5/S6 的确定性部分, 不依赖 LLM/网络)─────────────
+    //
+    // 端到端真机(tty REPL)无法在自动化里驱动: 管道喂入的 stdin 不是终端, 会被交互门禁拒(D5)。
+    // 这里用进程内直调覆盖"请求确认 → pending 状态机 → 宿主执行"的全部逻辑, 真机部分见
+    // tests/ai_live_smoke.rs(需 env key, #[ignore])与人工手测清单。
+
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn r3_temp_root(tag: &str) -> PathBuf {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("ricow-r3-{tag}-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("建临时目录 {}: {e}", dir.display()));
+        dir
+    }
+
+    const LUA_STUB: &str = "function on_tick(ctx) return {} end";
+
+    /// 在临时 root 里直接造一条 pending 的 strategy preview(不经网络/回测; 与正式载荷同构)。
+    async fn seed_pending_preview(root: &Path, name: &str) -> String {
+        let db =
+            ricow_strategy::Database::open(&root.join("ricow.db")).await.expect("open temp db");
+        let config = ricow_engine::create_strategy(name, LUA_STUB, "BTCUSDT", HashMap::new())
+            .expect("造 StrategyConfig(与 create 同校验)");
+        let payload = config.to_toml().expect("config → TOML");
+        ricow_engine::create_preview(&db, "strategy", &payload).await.expect("seed preview")
+    }
+
+    /// 模拟 REPL 确认后宿主执行 deploy, 返回执行回执。
+    async fn deploy_via_confirmation(root: &Path, name: &str, preview_id: &str) -> String {
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = ToolCtx::new(root.to_path_buf(), true, slot.clone());
+        let prepared = prepare_deploy(&ctx, &json!({ "preview_id": preview_id }))
+            .await
+            .expect("prepare_deploy 应通过");
+        *slot.lock().await = Some(prepared.action);
+        let disposition =
+            crate::ai::confirm::consume_line(&slot, &format!("确认部署 {name}")).await;
+        let action = match disposition {
+            crate::ai::confirm::LineDisposition::Confirm(a) => a,
+            other => panic!("逐字短语应判 Confirm, 实际 {other:?}"),
+        };
+        crate::commands::ai::execute_confirmed(&action, root).await.expect("宿主执行落盘")
+    }
+
+    #[tokio::test]
+    async fn r3s5_confirm_deploy_writes_files_and_consumes_preview() {
+        let root = r3_temp_root("deploy");
+        let name = "aidep01";
+        let preview_id = seed_pending_preview(&root, name).await;
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = ToolCtx::new(root.clone(), true, slot.clone());
+
+        let prepared = prepare_deploy(&ctx, &json!({ "preview_id": preview_id })).await.unwrap();
+        assert!(prepared.block.contains("落盘部署"), "{block}", block = prepared.block);
+        assert_eq!(prepared.action.kind, ActionKind::Deploy);
+        assert_eq!(prepared.action.expected_phrase(), format!("确认部署 {name}"));
+
+        // 登记 pending
+        *slot.lock().await = Some(prepared.action);
+
+        // 错误短语/普通提问: pending 原样保留, 零副作用
+        for line in ["好的部署吧", "确认部署", "y", "yes", "再解释一下风险?"] {
+            let d = crate::ai::confirm::consume_line(&slot, line).await;
+            assert!(
+                matches!(d, crate::ai::confirm::LineDisposition::Other),
+                "{line} 不应触发 Confirm: {d:?}"
+            );
+            assert!(slot.lock().await.is_some(), "错短语后 pending 必须保留");
+        }
+        // 落盘前零文件
+        assert!(!root.join("strategies").exists());
+
+        // 用外层同一个 slot 走完确认 → 宿主执行
+        let disposition =
+            crate::ai::confirm::consume_line(&slot, &format!("确认部署 {name}")).await;
+        let action = match disposition {
+            crate::ai::confirm::LineDisposition::Confirm(a) => a,
+            other => panic!("逐字短语应判 Confirm, 实际 {other:?}"),
+        };
+        let msg =
+            crate::commands::ai::execute_confirmed(&action, &root).await.expect("宿主执行落盘");
+        assert!(msg.contains("已确认并完成落盘"), "{msg}");
+
+        // 双证据①: 真实落盘 toml + lua
+        assert!(root.join("strategies").join(format!("{name}.toml")).is_file());
+        assert!(root.join("strategies").join(format!("{name}.lua")).is_file());
+        // 双证据②: preview 已 consumed(一次性 token, 不可重放)
+        let db = ricow_strategy::Database::open(&root.join("ricow.db")).await.unwrap();
+        let rec = ricow_engine::get_preview(&db, &preview_id).await.unwrap();
+        assert_eq!(rec.status, "consumed");
+
+        // pending 已被消费清空
+        assert!(slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn r3s5_same_name_deploy_is_refused_after_files_exist() {
+        let root = r3_temp_root("dup");
+        let name = "aidep02";
+        let id1 = seed_pending_preview(&root, name).await;
+        deploy_via_confirmation(&root, name, &id1).await;
+
+        // 同名再来一条 preview: prepare 必须拦下(不覆盖、不静默改名)
+        let id2 = seed_pending_preview(&root, name).await;
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = ToolCtx::new(root.clone(), true, slot);
+        let err = prepare_deploy(&ctx, &json!({ "preview_id": id2 })).await.unwrap_err();
+        assert!(err.to_string().contains("已存在"), "{err}");
+        // 第二条 preview 仍 pending, 未被触碰
+        let db = ricow_strategy::Database::open(&root.join("ricow.db")).await.unwrap();
+        assert_eq!(ricow_engine::get_preview(&db, &id2).await.unwrap().status, "pending");
+    }
+
+    #[tokio::test]
+    async fn r3s5_reject_sets_preview_terminal_and_writes_nothing() {
+        let root = r3_temp_root("reject");
+        let name = "aidep03";
+        let id = seed_pending_preview(&root, name).await;
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = ToolCtx::new(root.clone(), true, slot.clone());
+        let prepared = prepare_deploy(&ctx, &json!({ "preview_id": id })).await.unwrap();
+        *slot.lock().await = Some(prepared.action);
+
+        let disposition = crate::ai::confirm::consume_line(&slot, "拒绝").await;
+        let action = match disposition {
+            crate::ai::confirm::LineDisposition::Reject(a) => a,
+            other => panic!("应判 Reject: {other:?}"),
+        };
+        assert_eq!(action.kind, ActionKind::Deploy);
+        // REPL 在 Reject 分支对 deploy 做的终态化(与 commands/ai.rs 同口径)
+        let db = ricow_strategy::Database::open(&root.join("ricow.db")).await.unwrap();
+        ricow_engine::reject(&db, &id).await.unwrap();
+        assert_eq!(ricow_engine::get_preview(&db, &id).await.unwrap().status, "rejected");
+        assert!(!root.join("strategies").exists(), "拒绝后零落盘");
+        assert!(slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn r3s6_start_demo_gates_in_order() {
+        let root = r3_temp_root("demo");
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = ToolCtx::new(root.clone(), true, slot);
+
+        // ① 未部署: 先于凭据检查报错
+        let err = prepare_start_demo(&ctx, &json!({ "name": "ghost99" })).await.unwrap_err();
+        assert!(err.to_string().contains("尚未部署"), "{err}");
+
+        // 部署一个策略到该 root
+        let name = "aidemo01";
+        let id = seed_pending_preview(&root, name).await;
+        deploy_via_confirmation(&root, name, &id).await;
+
+        // ② 已部署但缺 demo 凭据: 不发确认块(避免用户白输短语)
+        let err = prepare_start_demo(&ctx, &json!({ "name": name })).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("demo_key") && msg.contains("demo_secret"), "{msg}");
+
+        // ③ 在该 root 配置占位测试网凭据(仅校验存在性, 不发任何网络请求)
+        std::fs::write(
+            crate::commands::config_file::path(&root),
+            "[exchange]\ndemo_key = \"placeholder-key\"\ndemo_secret = \"placeholder-secret\"\n",
+        )
+        .unwrap();
+        let prepared = prepare_start_demo(&ctx, &json!({ "name": name })).await.unwrap();
+        assert_eq!(prepared.action.kind, ActionKind::StartDemo);
+        assert_eq!(prepared.action.expected_phrase(), format!("确认启动测试网 {name}"));
+        // 确认块必须点明 demo 端点与"真实下单"事实
+        assert!(prepared.block.contains("demo-api.binance.com"), "{b}", b = prepared.block);
+        assert!(prepared.block.contains("真实"), "{}", prepared.block);
+    }
+
+    #[tokio::test]
+    async fn r3s5_consumed_preview_cannot_be_prepared_again() {
+        let root = r3_temp_root("twice");
+        let name = "aidep04";
+        let id = seed_pending_preview(&root, name).await;
+        deploy_via_confirmation(&root, name, &id).await;
+
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = ToolCtx::new(root.clone(), true, slot);
+        // 同一 preview 二次请求确认: 状态不是 pending, 必须失败(防 token 重放路径)
+        let err = prepare_deploy(&ctx, &json!({ "preview_id": id })).await.unwrap_err();
+        assert!(err.to_string().contains("pending"), "{err}");
     }
 }

@@ -49,6 +49,10 @@ pub(crate) enum Mode {
 pub(crate) const DEMO_SPOT_URL: &str = "https://demo-api.binance.com";
 pub(crate) const DEMO_FAPI_URL: &str = "https://demo-fapi.binance.com";
 
+/// 测试网凭据的环境变量覆盖名(成对出现时优先于 ricow.toml [exchange])。
+pub(crate) const ENV_DEMO_KEY: &str = "RICOW_DEMO_KEY";
+pub(crate) const ENV_DEMO_SECRET: &str = "RICOW_DEMO_SECRET";
+
 impl Mode {
     /// 面向用户的模式名(打印时必须如实, 绝不把 demo 说成实盘)。
     pub(crate) fn label(self) -> &'static str {
@@ -63,18 +67,33 @@ impl Mode {
 pub(crate) fn load_credentials(mode: Mode) -> ricow_core::CoreResult<(String, String)> {
     match mode {
         Mode::Live => load_live_credentials(),
-        Mode::Demo => {
-            let root = project_root();
-            let cfg = config_file::load(&root)?;
-            let path = config_file::path(&root);
-            match (cfg.exchange.demo_key, cfg.exchange.demo_secret) {
-                (Some(k), Some(s)) => Ok((k, s)),
-                _ => Err(ricow_core::CoreError::Auth(format!(
-                    "测试网(demo)凭据未填写: 请在 {} 的 [exchange] 段填入 demo_key / demo_secret\n             (币安 demo: demo.binance.com → API 管理 → 创建; 与实盘凭据分开存放)",
-                    path.display()
-                ))),
-            }
-        }
+        Mode::Demo => load_demo_credentials(&project_root()),
+    }
+}
+
+/// demo 凭据(env 成对覆盖 > 指定 root 下 ricow.toml [exchange])。拆出 root 参数便于 AI 会话按数据目录校验。
+pub(crate) fn load_demo_credentials(
+    root: &std::path::Path,
+) -> ricow_core::CoreResult<(String, String)> {
+    // 覆盖优先级: 环境变量 RICOW_DEMO_KEY/RICOW_DEMO_SECRET > ricow.toml [exchange]。
+    // env 供 CI/临时测试注入测试网凭据, 避免把 key 写进仓库配置; 两个必须成对出现, 否则回落文件。
+    let env_pair = (
+        std::env::var(ENV_DEMO_KEY).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        std::env::var(ENV_DEMO_SECRET).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+    );
+    let cfg = config_file::load(root)?;
+    let path = config_file::path(root);
+    let pair = match env_pair {
+        (Some(k), Some(s)) => (Some(k), Some(s)),
+        _ => (cfg.exchange.demo_key, cfg.exchange.demo_secret),
+    };
+    match pair {
+        (Some(k), Some(s)) => Ok((k, s)),
+        _ => Err(ricow_core::CoreError::Auth(format!(
+            "测试网(demo)凭据未填写: 请在 {} 的 [exchange] 段填入 demo_key / demo_secret\n             \
+             (或设置环境变量 {ENV_DEMO_KEY} / {ENV_DEMO_SECRET}; 币安 demo: demo.binance.com → API 管理 → 创建; 与实盘凭据分开存放)",
+            path.display()
+        ))),
     }
 }
 
@@ -284,7 +303,12 @@ pub(crate) fn deployed_strategy_names() -> Vec<String> {
 
 /// 确保策略目录存在 (运行时生成), 返回目录路径。
 pub(crate) fn ensure_strategies_dir() -> CoreResult<std::path::PathBuf> {
-    let dir = strategies_dir();
+    ensure_strategies_dir_in(&project_root())
+}
+
+/// 同 [ensure_strategies_dir], 但显式指定数据目录(AI 会话/测试用)。
+pub(crate) fn ensure_strategies_dir_in(root: &std::path::Path) -> CoreResult<std::path::PathBuf> {
+    let dir = root.join("strategies");
     std::fs::create_dir_all(&dir).map_err(|e| {
         CoreError::InvalidArgument(format!("创建策略目录 {} 失败: {e}", dir.display()))
     })?;

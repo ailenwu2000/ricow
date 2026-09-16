@@ -224,11 +224,14 @@ fn str_opt(t: &toml::Table, key: &str) -> Option<String> {
 }
 
 /// 权限提示(只提示不修改): 非 0600 时返回一句提醒。
+///
+/// 权限位是 unix 概念; Windows 下函数体为空, 参数仅为跨平台签名一致而保留。
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn permission_warning(root: &Path) -> Option<String> {
-    let p = path(root);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let p = path(root);
         let mode = std::fs::metadata(&p).ok()?.permissions().mode() & 0o777;
         if mode != 0o600 {
             return Some(format!(

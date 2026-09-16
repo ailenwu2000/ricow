@@ -136,6 +136,30 @@
 
 ## 追加(2026-09-15): T075 `examples/` 收敛
 
-用户最终判断"examples 目录甚至没必要" → **整个目录删除**, 建策略入口统一为 `create` / `approve` / `deploy` 闭环,
+用户最终判断"examples 目录甚至没必要" → **整个目录删除**, 建策入口统一为 `create` / `approve` / `deploy` 闭环,
 样板统一为内置 `strategies/builtin/shannon_grid.lua`。同步修改 `specs/lua-api.md` §九、两份 README、`specs/backtest.md` 历史注记。
 T076(数据目录 vs 源码树职责分离)仍挂起, 建议排在 v0.1.0 发布之后。
+
+## 追加(2026-09-16): R3 对话内确认 — FR/SC 证据对照
+
+**范围**: spec §七 R3 / plan D33–D37 / tasks 阶段十四(T080–T088)。结论: 代码、确定性证据与真机留档**全部完成**(S1–S8 全 ✅), 按宪法测试纪律**未以 mock 顶替**。
+
+| 条目 | R3 后的要求 | 证据(代码/测试, 2026-09-16 Windows) | 状态 |
+|:--|:--|:--|:--|
+| FR-010(收窄) | 写实仍非 LLM 工具; 仅交互 tty REPL 内用户逐字确认后宿主可代行落盘/启 demo | `ai/tools.rs`: `request_write_confirmation` 在 VIRTUAL_TOOLS(L1), 闭包内只 `prepare_*`+登记 pending; 结构性测试 `test_no_write_tool_names_are_allowed`/`test_registry_count_and_write_tool_boundary` 断言 deploy/approve/start_demo/stop_demo 等写实名不在白名单(9 只读+4 虚拟) | ✅ 代码+单测 |
+| FR-027(明确) | 平仓/停机/开关/改参不开放对话内 | `ai/prompt.rs::GATES_GUIDE` 与工具层 `stop_refusal`(live/demo 拒绝、dry_run 可代停); `test_allowed_is_exactly_the_registry` 断言 | ✅ |
+| 宪法 4.5 两步确认 | 对话渠道不得比终端宽 | 同一引擎内核: `execute_confirmed` = `engine::approve`(一次性 token, CAS)→`execute_strategy`; TTL/状态机复用; `r3s5_consumed_preview_cannot_be_prepared_again` 证不可重放 | ✅ 进程内全链路 |
+| R2 tty 门禁 | 管道/单次模式不得开放对话内确认 | REPL 条件 `prompt.is_none() && stdin().is_terminal()`; 集成测试 `approve_requires_interactive_tty`(默认运行, 管道→"交互终端"拒绝); 非交互 hint 单测只含终端命令 | ✅ |
+| 落盘双证据 | 确认后真实落盘 + preview consumed | `r3s5_confirm_deploy_writes_files_and_consumes_preview`: `<root>/strategies/<name>.toml`+`.lua` is_file、DB 状态 `consumed`; 错短语("好的部署吧"/裸 y/yes)5 例 pending 保留零落盘 | ✅ |
+| 同名不覆盖 | 同名部署拒绝, 旧 preview 不被触碰 | `r3s5_same_name_deploy_is_refused_after_files_exist`; consumed 再 prepare 拒绝 | ✅ |
+| 拒绝终态 | Reject 置 preview rejected 且零落盘 | `r3s5_reject_sets_preview_terminal_and_writes_nothing` | ✅ |
+| demo 前置门禁 | 未部署/缺凭据不得发确认块; 块含端点+真实下单提示 | `r3s6_start_demo_gates_in_order`(三档); 集成测试 `run_demo_without_credentials_fails_fast`(缺凭据先于时钟预检/网络) | ✅ |
+| FR-004/密钥纪律 | demo key env 覆盖、不落盘不入 git | `commands::load_demo_credentials(root)`: env 成对非空 > ricow.toml; 测试只用占位串/临时 root; `git status` 无密钥 | ✅ |
+| S1–S4/S7 真机 | DeepSeek 真实问答/工具/回测/负例 | 2026-09-16 晚实跑 **4 passed / 0 failed(104s)**: S1 中文单轮; S2 真实行情(75794.005); S3+S4 网格生成→168 根真实 K 线回测(30 笔/+6.34)→零落盘+终端两步; S7 注入负例模型拒绝、零副作用(S7 首跑 SSE 瞬断属网络抖动, 重跑过) | ✅ |
+| S6 demo 真机 | demo 端点真实下单链路 | 2026-09-16 晚: key 签名验证(canTrade=true)→`ricow create` 真实回测→手动同构落盘(agent shell 非 tty, `approve` 被门禁拒=设计使然; demo 落盘不需确认链)→`start --demo` 真连测试网→市价买 0.0328 BTC **5 笔真实成交**(USDT 4967.75→2484.40)→`stop --close-all` 平仓单 `btge2e-c5658710`→回落 4960.15, errors=0, 残留粉尘 0.0000072 BTC | ✅ |
+| S8 Dry Run 真机 | 起停+status/fills/logs 闭环 | 2026-09-16 晚: `start btge2e`(无凭据)→虚拟本金 100000、真实行情撮合成交 @75724.89→status 运行中/7 笔→stop 优雅退出 | ✅ |
+| S5/S6 tty 端到端 | 真实 tty REPL 人工走查 | 逻辑已 100% 由 bin 单测覆盖(r3s5_*/r3s6_*); agent shell 非 tty 被门禁拒(顺带实证 R2); 用户侧 tty 手测仍建议按 `ai_live_smoke.rs` 头注释脚本走一遍 | ⏳ 可选人工项(非阻塞) |
+
+**已知问题(2026-09-16 真机发现, 留观察)**: demo 启动偶发 `WS-API 用户流订阅失败: status=400 Timestamp outside recvWindow`(同一启动内 REST 签名成功), 重试即过; 疑 WS-API 签名时间戳竞态, 建议为 WS-API 订阅加时间戳重同步/单次重试。
+
+**门禁基线(本次实跑)**: workspace **355 passed / 0 failed / 15 ignored**(R3 新增 5 bin 单测 + 2 集成门禁测试; 新增 3 个 #[ignore] 真机项); `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
