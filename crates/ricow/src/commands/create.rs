@@ -53,6 +53,22 @@ pub struct PreviewOutcome {
     pub preview_id: String,
 }
 
+/// 策略名可用性校验 (**纯函数**, 供单测): 字符集/长度 + 与既有策略名**不得互为前缀** (019 D18 / FR-043)。
+///
+/// `existing` 由调用方提供(生产用 [`crate::commands::deployed_strategy_names`] → 可注入测试数据)。
+/// 互为前缀 → `ownership_prefix` 互相命中 → 停机撤单兜底会撤掉对方挂单, 故必须在 create 阶段拒绝。
+pub(crate) fn validate_new_name(name: &str, existing: &[String]) -> CoreResult<()> {
+    ricow_strategy::validate_strategy_name(name).map_err(CoreError::InvalidArgument)?;
+    if let Some(conflict) = ricow_strategy::prefix_conflict(name, existing) {
+        return Err(CoreError::InvalidArgument(format!(
+            "策略名 '{name}' 与既有策略 '{conflict}' 互为前缀: 两者的订单归属前缀会互相命中, 停机清理可能撤掉对方的挂单。\n\
+             请换一个与既有名字**不互为前缀**的名字 —— 新名不得以 '{conflict}' 开头, 也不能让 '{conflict}' 以新名开头\n\
+             (例如既有 'eth-grid' 时, 'eth-grid-300' 与 'eth' 都不行, 可改用 'grid-eth-300')。"
+        )));
+    }
+    Ok(())
+}
+
 /// **创建内核**(019 T019): 名字规范 → 参数/市场校验 → 编译门禁 → 真实 K 线 → 沙箱回测 → preview。
 ///
 /// - **零落盘**: 只写 `previews` 记录, 绝不写策略文件; 落盘必须经 `approve` + `deploy`。
@@ -66,8 +82,11 @@ pub async fn create_preview(
     days: u32,
     interval: &str,
 ) -> CoreResult<PreviewOutcome> {
-    // 策略名规范(创建期第一道防线; 部署期 execute_strategy 用同一校验器复核)
-    ricow_strategy::validate_strategy_name(name).map_err(CoreError::InvalidArgument)?;
+    // 策略名规范 (创建期第一道防线): 字符集/长度 + 与既有策略**不得互为前缀** (019 D18 / FR-043)。
+    // 校验必须落在本内核里 —— CLI `ricow create` 与 AI 工具 `preview_strategy` 共用它:
+    // 此前互前缀只查 CLI 侧, 对话内可生成 'eth-grid' 与 'eth-grid-300' 并互相误撤挂单。
+    // 顺序上先于拉 K 线, 失败即零副作用; 部署期 execute_strategy 另用同一校验器复核。
+    validate_new_name(name, &crate::commands::deployed_strategy_names())?;
 
     // ② 参数与市场校验
     let mut param_map: HashMap<String, ConfigValue> = HashMap::new();
@@ -123,8 +142,19 @@ pub async fn create_preview(
         eprintln!("提示: 预览记录清理失败(不影响本次生成): {e}");
     }
     let effective_mmr_pct = config.get_f64("mmr_pct").unwrap_or(1.0);
-    let initial_cash = config.get_f64("cash").unwrap_or(100_000.0);
-    let (report, preview_id) = Engine::new().backtest_and_preview(&db, config, &klines).await?;
+    // 回测本金口径 (FR-016 同口径): 唯一权威 = `BacktestParams::resolve` 三层合并
+    // (内置默认 100_000 < 策略 TOML `[backtest].initial_cash` < 显式覆盖)。
+    // 显式 `cash`(`--param cash=` / AI `params.cash`) 与 CLI `ricow backtest --cash` 同名同义,
+    // 作为**最上层覆盖**参与同一次 resolve —— 于是报告表头与实喂回测的本金同源,
+    // 不再一处 `config.get_f64("cash")` 一处硬编码常量(cash≠100000 时表头与本金各说一套)。
+    let cash_override =
+        ricow_strategy::BacktestToml { initial_cash: config.get_f64("cash"), ..Default::default() };
+    let initial_cash = Decimal::from_f64_retain(
+        ricow_strategy::BacktestParams::resolve(&config, &cash_override).initial_cash,
+    )
+    .ok_or_else(|| CoreError::InvalidArgument("回测本金 initial_cash 非法".into()))?;
+    let (report, preview_id) =
+        Engine::new().backtest_and_preview(&db, config, initial_cash, &klines).await?;
 
     let report_text = format_backtest_report(
         &report,
@@ -140,27 +170,16 @@ pub async fn create_preview(
                 "现货".to_string()
             }
         ),
-        Decimal::from_f64_retain(initial_cash).unwrap_or(Decimal::ZERO),
+        initial_cash,
         is_futures,
     );
     Ok(PreviewOutcome { report_text, preview_id })
 }
 
 pub async fn run(args: CreateArgs) -> CoreResult<()> {
-    // ⓪ 策略名规范 (019 D18 / FR-043): 字符集/长度 + 与既有策略名**不得互为前缀**
-    // (前缀互为前缀 → is_owned 互相命中 → 停机清理会撤掉对方挂单)。失败即退出, 不读码不拉 K 线。
-    ricow_strategy::validate_strategy_name(&args.name).map_err(CoreError::InvalidArgument)?;
-    let existing = crate::commands::deployed_strategy_names();
-    if let Some(conflict) = ricow_strategy::prefix_conflict(&args.name, &existing) {
-        return Err(CoreError::InvalidArgument(format!(
-            "策略名 '{}' 与既有策略 '{}' 互为前缀: 两者的订单归属前缀会互相命中, 停机清理可能撤掉对方的挂单。\n\
-             请换一个不与既有名字互为前缀的名字(例如加后缀: {}-2, 或改名: {})",
-            args.name,
-            conflict,
-            args.name,
-            ricow_strategy::suggest_strategy_name(&format!("{}-x", args.name))
-        )));
-    }
+    // ⓪ 策略名规范 (019 D18 / FR-043): 与 `create_preview` **共用同一校验**(字符集/长度 + 与既有名
+    // 不互为前缀)。在此先拦一道, 好处是失败即退出 —— 不读 stdin/不读文件、不拉 K 线、零副作用。
+    validate_new_name(&args.name, &crate::commands::deployed_strategy_names())?;
 
     // ① 读码: 文件 / stdin
     let raw = match args.script.as_deref() {
@@ -198,9 +217,47 @@ pub async fn run(args: CreateArgs) -> CoreResult<()> {
     print!("{}", out.report_text);
     println!();
     println!("编译门禁 ✓  沙箱回测 ✓  —— **尚未部署**(未写入任何策略文件)");
-    println!("preview_id: {}  (15 分钟内有效, 一次性 token)", out.preview_id);
+    // 分钟数从引擎常量派生, 不手抄 15 —— 常量改了这个提示不会跟着过期。
+    println!(
+        "preview_id: {}  ({} 分钟内有效, 一次性 token)",
+        out.preview_id,
+        ricow_engine::PREVIEW_TTL_SECS / 60
+    );
     println!("下一步:");
     println!("  1) 人工确认上述报告与策略内容是否可用: ricow approve {}", out.preview_id);
     println!("  2) 携一次性 token 落盘: ricow deploy {} --token <token>", out.preview_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FR-043 回归: 创建内核 (CLI 与 AI 工具共用) 必须拒**互前缀**名 ——
+    /// 否则对话内可生成 'eth-grid' 与 'eth-grid-300', 停机撤单兜底按前缀判归属会误撤对方挂单。
+    #[test]
+    fn test_validate_new_name_rejects_prefix_conflict() {
+        let existing = vec!["eth-grid".to_string()];
+
+        // 既有名是候选名的前缀 (eth-grid vs eth-grid-300): 任一方向都必须拒。
+        let e = validate_new_name("eth-grid-300", &existing).unwrap_err().to_string();
+        assert!(e.contains("互为前缀"), "{e}");
+        // 候选名是既有名的前缀 (eth vs eth-grid)。
+        assert!(validate_new_name("eth", &existing).is_err(), "候选名是既有名前缀须拒");
+        // 同名 (部署会覆盖同名策略) 亦属冲突。
+        assert!(validate_new_name("eth-grid", &existing).is_err(), "同名须拒");
+        // 不互为前缀 → 放行 (换前缀即可规避)。
+        assert!(validate_new_name("grid-eth-300", &existing).is_ok());
+        // 无既有策略时任何合法名都放行。
+        assert!(validate_new_name("eth-grid", &[]).is_ok());
+    }
+
+    /// 字符集/长度规范沿用既有校验器 (互前缀是追加条件, 不是替代)。
+    #[test]
+    fn test_validate_new_name_keeps_charset_and_len_rules() {
+        assert!(validate_new_name("网格A", &[]).is_err(), "中文须拒");
+        assert!(validate_new_name("", &[]).is_err(), "空名须拒");
+        assert!(validate_new_name(&"a".repeat(25), &[]).is_err(), "超 24 字符须拒");
+        assert!(validate_new_name(&"a".repeat(24), &[]).is_ok());
+    }
 }

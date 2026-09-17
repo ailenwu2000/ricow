@@ -9,19 +9,24 @@
 //! 因此模型输出永远不能触发写实: 它拿不到执行权, 也不持有 pending 的写入端之外的任何能力;
 //! 短语匹配只认真实用户输入行(见 [crate::commands::is_explicit_confirmation])。
 //!
-//! # 开放范围
-//! - 落盘部署: 短语 `确认部署 <名字>`(与终端 `ricow approve` 逐字一致);
-//! - 启动测试网 demo: 短语 `确认启动测试网 <名字>`。
+//! # 开放范围(R4 全对话化)
+//! 七类动作全部走同一状态机: 落盘部署 / 启动测试网 demo / 首次实盘风险确认 /
+//! 启动实盘 / 停止测试网 / 停止实盘 / 平仓停止实盘。
 //!
-//! 实盘启动、demo/实盘停机**不**在对话内开放(终端三判据与交易所侧清理语义不迁移)。
+//! 门禁一条不少: 短语逐字(实盘与终端 `ricow start --live` 同一句)、TTL 15 分钟、
+//! 跨动作短语互不放行、tty 门禁(单次模式与管道不登记 pending)。
+//! 实盘三判据本身不在此文件 —— 由宿主执行时经 `ctrl::live_preflight` 原样跑一遍。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-/// pending 有效期: 与引擎 preview TTL 同口径(15 分钟)。
-pub const PENDING_TTL: Duration = Duration::from_secs(15 * 60);
+/// pending 有效期 = 引擎 preview TTL, **同一个常量**(不各写一份 15 分钟)。
+///
+/// 待确认动作里多半带着 preview_id, 批准时引擎会再校验预览是否过期; 两处若各写一个数,
+/// 一旦漂移就会出现"短语逐字输对了, 却被告知预览已过期"这种自相矛盾的拒绝。
+pub const PENDING_TTL: Duration = Duration::from_secs(ricow_engine::PREVIEW_TTL_SECS as u64);
 
 /// 会话内待确认动作(工具登记 → 用户逐字确认 → 宿主执行)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,16 +36,33 @@ pub struct PendingAction {
     pub name: String,
     /// 落盘动作的 preview_id(start_demo 为 None)。
     pub preview_id: Option<String>,
+    /// 落盘动作是否走 **FR-044 受控覆盖**(仅 deploy 有意义; 其余动作恒为 false)。
+    ///
+    /// 为 true 时宿主会在覆盖前备份旧脚本; 该标记只能由用户逐字确认的 pending 携带,
+    /// 模型无法直接把它变成一次落盘 —— 它仍要过短语门禁。
+    pub replace: bool,
     created_at: Instant,
 }
 
-/// 动作种类(目前仅两类; 实盘启动永不加入)。
+/// 动作种类(019 R4: 七类, 覆盖策略全生命周期)。
+///
+/// 所有动作都只是**待确认登记**: 模型无执行权, 短语由用户本人在交互终端逐字输入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     /// 批准 preview 并落盘 strategies/<name>.{toml,lua}。
     Deploy,
     /// 以 --demo 启动已部署策略(币安测试网, 真实下单/撤单但无真实资金)。
     StartDemo,
+    /// 首次实盘风险确认(展示 RISK_DISCLOSURE 全文 → 写 risk_ack.json, 一次长期有效)。
+    AckRisk,
+    /// 以 --live 启动已部署策略(真实资金; 三判据 + 双条件一条不少)。
+    StartLive,
+    /// 停止测试网 demo 实例(交易所侧撤单清理, 不平仓)。
+    StopDemo,
+    /// 停止实盘实例(交易所侧撤单清理, 不平仓)。
+    StopLive,
+    /// 停止实盘实例并市价平掉策略持仓(不可逆)。
+    CloseLive,
 }
 
 impl ActionKind {
@@ -49,16 +71,32 @@ impl ActionKind {
         match self {
             ActionKind::Deploy => "落盘部署",
             ActionKind::StartDemo => "启动测试网 demo",
+            ActionKind::AckRisk => "首次实盘风险确认",
+            ActionKind::StartLive => "启动实盘",
+            ActionKind::StopDemo => "停止测试网 demo",
+            ActionKind::StopLive => "停止实盘",
+            ActionKind::CloseLive => "平仓停止实盘",
         }
     }
 }
 
 impl PendingAction {
+    /// 默认路径: 换个新名落盘(同名已存在时由 `prepare` 拒绝)。
     pub fn new_deploy(name: impl Into<String>, preview_id: impl Into<String>) -> Self {
+        Self::deploy_inner(name, preview_id, false)
+    }
+
+    /// FR-044 受控覆盖: 覆盖同名已部署策略 —— 宿主要在写新脚本前先备份旧脚本。
+    pub fn new_deploy_replace(name: impl Into<String>, preview_id: impl Into<String>) -> Self {
+        Self::deploy_inner(name, preview_id, true)
+    }
+
+    fn deploy_inner(name: impl Into<String>, preview_id: impl Into<String>, replace: bool) -> Self {
         Self {
             kind: ActionKind::Deploy,
             name: name.into(),
             preview_id: Some(preview_id.into()),
+            replace,
             created_at: Instant::now(),
         }
     }
@@ -68,18 +106,78 @@ impl PendingAction {
             kind: ActionKind::StartDemo,
             name: name.into(),
             preview_id: None,
+            replace: false,
+            created_at: Instant::now(),
+        }
+    }
+
+    pub fn new_ack_risk() -> Self {
+        Self {
+            kind: ActionKind::AckRisk,
+            name: String::new(),
+            preview_id: None,
+            replace: false,
+            created_at: Instant::now(),
+        }
+    }
+
+    pub fn new_start_live(name: impl Into<String>) -> Self {
+        Self {
+            kind: ActionKind::StartLive,
+            name: name.into(),
+            preview_id: None,
+            replace: false,
+            created_at: Instant::now(),
+        }
+    }
+
+    pub fn new_stop_demo(name: impl Into<String>) -> Self {
+        Self {
+            kind: ActionKind::StopDemo,
+            name: name.into(),
+            preview_id: None,
+            replace: false,
+            created_at: Instant::now(),
+        }
+    }
+
+    pub fn new_stop_live(name: impl Into<String>) -> Self {
+        Self {
+            kind: ActionKind::StopLive,
+            name: name.into(),
+            preview_id: None,
+            replace: false,
+            created_at: Instant::now(),
+        }
+    }
+
+    pub fn new_close_live(name: impl Into<String>) -> Self {
+        Self {
+            kind: ActionKind::CloseLive,
+            name: name.into(),
+            preview_id: None,
+            replace: false,
             created_at: Instant::now(),
         }
     }
 
     /// 用户需逐字输入的确认短语。
     ///
-    /// deploy 与终端 `ricow approve` 的 `确认部署 <name>` **逐字一致**(同一门禁体验);
-    /// demo 为 `确认启动测试网 <name>`。
+    /// deploy 与终端 `ricow approve` 的 `确认部署 <name>`、实盘与终端 `ricow start --live`
+    /// 的 `确认实盘 <name>` **逐字一致**(同一门禁体验); 其余动作各有独立短语, 互不放行。
+    ///
+    /// **受控覆盖(FR-044)另给一句 `确认覆盖 <name>`**: 覆盖是破坏性动作, 不能让"确认部署"
+    /// 的肌肉记忆顺手把已部署策略换掉 —— 想覆盖就得换一句话输。
     pub fn expected_phrase(&self) -> String {
         match self.kind {
+            ActionKind::Deploy if self.replace => format!("确认覆盖 {}", self.name),
             ActionKind::Deploy => format!("确认部署 {}", self.name),
             ActionKind::StartDemo => format!("确认启动测试网 {}", self.name),
+            ActionKind::AckRisk => "确认风险".to_string(),
+            ActionKind::StartLive => format!("确认实盘 {}", self.name),
+            ActionKind::StopDemo => format!("确认停止测试网 {}", self.name),
+            ActionKind::StopLive => format!("确认停止实盘 {}", self.name),
+            ActionKind::CloseLive => format!("确认平仓停止 {}", self.name),
         }
     }
 
@@ -168,8 +266,92 @@ mod tests {
         assert_eq!(deploy.expected_phrase(), "确认部署 eth-grid-1");
         let demo = PendingAction::new_start_demo("eth-grid-1");
         assert_eq!(demo.expected_phrase(), "确认启动测试网 eth-grid-1");
+        // 实盘短语与终端 `ricow start --live` 逐字一致(同一门禁体验)
+        let live = PendingAction::new_start_live("eth-grid-1");
+        assert_eq!(live.expected_phrase(), "确认实盘 eth-grid-1");
         // 两种短语互不混淆
         assert_ne!(deploy.expected_phrase(), demo.expected_phrase());
+    }
+
+    /// 七类动作的短语(同名策略)必须两两不同, 否则会出现跨动作误放行。
+    fn all_kinds(name: &str) -> Vec<PendingAction> {
+        vec![
+            PendingAction::new_deploy(name, "pv-1"),
+            PendingAction::new_start_demo(name),
+            PendingAction::new_ack_risk(),
+            PendingAction::new_start_live(name),
+            PendingAction::new_stop_demo(name),
+            PendingAction::new_stop_live(name),
+            PendingAction::new_close_live(name),
+        ]
+    }
+
+    #[test]
+    fn test_all_action_kinds_have_distinct_phrases_and_labels() {
+        let actions = all_kinds("g1");
+        assert_eq!(actions.len(), 7, "R4 动作全集: 七类");
+        let mut phrases: Vec<String> = actions.iter().map(|a| a.expected_phrase()).collect();
+        phrases.sort();
+        let before = phrases.len();
+        phrases.dedup();
+        assert_eq!(phrases.len(), before, "确认短语必须两两不同: {phrases:?}");
+        // 标签同样唯一(确认块与提示靠它区分动作)
+        let mut labels: Vec<&str> = actions.iter().map(|a| a.kind.label()).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "动作标签必须唯一: {labels:?}");
+        // 无名字的动作只有风险确认; 其余都带策略名(短语里必须出现名字)
+        assert_eq!(PendingAction::new_ack_risk().expected_phrase(), "确认风险");
+        for a in actions.iter().filter(|a| a.kind != ActionKind::AckRisk) {
+            assert!(a.expected_phrase().contains("g1"), "短语须含策略名: {}", a.expected_phrase());
+        }
+    }
+
+    #[test]
+    fn test_no_cross_action_phrase_unlocks_another_action() {
+        // 结构性保证: 任一动作的短语都不能放行另一个动作(七类全矩阵)
+        let actions = all_kinds("g1");
+        for pending in &actions {
+            for other in &actions {
+                if other.kind == pending.kind {
+                    continue;
+                }
+                let intent = classify_user_line(&other.expected_phrase(), pending);
+                assert_eq!(
+                    intent,
+                    UserIntent::Other,
+                    "{} 的短语不得放行 {}",
+                    other.kind.label(),
+                    pending.kind.label()
+                );
+            }
+            // 自己的短语必须命中
+            assert_eq!(
+                classify_user_line(&pending.expected_phrase(), pending),
+                UserIntent::Confirm,
+                "{} 的短语应命中自己",
+                pending.kind.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_stop_phrases_do_not_collide_with_bare_live_start() {
+        // 最容易混的一对: 「确认实盘 g1」/「确认停止实盘 g1」/「确认平仓停止 g1」
+        let live = PendingAction::new_start_live("g1");
+        let stop = PendingAction::new_stop_live("g1");
+        let close = PendingAction::new_close_live("g1");
+        assert_eq!(classify_user_line(&live.expected_phrase(), &stop), UserIntent::Other);
+        assert_eq!(classify_user_line(&stop.expected_phrase(), &live), UserIntent::Other);
+        assert_eq!(classify_user_line(&close.expected_phrase(), &stop), UserIntent::Other);
+        assert_eq!(classify_user_line(&stop.expected_phrase(), &close), UserIntent::Other);
+        // 裸「确认」/「确认风险」都不算(风险确认是一次性动作, 不能顺带触发停机)
+        assert_eq!(classify_user_line("确认", &close), UserIntent::Other);
+        assert_eq!(
+            classify_user_line(&PendingAction::new_ack_risk().expected_phrase(), &close),
+            UserIntent::Other
+        );
     }
 
     #[test]
@@ -213,6 +395,24 @@ mod tests {
         let deploy = PendingAction::new_deploy("eth", "pv");
         let demo_phrase = PendingAction::new_start_demo("eth").expected_phrase();
         assert_eq!(classify_user_line(&demo_phrase, &deploy), UserIntent::Other);
+    }
+
+    /// FR-044 受控覆盖: 破坏性动作另用一句短语, 且与普通部署互不放行。
+    #[test]
+    fn test_replace_phrase_differs_from_plain_deploy() {
+        let plain = PendingAction::new_deploy("g1", "pv");
+        let over = PendingAction::new_deploy_replace("g1", "pv");
+        assert_eq!(over.expected_phrase(), "确认覆盖 g1");
+        assert_ne!(plain.expected_phrase(), over.expected_phrase());
+        // 互不放行: 覆盖 pending 不认"确认部署", 普通 pending 也不认"确认覆盖"
+        assert_eq!(classify_user_line(&plain.expected_phrase(), &over), UserIntent::Other);
+        assert_eq!(classify_user_line(&over.expected_phrase(), &plain), UserIntent::Other);
+        assert_eq!(classify_user_line("确认覆盖 g1", &over), UserIntent::Confirm);
+        // 覆盖标记只随构造器进入, 且只有 deploy 有覆盖语义
+        assert!(over.replace);
+        assert!(!plain.replace);
+        assert!(!PendingAction::new_start_live("g1").replace);
+        assert!(!PendingAction::new_start_demo("g1").replace);
     }
 
     #[tokio::test]
@@ -265,6 +465,7 @@ mod tests {
             kind: ActionKind::Deploy,
             name: "old".into(),
             preview_id: Some("pv-old".into()),
+            replace: false,
             created_at: Instant::now() - PENDING_TTL - Duration::from_secs(1),
         });
         // 即使输入恰好是确认短语, 过期也优先 → Expired(不得执行)

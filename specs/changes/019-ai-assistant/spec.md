@@ -245,3 +245,33 @@ LLM 直接决策下单(product §六)、参数自动寻优、多智能体、语�
   - 待办状态机(D3): `Arc<Mutex<Option<PendingAction>>>`, 会话级单槽 —— TTL 15 分钟(过期优先于确认拦截)、新请求覆盖旧待办、错短语/普通提问原样保留、Confirm/Reject 即取走; deploy 被拒时连带 `engine::reject` 置终态。
   - demo 凭据: 新增 env 成对覆盖 `RICOW_DEMO_KEY` / `RICOW_DEMO_SECRET`(优先级高于 `ricow.toml [exchange]`; 不成对则回落文件), key 绝不入库入 git。
   - 测试证据(2026-09-16, Windows): bin 单测 `ai::tools::tests::r3s5_*`(4) / `r3s6_*`(1) 以临时数据目录进程内走完全链路 —— 真实落盘 `.toml`+`.lua`、preview `consumed`、错短语零副作用、同名拒绝、拒绝置 `rejected`、consumed 不可重放、demo 三档门禁(未部署/缺凭据/确认块含端点与真实下单提示); 集成测试 `tests/ai_live_smoke.rs` 含两个默认运行的确定性门禁(管道 approve 被 tty 门禁拒、缺 demo 凭据快速失败且先于网络)。**真机 S1–S8 已于 2026-09-16 晚全量通过**(DeepSeek 4 场景 + 币安 demo 测试网真实成交/平仓闭环 + Dry Run 起停), 证据见 converge.md; tty REPL 人工走查为可选项, 脚本在 smoke 测试文件头。
+
+- **R4(2026-09-16, 一句话启动 + 首次引导 + 全功能对话化; 代码已落地)**: R3 只开放"落盘部署 + 启动 demo"两种代行, 用户仍需记忆 `ricow pairs` / 手改 TOML 开关 / 手敲 approve+deploy+start 的完整命令序列。本轮把**用户唯一需要记住的命令收敛为 `ricow`**, 其余能力全部进对话。
+  - **裸入口与首次向导**: `ricow` 无子命令时进 `commands::chat`; 缺 AI key 且非本地 ollama 时先走 `commands::onboard` 向导(供应商选择 → **静默录入密钥** → 可选连通校验 → 外科式写回 `ricow.toml`); 币安凭据可跳过, 后续用 `/keys demo` 补录。**非 tty 一律双语报错 + 打印配置路径, exit 1**(不静默降级、不空跑)。原 clap 子命令全部保留, 变为同一 `ChatSession` 的薄壳。
+  - **密钥静默录入(D3)**: 新增跨平台纯 Rust 依赖 `rpassword`(Windows/Linux/macOS 同一实现), 不回显、不进日志、不进模型上下文; 会话缝以 `SessionSink::secret(prompt)` 抽象, 终端实现用 `rpassword`, 将来网页端换实现即可。
+  - **会话缝(B)**: 新 `ai/session.rs` 持有 `ChatSession`(root / 历史 / pending / LLM 客户端 / 配置缓存)+ `trait SessionSink { text, line, secret }`, `handle_line` 内**零 stdio**; `ai/provider.rs` 的流式输出改走 sink; `commands/chat.rs` 只是 stdio 薄壳。这是为"将来可扩网页端"预留的**唯一**架构动作, 本轮不做 HTTP/WS。
+  - **配置可写(修订 D31)**: `commands/config_file.rs` 新增 `set_values()` —— 按行外科替换/缺键插入, **保留注释**, 原子写 + 0600; 白名单 9 键(`ai/provider|model|base_url|api_key`、`exchange/demo_key|demo_secret|binance_key|binance_secret`、`market/show_all_pairs`), 白名单外一律拒绝。019 D31 原为"只读不写密钥", 本轮修订为"允许经 `set_values` 外科式更新"。
+  - **`/keys` 斜杠命令**: `/keys` 查看(只回显**尾 4 位**, 过短一律不回显) / `/keys ai|demo|live` 静默录入; 非交互会话拒绝录入; 空输入不写文件; demo/live 成对凭据不成对不写; 改 AI key 且**未被环境变量覆盖**时热重建 LLM 客户端, 被覆盖时如实提示"改的是文件、实际生效的是环境变量"。
+  - **`/market` 斜杠命令 + 交易对视野(D5)**: `ricow.toml` 增 `[market] show_all_pairs = false`; 默认视野 = bStock 现货(`<base>BUSDT`, XxxB × EQUITY 白名单交叉)**+ 股票永续**(`<base>USDT`, TRADIFI_PERPETUAL); `/market` 显示当前视野并可切 `bstock`/`all`(经 `set_values` 落盘, 零手编)。同时新增 CLI `ricow pairs [--market] [--all]` 与 L0 工具 `list_pairs`(免 key 公共端点, 进程内 TTL 缓存 + 输出截断并报告总数)。
+  - **建策略两条路(D6)**: 新增 L0 工具 `list_templates()` / `read_template(name)` 公开内置素材(`commands/templates.rs`, 由原私有 `BUILTIN_SCRIPTS` 迁出并附元数据 name/kind/说明/参数摘要); ① 基于内置完整策略模板对话式填空(代码 = 模板原文, 参数 = 用户回答), ② AI 完全新写。两条路都经既有三关(编译门禁 → 沙箱回测 → 用户逐字确认落盘), 每策略独立同名 `.toml` + `.lua`。
+  - **七动作全对话化(D1, 对 R3 开放范围的扩大)**: R3 的 2 种扩展为 **7 种**, `ActionKind` 全变体与逐字短语:
+
+    | 动作 | 逐字短语 | 宿主执行 |
+    |:--|:--|:--|
+    | Deploy | `确认部署 <名>` | `engine::approve`(一次性 token)→ `execute_strategy` |
+    | StartDemo | `确认启动测试网 <名>` | `ctrl::start_daemon(demo)` |
+    | AckRisk | `确认风险` | 展示 `RISK_DISCLOSURE` 全文后写 `risk_ack.json` |
+    | StartLive | `确认实盘 <名>` | `ctrl::live_preflight`(三判据原样跑一遍)→ `start_daemon(live, confirmed)` |
+    | StopDemo | `确认停止测试网 <名>` | `stop_daemon(close_all=false)` |
+    | StopLive | `确认停止实盘 <名>` | `stop_daemon(close_all=false)` |
+    | CloseLive | `确认平仓停止 <名>` | `stop_daemon(close_all=true)` |
+
+  - **安全模型一条未松**(关键): ① 写实动作**依然不是 LLM 工具** —— 工具表仍为 16 个(12 只读 L0 + 4 虚拟 L1), `request_write_confirmation` 自身只做前提校验 + 渲染确认块 + 在宿主内存登记 pending, **不落盘、不起进程、不返回 token**; ② 执行权在**宿主** `ChatSession` —— 用户下一行先经 `ai::confirm::consume_line` 判定, 只有**逐字短语**(复用 `is_explicit_confirmation`, 裸 y/yes/ok 不认)才走执行分支, **模型的任何输出永远不进入该分支**; ③ 实盘路径**共享同一 `ctrl::live_preflight`**, 018 风险确认 → 002 Dry Run 时长门禁 → FR-008 时钟预检**一条不少、顺序一字未改**, 且仍须 daemon `Request::Start.confirmed`; ④ tty 门禁不变(`prompt.is_none() && stdin().is_terminal()`), 单次模式/管道/外部 agent 只回终端命令文本; ⑤ 跨动作短语互不放行(TTL 15 分钟、新覆盖旧、过期优先—— 复用 R3 状态机)。
+  - **测试证据(2026-09-16, Windows)**: workspace **390 passed / 0 failed / 21 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。新增 `ai_live_smoke.rs` 确定性门禁 `piped_confirm_phrases_never_reach_the_host`(管道喂九种短语一律不进宿主分支)与真机 `#[ignore]` 场景 S9–S13(非交互下"生成+回测后要求直连测试网"/"跳过风险确认上实盘"/"代停并平仓"/"预授权短语"/"注入诱导实盘"全部零副作用)。
+
+- **R5(2026-09-16, 删除平台风控残留; **属 constitution 修订**)**: 用户 2026-09-16 决定 —— **风控由策略自己负责, 平台不替策略做投资判断**; 平台只保留"防 bug 风暴遭交易所封禁"的**固定工程护栏**。
+  - **删除**: `ricow_strategy/src/risk.rs` 的四个静态限额规则(`MaxPositionLimit` / `MaxDailyLoss` / `MinOrderSize` / `MaxSlippage`)、`RiskSettings`(含 `risk_max_orders_per_sec` 解析与校验)、`RiskEngine` 装配器; `config.rs` 的 `RiskConfig`、`StrategyConfig.risk` 字段与 `validate_risk()`(含 CLI `backtest.rs` / `run.rs` 两处调用点); 死模块 `scheduler.rs`(`StrategyScheduler` 全仓无消费者); 三处 Context 的 `risk_reject` → `guard_reject`; 提示词 / 工具描述 / 帮助里 `[risk] 限额同口径` 类表述。
+  - **保留**(不是风控, 不得误删): 实盘门禁 `risk_gate` / `--accept-risk` / `RISK_DISCLOSURE` / `risk_ack.json`(三判据之一, 属"风险确认书"而非投资判断); `read_doc("risk")` 话题改述为"实盘风险披露"; **固定 100 单/秒护栏** —— 独立小模块 `ricow_strategy::order_guard`(由 `risk.rs` 瘦身/改名而来), 固定常量、**不读任何配置**、不暴露配置面, 被拒仍返回 `Rejected` ack + `warn` 日志(`target=order_guard`), 策略循环不中断。
+  - **constitution 修订**: `specs/constitution.md` §安全要求的硬规则 "RiskEngine 硬检查(最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点)" **删除**, 替换为"平台不做投资判断: 风控由策略自管(`ctx:net_pnl()` / `ctx:equity()`); 平台仅保留固定下单频率护栏(100 单/秒)"。借未收敛的 019 变更走 SDD 记录本决策, **不做静默修改**。
+  - **兼容与影响**: 老策略 TOML 里残留的 `[risk]` 段与 `risk_*` 参数被 serde 忽略(装载不报错、**不再生效**); `params.risk_max_orders_per_sec` 是自由 HashMap 键, 不再被读取(无害保留); 下次被系统重写(起 Dry Run 写 `dry_run_started_at` / restart 写 `live_enabled`)时自然消失 —— 不做迁移脚本。删除静态限额不改变既有回测数值: 无 `[risk]` 段时唯一活动规则本就是频率护栏, 内置策略单 tick 下单数 ≤1, 远低于 100/s。
+  - **审计口径(可复跑)**: `grep -rn "RiskEngine\|RiskConfig\|validate_risk\|max_position_notional" crates/` 仅余 `order_guard` 内部与必要历史注释; 四静态限额在三态下单路径无任何分支; 100/s 护栏有单测(同 tick 第 101 单 `Rejected` 且循环不中断、窗口过期恢复)。

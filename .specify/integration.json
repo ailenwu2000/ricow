@@ -1,15 +1,15 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.8.dev0",
   "integration_state_schema": 1,
   "installed_integrations": [
-    "hermes"
+    "trae"
   ],
   "integration_settings": {
-    "hermes": {
-      "script": "sh",
+    "trae": {
+      "script": "ps",
       "invoke_separator": "-"
     }
   },
-  "integration": "hermes",
-  "default_integration": "hermes"
+  "integration": "trae",
+  "default_integration": "trae"
 }

@@ -163,7 +163,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),

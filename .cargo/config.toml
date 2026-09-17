@@ -1,2 +1,9 @@
 [build]
 rustdocflags = ["--check-cfg", "cfg(docsrs,test)"]
+
+# `cargo ai` is not a real cargo subcommand; `ai` is a subcommand of the ricow
+# binary itself (`ricow ai`, see crates/ricow/src/commands/ai.rs). This alias
+# makes the short form users reach for out of habit work from the repository
+# root. It only affects local development -- aliases never ship in a release.
+[alias]
+ai = "run -p ricow -- ai"

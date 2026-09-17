@@ -6,8 +6,6 @@
 //! - 本机端点(`127.0.0.1` / `localhost`)不要求密钥(如本地 Ollama), 其余端点必须带密钥;
 //! - 工具循环上限 = `Resolved::max_turns`(成本护栏), 每轮答复打印 token 用量。
 
-use std::io::Write;
-
 use futures::StreamExt;
 use ricow_core::{CoreError, CoreResult};
 use rig::agent::MultiTurnStreamItem;
@@ -17,6 +15,7 @@ use rig::providers::openai;
 use rig::streaming::StreamedAssistantContent;
 
 use super::config::Resolved;
+use super::session::SessionSink;
 
 /// 构造 OpenAI 兼容客户端(自定义 base_url + 密钥)。
 pub fn build_client(resolved: &Resolved, api_key: &str) -> CoreResult<openai::CompletionsClient> {
@@ -62,6 +61,22 @@ pub fn resolve_key(base_url: &str, from_config: CoreResult<String>) -> CoreResul
             }
         }
     }
+}
+
+/// 最小连通校验 (019-R4): 发一次极小请求, 验证"端点可达 + 密钥有效 + 模型可用"。
+///
+/// 与 [`connect`] 的区别: 不挂工具、不带系统提示、`max_tokens` 压到 1 —— 只为打通一次,
+/// 不产生实际消耗。失败原因原样回给调用方(向导据此让用户"重输 / 仍然保存 / 退出")。
+pub async fn probe(resolved: &Resolved, api_key: &str) -> CoreResult<()> {
+    let client = build_client(resolved, api_key)?;
+    let model = client.completion_model(resolved.model.as_str());
+    model
+        .completion_request("ping")
+        .max_tokens(1)
+        .send()
+        .await
+        .map_err(|e| CoreError::Exchange(format!("LLM 连通校验失败: {e}")))?;
+    Ok(())
 }
 
 /// 一轮问答的产出。
@@ -119,8 +134,13 @@ impl Llm {
         Ok(Answer { text: resp.output.clone(), usage: Some(usage) })
     }
 
-    /// 流式一轮: 逐段打印助手文本增量, 返回最终答复(整轮结束后)。
-    pub async fn ask_stream(&self, prompt: &str, history: &[Message]) -> CoreResult<Answer> {
+    /// 流式一轮: 逐段把助手文本增量交给 `sink`(本模块**不打印**), 返回最终答复(整轮结束后)。
+    pub async fn ask_stream(
+        &self,
+        prompt: &str,
+        history: &[Message],
+        sink: &mut dyn SessionSink,
+    ) -> CoreResult<Answer> {
         let mut stream = self.agent.stream_chat(prompt, history.to_vec()).await;
         let mut final_text: Option<String> = None;
         let mut printed = false;
@@ -129,8 +149,7 @@ impl Llm {
         while let Some(item) = stream.next().await {
             match item {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
-                    print!("{}", t.text);
-                    let _ = std::io::stdout().flush();
+                    sink.text(&t.text);
                     printed = true;
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(r)) => {
@@ -151,7 +170,8 @@ impl Llm {
             }
         }
         if printed {
-            println!();
+            // 收尾换行: 增量文本不以换行结尾, 由这里补齐(用量行另起一行)
+            sink.text("\n");
         }
         let text = final_text.ok_or_else(|| {
             CoreError::Exchange(

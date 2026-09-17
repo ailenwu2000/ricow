@@ -8,7 +8,10 @@ use ricow_core::{CoreError, CoreResult};
 use ricow_strategy::{Database, PreviewRecord};
 
 /// preview 有效期 (秒)。
-const PREVIEW_TTL_SECS: i64 = 15 * 60;
+///
+/// **对外可见**是刻意的: 对话内的"待确认动作"窗口必须与它同源 —— 确认短语必须在预览还有效时
+/// 才可能被批准, 两处各写一个 15 分钟迟早会漂移(漂移后表现为"短语输入正确却说预览已过期")。
+pub const PREVIEW_TTL_SECS: i64 = 15 * 60;
 
 /// 创建 preview, 返回 preview_id (status=pending, 无 token)。
 pub async fn create_preview(db: &Database, kind: &str, payload_json: &str) -> CoreResult<String> {

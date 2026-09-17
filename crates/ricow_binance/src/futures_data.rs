@@ -15,12 +15,15 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use ricow_core::{CoreError, CoreResult, Kline};
+use ricow_core::{CoreError, CoreResult, Kline, Market};
 use rust_decimal::Decimal;
 use serde_json::Value;
 
 /// USDT-M 合约主网 REST。
 const FAPI_MAINNET_REST: &str = "https://fapi.binance.com";
+
+/// 永续 `contractType` 白名单: 普通加密永续 + 美股代币永续(`TRADIFI_PERPETUAL`)。
+pub const PERP_CONTRACT_TYPES: [&str; 2] = ["PERPETUAL", "TRADIFI_PERPETUAL"];
 
 /// Binance USDT-M 公共数据客户端。
 pub struct FuturesDataClient {
@@ -111,6 +114,21 @@ impl FuturesDataClient {
         let symbols =
             raw["symbols"].as_array().ok_or_else(|| CoreError::Parse("missing symbols".into()))?;
         Ok(equity_bases_from_symbols(symbols))
+    }
+
+    /// 全永续市场列表 (PERPETUAL ∪ TRADIFI_PERPETUAL) —— 免 key 公开数据。
+    ///
+    /// 与签名客户端 `FuturesClient::get_exchange_info` 的差别: 这里包含美股代币永续
+    /// (contractType=`TRADIFI_PERPETUAL`), 供交易对视野枚举"全合约"用。
+    pub async fn get_perp_markets(&self) -> CoreResult<Vec<Market>> {
+        let url = format!("{}/fapi/v1/exchangeInfo", self.base_url);
+        let raw: Value = self.get_json(&url).await?;
+        let symbols =
+            raw["symbols"].as_array().ok_or_else(|| CoreError::Parse("missing symbols".into()))?;
+        Ok(symbols
+            .iter()
+            .filter_map(|s| crate::futures_client::parse_perp_symbol(s, &PERP_CONTRACT_TYPES))
+            .collect())
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> CoreResult<T> {

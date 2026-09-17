@@ -18,6 +18,18 @@ const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// 停机等待上限 (清理可能调用交易所, 故不用短超时)。
 pub const STOP_WAIT: Duration = Duration::from_secs(30);
 
+/// daemon 派生标记 (019 T030): daemon 派生策略子进程时注入, 子进程据此认定
+/// "实盘确认已在交互终端逐字完成", 不再索要 stdin 确认 (那里只收停机指令)。
+///
+/// 只注入给 daemon 自己派生的子进程; 用户手工在 shell 里跑 `ricow run --live` 没有这个标记,
+/// 因此即使凑巧传了内部标志 `--live-confirmed` 也仍会被要求逐字确认 —— 内部通道不会被误走成绕过。
+pub const DAEMON_SPAWN_ENV: &str = "RICOW_DAEMON_SPAWNED";
+
+/// 本进程是否由 daemon 派生 (见 [`DAEMON_SPAWN_ENV`])。
+pub fn spawned_by_daemon() -> bool {
+    std::env::var_os(DAEMON_SPAWN_ENV).is_some()
+}
+
 /// 运行中的策略实例句柄。
 pub struct ChildHandle {
     pub child: Child,
@@ -59,6 +71,8 @@ pub fn spawn_strategy(
         cmd.arg("--live");
         // 实盘确认已由唤醒它的交互终端完成(019 T030): 子进程不再索要, 否则会吃掉 daemon 的 stdin 停机指令
         cmd.arg("--live-confirmed");
+        // 光有标志不够, 子进程还要看到这个 daemon 注入的标记才会认账(见 `DAEMON_SPAWN_ENV`)
+        cmd.env(DAEMON_SPAWN_ENV, "1");
     }
     if demo {
         cmd.arg("--demo");

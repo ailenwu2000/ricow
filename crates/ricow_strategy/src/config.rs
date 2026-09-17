@@ -56,20 +56,6 @@ impl ConfigValue {
     }
 }
 
-/// 风控参数配置。
-///
-/// 静态限额(配置了才启用) + 工程护栏(频率上限, 默认启用)。
-/// 020 起平台不再有"默认启用的亏损熔断": 盈亏政策属于策略。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RiskConfig {
-    pub max_position_notional: Option<f64>,
-    pub max_daily_loss_usd: Option<f64>,
-    pub min_order_notional: Option<f64>,
-    pub max_slippage_bps: Option<u32>,
-    /// 下单频率上限 (每秒); 默认 100。
-    pub max_orders_per_sec: Option<u32>,
-}
-
 /// 策略配置 (TOML 文件反序列化)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyConfig {
@@ -81,8 +67,6 @@ pub struct StrategyConfig {
     pub exchange: String,
     #[serde(default)]
     pub params: HashMap<String, ConfigValue>,
-    #[serde(default)]
-    pub risk: Option<RiskConfig>,
     /// DryRun 首次启动时间 (ISO8601)。
     #[serde(default)]
     pub dry_run_started_at: Option<String>,
@@ -131,7 +115,6 @@ impl StrategyConfig {
                 market: self.market.clone(),
                 position_mode: self.position_mode.clone(),
             },
-            risk: self.risk.clone(),
             backtest: self.backtest.clone(),
         };
         toml::to_string_pretty(&raw)
@@ -156,19 +139,11 @@ impl StrategyConfig {
     pub fn get_dec(&self, key: &str) -> Option<Decimal> {
         self.params.get(key).and_then(|v| v.as_dec())
     }
-
-    /// 风控参数校验 (004 FR-009): 非法值在配置装载边界拒绝, 不留到运行期。
-    /// 生效值优先级见 `RiskSettings::raw`(--param `risk_*` 键 > `[strategy.risk]` > 默认)。
-    pub fn validate_risk(&self) -> Result<(), ricow_core::CoreError> {
-        crate::risk::RiskSettings::validate(self).map_err(ricow_core::CoreError::InvalidArgument)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RawStrategyToml {
     strategy: StrategyInner,
-    #[serde(default)]
-    risk: Option<RiskConfig>,
     /// 回测参数持久默认 (可选; 键全 Option, 缺省不覆盖内置默认)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     backtest: Option<BacktestToml>,
@@ -202,7 +177,6 @@ impl RawStrategyToml {
             enabled: self.strategy.enabled,
             exchange: self.strategy.exchange,
             params: self.strategy.params,
-            risk: self.risk,
             dry_run_started_at: self.strategy.dry_run_started_at,
             live_enabled: self.strategy.live_enabled,
             market: self.strategy.market,
@@ -382,16 +356,15 @@ exchange = "binance"
 pair = "ETH"
 order_size = 0.01
 
+# 019-R5: 旧版 [risk] 段不再被识别为风控配置(serde 忽略未知段, 装载不报错)。
 [risk]
 max_position_notional = 10000.0
-max_daily_loss_usd = 500.0
 "#;
         let config = StrategyConfig::from_toml(toml_str).unwrap();
         assert_eq!(config.name, "ETH 中性网格");
         assert_eq!(config.strategy_type, "shannon_grid");
         assert_eq!(config.get_str("pair"), Some("ETH"));
         assert_eq!(config.get_f64("order_size"), Some(0.01));
-        assert_eq!(config.risk.as_ref().unwrap().max_position_notional, Some(10000.0));
     }
 
     #[test]
@@ -405,7 +378,6 @@ exchange = "binance"
         let config = StrategyConfig::from_toml(toml_str).unwrap();
         assert!(config.enabled);
         assert!(config.params.is_empty());
-        assert!(config.risk.is_none());
         assert!(!config.live_enabled);
     }
 
@@ -493,7 +465,6 @@ exchange = "binance"
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),

@@ -13,8 +13,8 @@ use rust_decimal::Decimal;
 use crate::align::{ownership_prefix, prepare_live_order};
 use crate::config::StrategyConfig;
 use crate::fee::FeeModel;
+use crate::order_guard::OrderGuard;
 use crate::pnl::PnlTracker;
-use crate::risk::RiskEngine;
 
 /// 策略可见的上下文接口。
 ///
@@ -64,8 +64,8 @@ pub struct LiveContext {
     default_exchange: String,
     config: StrategyConfig,
     pnl: PnlTracker,
-    /// 风控护栏 (004): 所有下单先过 `RiskEngine` —— 与回测/Dry Run 同一装配函数。
-    risk: RefCell<RiskEngine>,
+    /// 下单工程护栏 (019-R5): 固定 100 单/秒, 与回测/Dry Run 同一实现; 平台不做投资风控。
+    guard: RefCell<OrderGuard>,
     /// 订单号归属前缀 `<策略名>-` (011 D6): 下单前注入, 停机撤单据此只撤本实例的单。
     order_prefix: String,
     /// 交易所过滤器缓存 (启动期 `get_markets` 注入): 下单参数对齐的依据; 缺失则不干预参数。
@@ -99,7 +99,7 @@ impl LiveContext {
             exchanges,
             default_exchange: default_exchange.into(),
             order_prefix,
-            risk: RefCell::new(RiskEngine::from_config(&config)),
+            guard: RefCell::new(OrderGuard::new()),
             config,
             pnl: PnlTracker::default(),
             markets: RwLock::new(HashMap::new()),
@@ -132,29 +132,20 @@ impl LiveContext {
         self.markets.read().ok()?.get(&pair_base.to_uppercase()).cloned()
     }
 
-    /// 风控前置检查 (004): 被拒 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
-    fn risk_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {
-        let verdict = self.risk.borrow_mut().check(req, self);
+    /// 工程护栏前置检查 (019-R5): 超频 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
+    fn guard_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {
+        let verdict = self.guard.borrow_mut().check(self.now_utc());
         match verdict {
             Ok(()) => None,
             Err(e) => {
                 tracing::warn!(
-                    target: "risk",
+                    target: "order_guard",
                     name = %self.config.name,
                     pair = %req.pair,
                     side = ?req.side,
-                    "风控拒单: {e}"
+                    "工程护栏拒单(下单频率超限): {e}"
                 );
-                Some(OrderAck {
-                    exchange_order_id: String::new(),
-                    client_order_id: req.client_order_id.clone(),
-                    pair: req.pair.clone(),
-                    side: req.side,
-                    price: req.price.unwrap_or(Decimal::ZERO),
-                    size: req.size,
-                    filled_size: Decimal::ZERO,
-                    status: OrderStatus::Rejected,
-                })
+                Some(crate::order_guard::rejected_ack(req))
             }
         }
     }
@@ -340,8 +331,8 @@ impl Context for LiveContext {
                 return Ok(rejected_ack);
             }
         };
-        // ② 风控 (004): 对齐后再校验 (看到的是实际下单量)
-        if let Some(rejected) = self.risk_reject(&req) {
+        // ② 工程护栏 (019-R5): 对齐后再校验 (看到的是实际下单量)
+        if let Some(rejected) = self.guard_reject(&req) {
             return Ok(rejected);
         }
         let exchange = self.resolve_exchange(&prefix)?;
@@ -398,8 +389,8 @@ pub struct DryRunContext {
     pnl: PnlTracker,
     fee_model: FeeModel,
     quote_asset: String,
-    /// 风控护栏 (004): 所有下单先过 `RiskEngine` —— 与回测/实盘同一装配函数。
-    risk: RefCell<RiskEngine>,
+    /// 下单工程护栏 (019-R5): 固定 100 单/秒, 与回测/实盘同一实现; 平台不做投资风控。
+    guard: RefCell<OrderGuard>,
     orderbook_cache: RwLock<HashMap<String, OrderBook>>,
     virtual_positions: RwLock<HashMap<String, Position>>,
     virtual_balance: RwLock<HashMap<String, Balance>>,
@@ -431,7 +422,7 @@ impl DryRunContext {
         Self {
             exchanges,
             default_exchange: default_exchange.into(),
-            risk: RefCell::new(RiskEngine::from_config(&config)),
+            guard: RefCell::new(OrderGuard::new()),
             config,
             pnl: PnlTracker::default(),
             fee_model: FeeModel::default(),
@@ -445,29 +436,20 @@ impl DryRunContext {
         }
     }
 
-    /// 风控前置检查 (004): 被拒 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
-    fn risk_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {
-        let verdict = self.risk.borrow_mut().check(req, self);
+    /// 工程护栏前置检查 (019-R5): 超频 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
+    fn guard_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {
+        let verdict = self.guard.borrow_mut().check(self.now_utc());
         match verdict {
             Ok(()) => None,
             Err(e) => {
                 tracing::warn!(
-                    target: "risk",
+                    target: "order_guard",
                     name = %self.config.name,
                     pair = %req.pair,
                     side = ?req.side,
-                    "风控拒单: {e}"
+                    "工程护栏拒单(下单频率超限): {e}"
                 );
-                Some(OrderAck {
-                    exchange_order_id: String::new(),
-                    client_order_id: req.client_order_id.clone(),
-                    pair: req.pair.clone(),
-                    side: req.side,
-                    price: req.price.unwrap_or(Decimal::ZERO),
-                    size: req.size,
-                    filled_size: Decimal::ZERO,
-                    status: OrderStatus::Rejected,
-                })
+                Some(crate::order_guard::rejected_ack(req))
             }
         }
     }
@@ -756,7 +738,7 @@ impl Context for DryRunContext {
     }
 
     fn place_order(&mut self, req: OrderRequest) -> CoreResult<OrderAck> {
-        if let Some(rejected) = self.risk_reject(&req) {
+        if let Some(rejected) = self.guard_reject(&req) {
             return Ok(rejected);
         }
         let exchange_order_id = uuid::Uuid::new_v4().to_string();

@@ -38,7 +38,6 @@ fn config(script: &str, params: &[(&str, ConfigValue)]) -> StrategyConfig {
         enabled: true,
         exchange: "binance".into(),
         params: map,
-        risk: None,
         dry_run_started_at: None,
         live_enabled: false,
         market: "spot".into(),

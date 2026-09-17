@@ -12,9 +12,44 @@
 
 > 本项目原名 **locus**, 2026-09 正式更名 **ricow**; Git 历史不继承(本仓库从 `v0.7.0` 重新开始)。
 
+## 安装
+
+预编译的自包含产物发在 [releases 页面](https://github.com/ailenwu2000/ricow/releases), **不需要 Rust 工具链**。同一份配置生成四类安装方式: shell、PowerShell、Homebrew、msi。
+
+**Linux / macOS —— shell 安装脚本**
+
+```bash
+curl -LsSf https://github.com/ailenwu2000/ricow/releases/latest/download/ricow-installer.sh | sh
+```
+
+**Windows —— PowerShell 安装脚本**
+
+```powershell
+irm https://github.com/ailenwu2000/ricow/releases/latest/download/ricow-installer.ps1 | iex
+```
+
+**Windows —— msi**
+
+从 releases 页面下载 `ricow-x86_64-pc-windows-msvc.msi` 双击安装。它把 `ricow.exe` 装到 `%ProgramFiles%\ricow\bin` 并追加进 `PATH` —— 请**新开**一个终端让改动生效。msi 只含可执行文件; 下面那个双击入口在 `.zip` 里。
+
+**macOS —— Homebrew**
+
+```bash
+curl -LO https://github.com/ailenwu2000/ricow/releases/latest/download/ricow.rb
+brew install ./ricow.rb
+```
+
+目前**没有 tap**, 所以 `brew install ricow` 用不了: 我们把公式本身作为 release 产物发布, 它直接装预编译二进制(不编译)。
+
+**任意平台 —— 手动解压**
+
+下载对应平台的压缩包, 解压后运行 `./ricow`(Windows 是 `ricow.exe`)。每个压缩包都带内置助手的启动脚本: Windows 双击 `启动-ricow-AI助手.cmd`(它替你切到 UTF-8 —— 中文不乱码就是靠这一步); Linux/macOS 执行 `./启动-ricow-AI助手.sh`; macOS 上也可直接双击 `启动-ricow-AI助手.command`, 它只是同一个脚本的双击外壳。启动脚本走的是 ricow 的裸入口, 所以第一次启动会在**对话里**问你要供应商与 API Key(输入不回显), 写进 `ricow.toml` 之后直接进入会话 —— 事先不需要设任何环境变量。
+
+**升级方式。** 我们发布的产物里**不含自动更新组件**: 程序不会从网络改写自己, 升级是你主动的动作 —— 下载新的压缩包/msi, 或重跑安装脚本。**不提供** winget / scoop 包; 请用 PowerShell 脚本、msi 或 `.zip`。
+
 ## 快速开始
 
-### 1. 构建
+### 1. 从源码构建(可选 —— 已装 release 就跳过)
 
 ```bash
 cargo build --release        # 产物: target/release/ricow
@@ -22,9 +57,11 @@ cargo build --release        # 产物: target/release/ricow
 
 数据目录(`$RICOW_ROOT`)解析顺序: 环境变量 `RICOW_ROOT` → 当前目录(含 `ricow.db` / `strategies/`) → 平台默认数据目录。
 
+在源码检出里启动助手, 与压缩包里的方式完全一致: Windows 双击 `packaging\启动-ricow-AI助手.cmd`, Linux/macOS 执行 `packaging/启动-ricow-AI助手.sh`。它按「脚本同目录 → `target/`(release 与 debug 中较新的那个)→ `PATH`」查找二进制; 回落到 `target/` 时会先 `cd` 到仓库根, 因此助手用的是本检出里的 `strategies/`, 而不是另建一个空数据目录。`cargo ai` 是本仓库的 alias(见 `.cargo/config.toml`, 等价于 `cargo run -p ricow -- ai`)—— `ai` 是 ricow 的子命令而非 cargo 子命令, 所以这种写法只在检出内存在。
+
 ### 2. 配置: 只有一个文件
 
-配置与凭据都在 `$RICOW_ROOT/ricow.toml`(权限 `0600`, 已在 `.gitignore`)。**产品不代写密钥**: 文件不存在时, 首次需要它的命令会生成带注释的模板并把路径告诉你, 你用编辑器填值即可(密钥与其供应商写在同一个 `[ai]` 段里, 不会搞混属于谁)。
+配置与凭据都在 `$RICOW_ROOT/ricow.toml`(已入 `.gitignore`;Unix 下写为 `0600` —— Windows 没有 POSIX 权限位, 那边靠写入时收紧 ACL 到仅当前用户)。文件不存在时, 首次需要它的命令会生成带注释的模板并把路径告诉你, 你用编辑器填值即可 —— 或者在 `ricow`(见 §4)里用 `/keys`(掩码输入, 不回显)与 `/market` 改; 这两条命令**按行外科式改写, 保留你的注释**, 只碰 9 个白名单键。密钥与其供应商写在同一个段里, 不会搞混属于谁。
 
 ```toml
 [ai]                     # 可选: 只用 AI 助手时才需要
@@ -56,7 +93,7 @@ demo 与实盘都真实调用交易所接口, 差别只在域名(`demo-api`/`dem
 
 ### 4. AI 助手(可选)
 
-`ricow ai "我部署了哪些策略?"` —— 用自然语言查状态、跑回测、读权威文档(全是**只读**操作); 落盘部署、启停实盘、平仓等**写实操作不在工具面内**, 只能由你本人敲命令确认。`--plain` 关闭流式输出。
+`ricow ai "我部署了哪些策略?"` —— 用自然语言查状态、跑回测、读权威文档(全是**只读**操作)。裸 `ricow` 进入同一助手的交互会话(`chat`); 全新安装时会先走首次配置向导。落盘部署、启停实盘、平仓等**写实操作不在工具面内**: 模型只能登记一条待确认动作, 由**你本人逐字输入**确认短语后, 宿主进程才执行(如 `确认实盘 <名字>`)。斜杠命令: `/help` `/keys` `/market` `/exit`。`--plain` 关闭流式输出。
 
 ### 5. 用你自己的 AI agent(可选)
 
@@ -86,10 +123,38 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_P
 
 ### 7. 安全须知
 
-- 凭据以**明文**存放于 `ricow.toml`(0600, 本机私有, 不入 git): 加密需要回答"解密密钥放哪"(绕回本文件=安全剧场, 绑机器指纹=换机即废)。
+- 凭据以**明文**存放于 `ricow.toml`(本机私有, 不入 git; Unix 为 `0600`, Windows 为仅当前用户的 ACL): 加密需要回答"解密密钥放哪"(绕回本文件=安全剧场, 绑机器指纹=换机即废)。
 - 不要把密钥发给任何人(包括 AI 助手), 不要提交进仓库。
 - 实盘先小额, 先跑 Dry Run 与 demo。
-- 写实确认(部署 `确认部署 <名字>` / 实盘 `确认实盘 <名字>`)**只能在交互终端手动输入**: 管道、脚本、AI agent 工具调用喂入的短语一律被拒绝。
+- 写实确认由**你本人在交互终端逐字输入** —— 部署 `确认部署 <名字>` / 启动测试网 `确认启动测试网 <名字>` / 首次实盘风险确认 `确认风险` / 实盘 `确认实盘 <名字>` / 停止测试网 `确认停止测试网 <名字>` / 停止实盘 `确认停止实盘 <名字>` / 平仓并停止 `确认平仓停止 <名字>`。管道、脚本、AI agent 工具调用喂入的短语一律被拒绝, 裸 `y`/`yes`/回车也不算。实盘仍会原样重跑宿主三门禁(风险确认 → Dry Run 时长 → 时钟预检)。
+
+## 常见问题
+
+**Windows 控制台里中文是乱码/方块。** 控制台代码页不是 UTF-8。先在该终端执行 `chcp 65001`, 或者用 `启动-ricow-AI助手.cmd` 启动(它替你做了这一步 —— 这个文件存在的全部理由)。想一劳永逸: 打开 Windows 11 的*设置 → 时间和语言 → 语言和区域 → 管理语言设置 → Beta: 使用 Unicode UTF-8 提供全球语言支持*。
+
+**Windows 报「Windows 已保护你的电脑」/ 被 SmartScreen 拦下。** 我们没有代码签名证书(这是有意的决定, 见下面两条)。点*更多信息 → 仍要运行*; 或对解压出来的文件做一次性解锁, 从此不再弹:
+
+```powershell
+powershell -Command "Get-ChildItem -Recurse .\ | Unblock-File"
+```
+
+**macOS 报「无法打开, 因为无法验证开发者」(或「已损坏」)。** 这是 Gatekeeper, 不是下载坏了: 二进制既没签名也没公证。去掉隔离标记即可:
+
+```bash
+xattr -d com.apple.quarantine ./ricow
+```
+
+或用*系统设置 → 隐私与安全性 → 仍要打开*。**为什么不签名**: 苹果开发者证书是付费订阅, Windows 证书需要企业主体; 而本项目的立场是「自己构建、只信自己读过的源码」—— `cargo build --release` 得到的二进制不需要任何人背书。
+
+**Linux/macOS 上启动脚本报 `Permission denied`。** 双击或执行启动脚本需要可执行位; 压缩包一般带着它, 万一丢了就补一次: `chmod +x ricow 启动-ricow-AI助手.sh 启动-ricow-AI助手.command`(脚本自己也会在检测到 `./ricow` 存在但不可执行时给出这条提示)。
+
+**怎么换 AI 供应商, 或用本地模型?** 改 `ricow.toml` 里的 `[ai]`: `provider`(预设: `deepseek`(默认)/ `moonshot` / `zhipu` / `qwen` / `openrouter` / `openai` / `ollama`)、`model`, 不在列表里的再补 `base_url`。该供应商的 `api_key` 写在同一个段里。在助手会话里用 `/keys` 可以把 provider + 密钥 + 模型写回文件, 且保留你的注释。
+
+**能完全离线跑吗?** AI 那半边可以: `provider = "ollama"` + `base_url = "http://127.0.0.1:11434/v1"` + 你本地已拉取的模型(`ollama list`), 全程不联网。交易内核不行: 回测要下载真实 K 线, demo/实盘要真实下单, 所以币安必须可达(国内网络请设 `HTTPS_PROXY`)。只有 AI 端点这一项是可选的。
+
+**策略、数据库、配置放在哪?** 都在 `$RICOW_ROOT` —— 解析顺序: 环境变量 `RICOW_ROOT` → 当前目录(已经含 `ricow.db`/`strategies/` 时) → 平台默认数据目录。`ricow.toml`(Unix `0600` / Windows 仅当前用户 ACL)与 `ricow.db` 都在那里。
+
+**包多大、编译要多久?** 2026-09-17 在维护者机器上实测(如实记录, 非预判): `dist` profile 的 `ricow.exe` 为 21,042,176 字节(20.1 MiB), `ricow.exe` + `README.md` + `LICENSE` 打成的 Windows `.zip` 为 8,614,204 字节(≈8.2 MiB); 该 profile 从零冷编译耗时 284.5 秒(4m44s)。普通 `cargo build --release` 产物为 19,930,624 字节(≈19.0 MiB)。一台机器一次测量 —— 请当数量级参考, 不是承诺。
 
 ## 当前内容
 
@@ -105,8 +170,11 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_P
 | 平台 | 状态 |
 |---|---|
 | Linux x86_64 | 实机验证(构建、回测、demo 测试网真实下单流程) |
+| Linux arm64 | 由 CI 构建并发布; 尚未实机跑过交易流程 |
 | Windows x86_64 | 编译与全量单元测试已由 CI 实测通过(`test (windows-latest)`, 2026-09-15); **尚未实机跑过交易流程** |
 | macOS | 未验证 —— 无实机且暂无 CI 覆盖; 代码走与 Linux 同源的 `cfg(unix)` 分支 |
+
+四类安装方式由同一份配置生成, 但只有 shell 脚本在实机(Linux)上跑过; PowerShell 安装器、msi 与 Homebrew 公式**尚未**在真实 Windows/macOS 机器上装过。本地**已核对**的是: `dist plan` 列出 shell + PowerShell + Homebrew + msi 四类, 每个压缩包都带 `LICENSE`/`README.md`/`启动-ricow-AI助手.cmd`/`启动-ricow-AI助手.sh`/`启动-ricow-AI助手.command`, 且产物中没有任何更新器。
 
 ## 免责声明
 

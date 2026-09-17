@@ -3,13 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
 use clap::Args;
 use ricow_core::{Balance, CoreError, CoreResult, Exchange};
-use ricow_engine::{
-    check_clock_skew, live_gate, skew_ms, ClockVerdict, Engine, LiveGate, RunOutcome, StopReason,
-    StopRequest,
-};
+use ricow_engine::{live_gate, Engine, LiveGate, RunOutcome, StopReason, StopRequest};
 use ricow_strategy::{ConfigValue, Database, StrategyConfig};
 use rust_decimal::Decimal;
 
@@ -36,7 +32,8 @@ pub struct RunArgs {
     /// 但仍需 demo 凭据与时钟预检。与 `--live` 互斥使用(同时给则报错)。
     #[arg(long)]
     pub demo: bool,
-    /// 内部: 实盘确认已在交互终端完成(由 daemon 派生时注入); 用户不需要也不应手工传
+    /// 内部: 实盘确认已在交互终端完成(由 daemon 派生时注入); 单独传无效, 须同时有 daemon 注入的
+    /// `RICOW_DAEMON_SPAWNED` 环境变量 —— 用户手工传这个标志仍会被要求逐字确认
     #[arg(long, hide = true)]
     pub live_confirmed: bool,
     /// 实盘停机时市价平掉策略持仓 (仅实盘生效; Dry Run 无效果)
@@ -44,9 +41,22 @@ pub struct RunArgs {
     pub close_all: bool,
 }
 
+/// 内部通道判定 (纯函数, 单测锁定边界): `--live-confirmed` 标志与 daemon 注入的环境变量
+/// **两者齐备**才认账; 缺一即回到"逐字确认"这条正常路径。
+fn daemon_confirmation_accepted(flag: bool, daemon_marked: bool) -> bool {
+    flag && daemon_marked
+}
+
 pub async fn run(args: RunArgs) -> CoreResult<()> {
-    // 实盘二次分离 (019 D4 / T029-T030): 未带内部确认标志时, 前台也要求逐字确认(零副作用)。
-    if args.live && !args.live_confirmed {
+    // daemon 派生链的内部通道: 标志 + daemon 注入的环境变量**两者齐备**才认账。
+    // 只认标志的话, 任何人在 shell 里敲 `ricow run <名> --live --live-confirmed` 就能跳过逐字确认,
+    // 等于把"每次实盘启动都必须用户逐字确认"这条规则变成一个可绕过的开关。
+    let confirmed_by_daemon = daemon_confirmation_accepted(
+        args.live_confirmed,
+        crate::supervisor::procs::spawned_by_daemon(),
+    );
+    // 实盘二次分离 (019 D4 / T029-T030): 未走内部通道时, 前台也要求逐字确认(零副作用)。
+    if args.live && !confirmed_by_daemon {
         crate::commands::require_explicit_phrase(
             &format!("即将启动 **实盘**(真实资金): 策略 {}", args.strategy),
             &format!("确认实盘 {}", args.strategy),
@@ -62,8 +72,6 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
     } else {
         inline_config(&args, &exchange).await?
     };
-    // 风控参数校验 (004 FR-009): 非法值在此拒绝 (Dry Run / 实盘同一门禁)。
-    config.validate_risk()?;
 
     let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();
 
@@ -87,15 +95,11 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
         }
         // 凭据先校验(快速失败): 缺 demo key 时不应先打印"启动策略"
         crate::commands::load_credentials(crate::commands::Mode::Demo)?;
-        let skew = fetch_clock_skew(&config.market, crate::commands::Mode::Demo).await?;
-        match check_clock_skew(skew) {
-            ClockVerdict::Reject { message, .. } => {
-                return Err(CoreError::InvalidArgument(message))
-            }
-            ClockVerdict::Ok { skew_ms } => {
-                println!("时钟预检通过(按 demo 服务器): 本机比服务器 {skew_ms:+} ms")
-            }
-        }
+        // FR-008 时钟预检走共享内核 (与实盘同一份判定, 只换服务器: demo 端点)
+        let skew_ms =
+            crate::commands::ctrl::clock_gate_shared(&config.market, crate::commands::Mode::Demo)
+                .await?;
+        println!("时钟预检通过(按 demo 服务器): 本机比服务器 {skew_ms:+} ms");
         println!(
             "启动策略 {} ({}, {} · 真实调用测试网下单接口, 无真实资金)。",
             config.name,
@@ -137,40 +141,25 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
     // 实盘门禁 (FR-013 / D2): 配置声明 **且** 命令行 --live, 缺一即按 Dry Run 运行并说明原因
     match live_gate(config.live_enabled, args.live) {
         LiveGate::Live => {
-            // 首次使用风险确认 (018, product.md §十): 真实资金前先过一次(确认一次即长期有效)
-            match ricow_engine::risk_gate(crate::commands::risk_acked(), args.accept_risk) {
-                ricow_engine::RiskGate::Refuse { message } => {
-                    return Err(CoreError::InvalidArgument(message))
-                }
-                ricow_engine::RiskGate::JustAcked => {
-                    let p = crate::commands::write_risk_ack()?;
-                    println!("已记录风险确认: {} (后续实盘不再要求)", p.display());
-                }
-                ricow_engine::RiskGate::Proceed => {}
+            // 实盘三判据走共享内核 (019 R4): 与 `ricow start --live`、对话内执行路径同一份实现,
+            // 判据顺序/取参默认值/拒绝话术不可能各走各的。
+            // 018 首次使用风险确认 (product.md §十): 真实资金前先过一次(确认一次即长期有效)
+            if let Some(notice) = crate::commands::ctrl::risk_gate_shared(args.accept_risk)? {
+                println!("{notice}");
             }
-            // Dry Run 时长门禁 (002 FR-007): 声明实盘前须先在 Dry Run 下观察足够久 (可 params 调低/设 0 关闭)。
-            // 拒绝而非降级: 用户已显式要求实盘, 静默降级更危险。
-            let min_dry_run_hours = config
-                .get_f64("min_dry_run_hours")
-                .unwrap_or(ricow_engine::DEFAULT_MIN_DRY_RUN_HOURS);
-            ricow_engine::dry_run_gate(
-                config.dry_run_started_at.as_deref(),
-                chrono::Utc::now(),
-                min_dry_run_hours,
-            )
-            .map_err(CoreError::InvalidArgument)?;
+            // 002 Dry Run 时长门禁 (FR-007): 声明实盘前须先在 Dry Run 下观察足够久
+            // (可 params 调低/设 0 关闭)。拒绝而非降级。
+            crate::commands::ctrl::dry_run_gate_shared(&config)
+                .map_err(CoreError::InvalidArgument)?;
 
             let is_futures = config.market.eq_ignore_ascii_case("futures");
-            // 时钟预检 (FR-008): 按**本市场**取数 (现货/合约服务器时间不同步), 不通过即退出
-            let skew = fetch_clock_skew(&config.market, crate::commands::Mode::Live).await?;
-            match check_clock_skew(skew) {
-                ClockVerdict::Reject { message, .. } => {
-                    return Err(CoreError::InvalidArgument(message))
-                }
-                ClockVerdict::Ok { skew_ms } => {
-                    println!("时钟预检通过: 本机比交易所服务器 {skew_ms:+} ms")
-                }
-            }
+            // FR-008 时钟预检: 按**本市场**取数 (现货/合约服务器时间不同步), 不通过即退出
+            let skew_ms = crate::commands::ctrl::clock_gate_shared(
+                &config.market,
+                crate::commands::Mode::Live,
+            )
+            .await?;
+            println!("时钟预检通过: 本机比交易所服务器 {skew_ms:+} ms");
 
             let live_exchange = build_exchange(&config, crate::commands::Mode::Live).await?;
             println!(
@@ -209,7 +198,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                 }
             }
             // Dry Run 初始虚拟资金按交易对的报价资产配平 (否则 USDT 对本金记在 USDC 上, 策略判定"无可用资金");
-            // 金额可配 (016: params.initial_cash, 默认 100k) —— 小资金配置才能用同一套 [risk] 限额预演。
+            // 金额可配 (016: params.initial_cash, 默认 100k) —— 让虚拟本金贴近真实可投入资金, 预演才有参考价值。
             let dry_run_cash = ricow_engine::dry_run_initial_cash(config.get_f64("initial_cash"))
                 .map_err(CoreError::InvalidArgument)?;
             let initial_balance =
@@ -256,30 +245,6 @@ async fn build_exchange(
     } else {
         crate::commands::bn_spot_signed_mode(mode)
     }
-}
-
-/// 时钟预检取数: 公共端点读**该市场自己的**服务器时间 (免 key), 返回"本机 - 交易所"偏差 (ms)。
-///
-/// 现货与合约的 demo 服务器时间不同步(实测差 1.5~1.9s), 必须按市场取数, 否则校准白做。
-async fn fetch_clock_skew(market: &str, mode: crate::commands::Mode) -> CoreResult<i64> {
-    use crate::commands::Mode;
-    let demo = mode == Mode::Demo;
-    let server = if market.eq_ignore_ascii_case("futures") {
-        // 公开端点: 无需凭据
-        let c = ricow_binance::FuturesClient::new()?;
-        let c = if demo { c.with_base_url(crate::commands::DEMO_FAPI_URL) } else { c };
-        c.server_time().await
-    } else {
-        let c = ricow_binance::BinanceClient::new()?;
-        let c = if demo { c.with_base_url(crate::commands::DEMO_SPOT_URL) } else { c };
-        c.server_time().await
-    }
-    .map_err(|e| {
-        CoreError::Network(format!(
-            "时钟预检失败: 读取交易所服务器时间失败 ({e}); 网络不通时无法安全启动实盘"
-        ))
-    })?;
-    Ok(skew_ms(Utc::now(), server))
 }
 
 /// 解析停机指令行 (纯函数, 便于单测): `stop` / `stop --close-all` (大小写不敏感, 允许两端空白)。
@@ -455,7 +420,6 @@ async fn inline_config(
         enabled: true,
         exchange: "binance".into(),
         params,
-        risk: None,
         dry_run_started_at: None,
         live_enabled: false,
         market: "spot".into(),
@@ -468,6 +432,16 @@ async fn inline_config(
 mod tests {
     use super::*;
     use std::fs;
+
+    /// 内部通道边界 (019 审核): 只有标志或只有 daemon 标记都不算确认 ——
+    /// 防止日后有人把 `&&` 改成 `||`, 让手工传 `--live-confirmed` 变成静默绕过逐字确认。
+    #[test]
+    fn live_confirmation_requires_both_flag_and_daemon_marker() {
+        assert!(daemon_confirmation_accepted(true, true), "daemon 派生且带标志: 认账");
+        assert!(!daemon_confirmation_accepted(true, false), "仅手工传标志: 不认账, 仍要逐字确认");
+        assert!(!daemon_confirmation_accepted(false, true), "仅继承标记: 不认账");
+        assert!(!daemon_confirmation_accepted(false, false), "都没有: 不认账");
+    }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         // 每测试独立子目录: 避免并行测试互相 remove/create 竞争。

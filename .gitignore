@@ -8,6 +8,7 @@ venv/
 temp/
 .hermes/
 target/
+target-cold/
 backup/
 strategies/*
 !strategies/builtin/

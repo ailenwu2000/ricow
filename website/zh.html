@@ -35,7 +35,7 @@
     <ul style="margin:0">
       <li><strong>单一二进制</strong> —— <code>ricow</code>,由 5 个 crate 的 Rust workspace 构建。</li>
       <li><strong>策略用 Lua 写</strong>,跑在沙箱里(无 <code>os</code>/<code>io</code>/<code>require</code>/<code>loadstring</code>/<code>pcall</code>;每 tick 指令预算 100 万,内存 64&nbsp;MB)。</li>
-      <li><strong>只有一个配置文件</strong>:<code>ricow.toml</code>(权限 <code>0600</code>,明文,永不入 git)。</li>
+      <li><strong>只有一个配置文件</strong>:<code>ricow.toml</code>(明文,永不入 git;Unix <code>0600</code>,Windows 仅当前用户 ACL)。</li>
       <li><strong>四档运行</strong>:回测 → Dry Run → demo(币安测试网真实下单) → 实盘(真实资金)。</li>
     </ul>
   </div>
@@ -78,10 +78,10 @@ ricow deploy &lt;preview_id&gt; --token &lt;token&gt;                           
 <section>
   <h2>安全模型</h2>
   <ul>
-    <li><strong>密钥只在本机。</strong>只有一个 <code>ricow.toml</code>(权限 <code>0600</code>,已被 git 忽略);产品不代写密钥,也从不上传。</li>
+    <li><strong>密钥只在本机。</strong>只有一个 <code>ricow.toml</code>(Unix <code>0600</code> / Windows 仅当前用户 ACL,已被 git 忽略);产品不代写密钥,也从不上传。</li>
     <li><strong>实盘有多道门。</strong>策略必须声明 <code>live_enabled = true</code>;命令行须 <code>--live --accept-risk</code>,并有首次风险确认与 Dry Run 时长门禁。</li>
-    <li><strong>写实操作只能人来做。</strong>确认短语(部署 / 实盘)只接受在交互终端逐字输入 —— 管道、脚本、AI 工具调用喂入的一律拒绝。</li>
-    <li><strong>内置 AI 助手是只读的。</strong>能问答、跑回测、查文档;不能下单、部署或转移资金。</li>
+    <li><strong>写实操作只能人来做。</strong>确认短语(部署 / 实盘 / 风险确认 / 停机)只认<em>你本人敲进去</em>的按键:助手可以登记一条待确认动作,但短语要在同一交互会话里逐字输入才生效 —— 管道、脚本、工具调用喂入的一律拒绝。</li>
+    <li><strong>助手永远拿不到写实工具。</strong>能问答、跑回测、查文档;要部署、启动或停止,必须"登记待确认 + 你本人逐字输入短语"两件事同时成立。</li>
   </ul>
 </section>
 

@@ -14,8 +14,8 @@ use rust_decimal_macros::dec;
 use crate::config::{BacktestParams, BacktestToml, ConfigValue, StrategyConfig};
 use crate::context::Context;
 use crate::fee::FeeModel;
+use crate::order_guard::OrderGuard;
 use crate::pnl::PnlTracker;
-use crate::risk::RiskEngine;
 
 /// hedge 模式按侧明细 (013 FR-006) —— 与交易所账单/真实清算事件对照用。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -163,8 +163,8 @@ pub struct BacktestContext {
     funding_rate_8h: Decimal,
     /// 资金不足/无仓可平而被拒的订单数 (市价单丢弃; 报告如实显示)。
     rejected_count: u64,
-    /// 风控护栏 (004): 与 Dry Run / 实盘同一装配函数 (`RiskEngine::from_config`)。
-    risk: RefCell<RiskEngine>,
+    /// 下单工程护栏 (019-R5): 固定 100 单/秒, 与 Dry Run / 实盘同一实现; 平台不做投资风控。
+    guard: RefCell<OrderGuard>,
     pending_orders: Vec<(String, OrderRequest)>,
     fill_queue: Vec<OrderFill>,
     current_bar: Option<Kline>,
@@ -254,8 +254,8 @@ impl BacktestContext {
         if !is_futures {
             balance_map.insert(initial_balance.asset.clone(), initial_balance);
         }
-        // 风控护栏在 config 移入结构体前装配 (from_config 借用 config)。
-        let risk = RefCell::new(RiskEngine::from_config(&config));
+        // 工程护栏: 固定 100 单/秒, 不接受配置。
+        let guard = RefCell::new(OrderGuard::new());
         Self {
             config,
             pnl: PnlTracker::default(),
@@ -274,7 +274,7 @@ impl BacktestContext {
             mmr: Decimal::from_f64_retain(p.mmr_pct).unwrap_or(Decimal::ZERO) / dec!(100),
             funding_rate_8h: Decimal::from_f64_retain(p.funding_rate_8h).unwrap_or(Decimal::ZERO),
             rejected_count: 0,
-            risk,
+            guard,
             pending_orders: Vec::new(),
             fill_queue: Vec::new(),
             current_bar: None,
@@ -302,30 +302,21 @@ impl BacktestContext {
         self.config.market == "futures"
     }
 
-    /// 风控前置检查 (004): 被拒 → `Rejected` ack (与资金不足/无仓可平同形, 计入 rejected_count),
-    /// 并 `tracing::warn!(target: "risk")` 输出规则名与关键数值。策略循环不中断。
-    fn risk_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {
-        let verdict = self.risk.borrow_mut().check(req, self);
+    /// 工程护栏前置检查 (019-R5): 超频 → `Rejected` ack (与资金不足/无仓可平同形, 计入 rejected_count),
+    /// 并 `tracing::warn!(target: "order_guard")` 输出上限与窗口计数。策略循环不中断。
+    fn guard_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {
+        let verdict = self.guard.borrow_mut().check(self.now_utc());
         match verdict {
             Ok(()) => None,
             Err(e) => {
                 tracing::warn!(
-                    target: "risk",
+                    target: "order_guard",
                     name = %self.config.name,
                     pair = %req.pair,
                     side = ?req.side,
-                    "风控拒单: {e}"
+                    "工程护栏拒单(下单频率超限): {e}"
                 );
-                Some(OrderAck {
-                    exchange_order_id: String::new(),
-                    client_order_id: req.client_order_id.clone(),
-                    pair: req.pair.clone(),
-                    side: req.side,
-                    price: req.price.unwrap_or(Decimal::ZERO),
-                    size: req.size,
-                    filled_size: Decimal::ZERO,
-                    status: OrderStatus::Rejected,
-                })
+                Some(crate::order_guard::rejected_ack(req))
             }
         }
     }
@@ -1629,7 +1620,7 @@ impl Context for BacktestContext {
     }
 
     fn place_order(&mut self, req: OrderRequest) -> CoreResult<OrderAck> {
-        if let Some(rejected) = self.risk_reject(&req) {
+        if let Some(rejected) = self.guard_reject(&req) {
             self.rejected_count += 1;
             return Ok(rejected);
         }
@@ -1860,7 +1851,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -1888,7 +1878,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -1915,7 +1904,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -1945,7 +1933,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -1971,7 +1958,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -2044,7 +2030,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -2103,7 +2088,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params,
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -2147,7 +2131,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -2183,7 +2166,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params,
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -2224,7 +2206,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -2267,7 +2248,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params,
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -2299,7 +2279,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -2328,7 +2307,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: market.into(),
@@ -2341,48 +2319,38 @@ mod tests {
         )
     }
 
-    /// 004: 风控接线 —— 极小频率上限在回测中如实拒单, 且策略循环不中断 (同一 tick 第 2 单起被拒)。
+    /// 019-R5: 固定工程护栏接线 —— 同一 tick 第 101 单被拒, 且策略循环不中断 (前 100 单正常)。
     #[test]
-    fn test_risk_rate_limit_wired_into_backtest() {
-        let mut params = HashMap::new();
-        params.insert("risk_max_orders_per_sec".to_string(), ConfigValue::Integer(1));
-        let config = StrategyConfig {
-            name: "t".into(),
-            strategy_type: "custom".into(),
-            enabled: true,
-            exchange: "binance".into(),
-            params,
-            risk: None,
-            dry_run_started_at: None,
-            live_enabled: false,
-            market: "spot".into(),
-            position_mode: "one-way".into(),
-            backtest: None,
-        };
-        let mut ctx = BacktestContext::new(
-            config,
-            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
-        );
+    fn test_order_guard_rate_limit_wired_into_backtest() {
+        let mut ctx = test_ctx("spot", "one-way", 100000);
         ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
-        let a1 = ctx.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1))).unwrap();
-        assert_eq!(a1.status, OrderStatus::Filled, "第 1 单应正常成交");
-        let a2 = ctx.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1))).unwrap();
-        assert_eq!(a2.status, OrderStatus::Rejected, "同 tick 第 2 单应被频率上限拒绝: {a2:?}");
-        assert_eq!(ctx.report().rejected_count, 1, "风控拒单应如实计数");
-        assert_eq!(ctx.balance("ETH"), Some(dec!(1)), "被拒订单不得成交");
+        for i in 1..=100 {
+            let ack =
+                ctx.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1))).unwrap();
+            assert_eq!(ack.status, OrderStatus::Filled, "第 {i} 单应正常成交 (固定上限 100 单/秒)");
+        }
+        let a101 =
+            ctx.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1))).unwrap();
+        assert_eq!(
+            a101.status,
+            OrderStatus::Rejected,
+            "同 tick 第 101 单应被工程护栏拒绝: {a101:?}"
+        );
+        assert_eq!(ctx.report().rejected_count, 1, "护栏拒单应如实计数");
+        assert_eq!(ctx.balance("ETH"), Some(dec!(100)), "被拒订单不得成交");
     }
 
-    /// 004: 默认护栏不误伤常规节奏 (SC-003/不误伤)。
+    /// 019-R5: 固定护栏不误伤常规节奏 (单 tick 少量下单恒放行)。
     #[test]
-    fn test_risk_defaults_do_not_misfire() {
+    fn test_order_guard_defaults_do_not_misfire() {
         let mut ctx = test_ctx("spot", "one-way", 100000);
         ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
         for _ in 0..5 {
             let ack =
                 ctx.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1))).unwrap();
-            assert_eq!(ack.status, OrderStatus::Filled, "默认参数下小程序下单不应被拒");
+            assert_eq!(ack.status, OrderStatus::Filled, "固定护栏下小程序下单不应被拒");
         }
-        assert_eq!(ctx.report().rejected_count, 0, "默认护栏不得误拒");
+        assert_eq!(ctx.report().rejected_count, 0, "固定护栏不得误拒");
     }
 
     #[test]
@@ -2526,7 +2494,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: market.into(),
@@ -2913,7 +2880,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),

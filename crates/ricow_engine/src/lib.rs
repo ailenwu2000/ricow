@@ -6,6 +6,7 @@ mod confirm;
 mod live;
 mod loader;
 mod market;
+mod market_class;
 mod nasdaq;
 mod notify;
 mod strategy;
@@ -15,7 +16,7 @@ pub use backtest_runner::{
     build_daily_ticks, build_interval_ticks, run_backtest, run_portfolio_backtest,
 };
 pub use command::{Engine, RunOutcome, StopReason, StopRequest, StopSignal};
-pub use confirm::{approve, consume, create_preview, get_preview, reject};
+pub use confirm::{approve, consume, create_preview, get_preview, reject, PREVIEW_TTL_SECS};
 pub use live::{
     check_clock_skew, clock_align_guidance, dry_run_gate, dry_run_initial_cash,
     liquidation_distance, live_gate, plan_cleanup, residual_owned, risk_gate, skew_ms,
@@ -24,6 +25,7 @@ pub use live::{
 };
 pub use loader::load_strategy;
 pub use market::{fetch_orderbook, subscribe_orderbook, to_orderbook};
+pub use market_class::{bstock_spot_pool, build_view, filter_view, is_bstock_base, PairsView};
 pub use nasdaq::{parse_historical, NasdaqClient};
 pub use notify::{EventKind, Notifier, NotifyConfig, NotifyEvent};
 /// 订单号归属判定 (011 D6): 实现见 `ricow_strategy::align`, 此处转发便于引擎/CLI 直接用。

@@ -1,7 +1,7 @@
 # 币安测试网环境 (demo.binance.com)
 
 > 状态: 已配置(2026-09-04 用户提供凭据)
-> 用途: ricow 现货 + 合约功能在币安测试网的真实联调与测试(下单/撤单/成交/持仓/风控全闭环)。
+> 用途: ricow 现货 + 合约功能在币安测试网的真实联调与测试(下单/撤单/成交/持仓/门禁全闭环)。
 > 凭据授权: ~~曾授权明文入库~~ → 2026-09-14 收敛 T072: 凭据值已移出仓库, 统一存于 `$RICOW_ROOT/ricow.toml`。
 
 ## 平台信息
@@ -27,7 +27,7 @@
 **本文件不再保存凭据值**(2026-09-14 收敛 T072)。凭据统一存放在用户的唯一配置文件里:
 
 ```toml
-# $RICOW_ROOT/ricow.toml (权限 0600, 不入 git)
+# $RICOW_ROOT/ricow.toml (Unix 权限 0600, 不入 git)
 [exchange]
 demo_key=***      # 币安模拟交易平台的 API Key
 demo_secret=***   # 对应 Secret
@@ -43,7 +43,7 @@ demo_secret=***   # 对应 Secret
 - 现货/合约 REST 基址: 代码已支持环境变量覆盖主网域名
   (`RICOW_BN_BASE_URL` 现货 / `RICOW_FAPI_BASE_URL` USDT-M), 指向上表 demo 端点即可切换测试网。
 - 密钥注入: 集成测试/联调读环境变量 `RICOW_BN_API_KEY` / `RICOW_BN_SECRET_KEY`(不落盘)。
-  产品路径走统一密钥层(OS Keyring 优先, headless 回落 env)——keyring 双 key 模型适配另立任务。
+  产品路径走**单一配置文件** `ricow.toml` `[exchange]` 段(Unix 0600 明文 / Windows 仅当前用户 ACL; OS Keyring 方案已于 2026-09-14 随 019 D31 移除)。
 
 ## 注意事项
 

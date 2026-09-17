@@ -7,14 +7,16 @@ mod supervisor;
 use clap::{Parser, Subcommand};
 
 use commands::{
-    agentkit, approve, backtest, create, ctrl, daemon, db, deploy, instances, logs, market, run,
+    agentkit, approve, backtest, chat, create, ctrl, daemon, db, deploy, instances, logs, market,
+    pairs, run,
 };
 
 #[derive(Parser)]
 #[command(name = "ricow", version, about = "ricow 本地量化终端 (回测 / Dry Run / 实盘)")]
 pub(crate) struct Cli {
+    /// 省略子命令 = 进入对话模式 (向导 + AI 助手)
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -43,6 +45,8 @@ enum Command {
     Ticker(market::TickerArgs),
     /// 盘口
     Orderbook(market::OrderbookArgs),
+    /// 交易对视野 (默认只列股票类; --all 列全部)
+    Pairs(pairs::PairsArgs),
     /// K 线库管理
     Db(db::DbArgs),
     /// 日志 (读 logs/<name>.log, --follow 尾随)
@@ -81,25 +85,28 @@ async fn main() {
 
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Start(args) => ctrl::start(args).await,
-        Command::Stop(args) => ctrl::stop(args).await,
-        Command::Restart(args) => ctrl::restart(args).await,
-        Command::List(args) => instances::list(args).await,
-        Command::Status(args) => instances::status(args).await,
-        Command::Info(args) => instances::info(args).await,
-        Command::Fills(args) => instances::fills(args).await,
-        Command::Daemon(args) => daemon::run(args).await,
-        Command::Run(args) => run::run(args).await,
-        Command::Backtest(args) => backtest::run(args).await,
-        Command::Ticker(args) => market::ticker(args).await,
-        Command::Orderbook(args) => market::orderbook(args).await,
-        Command::Db(args) => db::run(args).await,
-        Command::Logs(args) => logs::run(args),
-        Command::Approve(args) => approve::run(args).await,
-        Command::Create(args) => create::run(args).await,
-        Command::Deploy(args) => deploy::run(args).await,
-        Command::Ai(args) => commands::ai::run(args).await,
-        Command::AgentKit(args) => commands::agentkit::run(args),
+        // 裸入口: `ricow` 一条命令即启动 (缺密钥时先走向导, 随后进入对话)
+        None => chat::run().await,
+        Some(Command::Start(args)) => ctrl::start(args).await,
+        Some(Command::Stop(args)) => ctrl::stop(args).await,
+        Some(Command::Restart(args)) => ctrl::restart(args).await,
+        Some(Command::List(args)) => instances::list(args).await,
+        Some(Command::Status(args)) => instances::status(args).await,
+        Some(Command::Info(args)) => instances::info(args).await,
+        Some(Command::Fills(args)) => instances::fills(args).await,
+        Some(Command::Daemon(args)) => daemon::run(args).await,
+        Some(Command::Run(args)) => run::run(args).await,
+        Some(Command::Backtest(args)) => backtest::run(args).await,
+        Some(Command::Ticker(args)) => market::ticker(args).await,
+        Some(Command::Orderbook(args)) => market::orderbook(args).await,
+        Some(Command::Pairs(args)) => pairs::pairs(args).await,
+        Some(Command::Db(args)) => db::run(args).await,
+        Some(Command::Logs(args)) => logs::run(args),
+        Some(Command::Approve(args)) => approve::run(args).await,
+        Some(Command::Create(args)) => create::run(args).await,
+        Some(Command::Deploy(args)) => deploy::run(args).await,
+        Some(Command::Ai(args)) => commands::ai::run(args).await,
+        Some(Command::AgentKit(args)) => commands::agentkit::run(args),
     };
 
     if let Err(e) = result {

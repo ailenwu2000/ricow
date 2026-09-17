@@ -4,9 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 description.workspace = true
 repository.workspace = true
+homepage.workspace = true
 readme.workspace = true
+
+[package.metadata.wix]
+upgrade-guid = "9EAEC2D1-DAAE-428F-A936-FA88C837A30D"
+path-guid = "15AB41BC-15B9-4C8B-AF87-E8487C222BE0"
+license = false
+eula = false
 
 [[bin]]
 name = "ricow"
@@ -30,6 +38,8 @@ toml = "0.8"
 futures.workspace = true
 rig.workspace = true
 rustls.workspace = true
+# 019: 向导/`/keys` 静默录入密钥 (Win=winapi Console, Unix=termios); 纯 Rust 无异步依赖
+rpassword = "7"
 
 [dev-dependencies]
 rust_decimal_macros = "1"

@@ -35,7 +35,7 @@
     <ul style="margin:0">
       <li><strong>One binary</strong> — <code>ricow</code>, built from a 5-crate Rust workspace.</li>
       <li><strong>Strategies in Lua</strong>, sandboxed (no <code>os</code>/<code>io</code>/<code>require</code>/<code>loadstring</code>/<code>pcall</code>, 1M instructions per tick, 64&nbsp;MB memory).</li>
-      <li><strong>One config file</strong>: <code>ricow.toml</code> (mode <code>0600</code>, plaintext, never committed).</li>
+      <li><strong>One config file</strong>: <code>ricow.toml</code> (plaintext, never committed; <code>0600</code> on Unix, current-user ACL on Windows).</li>
       <li><strong>Four run modes</strong>: backtest → Dry Run → demo (Binance testnet, real orders) → live (real money).</li>
     </ul>
   </div>
@@ -78,10 +78,10 @@ ricow deploy &lt;preview_id&gt; --token &lt;token&gt;                           
 <section>
   <h2>Safety model</h2>
   <ul>
-    <li><strong>Keys stay local.</strong> One <code>ricow.toml</code> on your machine (<code>0600</code>, git-ignored). The tool never writes keys for you and never sends them anywhere.</li>
+    <li><strong>Keys stay local.</strong> One <code>ricow.toml</code> on your machine (<code>0600</code> on Unix / current-user ACL on Windows, git-ignored). The tool never writes keys for you and never sends them anywhere.</li>
     <li><strong>Live trading is gated.</strong> A strategy must declare <code>live_enabled = true</code>; the CLI requires <code>--live --accept-risk</code>, a first-use risk acknowledgement, and a minimum Dry Run duration before it will go live.</li>
-    <li><strong>Write actions are human-only.</strong> The confirmation phrases (deploy / go live) can only be typed in an interactive terminal — anything fed through pipes, scripts, or AI tool calls is rejected.</li>
-    <li><strong>The built-in AI assistant is read-only.</strong> It can answer questions, run backtests, and read the docs — it cannot place orders, deploy, or move money.</li>
+    <li><strong>Write actions are human-only.</strong> Confirmation phrases (deploy / go live / risk ack / stop) are only accepted when <em>typed by you</em>: the assistant can register a pending action, but the phrase is checked against your keystrokes in the same interactive session — anything fed through pipes, scripts, or tool calls is rejected.</li>
+    <li><strong>The assistant never gets write tools.</strong> It can answer questions, run backtests, and read the docs; deploying, starting, or stopping anything takes a pending action <em>plus</em> a phrase you type yourself.</li>
   </ul>
 </section>
 

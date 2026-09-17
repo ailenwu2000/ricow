@@ -1,14 +1,14 @@
 # ricow 架构文档 v4.1(现状, 纯 CLI 客户端)
 
 > 状态: ✅ 已实施(P1-P3 完成; P4 dogfood 实盘待开始, 进度见 specs/roadmap.md)
-> 职责: 本文描述**当前实际架构**(与代码逐份复核, 2026-09-11)。产品定位见 specs/product.md, 里程碑见 specs/roadmap.md。
+> 职责: 本文描述**当前实际架构**(与代码逐份复核, 2026-09-16)。产品定位见 specs/product.md, 里程碑见 specs/roadmap.md。
 > 策略 API 唯一权威见 specs/lua-api.md; 回测口径唯一权威见 specs/backtest.md。
 
 ---
 
 ## 一、目标架构
 
-CLI 单入口直连同一引擎与同一下单路径, 安全模型一致(confirm + RiskEngine + Dry Run 默认):
+CLI 单入口直连同一引擎与同一下单路径, 安全模型一致(confirm + 固定下单频率护栏 + Dry Run 默认):
 
 ```
 ricow CLI (clap)
@@ -17,7 +17,7 @@ ricow CLI (clap)
 ricow_engine (headless 核心: 命令分发 / 回测 / 确认通道)
       │
       ▼
-ricow_strategy (Lua 沙箱 + ctx.* API + exec.* 组件 + 指标 / 风控 / 回测 / SQLite)
+ricow_strategy (Lua 沙箱 + ctx.* API + exec.* 组件 + 指标 / 回测 / SQLite / 固定 100/s 护栏)
       │
       ▼
 ricow_core: Exchange trait ─► ricow_binance
@@ -30,13 +30,13 @@ ricow_core: Exchange trait ─► ricow_binance
 |:--|:--|
 | ricow_core | 核心类型(Order/Position/Balance/Kline…)+ Exchange trait |
 | ricow_binance | Binance 现货 REST/HMAC/WS (place_order/cancel/account) + USDT-M 公共数据源 (`FuturesDataClient`: fapi K 线 / 首档 MMR 表) + **fapi 签名交易客户端 `FuturesClient`** (下单/账户/持仓/杠杆/双向持仓, 2026-09-04 testnet 联调新增; 域名 RICOW_BN_BASE_URL / RICOW_FAPI_BASE_URL 可配 demo 测试网) |
-| ricow_strategy | 策略引擎: Lua 沙箱 / ctx 与 exec 注册 / 指标(ta)/ 风控 / 回测 / PnL / SQLite |
+| ricow_strategy | 策略引擎: Lua 沙箱 / ctx 与 exec 注册 / 指标(ta)/ 回测 / PnL / SQLite / **固定 100 单·秒⁻¹ 护栏 `order_guard`(2026-09-16 019-R5: 原 `risk.rs` 四条静态限额与装配器已删除)** |
 | ricow_engine | headless 核心: Engine 命令分发 / backtest_runner(单标的 + 组合) / confirm(preview+approve)/ loader / market / **美股层 `nasdaq`(Nasdaq 日线客户端) / `us_tickers`(bStock↔美股映射, 70 只快照) / `market_class`(bStock 现货池识别, 通用能力保留: 当前无内置消费者)** |
-| ricow | 二进制 `ricow`: clap 子命令分发 + **AI 助手 `ai/`(019: 提示词、工具白名单 L0 只读 + L1 虚拟、审批门 `ToolGuard`; R3 对话内确认状态机 `ai/confirm.rs`)** + 单一配置文件读写 `commands/config_file.rs` |
+| ricow | 二进制 `ricow`: clap 子命令分发 + **AI 助手 `ai/`(019: 提示词、工具白名单 L0 只读 + L1 虚拟、审批门 `ToolGuard`; 会话缝 `ai/session.rs`(`ChatSession` + `SessionSink`, 零 stdio); R3/R4 对话内确认状态机 `ai/confirm.rs` 7 动作)** + 首次向导 `commands/onboard.rs` + 单一配置文件读写 `commands/config_file.rs`(含 `set_values` 白名单 9 键) |
 
 > **内置 AI 助手已落地**(019-ai-assistant): `ricow ai` 调用用户自配的 LLM(`ricow.toml [ai]` provider+api_key)。
 > **LLM 接口统一为 rig 0.42 的 OpenAI 兼容通道**(2026-09-16 重审): 7 个预设(deepseek 首项, 默认模型 `deepseek-flash`; 其余为 OpenAI 兼容的主流厂商)+ custom 自定义 base_url, 供应商差异只收敛在 `ai/provider.rs` 一个文件, 无需 Anthropic 等第二通道; 不支持工具调用的模型如实报错, 不自动降级。
-> 写实动作**不作工具注册**(L2), 工具面只有只读(L0, 9 个)与虚拟(L1, 4 个)。**R3(2026-09-16)**: L1 新增 `request_write_confirmation` —— 它自身不落盘不起进程, 只渲染确认块并在会话内存登记一条 pending(`Arc<Mutex<Option<PendingAction>>>`, TTL 15min); 用户在**同一交互式 tty REPL** 逐字输入短语(`确认部署 <name>` / `确认启动测试网 <name>`, 裸 y/yes/ok 不认)后, 由**宿主**进程内直调既有引擎内核完成 deploy(`approve`→`execute_strategy`)或 demo 启动(`ctrl::start_daemon(demo=true)`)。模型输出永远不进入执行分支; 实盘启动/停机/平仓/改开关/改参数仍须本人终端; 单次模式/管道/外部 agent 只回终端命令。详见 `specs/changes/019-ai-assistant/spec.md` §七 R3。
+> 写实动作**不作工具注册**(L2), 工具面只有只读(L0, 12 个)与虚拟(L1, 4 个)。**R3/R4(2026-09-16)**: L1 的 `request_write_confirmation` 自身不落盘不起进程, 只渲染确认块并在会话内存登记一条 pending(`Arc<Mutex<Option<PendingAction>>>`, TTL 15min); 用户在**同一交互式 tty REPL** 逐字输入短语(裸 y/yes/ok 不认)后, 由**宿主** `ChatSession` 进程内直调既有引擎内核执行 —— **7 动作**: Deploy / StartDemo / StartLive(仍须原样跑 `ctrl::live_preflight` 三判据) / AckRisk / StopDemo / StopLive / CloseLive, 完整对照表见 019 spec §七 R4。模型输出永远不进入执行分支; 改开关/改参数仍须本人终端; 单次模式/管道/外部 agent 只回终端命令。详见 `specs/changes/019-ai-assistant/spec.md` §七 R3/R4。
 > **MCP 不做**(2026-09-15 定案, 修订 product.md D12 修订 2): 单机程序, 用户已有的 agent 可直接调用本机 CLI, 生态入口 = `ricow agent-kit` 手册(019 T045–T047)。
 > 原 2026-08-24 决策"无 MCP / 内置 LLM"中**内置 LLM 一项已由 019 修订**; MCP 一项维持不做(GUI 与 Telegram 仍不做)。
 > Hyperliquid 适配 crate(`locus_hl`)已于 2026-09-12 全量移除(从未落地, 暂不考虑) —— 见 `specs/changes/009-remove-hyperliquid/`。
@@ -77,16 +77,19 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
     (`universe` 键 / `signal_klines` / `SIGNAL_TAIL` 尾窗) + 任意 interval tick 对齐 `build_interval_ticks`,
     暂无内置消费者; 组合回测 CLI 入口随策略一并删除。
 - 用户策略: `<项目根>/strategies/<name>.toml` + `strategies/scripts/<name>.lua`(git 忽略默认私有; builtin 例外)
-- **单一配置文件**(019 D31): `$RICOW_ROOT/ricow.toml`(权限 0600, 进 `.gitignore`)—— `[ai]`(provider / model / base_url / max_turns / api_key)与
-  `[exchange]`(demo_key / demo_secret / binance_key / binance_secret)同文件; 该文件**即界面**(无 `ricow keyring` / `ricow setup` / 写凭据命令), 未知键硬失败。
+- **单一配置文件**(019 D31, R4 修订): `$RICOW_ROOT/ricow.toml`(权限: **Unix 0600 / Windows 无 POSIX 权限位**, 写入时尽力收紧为仅当前用户 ACL —— 对外展示口径统一取 `commands/config_file.rs::permission_summary`, 不得无条件写"0600"; 进 `.gitignore`)—— `[ai]`(provider / model / base_url / max_turns / api_key)、
+  `[exchange]`(demo_key / demo_secret / binance_key / binance_secret)与 `[market]`(show_all_pairs)同文件; 该文件**即界面**(无 `ricow keyring` / `ricow setup` / 写凭据命令), 未知键硬失败。
+  **R4 起文件可写**: `commands/config_file.rs::set_values` 按行外科替换/缺键插入(**保留注释**、原子写 + 0600), 白名单 9 键, 白名单外一律拒绝 —— 入口是首次向导 `commands/onboard.rs` 与对话内 `/keys` `/market`, 仍无独立"写凭据命令"。
   目录顺序: `RICOW_ROOT` env > 当前目录(含 `ricow.db`/`strategies/`)> 平台数据目录。
 
 ## 五、CLI
 
-命令集(**以 `ricow --help` 实测为准**, 2026-09-14):
+命令集(**以 `ricow --help` 实测为准**, 2026-09-16):
 `start [--demo]` / `stop [--close-all]` / `restart` / `list` / `status [name]` / `info` / `fills` / `logs` / `run [--live|--demo]` /
-`backtest` / `ticker` / `orderbook` / `create` / `approve` / `deploy` / `db` / `daemon {start|stop|status|run}` /
+`backtest` / `ticker` / `orderbook` / `pairs [--market] [--all]` / `create` / `approve` / `deploy` / `db` / `daemon {start|stop|status|run}` /
 **`ai`**(019: 内置 AI 助手, 交互 / 单次 / `--plain`)/ **`agent-kit`**(019: `ricow agent-kit [--install [目录]]` 生成给外部 agent 的手册 —— AGENTS.md / SKILL.md / CLAUDE.md / lua-api.md, 与内置 AI 同源); `mcp` **不做**(2026-09-15 定案)。
+
+**裸入口(019 R4)**: `ricow` 不带子命令 → 直接进对话(`commands::chat`); 缺 AI key 且非本地 ollama 时先走首次向导(`commands::onboard`: 供应商选择 → 静默录入密钥 → 可选连通校验 → 外科式写回 `ricow.toml`), 币安凭据可跳过后用 `/keys demo` 补录。非 tty 一律双语报错 + 打印配置路径, exit 1(不静默降级)。原 clap 子命令全部保留, 变成同一 `ChatSession` 的薄壳。对话内斜杠命令: `/keys [ai|demo|live]` 查看/静默录入密钥(只回显尾 4 位)、`/market [bstock|all]` 查看/切换交易对视野(`[market] show_all_pairs`)。
 
 ~~`keyring`~~ / ~~`setup`~~ / ~~`credentials`~~ / ~~`config`~~ —— 2026-09-14 随单一配置文件方案**全部删除**(019 D31: 文件即界面)。
 
@@ -95,7 +98,8 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   `ricow approve <preview_id>`(人工批准: 打印**确认块**(动作/目标/关键参数/后果), 要求**逐字输入** `确认部署 <策略名>` —— 裸 `y` 不接受, **且必须来自交互终端**(stdin 非终端即拒绝: 管道/脚本/agent 工具调用喂入的短语一律无效, 019 spec §七 R2 已实现); 通过后发一次性 token, 15 分钟有效)→ `ricow deploy <preview_id> --token <t>`
   —— 落盘 `strategies/<name>.toml`(`params.script_path` 指向)+ `strategies/<name>.lua`; 同名策略存在即拒绝(不覆盖)
 - 首次使用风险确认(018, product.md §十): 实盘启动前一次性确认 —— 未确认时**拒绝启动**并打印披露要点(仅供学习/无止损与选品责任/先 Dry Run + 子账号小额/不代管资金密钥)与确认方式; `--accept-risk` 确认一次后记入 `$RICOW_ROOT/risk_ack.json`(带 schema 版本, 披露实质变更可递增触发重新确认)。判定顺序: **风险确认 → Dry Run 时长门禁 → 时钟预检**(未确认时零交易所往返); Dry Run/回测不受影响
-- Dry Run 虚拟本金可配(016): `params.initial_cash`(缺省 100000) —— 用小资金同口径预演才能让 `[risk]` 限额同时适配 Dry Run 与实盘; 非法值报错不静默回落; 启动打印本金额
+- 交易对视野(019 R4/D5): `ricow pairs [--market spot|futures] [--all]` —— 默认视野 = bStock 现货(`<base>BUSDT`, XxxB × EQUITY 白名单交叉)+ 股票永续(`<base>USDT`, TRADIFI_PERPETUAL); `--all` 见全量。免 key 公共端点, 进程内 TTL 缓存 + 输出截断并报告总数; 同一视野由对话内 `/market` 与 L0 工具 `list_pairs` 共用
+- Dry Run 虚拟本金可配(016): `params.initial_cash`(缺省 100000) —— 用小资金同口径预演, Dry Run 的权益口径才与实盘可比; 非法值报错不静默回落; 启动打印本金额
 - Dry Run 起点与实盘时长门禁(002): 首次 Dry Run 启动时把 `dry_run_started_at`(ISO8601)写入策略 TOML;
   实盘启动要求 Dry Run 累计 ≥ `params.min_dry_run_hours`(默认 24 小时, 设 0 关闭), 不足则**拒绝启动**(不降级)
 
@@ -115,10 +119,10 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - `RICOW_ROOT`(数据目录, 决策 D4): 显式覆盖 > 当前目录已有 `ricow.db`/`strategies/` 时沿用现状 > 平台标准目录
   (Windows `%APPDATA%\ricow` / macOS `~/Library/Application Support/ricow` / Linux `$XDG_DATA_HOME|~/.local/share`+`/ricow`)
 - `RICOW_DB`(默认 `RICOW_ROOT/ricow.db`): SQLite — `klines`(交易所 K 线缓存)/ `fills`(成交, 含 `strategy_id`)/ `pnl_snapshots`(盈亏快照)/ `previews`(写操作预览)/ `us_klines`(美股 Nasdaq 日线, 信号轨与交易日历; **缓存不回源, 需手工增量补最后若干天**)
-- `RICOW_ROOT/run/`: `daemon.json`(daemon pid/端口/token, 权限 0600)/ `<name>.json`(实例台账: pid/启动时间/模式/上次退出码与原因)
+- `RICOW_ROOT/run/`: `daemon.json`(daemon pid/端口/token, Unix 0600 / Windows 仅当前用户 ACL)/ `<name>.json`(实例台账: pid/启动时间/模式/上次退出码与原因)
   > ⚠️ 多进程共享同一 `ricow.db` 的并发写依赖 WAL + `busy_timeout`(sqlx 默认 5s): 实测 3 进程 × 200 事务在 busy_timeout=5s 下全部成功, =0 时失败 83%(`.hermes`→已归档 `specs/research/process-model-probe-2026-09.md` §四)。**不得把 `busy_timeout` 设为 0, 也不得把数据目录放在网络盘/云同步盘**(SQLite WAL 明确不支持网络文件系统)
 - `RICOW_ROOT/logs/`: `<name>.log`(策略进程 stdout/stderr 追加日志; 启动时 >10MB 轮转 `.log.1`)与 `daemon.log`
-- 密钥: OS Keyring + headless 加密文件 fallback(无 Secret Service 时)
+- 密钥: 单一明文配置文件 `ricow.toml`(Unix 0600 / Windows 仅当前用户 ACL; 019 D31/R4; OS Keyring 与 headless 加密文件 fallback 已于 2026-09-14 移除)
 
 ## 七、安全模型
 
@@ -129,16 +133,18 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - Dry Run 时长门禁(002): 实盘启动额外要求该策略 Dry Run 累计 ≥ `params.min_dry_run_hours`(默认 24 小时 = 覆盖三个交易时段的一个完整日周期;
   设 0 关闭)。起点由首次 Dry Run 启动写入 TOML `dry_run_started_at`(ISO8601); 不足即拒绝启动, 并给出已运行时长与解除方式。
   Dry Run / 回测 / 沙箱不受此门禁影响。
-- RiskEngine 下单前硬检查 — 回测 / Dry Run / 实盘**同一引擎同一装配**(`RiskEngine::from_config`), 三条 `place_order` 顶部统一拦截:
-  - 静态限额(用户显式配置才启用): 最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点 —— 平台不替用户定政策, 只执行用户写下的政策;
-  - 工程护栏(默认启用): **下单频率上限**(滑动窗口 1s, 默认 100/s) —— 防风暴下单被交易所限流封禁;
-  - ~~两级亏损熔断~~ **已于 2026-09-15 删除**(020): 盈亏政策属于策略, 平台不再代做投资判断; 策略用 `ctx:net_pnl()` / `ctx:equity()` 自管 (内置 `shannon_grid` 的 `dd_stop_pct` 为参考写法);
-  - 被拒请求返回 `Rejected` ack(与资金不足同形)并计入回测报告"拒单次数", 同时 `tracing::warn!(target: "risk")` 输出规则名与关键数值; 平仓/减仓不受熔断限制。详见 `specs/backtest.md` §二.6 与 `specs/changes/004-risk-guards/`。
-  - > 修正记录(2026-09-12): 004 之前 RiskEngine 的唯一调用点是无消费者的 `StrategyScheduler`, 三条真实下单路径**均未过风控** —— 即上述四条规则当时实际从未生效; 已随 004 接入。
+- **平台不做投资判断**(2026-09-16, 019-R5; 宪法 §安全要求已同步修订) —— 赚赔政策属于策略, 平台只做执行 + 数据 + 门禁 + 状态:
+  - **已删除**: `risk.rs` 的四条静态限额规则(最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点)、`RiskSettings` / `RiskEngine` 装配器、`config.rs` 的 `RiskConfig` 与 `validate_risk()`、死模块 `scheduler.rs`; 老策略 TOML 残留的 `[risk]` 段与 `risk_*` 参数被 serde 忽略(**不再生效**, 装载不报错), 不做迁移脚本。
+  - 策略自管: 用只读 `ctx:net_pnl()` / `ctx:equity()` 实现止损/回撤/仓位政策(内置 `shannon_grid` 的 `dd_stop_pct` 为参考写法, 默认关闭); ~~平台级两级亏损熔断~~ 已于 2026-09-15 删除(020)。
+  - **保留**: 固定工程护栏 `ricow_strategy::order_guard` —— 三条 `place_order` 顶部统一拦截**下单频率上限**(滑动窗口 1s, 固定 100/s, 回测 / Dry Run / 实盘同一装配, 计数对全部 pair 共享), 防 bug 风暴下单被交易所限流封禁; **固定常量、不读任何配置、无配置面**。
+  - 被拒请求返回 `Rejected` ack(与资金不足同形)并计入回测报告"拒单次数", 同时 `tracing::warn!(target: "order_guard")` 输出关键数值; 策略循环不中断。详见 `specs/backtest.md` §二.6 与 `specs/changes/019-ai-assistant/spec.md` §七 R5。
+  - > 修正记录(2026-09-12): 004 之前 RiskEngine 的唯一调用点是无消费者的 `StrategyScheduler`, 三条真实下单路径**均未过风控** —— 即四条静态规则当时实际从未生效; 已随 004 接入, 又随 2026-09-16 R5 整体删除。
 - Dry Run 默认, 确认后切实盘(011 落地): 门禁**双条件** = TOML `live_enabled=true` **且** 命令行 `--live`(缺一即按 Dry Run 运行并打印原因; `ricow start` 同口径, 台账 `mode` 与实际运行器一致)
 - **实盘二次分离**(019 D4/T029-T030): 双条件之外, 每次实盘启动必须在**交互终端逐字输入** `确认实盘 <策略名>`(裸 `y`/空/EOF 一律拒绝, 零副作用);
   确认只发生在父进程 CLI, daemon 协议 `Request::Start.confirmed` 缺失时**明确拒绝**(不静默降级), 子进程由 daemon 注入内部 `--live-confirmed` 不再索要 stdin。
+  > **内部通道双条件(019 R4 收敛)**: 子进程认账要求 `--live-confirmed` 标志 **且** 环境变量 `RICOW_DAEMON_SPAWNED`(由 daemon spawn 时经 `cmd.env` 注入)同时成立 —— 单靠标志可被手工构造, 加环境变量后"用户自己敲命令加 flag"不成立, 只剩 daemon 派生链内部可信(`supervisor/procs.rs::DAEMON_SPAWN_ENV` / `spawned_by_daemon()`, 判定与单测在 `commands/run.rs::daemon_confirmation_accepted`)。
   实盘三判据(018 风险披露确认 → 002 Dry Run 时长门禁 → 008 时钟预检)顺序与判据**未改动**。
+  > **R4(2026-09-16)**: 该短语现在也可在**对话内**输入(`ricow` REPL / `ricow ai`, 仍须交互式 tty); 执行由宿主进程内直调 `ctrl::live_preflight` → `start_daemon(live, confirmed)`, **三判据一条不少、顺序一字未改**。停 demo/实盘与 `--close-all` 平仓同理(短语见 019 spec §七 R4 表)。
 - **demo 运行模式**(019 T062): `ricow run|start <name> --demo` —— 真实调用币安**模拟交易(demo)**平台下单接口(无真实资金),
   因此**不适用**实盘三判据, 但仍需 demo 凭据、并按 **demo 服务器**做时钟预检; `--demo --live` 同时给直接拒绝; 台账与 CLI 文案均标注 `测试网模拟盘(demo)`。
 - 实盘启动前**时钟预检**: 本机超前交易所服务器 >1000ms 或滞后 >4000ms → 拒绝启动并打印对齐步骤(币安对签名请求超前 >1s 直接拒绝, 见 `specs/testnet.md`); 取数走公共 `/api/v3/time`
@@ -160,8 +166,8 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-09-15, 021 clippy 清零后实跑)**: `cargo test --workspace` = **339 passed / 0 failed / 12 ignored**(ignored 仍为需真实外部环境的联调用例; 021 只做机械清理, 用例数不变)
-- 历史基线(2026-09-13, 018 实施后): 308 passed / 0 failed / 11 ignored(ignored = 需真实外部环境的联调用例, 不 mock 替代; 构成: BN demo 现货 4 + 合约 5 + Nasdaq 冒烟 2)
+- **基线(2026-09-17, 019 R5 + gr 复核修复后实跑)**: `cargo test --workspace` = **403 passed / 0 failed / 21 ignored**(ignored 仍为需真实外部环境的联调用例, 不 mock 替代; R4/R5 新增护栏单测 + 配置写回/交易对视野/`/keys` 单测 + 1 个管道确认门禁集成用例, 另增 5 个真机 `#[ignore]` 场景; gr 复核修复再增 bin 单测 13 条: 会话 root 取数 / preview TTL 与引擎常量同源 / 门禁指南关键词 / daemon 双条件认账等)
+- 历史基线(2026-09-15, 021 clippy 清零后): 339 passed / 0 failed / 12 ignored; 更早(2026-09-13, 018 实施后): 308 passed / 0 failed / 11 ignored(ignored = 需真实外部环境的联调用例, 不 mock 替代; 构成: BN demo 现货 4 + 合约 5 + Nasdaq 冒烟 2)
 - 实盘链路真实验证(011 demo 现货 / 012 demo 合约): 用户流订阅 → 真实下单 → 成交回写落库 → 停机撤单兜底/平仓 → 交易所侧零残留(合约含 one-way 与 hedge 双向); 记录见 `specs/testnet.md`
 - 账目类数字(SQLite `SUM`)须在 Rust 侧用 `Decimal` 聚合: SQL 的 INTEGER 兜底可击穿 f64 解码(崩溃), REAL 往返会污染小数(012 实测)
 
@@ -175,7 +181,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 | 脚本 | mlua 0.11(Lua 5.4, vendored) |
 | 指标 | ta 0.5 |
 | 数值 | rust_decimal(金额/价格) |
-| 密钥 | 单一 0600 配置文件 `ricow.toml`(明文; 取舍理由见 §七 与 README) |
+| 密钥 | 单一配置文件 `ricow.toml`(明文; Unix 0600 / Windows 仅当前用户 ACL; 取舍理由见 §七 与 README) |
 | AI 助手 | rig 0.42(`rig-core`/`rig-agent`) + reqwest; **rustls crypto provider 进程启动时显式安装**(019: 依赖图内 aws-lc-rs 与 ring 并存时, 用户数据流 WS 会在建 TLS 时 panic) |
 
 ## 十一、CLI 残留与文档-实现缺口
@@ -235,7 +241,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 | # | 残留 | 处置 |
 |:--|:--|:--|
-| O | 熔断/成交/强平/残留等高风险事件只落本地日志(product.md §三.4 的承诺未兑现) | ✅ 出站通知(`ricow_engine::notify`): 用户自选 webhook + 四类事件 + 白名单/限速/去重 + 失败只 warn 不反压循环; 配置走 params, 默认关闭 |
+| O | 熔断/成交/强平/残留等高风险事件只落本地日志(product.md §三.4 的承诺未兑现) | ✅ 出站通知(`ricow_engine::notify`): 用户自选 webhook + 事件白名单/限速/去重 + 失败只 warn 不反压循环; 配置走 params, 默认关闭。**熔断事件已于 2026-09-15 随 020 删除**(现行 3 类: 成交 / 接近强平 / 停机残留) |
 
 ### 已清理(2026-09-13, 随 017 实施一并处理 — dogfood 实测发现)
 

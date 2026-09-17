@@ -13,8 +13,12 @@ version = "0.7.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.88"
+# cargo-dist 的 msi 安装器(cargo wix)要求 manifest 里有 authors:
+# 它会写进 WiX 的 Manufacturer(Windows「应用和功能」里显示的名字)。
+authors = ["ailenwu2000"]
 description = "ricow —— 完全本地运行的量化策略引擎(回测 / Dry Run / 实盘), 策略用 Lua 编写, 纯本地 CLI"
 repository = "https://github.com/ailenwu2000/ricow"
+homepage = "https://github.com/ailenwu2000/ricow"
 readme = "README.md"
 
 [workspace.dependencies]

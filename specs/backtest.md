@@ -1,6 +1,6 @@
 # ricow 回测规范(现货 + 合约)
 
-> **状态**: ✅ 已实施(2026-09-04 定稿 D1-D11 并同日完成引擎重构;v0.2;2026-09-13 由 **013-futures-margin-model** 按真实清算实测校准记账模型: 逐仓钱包按侧独立 + 按侧强平 + 结算时点修正(L1/L2 关闭;L4 由 **015-backtest-noop-fill** 关闭);测试基线 304, §十 遗留项已全部关闭)
+> **状态**: ✅ 已实施(2026-09-04 定稿 D1-D11 并同日完成引擎重构;v0.2;2026-09-13 由 **013-futures-margin-model** 按真实清算实测校准记账模型: 逐仓钱包按侧独立 + 按侧强平 + 结算时点修正(L1/L2 关闭;L4 由 **015-backtest-noop-fill** 关闭);测试基线 390/21 ignored(2026-09-16), §十 遗留项已全部关闭)
 > **范围**: 事件驱动 bar 回测,统一覆盖现货与合约(USDT-M);本规范为回测引擎实现的唯一权威。
 > **参考**: freqtrade 回测撮合假设(官方文档)、backtesting.py(费用/保证金模型)、本项目 2026-08 回测实测教训(见 grid-trading-strategy skill references)、2026-09-04 实测发现的 Bug A(余额不足免费建仓)/Bug B(手续费不入余额)。
 > **原则**: 简单实用;默认保守(不高估收益、不低估成本);确定性可复现;无前视。
@@ -25,14 +25,11 @@
 3. **保守触及**: 成交价不优于限价;跳空越过(open 已优于 limit)仍按 limit(保守,不高估)。
 4. **每根 bar 顺序**(确定性): ① 撮合已有挂单(reduce_only 单先) ② `on_tick` ③ 新市价单即时成交 ④ 收盘估值。
 5. 每根 bar 每单至多成交一次;成交记 fill(价格/数量/费用/时间)。
-6. **风控前置检查(004)**: 每笔下单请求先过 `RiskEngine`(回测 / Dry Run / 实盘同一引擎与同一装配) ——
-   静态限额(最大持仓 / 单日亏损 / 最小订单 / 最大滑点, **用户显式配置才启用**) + 工程护栏(下单频率上限 100/s, 默认启用)。
-   **平台不做投资判断**(2026-09-15 020): 原"两级亏损熔断"已删除 —— 盈亏政策属于策略, 策略用 `ctx:net_pnl()` / `ctx:equity()` 自管回撤/止损。
-   被拒 → 返回 `Rejected` ack(与资金不足同形)并计入报告"拒单次数", 日志 `target=risk` 含规则名与关键数值; 平仓/减仓豁免熔断(减亏通道保留)。
-   参数: `[risk]` TOML 或 `--param risk_*`(`risk_max_orders_per_sec` / `risk_max_position_notional` / `risk_max_daily_loss_usd` / `risk_min_order_notional` / `risk_max_slippage_bps`), 非法值在配置装载时拒绝。
-   已删除参数(2026-09-15 020): `risk_consecutive_loss_periods` / `risk_loss_period` / `risk_peak_drawdown_pct` / `risk_level1_enabled` / `risk_level2_enabled` —— 策略 TOML 里若仍写着它们, 不再生效(TOML 未知键被忽略, 不报错), 请在策略里改用 `ctx:net_pnl()` / `ctx:equity()` 自管。
-   时间源 = `ctx:now_utc()`: 回测用本 tick 的 bar 时间(可复现), Dry Run / 实盘用真实 UTC —— 语义一致, 时间源按运行态取值。
-   熔断状态仅驻内存, 重启清零; 按策略实例独立核算, 不跨策略联动。默认值实测定标: 内置脚本单 tick 下单数 ≤1(1m 粒度, `limit=1` 零拒单), 默认 100/s 覆盖网格类"一次挂多档"且远低于风暴量级。
+6. **下单前护栏(004 接入, 2026-09-16 019-R5 收窄为仅频率护栏)**: 每笔下单请求先过 `OrderGuard`(回测 / Dry Run / 实盘同一装配)—— **固定下单频率上限 100 单/秒**(滑动窗口 1s, 计数对全部 pair 共享)。
+   **平台不做投资判断**(2026-09-15 020 + 2026-09-16 R5): 原"两级亏损熔断"与 `RiskEngine` 四条**静态限额**(最大持仓 / 单日亏损 / 最小订单 / 最大滑点)均已删除 —— 盈亏/仓位政策属于策略, 策略用 `ctx:net_pnl()` / `ctx:equity()` 自管回撤/止损。
+   护栏为**固定常量、不读任何配置**(无配置面), 被拒 → 返回 `Rejected` ack(与资金不足同形)并计入报告"拒单次数", 日志 `target=order_guard`, 策略循环不中断。
+   参数面已删除: `[risk]` TOML 段与 `risk_*` 参数(`risk_max_orders_per_sec` / `risk_max_position_notional` / `risk_max_daily_loss_usd` / `risk_min_order_notional` / `risk_max_slippage_bps` / `risk_consecutive_loss_periods` / `risk_loss_period` / `risk_peak_drawdown_pct` / `risk_level1_enabled` / `risk_level2_enabled`)不再被读取 —— 策略 TOML 里若仍写着它们, 装在不报错但**不再生效**(serde 忽略未知键), 不做迁移脚本。
+   时间源 = `ctx:now_utc()`: 回测用本 tick 的 bar 时间(可复现), Dry Run / 实盘用真实 UTC —— 语义一致, 时间源按运行态取值。护栏状态仅驻内存, 重启清零; 按策略实例独立核算。默认值依据: 内置脚本单 tick 下单数 ≤1(1m 粒度, `limit=1` 零拒单), 100/s 覆盖网格类"一次挂多档"且远低于风暴量级(参照 NautilusTrader 默认)。
 
 > 现状已基本符合(freqtrade 同款"请求价成交"口径);重构仅补余额校验(§四)。
 
@@ -130,7 +127,7 @@
 
 > ✅ 全部通过(2026-09-04 重构落地当日核对;测试数于 2026-09-11 复核更新):
 > 1. `cargo test --workspace` 全绿(重构当日 173 测试: 10+15+19+20+16+93;新增 余额不足拒单 / 手续费实扣 / 现货禁空 / 合约开平仓 / 强平组合触发与先平浮亏仓 / 资金费 8h 结算 / hedge 方向仓查询 / 前视回归不变)。
->    **2026-09-12 复核对齐**: 当前基线 = 216 passed / 0 failed / 9 ignored(见 specs/roadmap.md "测试基线")。
+>    **2026-09-17 复核对齐**: 当前基线 = 403 passed / 0 failed / 21 ignored(见 specs/roadmap.md "测试基线"; 019 R5 + gr 复核修复后实跑)。
 > 2. 真数据冒烟通过(BN fapi 可达): 现货 dca 60d 现金耗尽场景总价值自洽(总价值 ≈ 现金 + 持仓市值,费用已扣);合约做多 14d(dca/futures_long.lua)与 hedge 14d(futures_hedge.lua 双向 82 笔,资金费净额 ≈0 证明多空对冲自洽)。(注: 该次冒烟用的 `examples/futures_long.lua` / `examples/futures_hedge.lua` 已于 2026-09-15 随 T075 收敛删除 —— `examples/` 目录整体移除, 需要时从 git 历史取回)
 > 3. Bug A 复现用例(60d dca, order_size=0.05)修复后: 1440 根中 1066 成交、现金耗尽后 374 笔拒单如实计数、持仓停在 53.3 ETH 不再增长。
 > 4. 报告含 §六 全部字段;合约报告含 杠杆/资金费净额/强平次数/名义敞口;hedge 模式经 pos_size/pos_entry 方向查询分列。

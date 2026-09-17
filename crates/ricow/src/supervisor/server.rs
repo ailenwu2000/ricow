@@ -28,7 +28,38 @@ pub struct Server {
     shutdown_tx: watch::Sender<bool>,
 }
 
+/// 取状态锁, **容忍锁中毒**。
+///
+/// 持锁线程 panic 后 `Mutex` 会进入 poisoned 状态, 默认做法 `expect(...)` 会让之后每一次取锁
+/// 都继续 panic —— 一次局部异常会放大成 "list/stop/shutdown 全部不可用, 只能重启 daemon"。
+/// 这里的内部状态是 `root`/`exe`/`children` 三样简单数据, 不存在"被写坏到不能用"的不变量,
+/// 因此中毒后继续沿用内部值, 把影响限制在真正出问题的那一次请求上。
+fn lock_state(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 常量时间比较 (控制通道 token)。
+///
+/// 逐字节短路比较 (字符串 `==`) 会按第一个不同的字节提前返回, 在回环网络上仍可能被
+/// 反复试探出前缀; 这里对全长度做定长累加, 不提前退出。长度不等直接判否 (长度本身不敏感)。
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl Server {
+    /// 取状态锁 (同 [lock_state]: 锁中毒后沿用内部数据, 不把 panic 扩散到后续请求)。
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        lock_state(&self.state)
+    }
+
     pub fn new(
         root: PathBuf,
         exe: PathBuf,
@@ -41,7 +72,7 @@ impl Server {
 
     /// 处理一条请求 (纯逻辑入口, 单测与集成测共用)。
     pub async fn handle(&self, env: Envelope) -> Response {
-        if env.token != self.token {
+        if !ct_eq(&env.token, &self.token) {
             tracing::warn!(target: "supervisor", "拒绝请求: 令牌不匹配");
             return Response::err("令牌不匹配 (控制通道拒绝)");
         }
@@ -69,7 +100,7 @@ impl Server {
 
     /// 运行中实例 + 台账并集 (CLI 再与已部署清单合并)。
     fn list_views(&self) -> Vec<InstanceView> {
-        let state = self.state.lock().expect("state lock");
+        let state = self.state();
         let mut views: Vec<InstanceView> = Vec::new();
         for rec in ledger::list_instances(&state.root) {
             match state.children.get(&rec.name) {
@@ -106,7 +137,7 @@ impl Server {
     /// 启动策略: 台账校验 → spawn → 台账落盘。
     async fn start(&self, name: &str, live: bool, demo: bool, confirmed: bool) -> Response {
         let (root, exe) = {
-            let state = self.state.lock().expect("state lock");
+            let state = self.state();
             if state.children.contains_key(name) {
                 return Response::err(format!("策略 {name} 已在运行, 不重复拉起"));
             }
@@ -114,7 +145,9 @@ impl Server {
         };
 
         // 策略 TOML 校验 (enabled=false / 解析失败 / 缺脚本在此拒绝), 并取运行元数据
-        let dir = crate::commands::strategies_dir();
+        // 目录与台账/子进程同源(daemon 的 root), 不用进程全局 `strategies_dir()` ——
+        // 否则 `RICOW_STATE_ROOT` 之类把 data root 指到别处时, 会拿另一个目录的 TOML 去启动。
+        let dir = root.join("strategies");
         let config = match crate::commands::load_strategy_toml(&dir, name) {
             Ok(c) => c,
             Err(e) => return Response::err(format!("{e}")),
@@ -171,14 +204,14 @@ impl Server {
         }
 
         let view = with_uptime(&handle.view);
-        self.state.lock().expect("state lock").children.insert(name.to_string(), handle);
+        self.state().children.insert(name.to_string(), handle);
         tracing::info!(target: "supervisor", name = %name, pid = ?view.pid, "策略已启动");
         Response::ok(Some(serde_json::json!(view)))
     }
 
     /// 停止策略: 下发停机指令 → 等待退出 → 台账记录; 超时如实报告且不静默强杀。
     async fn stop(&self, name: &str, close_all: bool) -> Response {
-        let handle = { self.state.lock().expect("state lock").children.remove(name) };
+        let handle = { self.state().children.remove(name) };
         let Some(mut handle) = handle else {
             let report = StopReport {
                 name: name.to_string(),
@@ -206,9 +239,10 @@ impl Server {
             Err(e) => return Response::err(format!("停机任务失败: {e}")),
         };
 
-        let root = self.state.lock().expect("state lock").root.clone();
+        let root = self.state().root.clone();
         // 清理提示: 依据运行模式与脚本是否定义 on_stop 如实说明 (不臆测清理结果)
         let cleanup_hint = cleanup_hint_for(
+            &root,
             name,
             matches!(handle.view.mode.as_deref(), Some("live") | Some("demo")),
             close_all,
@@ -227,7 +261,7 @@ impl Server {
             write_exit_record(&root, name, &handle.view, code, "停机指令");
         } else {
             // 超时: 放回状态表, 避免"摘除后失联"
-            self.state.lock().expect("state lock").children.insert(name.to_string(), handle);
+            self.state().children.insert(name.to_string(), handle);
         }
 
         let report = StopReport {
@@ -286,7 +320,7 @@ impl Server {
                 );
             }
         }
-        ledger::remove_daemon_info(&self.state.lock().expect("state lock").root);
+        ledger::remove_daemon_info(&self.state().root);
         Ok(())
     }
 }
@@ -328,7 +362,7 @@ async fn monitor_loop(state: Arc<Mutex<State>>) {
         tokio::time::sleep(Duration::from_millis(1000)).await;
         let mut exited: Vec<(String, Option<i32>, InstanceView, PathBuf)> = Vec::new();
         {
-            let mut guard = state.lock().expect("state lock");
+            let mut guard = lock_state(&state);
             let root = guard.root.clone();
             let names: Vec<String> = guard.children.keys().cloned().collect();
             for name in names {
@@ -375,10 +409,10 @@ fn write_exit_record(
 /// 停机: 逐个下发停机指令并等待 (不强制终止, 超时如实计数)。
 fn stop_all(state: &Arc<Mutex<State>>) -> (usize, usize) {
     let handles: Vec<(String, ChildHandle)> = {
-        let mut guard = state.lock().expect("state lock");
+        let mut guard = lock_state(state);
         guard.children.drain().collect()
     };
-    let root = state.lock().expect("state lock").root.clone();
+    let root = lock_state(state).root.clone();
     let (mut graceful, mut timed_out) = (0usize, 0usize);
     for (name, mut h) in handles {
         let _ = procs::request_stop(&mut h.stdin, false);
@@ -397,7 +431,10 @@ fn stop_all(state: &Arc<Mutex<State>>) -> (usize, usize) {
 ///
 /// - 实盘: 引擎按订单号前缀撤单兜底, `close_all` 时平仓; 真实结果以日志与交易所状态为准;
 /// - Dry Run: 订单是虚拟撮合, 交易所侧无本策略挂单, 只有脚本自身 `on_stop` 的逻辑。
-fn cleanup_hint_for(name: &str, live: bool, close_all: bool) -> String {
+///
+/// `root` = daemon 自己的数据根: 脚本要从**同一份**策略目录读, 否则会去判断另一份 TOML
+/// 有没有 `on_stop`(提示与实际运行的策略不符)。
+fn cleanup_hint_for(root: &std::path::Path, name: &str, live: bool, close_all: bool) -> String {
     if live {
         let action = if close_all {
             "撤单兜底 + 平掉策略持仓"
@@ -408,7 +445,7 @@ fn cleanup_hint_for(name: &str, live: bool, close_all: bool) -> String {
             "实盘停机: 引擎执行{action}; 详细结果见 logs/{name}.log 的停机清理段落, 请以交易所账户实际状态为准"
         );
     }
-    let dir = crate::commands::strategies_dir();
+    let dir = root.join("strategies");
     match crate::commands::load_strategy_toml(&dir, name) {
         Ok(config) => match ricow_engine::load_strategy(&config) {
             Ok(strategy) if strategy.has_on_stop() => format!(

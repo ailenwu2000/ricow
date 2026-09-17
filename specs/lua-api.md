@@ -97,7 +97,7 @@ end
 | `ctx:config_f64(key)` | number | 浮点参数 |
 
 > **引擎级运行时参数(非策略 API, 写在 `[strategy.params]`)**: `initial_cash` —— Dry Run 的虚拟本金(缺省 100000;
-> 设为与实盘相同的资金口径, `[risk]` 限额才能同时适配 Dry Run 与实盘, 见 `specs/changes/016-dryrun-initial-cash/`);
+> 设为与实盘相同的资金口径, Dry Run 的权益口径才与实盘可比, 见 `specs/changes/016-dryrun-initial-cash/`; 注意平台自 2026-09-16 起不再有 `[risk]` 配置面, 风控由策略自管 —— 见 `specs/changes/019-ai-assistant/spec.md` §七 R5);
 > `min_dry_run_hours` —— 实盘前的 Dry Run 时长门禁(缺省 24, 设 0 关闭);
 > `liq_warn_pct` —— 合约距强平告警阈值(缺省 15);
 > `notify_webhook` / `notify_chat_id` / `notify_events` / `notify_min_interval_secs` —— 出站通知(缺省关闭)。

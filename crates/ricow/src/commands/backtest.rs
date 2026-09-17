@@ -97,12 +97,9 @@ async fn resolve_config(
                 config.params.insert(k, v);
             }
         }
-        config.validate_risk()?;
         return Ok(config);
     }
     let config = inline_config(args, exchange).await?;
-    // 风控参数校验 (004 FR-009): 非法值在此拒绝, 不留到运行期。
-    config.validate_risk()?;
     Ok(config)
 }
 
@@ -186,7 +183,6 @@ async fn inline_config(
         enabled: true,
         exchange: "binance".into(),
         params,
-        risk: None,
         dry_run_started_at: None,
         live_enabled: false,
         market: "spot".into(),

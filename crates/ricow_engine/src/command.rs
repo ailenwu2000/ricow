@@ -966,20 +966,33 @@ impl Engine {
             return Err(CoreError::InvalidArgument(format!("no klines for {pair}")));
         }
 
-        self.backtest_and_preview(db, config, &klines).await
+        let initial_cash = Decimal::from_f64_retain(
+            ricow_strategy::BacktestParams::resolve(
+                &config,
+                &ricow_strategy::BacktestToml::default(),
+            )
+            .initial_cash,
+        )
+        .ok_or_else(|| CoreError::InvalidArgument("initial_cash 非法".into()))?;
+
+        self.backtest_and_preview(db, config, initial_cash, &klines).await
     }
 
     /// 回测 + 生成两步确认 preview (纯逻辑, 与数据源解耦, 可单元测试)。
+    ///
+    /// `initial_cash` 为回测本金 (quote), 由调用方按**唯一权威** `BacktestParams::resolve`
+    /// (三层合并: 内置默认 < TOML `[backtest]` < CLI/显式覆盖) 解析后传入 —— 引擎不自行取值,
+    /// 免得预览报告表头与本金额各算一套 (FR-016 同口径)。
     pub async fn backtest_and_preview(
         &self,
         db: &Database,
         config: StrategyConfig,
+        initial_cash: Decimal,
         klines: &[Kline],
     ) -> CoreResult<(ricow_strategy::BacktestReport, String)> {
         // 计价资产: 全项目口径 USDT (bStocks 现货 quote 亦为 USDT, 见 specs/backtest.md §十一) ——
         // 原先硬编码 "USDC" 会让报告打错币种。
-        let balance =
-            Balance { asset: "USDT".into(), free: Decimal::from(100_000), locked: Decimal::ZERO };
+        let balance = Balance { asset: "USDT".into(), free: initial_cash, locked: Decimal::ZERO };
         let report = self.backtest(config.clone(), balance, klines)?;
 
         let toml_str = config.to_toml().map_err(|e| CoreError::Parse(e.to_string()))?;
@@ -1025,7 +1038,7 @@ mod tests {
         let klines = make_klines(24);
 
         let (report, preview_id) = Engine::new()
-            .backtest_and_preview(&db, lua_config("t-grid", "ETH"), &klines)
+            .backtest_and_preview(&db, lua_config("t-grid", "ETH"), dec!(100_000), &klines)
             .await
             .expect("回测+preview 应成功");
 
@@ -1039,5 +1052,22 @@ mod tests {
         let restored = StrategyConfig::from_toml(&payload).unwrap();
         assert_eq!(restored.name, "t-grid");
         assert_eq!(restored.strategy_type, "lua");
+    }
+
+    /// FR-016 同口径回归: 回测本金必须**用调用方传入值**, 不得再硬编码 100_000
+    /// (否则 `--param cash=<非默认>` 时预览报告表头与实喂本金各说一套)。
+    #[tokio::test]
+    async fn test_backtest_and_preview_uses_given_initial_cash() {
+        let db = Database::open_in_memory().await.expect("open in-memory db");
+        let klines = make_klines(24);
+
+        let (report, _) = Engine::new()
+            .backtest_and_preview(&db, lua_config("t-cash", "ETH"), dec!(50_000), &klines)
+            .await
+            .expect("回测+preview 应成功");
+
+        // 空策略无成交无费用 → 期末现金 = 建仓后现金 = 传入本金。
+        assert_eq!(report.final_cash, dec!(50_000), "期末现金须等于传入本金");
+        assert_eq!(report.base_cash, dec!(50_000), "现金变化基准须等于传入本金");
     }
 }

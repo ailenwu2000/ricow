@@ -35,13 +35,16 @@
 
 ## 测试基线
 
-- **当前基线 (2026-09-16, Windows, 019 R3 对话内确认落地后实跑)**: `cargo test --workspace` = **355 passed / 0 failed / 15 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
-  较 2026-09-15 的 348/12(Windows): +7 通过 = R3 对话内确认 bin 单测 5(`r3s5_*`×4 真实落盘/preview consumed/同名拒绝/reject 终态, `r3s6_*`×1 demo 三档门禁)+ `tests/ai_live_smoke.rs` 默认门禁 2(管道 approve 被 tty 门禁拒、缺 demo 凭据先于网络失败); +3 ignored = 真机 S1/S2/S3+S4/S7(DeepSeek, 已于 2026-09-16 全量跑绿; 旧 ollama smoke 1 ignored 已被该文件取代)。
-- **前基线 (2026-09-15, 021 clippy 清零后实跑)**: `cargo test --workspace` = **339 passed / 0 failed / 12 ignored**(Linux; 文档此前记 306/308 均已过时, 以本次实跑为准)。
-  ignored 全部为需真实外部环境的用例 (BN demo 现货 4 + 合约 5 + Nasdaq 冒烟 2), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
+- **当前基线 (2026-09-17, Windows, 019 R5 + gr 复核修复后实跑)**: `cargo test --workspace` = **403 passed / 0 failed / 21 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
+  较 2026-09-16 的 390/21: **+13 通过 / ignored 不变** —— 全为 gr 复核修复引入的 bin 单测(会话 root 取数 / preview TTL 与引擎常量同源 / 门禁指南关键词 / daemon 双条件认账等), 逐条见 `specs/changes/019-ai-assistant/converge.md`。
+- **前基线 (2026-09-16, Windows, 019 R4/R5 落地后实跑)**: `cargo test --workspace` = **390 passed / 0 failed / 21 ignored**。
+  较同日 R3 后的 355/15: **+35 通过 / +6 ignored** —— R4 新增会话缝 `ai/session.rs`、七动作确认状态机 `ai/confirm.rs`、裸入口 `chat` / 首次向导 `onboard`、`/keys` `/market`、`pairs` 的对应用例; R5 删平台风控后 `risk.rs` / `scheduler.rs` 及其用例随文件删除, 频率护栏用例改挂 `order_guard`(逐条见 `specs/changes/019-ai-assistant/tasks.md`)。
+- **前基线 (2026-09-16, Windows, 019 R3 对话内确认落地后实跑)**: `cargo test --workspace` = **355 passed / 0 failed / 15 ignored**; 较 2026-09-15 的 348/12(Windows): +7 通过 = R3 对话内确认 bin 单测 5(`r3s5_*`×4 真实落盘/preview consumed/同名拒绝/reject 终态, `r3s6_*`×1 demo 三档门禁)+ `tests/ai_live_smoke.rs` 默认门禁 2(管道 approve 被 tty 门禁拒、缺 demo 凭据先于网络失败); +3 ignored = 真机 S1/S2/S3+S4/S7(DeepSeek, 已于 2026-09-16 全量跑绿; 旧 ollama smoke 1 ignored 已被该文件取代)。
+- **更早基线 (2026-09-15, 021 clippy 清零后实跑)**: `cargo test --workspace` = **339 passed / 0 failed / 12 ignored**(Linux; 文档此前记 306/308 均已过时, 以本次实跑为准)。
+  ignored 全部为需真实外部环境的用例 (BN demo 现货 / 合约 / 用户流、Nasdaq 冒烟、019 AI 真机与 demo 联调), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
   220 → 204 的差额 = 009 移除 `locus_hl`(16 个内联测试); 204 → 216 = 008 新增 supervisor / CLI 命令面用例; 216 → 233 = 004 风控用例(频率窗口/两级熔断/装配与参数校验/接线); 233 → 270 = 011 用例(下单参数对齐 / 时钟预检判定 / 归属与停机清理编排 / 门禁 / proto 往返 / 现货事件解析 / 交易所过滤器解析 / 归属前缀长度约束)。
 - 验证方式: `cargo test --workspace`(纯逻辑) + 带 env key 的 `#[ignore]` 真实联调 (见 `specs/testnet.md`)。
-- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后, 当前)。
+- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → **403(019 R5 + gr 复核修复, 当前)**。
 
 ## 变更档案状态 (specs/changes/)
 
@@ -64,7 +67,7 @@
 | 016-dryrun-initial-cash | Dry Run 虚拟本金可配 (`params.initial_cash`) | ✅ 已实施 (2026-09-13) | 原 Dry Run 本金硬编码 100k, 使"小资金预演"不成立 —— 同一份 `[risk]` 限额不可能同时适配 100k 与真实几百 USDT(实测: 小资金限额下 Dry Run `tick=66 提交订单=65 拒单=65 成交=0`); 现 `params.initial_cash` 可配(缺省 100000 保持既有行为), 非法值报错**不静默回落**, 启动打印本金额; 实测 `initial_cash=300.0` → 建仓 150 USDT/拒单 0(对比修复前 65 单全拒); 测试 304 → 306 |
 | 017-spot-live-snapshot-fix | 现货实盘快照一致性修复 (dogfood 实测) | ✅ 已实施 (2026-09-13) | demo 实盘预演暴露三处: ① **`stop --close-all` 静默不平仓**(012 起清理改走 `get_positions_directional`, 现货实现恒空 → 报告"无持仓"而账户仍持 2.016 ETH); ② **现货成交后只刷持仓不刷现金** → 策略按 equity 决策以为"只有币没有钱", 每 tick 再卖一半, 几何级数清仓(`1.0079→0.5039→0.252→…` 全卖光); ③ 成交回写异步窗口内重复下单(1.4s 内 3 次同单)。修复: 清理/残留持仓源按市场分支(现货复用 `spot_position_of`)+ 现货补刷 base/quote 余额 + 下单后按 `any_filled` 立刻对齐快照。实测修复前 `提交订单=216/拒单=209/成交=8/持仓清空` → 修复后 `提交订单=1/拒单=0/成交=2/平仓单执行/残留 0.000058`, 交易所侧 `openOrders=0`; 测试 306 不变(接线/时序缺陷无 mock 单测, 以真实链路为证) |
 | 018-first-use-risk-ack | 首次使用风险确认 | ✅ 已实施 (2026-09-13) | 补齐 `product.md` §十 风险披露的第二条(README 免责声明早已有, 代码侧确认**完全缺失** —— 克隆仓库配好 key 即可用真钱开跑且无任何告知)。实盘启动最前置判定: 未确认 → 拒绝 + 打印四条披露要点与确认方式; `--accept-risk` → 记录到 `$RICOW_ROOT/risk_ack.json`(含 schema 版本, 披露变更可递增触发重新确认)后放行, 之后不再要求; 判定顺序 风险确认→时长门禁→时钟预检(未确认时零交易所往返), Dry Run/回测不受影响; 实测三步(拒绝且无记录文件 / 确认落地 / 再跑不再要求并正常启动); 测试 306 → 308 |
-| 019-ai-assistant | 内置 AI 助手 + 生态入口 + 开箱即用分发 | 🔄 **P1 主线已打通, 进行中 (2026-09-14)** | 已落地并真机验证: `ricow ai`(交互/单次/`--plain`, 只读 9 + 虚拟 3 工具)、策略生成闭环(`preview_strategy` → 编译门禁 → 真实 K 线沙箱回测 → 零落盘)、`ricow create/approve/deploy` 两步确认(逐字短语)、**`ricow agent-kit`**(AGENTS.md / SKILL.md / CLAUDE.md / lua-api.md, 与内置 AI 系统提示同源; 命令速查由 clap 生成; 拒覆盖)、`--demo` 测试网运行、实盘二次分离(逐字 `确认实盘 <name>`)、策略名规范、提示词按需取文档(8k→1.8k tokens)、**单一配置文件 `ricow.toml`**(provider+api_key 同段, 删 keyring/setup/写凭据命令)。未完成: 三平台分发(CI)、文档/测试收口、agent-kit 的真机第三方 agent 验证(T047)(`ricow mcp` **不做** —— 2026-09-15 定案: 单机程序, 用户已有的 agent 直接调本机 CLI, 生态入口 = agent-kit 手册); Phase 1–4 主体完成(仅 Windows 双击入口 T034/T035 未做, 本机无法产出 Windows 产物), 见 `specs/changes/019-ai-assistant/tasks.md`(T001–T078) |
+| 019-ai-assistant | 内置 AI 助手 + 生态入口 + 开箱即用分发 | 🔄 **主线已打通, 做文档/测试收口 (2026-09-16)** | 已落地并真机验证: `ricow ai`(交互/单次/`--plain`, 只读 12 + 虚拟 4 工具)、策略生成闭环(`preview_strategy` → 编译门禁 → 真实 K 线沙箱回测 → 零落盘)、`ricow create/approve/deploy` 两步确认(逐字短语)、**`ricow agent-kit`**(AGENTS.md / SKILL.md / CLAUDE.md / lua-api.md, 与内置 AI 系统提示同源; 命令速查由 clap 生成; 拒覆盖)、`--demo` 测试网运行、实盘二次分离(逐字 `确认实盘 <name>`)、策略名规范、提示词按需取文档(8k→1.8k tokens)、**单一配置文件 `ricow.toml`**(provider+api_key 同段, 删 keyring/setup/写凭据命令)。**R4(2026-09-16)全功能对话化**: 裸 `ricow` 即入口(默认 `chat`, 首次跑走向导 `onboard`)、会话缝 `ai/session.rs`(`ChatSession` + `SessionSink`, 业务零 stdio)、对话内七动作确认状态机(逐字短语:`确认部署` / `确认启动测试网` / `确认风险` / `确认实盘` / `确认停止测试网` / `确认停止实盘` / `确认平仓停止`; 实盘仍原样跑 `ctrl::live_preflight` 三判据)、`/keys` `/market` 外科式改 `ricow.toml`(`set_values` 白名单 9 键, 保留注释 + 原子写; 权限 Unix 0600 / Windows 仅当前用户 ACL)、`pairs` 命令与交易对视野。**R5(2026-09-16)删平台风控残留**: 删 `risk.rs` 静态限额(`RiskEngine` / `[risk]` 配置面 / 装配器)与 `scheduler.rs`, 只留固定 100 单·秒⁻¹ 工程护栏 `order_guard` —— 平台不做投资判断, 风控由策略自管(`constitution.md` 已同步修订)。未完成: 三平台分发(CI)、文档/测试收口、agent-kit 的真机第三方 agent 验证(T047)(`ricow mcp` **不做** —— 2026-09-15 定案: 单机程序, 用户已有的 agent 直接调本机 CLI, 生态入口 = agent-kit 手册); Phase 1–4 主体完成(仅 Windows 双击入口 T034/T035 未做, 本机无法产出 Windows 产物), 见 `specs/changes/019-ai-assistant/tasks.md`(T001–T078) |
 
 > SDD 产物规范: 计划与任务分解应存于 `specs/changes/<feature>/{spec,plan,tasks}.md`。
 > 005/006/007 的计划当时落在 `.hermes/plans/`(临时区, 已 git 忽略), 未回填档案 —— 后续变更须归档到位。
@@ -120,6 +123,10 @@
 3. **backlog 变更**: ~~003-notifications~~(2026-09-13 实施) → ~~002-ai-quant-researcher~~(2026-09-13 实施); backlog 已清空; **019-ai-assistant 已定稿(2026-09-14)进入实施**, P4 dogfood 仍待执行。
 4. **P4 dogfood**: 上述前置已完成, 以真实小资金跑通"回测 → Dry Run → 实盘"闭环 —— **执行清单见 [`specs/research/p4-dogfood-runbook-2026-09.md`](research/p4-dogfood-runbook-2026-09.md)**(含一次性准备、四阶段命令与判据、立即停手条件、回滚、实测坑清单、结果留档表)。
 5. ~~**全仓 rustfmt 对齐**~~ ✅ 已随 **022**(2026-09-15)完成: 工具链钉死 1.96.1 后一次性对齐 41 个文件(+612 −518), CI 已开 `cargo fmt --all -- --check` 硬门禁。原记录(2026-09-14):: 实测 `cargo fmt --all` 会改动 **34 个文件 / 约 +6069 −1139 行**, 且**非纯空白差异**(结构体字段换行、长表达式换行等), 即现有代码与当前 `rustfmt.toml`(`max_width = 100`, `use_small_heuristics = "Max"`)的输出不一致。**已全部回退, 未纳入 019**。开工前需先确认团队基准 rustfmt 版本/配置; 单独立项(否则 review 无法区分语义改动与格式噪声), 不与其他变更混做。
+6. **AI 对话流程仍需简化**(2026-09-17 用户反馈, 原话: 「AI对话流程还需要简化。目前有点过于复杂」)。
+   - 现象(本轮自查, 未改动): 用户要理解的东西偏多 —— 首次向导 4 步(供应商 / 模型 / 密钥 / 可选连通校验, 外加可跳过的 demo 凭据)、对话内七类**逐字**确认短语(`确认部署 <名字>` / `确认启动测试网 <名字>` / `确认风险` / `确认实盘 <名字>` / `确认停止测试网 <名字>` / `确认停止实盘 <名字>` / `确认平仓停止 <名字>`, FR-044 覆盖另有 `确认覆盖 <名字>`)、以及"裸入口 / `ai` 子命令 / 一堆 CLI 子命令"多档入口并存。
+   - 注意: 逐字短语是**安全机制**(不是可删的复杂度) —— 简化只能改"怎么让用户少记", 不能削弱"写实必须本人逐字确认"。
+   - **未排期**, 方向待与用户对齐后再立项(候选: 首启向导默认值一路回车到底、确认短语收敛为单一动作词 + 策略名、入口只对外讲一条路径)。
 
 ## 文档-实现缺口 (2026-09-11 审计)
 

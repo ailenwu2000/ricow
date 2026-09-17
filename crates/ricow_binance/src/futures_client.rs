@@ -496,10 +496,22 @@ pub fn parse_income(v: &Value) -> Vec<FundingIncome> {
 ///
 /// 过滤器: LOT_SIZE(minQty/stepSize) / PRICE_FILTER(tickSize) / MIN_NOTIONAL(minNotional)。
 pub fn parse_futures_symbol(s: &Value) -> Option<Market> {
+    parse_perp_symbol(s, &[PERPETUAL])
+}
+
+/// 普通加密永续的 `contractType` 口径。
+const PERPETUAL: &str = "PERPETUAL";
+
+/// 合约市场解析, `contract_types` 为放行的 `contractType` 白名单。
+///
+/// 单独开这个入口是因为**美股代币永续**的 contractType 是 `TRADIFI_PERPETUAL`,
+/// [`parse_futures_symbol`] 会把它过滤掉(specs/backtest.md §十一)。
+/// 需要枚举"全永续"(交易对视野)时用 `&["PERPETUAL", "TRADIFI_PERPETUAL"]`。
+pub fn parse_perp_symbol(s: &Value, contract_types: &[&str]) -> Option<Market> {
     if s["status"].as_str()? != "TRADING" {
         return None;
     }
-    if s["contractType"].as_str()? != "PERPETUAL" {
+    if !contract_types.contains(&s["contractType"].as_str()?) {
         return None;
     }
     let symbol = s["symbol"].as_str()?;
@@ -753,6 +765,35 @@ mod tests {
             "baseAsset": "BTC", "quoteAsset": "USDT", "filters": []
         });
         assert_eq!(parse_futures_symbol(&none).unwrap().min_notional, None);
+    }
+
+    #[test]
+    fn test_parse_perp_symbol_contract_type_whitelist() {
+        use crate::futures_data::PERP_CONTRACT_TYPES;
+        // 美股代币永续 (TRADIFI_PERPETUAL): 默认口径过滤掉, 全永续口径放行。
+        let tradifi = serde_json::json!({
+            "symbol": "TSLAUSDT", "status": "TRADING", "contractType": "TRADIFI_PERPETUAL",
+            "baseAsset": "TSLA", "quoteAsset": "USDT", "filters": []
+        });
+        assert!(parse_futures_symbol(&tradifi).is_none(), "旧口径不含 TRADIFI_PERPETUAL");
+        let m = parse_perp_symbol(&tradifi, &PERP_CONTRACT_TYPES).expect("全永续口径应放行");
+        assert_eq!(m.symbol, "TSLAUSDT");
+        assert_eq!(m.base_asset, "TSLA");
+        assert!(m.is_perpetual);
+
+        // 普通加密永续在全永续口径下同样放行。
+        let perp = serde_json::json!({
+            "symbol": "BTCUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+            "baseAsset": "BTC", "quoteAsset": "USDT", "filters": []
+        });
+        assert!(parse_perp_symbol(&perp, &PERP_CONTRACT_TYPES).is_some());
+
+        // 交割合约两个口径都不放行。
+        let delivery = serde_json::json!({
+            "symbol": "X", "status": "TRADING", "contractType": "CURRENT_QUARTER",
+            "baseAsset": "X", "quoteAsset": "USDT", "filters": []
+        });
+        assert!(parse_perp_symbol(&delivery, &PERP_CONTRACT_TYPES).is_none());
     }
 
     #[test]

@@ -91,6 +91,22 @@
 | D36 | 宿主执行进程内直调同一引擎内核(`engine::approve`→`execute_strategy`;`ctrl::start_daemon(demo=true)`), 不经 shell、无第二条路径; deploy 拒绝连带 `engine::reject` 终态 | ✅ 已实现 |
 | D37 | 仅交互式 tty REPL 开放对话内确认; 单次 prompt / 管道 / 非终端 stdin 一律只回终端命令(与 R2 同一 `IsTerminal` 门禁); demo 凭据新增 env 成对覆盖 `RICOW_DEMO_KEY/SECRET` | ✅ 已实现 |
 
+### 4.2 R4/R5 批次(2026-09-16, 一句话启动 + 首次引导 + 全功能对话化 + 删风控; 对应 spec.md §七 R4/R5)
+
+> 工作稿: `.trae/documents/conversational-onboarding_plan.md`(v2, 用户已拍板 D1–D6)。基线 HEAD 重审后实施。
+
+| # | 决策 | 状态 |
+|:--|:--|:--|
+| D38 | 用户唯一需要记住的命令 = `ricow`; 裸入口进 `commands::chat`; 缺 AI key 且非 ollama 时先走 `commands::onboard` 向导; 原 clap 子命令全部保留并退化为同一 `ChatSession` 的薄壳 | ✅ 已实现 |
+| D39 | 密钥静默录入用跨平台纯 Rust 依赖 `rpassword`; 会话缝以 `SessionSink::secret(prompt)` 抽象, 终端实现用 `rpassword`; 非 tty 拒绝录入(与 R2/R3 同一门禁) | ✅ 已实现 |
+| D40 | 会话缝: `ai/session.rs` 持 `ChatSession` + `trait SessionSink { text, line, secret }`, `handle_line` 内零 stdio; `provider` 流式改走 sink; 为网页端预留的唯一架构动作, 本轮不做 HTTP/WS | ✅ 已实现 |
+| D41 | 修订 D31(配置只读): 新增 `config_file::set_values()` 按行外科替换(保留注释, 原子写 + 0600), 白名单 9 键; 白名单外拒绝 | ✅ 已实现 |
+| D42 | 斜杠命令 `/keys`(查看只回显尾 4 位 / `ai|demo|live` 静默录入 / 改 AI key 且未被 env 覆盖时热重建客户端)与 `/market`(显示并可切 bstock/all, 经 `set_values` 落盘); `[market] show_all_pairs` 默认 false | ✅ 已实现 |
+| D43 | 七动作全对话化: `ActionKind` = Deploy / StartDemo / AckRisk / StartLive / StopDemo / StopLive / CloseLive; 宿主执行分别走 `engine::approve`→`execute_strategy`、`ctrl::start_daemon(demo)`、写 `risk_ack.json`、`ctrl::live_preflight`→`start_daemon(live, confirmed)`、`stop_daemon(close_all)`; 写实仍非 LLM 工具(16 个 = 12 只读 + 4 虚拟) | ✅ 已实现 |
+| D44 | 删除平台风控残留(D4): 四静态限额 + `RiskConfig`/`risk` 字段/`validate_risk` + 死模块 `scheduler.rs`; 保留固定 100 单/秒 `order_guard`(不读配置); 实盘 `risk_gate`/`risk_ack.json` 属三判据, **不是风控, 保留**; 同步修订 constitution §安全要求 | ✅ 已实现 |
+
+> R2(实测数据): 删静态限额**不改变**既有回测数值 —— 无 `[risk]` 段时唯一活动规则本就是频率护栏, 内置策略单 tick 下单数 ≤1。R3(老策略 TOML 含 `[risk]`): serde 忽略未知段、装载不报错、不再生效, 重写时自然消失, 不做迁移脚本。
+
 ## 五、改动清单(文件 → 改动)
 
 | 文件 | 改动 |

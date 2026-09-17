@@ -45,36 +45,12 @@ pub struct RestartArgs {
 /// 实盘门禁与前台 `run` 同一口径 (双条件): 只有 `--live` **且** TOML 声明 `live_enabled=true`
 /// 才写 live 台账并透传 `--live`; 缺一按 Dry Run 启动并如实说明。
 pub async fn start(args: StartArgs) -> CoreResult<()> {
-    // Dry Run 时长门禁前置检查 (002 FR-007): 在**发起启动请求前**同步拒绝, 避免子进程起来再死掉
-    // (子进程侧 `run` 亦有同一门禁 —— 双保险, 与 011 的双条件门禁同思路)。
-    if args.live && !args.demo {
-        // 首次使用风险确认 (018): 在发起启动请求前同步落地确认记录(子进程据此放行)
-        match ricow_engine::risk_gate(crate::commands::risk_acked(), args.accept_risk) {
-            ricow_engine::RiskGate::Refuse { message } => {
-                return Err(CoreError::InvalidArgument(message))
-            }
-            ricow_engine::RiskGate::JustAcked => {
-                let p = crate::commands::write_risk_ack()?;
-                println!("已记录风险确认: {} (后续实盘不再要求)", p.display());
-            }
-            ricow_engine::RiskGate::Proceed => {}
-        }
-        if let Some(config) = crate::commands::read_strategy_config(&args.name) {
-            if config.live_enabled {
-                let min_hours = config
-                    .get_f64("min_dry_run_hours")
-                    .unwrap_or(ricow_engine::DEFAULT_MIN_DRY_RUN_HOURS);
-                ricow_engine::dry_run_gate(
-                    config.dry_run_started_at.as_deref(),
-                    chrono::Utc::now(),
-                    min_hours,
-                )
-                .map_err(CoreError::InvalidArgument)?;
-            }
-        }
-    }
     // 实盘二次分离 (019 D4 / T029-T030): 018 首次披露之外, **每次启动**都要逐字确认;
     // 确认发生在**交互终端(本进程)**, 不进入 daemon 协议的子进程 stdin(那里只收 stop)。
+    //
+    // 顺序要求: 短语确认必须**先于**三判据预检 —— 018 预检带 `--accept-risk` 时会落盘
+    // `risk_ack.json`, 若先预检再确认, 用户中途放弃(或非交互终端被拒)也会留下确认记录,
+    // 等于替用户做了他从未做过的确认。与前台 `run`(先确认后跑门禁)保持同一顺序。
     if args.live {
         crate::commands::require_explicit_phrase(
             &format!(
@@ -83,6 +59,15 @@ pub async fn start(args: StartArgs) -> CoreResult<()> {
             ),
             &format!("确认实盘 {}", args.name),
         )?;
+    }
+    // 实盘三判据前置检查 (002 FR-007 / 018 / FR-008): 在**发起启动请求前**同步拒绝,
+    // 避免子进程起来再死掉 (子进程侧 `run` 亦有同一份门禁 —— 双保险, 与 011 的双条件门禁同思路)。
+    if args.live && !args.demo {
+        if let Some(notice) =
+            live_preflight(&crate::commands::project_root(), &args.name, args.accept_risk).await?
+        {
+            println!("{notice}");
+        }
     }
 
     let (pid, mode) =
@@ -119,9 +104,98 @@ pub async fn stop(args: StopArgs) -> CoreResult<()> {
     Ok(())
 }
 
+// ———————— 实盘三判据共享内核 (019 R4) ————————
+//
+// 018 风险确认 / 002 Dry Run 时长门禁 / FR-008 时钟预检 原本在三条实盘路径各写一遍
+// (`ricow start --live` / 前台 `ricow run --live` / 对话内 AI 预检与执行)。三份平行实现
+// 一旦判据顺序、取参默认值或降级行为漂移, 就会出现"某条路径更松"的静默漏洞。
+// 这里收敛成三个小内核, 全部实盘路径只准从这里取判据。
+
+/// 018 首次实盘风险确认 (共享内核): 已确认 → 放行; 带 `--accept-risk` → 落记录并放行; 否则拒绝。
+///
+/// 对话内路径只能传 `accept_risk = false`(确认必须在交互终端逐字完成, 见 `ai::confirm`),
+/// 因此本内核在对话侧等价于"是否已确认过"。
+///
+/// 返回刚记录确认时的提示文本(供调用方按自己的输出通道回显)。
+pub(crate) fn risk_gate_shared(accept_risk: bool) -> CoreResult<Option<String>> {
+    match ricow_engine::risk_gate(crate::commands::risk_acked(), accept_risk) {
+        ricow_engine::RiskGate::Refuse { message } => Err(CoreError::InvalidArgument(message)),
+        ricow_engine::RiskGate::JustAcked => {
+            let p = crate::commands::write_risk_ack()?;
+            Ok(Some(format!("已记录风险确认: {} (后续实盘不再要求)", p.display())))
+        }
+        ricow_engine::RiskGate::Proceed => Ok(None),
+    }
+}
+
+/// 002 Dry Run 时长门禁 (共享内核): 生效门限 = TOML `min_dry_run_hours`, 未配置回落
+/// [`ricow_engine::DEFAULT_MIN_DRY_RUN_HOURS`]。
+///
+/// 返回**实际生效门限**(小时, 供确认块/日志如实回显); 未通过时返回拒绝说明 ——
+/// **拒绝而非降级**: 用户已显式要求实盘, 静默降级更危险。
+pub(crate) fn dry_run_gate_shared(config: &ricow_strategy::StrategyConfig) -> Result<f64, String> {
+    let min_hours =
+        config.get_f64("min_dry_run_hours").unwrap_or(ricow_engine::DEFAULT_MIN_DRY_RUN_HOURS);
+    ricow_engine::dry_run_gate(
+        config.dry_run_started_at.as_deref(),
+        chrono::Utc::now(),
+        min_hours,
+    )?;
+    Ok(min_hours)
+}
+
+/// FR-008 时钟预检 (共享内核, 实盘判据里**唯一联网项**): 按**本市场**取数
+/// (现货/合约服务器时间不同步), 不通过即拒绝。
+///
+/// 返回本机相对交易所服务器的偏差(ms), 供调用方如实回显 (不通过时偏差在拒绝说明里)。
+pub(crate) async fn clock_gate_shared(
+    market: &str,
+    mode: crate::commands::Mode,
+) -> CoreResult<i64> {
+    let skew = crate::commands::fetch_clock_skew(market, mode).await?;
+    match ricow_engine::check_clock_skew(skew) {
+        ricow_engine::ClockVerdict::Reject { message, .. } => {
+            Err(CoreError::InvalidArgument(message))
+        }
+        ricow_engine::ClockVerdict::Ok { skew_ms } => Ok(skew_ms),
+    }
+}
+
+/// 实盘共享预检 (019 R4 / T031): 018 首次风险确认 → 002 Dry Run 时长门禁 → FR-008 时钟预检。
+///
+/// **同一份实现**服务命令行 `ricow start <名> --live` 与对话内 `确认实盘 <名>` ——
+/// 两条路径的门禁顺序、拒绝话术与降级行为不可能走偏。子进程 `run` 的实盘分支仍原样再跑一遍
+/// (双保险: 父进程是快速失败, 子进程是最后一道), 且跑的是同一批内核函数。
+///
+/// - `root`: 数据目录 (读 `strategies/<名>.toml` 取市场与时长门禁参数);
+/// - 018 的确认记录**固定写在 `project_root()`** —— 子进程 `run` 读的也是那一份, 必须同一个位置。
+///
+/// 返回需要展示给用户的提示(如"已记录风险确认"), 由调用方决定输出通道 (CLI 直接打印 / 会话走 sink)。
+pub(crate) async fn live_preflight(
+    root: &std::path::Path,
+    name: &str,
+    accept_risk: bool,
+) -> CoreResult<Option<String>> {
+    // 018 首次使用风险确认: 确认一次即长期有效 (子进程据此放行)
+    let notice = risk_gate_shared(accept_risk)?;
+    // TOML 不存在时无从得知市场与时长门禁参数: 只跑 018, 让子进程给出更明确的报错
+    let Some(config) = crate::commands::read_strategy_config_in(root, name) else {
+        return Ok(notice);
+    };
+    // TOML live_enabled=false 时 daemon 会按 Dry Run 启动(双条件缺一), 002/FR-008 不适用 ——
+    // 与子进程 `run` 的 LiveGate 口径一致: 只有真会进实盘才跑这两项, 不在降级路径上徒增网络依赖。
+    if !config.live_enabled {
+        return Ok(notice);
+    }
+    dry_run_gate_shared(&config).map_err(CoreError::InvalidArgument)?;
+    clock_gate_shared(&config.market, crate::commands::Mode::Live).await?;
+    Ok(notice)
+}
+
 /// 启动内核(**不打印**): 走既有 daemon 控制通道, 返回 `(pid, mode)`。
 ///
-/// CLI `ricow start` 与 AI 的 L1 工具共用(019 T031); 门禁与打印留在各自调用方。
+/// CLI `ricow start` 与 AI 的 L1 工具共用(019 T031); 实盘三判据见 [`live_preflight`],
+/// 打印留在各自调用方 (CLI stdout / 会话 sink)。
 pub(crate) async fn start_daemon(
     root: &std::path::Path,
     name: &str,
@@ -180,7 +254,57 @@ pub(crate) async fn stop_daemon(
 }
 
 /// 重启 = 停止 (等清理完成) + 启动。
+///
+/// **按原实例模式重启, 不静默降级**: 此前无条件 `live:false, demo:false` —— 一个正在跑
+/// 测试网 demo 或实盘的实例, 重启后会变成 Dry Run, 而用户以为它还在原位跑 (真实资金策略
+/// 悄悄下线 / 测试网验证被换掉)。这里先读停机前的运行模式, 原样传回 `start`; 实盘仍会
+/// 重过三判据并**再逐字确认一次** (`start` 内既有逻辑), 拒绝而非静默降级。
 pub async fn restart(args: RestartArgs) -> CoreResult<()> {
+    // 必须在 stop 之前读: 停机后台账/daemon 视图已被覆盖, 无从得知原本的模式。
+    let prev_mode = crate::commands::instances::views(&crate::commands::project_root())
+        .await
+        .into_iter()
+        .find(|v| v.name == args.name && v.running)
+        .and_then(|v| v.mode);
+    let (live, demo) = restart_flags(prev_mode.as_deref());
+    if live {
+        println!(
+            "注意: {} 原本以**实盘**运行, 重启将再次执行实盘三判据并逐字确认 (不会静默降级为 Dry Run)",
+            args.name
+        );
+    } else if demo {
+        println!("注意: {} 原本以**测试网模拟盘(demo)**运行, 重启后仍是 demo", args.name);
+    }
     stop(StopArgs { name: args.name.clone(), close_all: false }).await?;
-    start(StartArgs { name: args.name, live: false, demo: false, accept_risk: false }).await
+    start(StartArgs { name: args.name, live, demo, accept_risk: false }).await
+}
+
+/// 重启模式判定 (**纯函数**, 便于单测): 按停机前的运行模式原样重启。
+///
+/// 未知模式 (`None` / 未运行 / 无法识别的字符串) 一律回落到 Dry Run —— 与 `start` 的
+/// 双条件门禁一致 (说不清就按最保守的来)。
+fn restart_flags(prev_mode: Option<&str>) -> (bool, bool) {
+    match prev_mode {
+        Some("live") => (true, false),
+        Some("demo") => (false, true),
+        _ => (false, false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restart_flags;
+
+    #[test]
+    fn test_restart_flags_keeps_previous_mode() {
+        assert_eq!(restart_flags(Some("live")), (true, false), "原实盘 → 仍实盘(重过门禁)");
+        assert_eq!(restart_flags(Some("demo")), (false, true), "原 demo → 仍 demo");
+        assert_eq!(restart_flags(Some("dry_run")), (false, false), "原 Dry Run → 仍 Dry Run");
+    }
+
+    #[test]
+    fn test_restart_flags_unknown_falls_back_to_dry_run() {
+        assert_eq!(restart_flags(None), (false, false), "未运行/无记录 → Dry Run");
+        assert_eq!(restart_flags(Some("weird")), (false, false), "无法识别 → Dry Run");
+    }
 }

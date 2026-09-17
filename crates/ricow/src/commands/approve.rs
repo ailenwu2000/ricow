@@ -119,8 +119,10 @@ pub async fn run(args: ApproveArgs) -> CoreResult<()> {
         return Ok(());
     }
     // 输入错/空/中断 → **零副作用**: 不改状态, 预览仍在有效期内可重试 (FR-021)
+    // 分钟数从引擎常量派生(与预览 TTL 同源), 不手抄 15。
     Err(CoreError::InvalidArgument(format!(
-        "未确认: 输入与确认短语不一致(期望逐字: {expected})。预览保持有效(15 分钟内可重试), 未产生任何副作用。"
+        "未确认: 输入与确认短语不一致(期望逐字: {expected})。预览保持有效({} 分钟内可重试), 未产生任何副作用。",
+        ricow_engine::PREVIEW_TTL_SECS / 60
     )))
 }
 

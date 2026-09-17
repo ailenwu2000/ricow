@@ -1,7 +1,7 @@
 //! 实例台账与 daemon 元信息文件读写 (008)。
 //!
 //! 文件布局 (RICOW_ROOT 下):
-//! - `run/daemon.json`  daemon 元信息 (pid/port/token), 权限 0600 (仅本机用户可读)
+//! - `run/daemon.json`  daemon 元信息 (pid/port/token), 权限收紧 (unix 0600 / Windows 仅当前用户)
 //! - `run/<name>.json`  策略实例台账 (pid/启动时间/模式/上次退出码与原因)
 //! - `logs/<name>.log`  策略进程 stdout/stderr 追加日志 (见 `procs`)
 
@@ -88,17 +88,28 @@ pub fn now_str() -> String {
     now_rfc3339()
 }
 
-/// 写 daemon 元信息; Unix 上收紧为 0600 (token 等同本机操作凭据)。
+/// 写 daemon 元信息; token 等同本机操作凭据, 因此收紧文件权限 (unix 0600 / Windows 仅当前用户)。
 pub fn write_daemon_info(root: &Path, info: &DaemonInfo) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(info).unwrap_or_default();
-    write_atomic(&daemon_info_path(root), &json)?;
+    let path = daemon_info_path(root);
+    write_atomic(&path, &json)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            daemon_info_path(root),
-            std::fs::Permissions::from_mode(0o600),
-        );
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        // Windows 上 `write_atomic` 只能继承父目录 ACL → 同机其它账户可能读到 token。
+        // 复用配置文件那条收紧路径 (icacls 断继承 + 只授当前用户)。
+        // **尽力而为**: 失败不阻断 daemon 启动, 但如实警告, 不静默假装已保护。
+        if let Err(msg) = crate::commands::config_file::harden_secret_file(&path) {
+            tracing::warn!(
+                target: "supervisor",
+                path = %path.display(),
+                "未能收紧 daemon.json 的访问权限: {msg}; 该文件含控制通道 token, 请确认其所在目录非共享目录"
+            );
+        }
     }
     Ok(())
 }

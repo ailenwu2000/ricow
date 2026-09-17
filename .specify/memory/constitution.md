@@ -53,7 +53,8 @@ spec-kit 命令模板保持官方英文逻辑, 产物由本宪法与 zh preset �
 ## 安全要求
 
 - 写操作强制确认: 提交 → 编译门禁 → 沙箱回测 → preview → `ricow approve`(一次性 token 重放) → 部署。
-- RiskEngine 硬检查(最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点)。
+- 平台不做投资判断: 风控由策略自管(`ctx:net_pnl()` / `ctx:equity()`); 平台仅保留固定下单频率护栏(100 单/秒)。
+  - 修订记录(2026-09-16, 019-ai-assistant R5): 原硬规则"RiskEngine 硬检查(最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点)"**删除** —— 平台只做执行 + 数据 + 门禁 + 状态, 赚赔政策属于策略; 依据见 `specs/changes/019-ai-assistant/spec.md` §七 R5。
 - Dry Run 默认, 确认后切实盘。
 - Lua 沙箱: 无 os/io/require/loadstring/pcall; 指令预算 1M/tick; 内存 64MB。
 

@@ -79,7 +79,6 @@ pub fn create_strategy(
         enabled: true,
         exchange: "binance".into(),
         params: merged,
-        risk: None,
         dry_run_started_at: None,
         live_enabled: false,
         market: "spot".into(),
@@ -88,22 +87,32 @@ pub fn create_strategy(
     })
 }
 
+/// 一次落盘的结果(路径 + 受控覆盖时的旧脚本备份)。
+#[derive(Debug, Clone)]
+pub struct DeployedStrategy {
+    pub toml_path: PathBuf,
+    pub lua_path: PathBuf,
+    /// 受控覆盖(FR-044)时旧脚本的备份路径; 全新部署为 `None`。
+    pub backup: Option<PathBuf>,
+}
+
 /// 部署已批准的建策略 preview (002 FR-003/FR-004/FR-005): 消费一次性 token → 落盘。
 ///
 /// - `(preview_id, token)` 由 `confirm::consume` **原子**校验: 未批准 / token 不匹配 / 已消费 / 过期
 ///   都在此步失败, 因此部署无法绕过两步确认;
-/// - **同名策略已存在即拒绝**(不覆盖用户已部署的策略, 也不静默改名);
+/// - **同名策略默认拒绝覆盖**(不覆盖用户已部署的策略, 也不静默改名) —— 默认路径是**换个新名**部署;
+/// - `allow_replace = true` 走 **FR-044 受控覆盖**: 必须由"已逐字确认"的调用方传入(对话内确认块),
+///   覆盖前**先把旧 `.lua`/`.toml` 备份**成 `<name>.<ext>.<ts>.bak`, 备份失败即中止(不拿用户资产冒险);
 /// - 落盘形态: 代码进 `<name>.lua`, TOML 只留 `params.script_path` —— 避免把整段 Lua 内嵌回 TOML
 ///   (loader 会把 `script_path` 的内容注入内存 `script`, 若不摘除就会在写回时被固化);
 /// - 写 TOML 失败时回收已写的 `.lua`, 不留半成品。
-///
-/// 返回 `(toml_path, lua_path)`。
 pub async fn execute_strategy(
     db: &Database,
     preview_id: &str,
     token: &str,
     dir: &Path,
-) -> CoreResult<(PathBuf, PathBuf)> {
+    allow_replace: bool,
+) -> CoreResult<DeployedStrategy> {
     let payload = crate::confirm::consume(db, preview_id, token).await?;
     let mut config = StrategyConfig::from_toml(&payload)
         .map_err(|e| CoreError::Parse(format!("preview 载荷解析失败: {e}")))?;
@@ -119,9 +128,11 @@ pub async fn execute_strategy(
 
     let toml_path = dir.join(format!("{name}.toml"));
     let lua_path = dir.join(format!("{name}.lua"));
-    if toml_path.exists() || lua_path.exists() {
+    let existed = toml_path.exists() || lua_path.exists();
+    if existed && !allow_replace {
         return Err(CoreError::InvalidArgument(format!(
-            "同名策略已存在, 拒绝覆盖: {} (如需替换请先自行移除)",
+            "同名策略已存在, 拒绝覆盖: {} (如需替换: 换个新名部署, 或在 AI 对话里走 \"改脚本\" \
+             受控覆盖流程 —— 会先备份旧脚本)",
             toml_path.display()
         )));
     }
@@ -140,13 +151,53 @@ pub async fn execute_strategy(
 
     std::fs::create_dir_all(dir)
         .map_err(|e| CoreError::Exchange(format!("创建策略目录 {} 失败: {e}", dir.display())))?;
+    // FR-044: 受控覆盖前先备份。放在写文件之前, 且备份失败即中止 —— 旧脚本是用户资产,
+    // 一旦被覆盖就无从恢复(预览 TTL 过期后也拿不回原文)。
+    let backup =
+        if existed { Some(backup_existing(&name, dir, &toml_path, &lua_path)?) } else { None };
     std::fs::write(&lua_path, &code)
         .map_err(|e| CoreError::Exchange(format!("写 {} 失败: {e}", lua_path.display())))?;
     if let Err(e) = std::fs::write(&toml_path, &toml_str) {
         let _ = std::fs::remove_file(&lua_path); // 不留半成品
         return Err(CoreError::Exchange(format!("写 {} 失败: {e}", toml_path.display())));
     }
-    Ok((toml_path, lua_path))
+    Ok(DeployedStrategy { toml_path, lua_path, backup })
+}
+
+/// FR-044: 覆盖前把已有的 `<name>.{lua,toml}` 备份成 `<name>.<ext>.<ts>.bak`。
+///
+/// 返回首个备份路径(供如实回报给用户); 存在即备份、不存在就跳过。**任一步失败都要中止落盘**:
+/// 宁可不覆盖, 也不能在没有备份的情况下抹掉旧脚本。
+fn backup_existing(
+    name: &str,
+    dir: &Path,
+    toml_path: &Path,
+    lua_path: &Path,
+) -> CoreResult<PathBuf> {
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+    let mut first: Option<PathBuf> = None;
+    for (src, ext) in [(lua_path, "lua"), (toml_path, "toml")] {
+        if !src.exists() {
+            continue;
+        }
+        let mut dst = dir.join(format!("{name}.{ext}.{ts}.bak"));
+        // 时间戳只到秒: 同一秒内第二次覆盖会撞名, `copy` 会直接抹掉上一份备份 ——
+        // 用户以为有两个回滚点, 实际只剩一个。依次加序号直到空位。
+        let mut n = 1u32;
+        while dst.exists() {
+            dst = dir.join(format!("{name}.{ext}.{ts}-{n}.bak"));
+            n += 1;
+        }
+        std::fs::copy(src, &dst).map_err(|e| {
+            CoreError::Exchange(format!(
+                "备份旧脚本失败({} → {}): {e}; 已中止覆盖, 旧策略保持原样",
+                src.display(),
+                dst.display()
+            ))
+        })?;
+        first.get_or_insert(dst);
+    }
+    Ok(first.unwrap_or_else(|| dir.join(format!("{name}.lua.{ts}.bak"))))
 }
 
 #[cfg(test)]
@@ -195,15 +246,17 @@ mod tests {
         let pid = preview_of(&db, "ai-grid").await;
 
         // 未批准 → 拒绝, 且不落任何文件
-        assert!(execute_strategy(&db, &pid, "forged-token", &dir).await.is_err());
+        assert!(execute_strategy(&db, &pid, "forged-token", &dir, false).await.is_err());
         assert!(!dir.join("ai-grid.toml").exists(), "未批准不得落盘");
         assert!(!dir.join("ai-grid.lua").exists());
 
         // 批准后成功
         let token = crate::confirm::approve(&db, &pid).await.unwrap();
-        let (toml_path, lua_path) = execute_strategy(&db, &pid, &token, &dir).await.unwrap();
+        let out = execute_strategy(&db, &pid, &token, &dir, false).await.unwrap();
+        let (toml_path, lua_path) = (out.toml_path, out.lua_path);
         assert_eq!(toml_path, dir.join("ai-grid.toml"));
         assert_eq!(lua_path, dir.join("ai-grid.lua"));
+        assert!(out.backup.is_none(), "全新部署不应产生备份");
 
         let body = std::fs::read_to_string(&toml_path).unwrap();
         assert!(body.contains("script_path"), "TOML 应引用脚本文件: {body}");
@@ -212,7 +265,7 @@ mod tests {
         assert!(lua.contains("function on_tick"), "脚本内容应与提交一致");
 
         // 一次性 token: 二次部署失败
-        assert!(execute_strategy(&db, &pid, &token, &dir).await.is_err());
+        assert!(execute_strategy(&db, &pid, &token, &dir, false).await.is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -226,10 +279,54 @@ mod tests {
 
         let pid = preview_of(&db, "ai-grid").await;
         let token = crate::confirm::approve(&db, &pid).await.unwrap();
-        let err = execute_strategy(&db, &pid, &token, &dir).await.unwrap_err();
+        let err = execute_strategy(&db, &pid, &token, &dir, false).await.unwrap_err();
         assert!(err.to_string().contains("拒绝覆盖"), "{err}");
         // 不产生半成品: .lua 不应被写出来
         assert!(!dir.join("ai-grid.lua").exists(), "拒绝覆盖时不得留下脚本文件");
+        assert!(
+            !dir.read_dir()
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".bak")),
+            "拒绝覆盖时不该有备份"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FR-044 受控覆盖: 经确认块放行时必须**先备份旧脚本**, 再写新脚本。
+    #[tokio::test]
+    async fn test_execute_strategy_replace_backs_up_old_script_first() {
+        let db = Database::open_in_memory().await.unwrap();
+        let dir = tmp_dir("t4");
+        let old_lua = "function on_tick(ctx)\n    return { old = true }\nend\n";
+        std::fs::write(dir.join("ai-grid.lua"), old_lua).unwrap();
+        std::fs::write(dir.join("ai-grid.toml"), "[strategy]\nname = \"ai-grid\"\n").unwrap();
+
+        let pid = preview_of(&db, "ai-grid").await;
+        let token = crate::confirm::approve(&db, &pid).await.unwrap();
+        let out = execute_strategy(&db, &pid, &token, &dir, true).await.unwrap();
+
+        let backup = out.backup.expect("受控覆盖必须产生备份");
+        assert!(backup.exists(), "备份文件必须落盘: {}", backup.display());
+        assert!(
+            backup.to_string_lossy().contains("ai-grid.lua."),
+            "备份名应含原名与扩展名: {}",
+            backup.display()
+        );
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), old_lua, "备份必须是旧脚本原文");
+        // 新脚本已就位(与旧脚本不同)
+        let now = std::fs::read_to_string(&out.lua_path).unwrap();
+        assert!(now.contains("function on_tick"), "{now}");
+        assert_ne!(now, old_lua, "覆盖后应是新脚本");
+        // TOML 也一并备份(参数同样不可丢)
+        assert!(
+            dir.read_dir().unwrap().flatten().any(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("ai-grid.toml.") && n.ends_with(".bak")
+            }),
+            "旧 TOML 也应备份"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -240,7 +337,7 @@ mod tests {
         let dir = tmp_dir("t3");
         let pid = preview_of_raw_name(&db, "../evil").await;
         let token = crate::confirm::approve(&db, &pid).await.unwrap();
-        let err = execute_strategy(&db, &pid, &token, &dir).await.unwrap_err();
+        let err = execute_strategy(&db, &pid, &token, &dir, false).await.unwrap_err();
         assert!(err.to_string().contains("策略名非法"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -24,6 +24,6 @@ pub use futures::{
 pub use futures_client::{
     parse_available_balance, position_amount, position_liquidation_price, FuturesClient,
 };
-pub use futures_data::{tier1_mmr_pct, FuturesDataClient};
+pub use futures_data::{tier1_mmr_pct, FuturesDataClient, PERP_CONTRACT_TYPES};
 pub use futures_ws::parse_futures_user_event;
 pub use spot::BnSpotExchange;

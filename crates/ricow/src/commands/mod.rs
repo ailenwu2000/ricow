@@ -11,6 +11,7 @@ pub mod agentkit;
 pub mod ai;
 pub mod approve;
 pub mod backtest;
+pub mod chat;
 pub mod config_file;
 pub mod create;
 pub mod ctrl;
@@ -20,7 +21,10 @@ pub mod deploy;
 pub mod instances;
 pub mod logs;
 pub mod market;
+pub mod onboard;
+pub mod pairs;
 pub mod run;
+pub mod templates;
 
 use std::fmt::Write as _;
 use std::io::IsTerminal;
@@ -133,6 +137,30 @@ pub(crate) fn bn_signed_exchange_mode(
     }
 }
 
+/// 时钟预检取数: 公共端点读**该市场自己的**服务器时间 (免 key), 返回"本机 - 交易所"偏差 (ms)。
+///
+/// 现货与合约的 demo 服务器时间不同步(实测差 1.5~1.9s), 必须按市场取数, 否则校准白做。
+/// 前台 `run` 与 `start` 的实盘预检 (019 R4) 共用这一份实现。
+pub(crate) async fn fetch_clock_skew(market: &str, mode: Mode) -> CoreResult<i64> {
+    let demo = mode == Mode::Demo;
+    let server = if market.eq_ignore_ascii_case("futures") {
+        // 公开端点: 无需凭据
+        let c = ricow_binance::FuturesClient::new()?;
+        let c = if demo { c.with_base_url(DEMO_FAPI_URL) } else { c };
+        c.server_time().await
+    } else {
+        let c = ricow_binance::BinanceClient::new()?;
+        let c = if demo { c.with_base_url(DEMO_SPOT_URL) } else { c };
+        c.server_time().await
+    }
+    .map_err(|e| {
+        CoreError::Network(format!(
+            "时钟预检失败: 读取交易所服务器时间失败 ({e}); 网络不通时无法安全启动实盘"
+        ))
+    })?;
+    Ok(ricow_engine::skew_ms(chrono::Utc::now(), server))
+}
+
 /// API 凭据 (签名请求必需)。
 ///
 /// 来源优先级: env `RICOW_BN_API_KEY` / `RICOW_BN_SECRET_KEY` (specs/testnet.md 的联调约定,
@@ -209,10 +237,19 @@ pub(crate) fn platform_data_dir() -> Option<std::path::PathBuf> {
 
 /// 本地数据库默认路径 (<项目根>/ricow.db, 可用 RICOW_DB 覆盖)。
 pub(crate) fn default_db_path() -> std::path::PathBuf {
+    db_path_in(&project_root())
+}
+
+/// 数据库路径 (以**调用方给定的 root** 为基准, `RICOW_DB` 全局覆盖仍最优先)。
+///
+/// 与 [`default_db_path`] 的区别只在基准目录: 会话/daemon 手里已经有 root, 直接用它的
+/// 即可, 且必须与 `create`/`approve`/`deploy` 取同一个库 —— 否则设了 `RICOW_DB` 时
+/// 会出现"预览写在一个库里、确认去另一个库里找"的静默不一致。
+pub(crate) fn db_path_in(root: &std::path::Path) -> std::path::PathBuf {
     if let Ok(p) = std::env::var("RICOW_DB") {
         return std::path::PathBuf::from(p);
     }
-    project_root().join("ricow.db")
+    root.join("ricow.db")
 }
 
 /// 策略目录 (<项目根>/strategies/)。
@@ -222,7 +259,15 @@ pub(crate) fn strategies_dir() -> std::path::PathBuf {
 
 /// 读取策略 TOML 配置 (仅解析; 不做 enabled/脚本门禁 —— 供展示类命令使用)。
 pub(crate) fn read_strategy_config(name: &str) -> Option<StrategyConfig> {
-    let path = strategies_dir().join(format!("{name}.toml"));
+    read_strategy_config_in(&project_root(), name)
+}
+
+/// 同上, 但显式指定数据目录 (019 R4: 会话 root 与进程全局 root 未必同一份时按前者取数)。
+pub(crate) fn read_strategy_config_in(
+    root: &std::path::Path,
+    name: &str,
+) -> Option<StrategyConfig> {
+    let path = root.join("strategies").join(format!("{name}.toml"));
     let text = std::fs::read_to_string(path).ok()?;
     StrategyConfig::from_toml(&text).ok()
 }
@@ -315,26 +360,13 @@ pub(crate) fn ensure_strategies_dir_in(root: &std::path::Path) -> CoreResult<std
     Ok(dir)
 }
 
-/// 内置脚本表 (策略样板 + 执行模式示例), 编译期嵌入, 路径在表内集中维护。
-/// 新增内置脚本只需加一行: 名字 → strategies/builtin/ 下路径。
-const BUILTIN_SCRIPTS: &[(&str, &str)] = &[
-    ("shannon_grid", include_str!("../../../../strategies/builtin/shannon_grid.lua")),
-    ("dca", include_str!("../../../../strategies/builtin/executors/dca.lua")),
-    ("twap", include_str!("../../../../strategies/builtin/executors/twap.lua")),
-    ("vwap", include_str!("../../../../strategies/builtin/executors/vwap.lua")),
-    ("pullback", include_str!("../../../../strategies/builtin/executors/pullback.lua")),
-    ("ladder", include_str!("../../../../strategies/builtin/executors/ladder.lua")),
-];
-
 /// 内置脚本 Lua 化: strategy_type 命中内置名且无 script 参数时, 注入
 /// `strategies/builtin/` 对应脚本内容 (编译期嵌入), type 改 "lua"。
 /// 非内置名 / 已有 script(用户 lua 策略)原样返回。
+///
+/// 内置清单本身在 [`templates`](crate::commands::templates)(带类别/说明/参数摘要, 供 AI 工具复用)。
 pub(crate) fn resolve_builtin_script(mut config: StrategyConfig) -> CoreResult<StrategyConfig> {
-    let Some(code) = BUILTIN_SCRIPTS
-        .iter()
-        .find(|(name, _)| *name == config.strategy_type.as_str())
-        .map(|(_, code)| *code)
-    else {
+    let Some(code) = templates::code_of(&config.strategy_type) else {
         return Ok(config); // 非内置名
     };
     if config.get_str("script").is_some() {
@@ -510,7 +542,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params,
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -531,7 +562,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params: HashMap::new(),
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
@@ -551,7 +581,6 @@ mod tests {
             enabled: true,
             exchange: "binance".into(),
             params,
-            risk: None,
             dry_run_started_at: None,
             live_enabled: false,
             market: "spot".into(),
