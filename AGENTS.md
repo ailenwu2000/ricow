@@ -6,3 +6,13 @@
 - 变更流程: 所有变更走 SDD — `/speckit-specify` → `/speckit-plan` → `/speckit-tasks` → `/speckit-implement` → `/speckit-converge`
 - 测试纪律: 交易流程必须 testnet 真实调用(币安 demo), 禁 mock 替身、禁假 token; 纯逻辑用单元测试
 - 提交纪律: 用户明确说"提交"才可 git commit
+- 工作目录：当前项目根，先 Get-Location
+- 只处理项目内文件，不访问 C:\Windows、AppData 以外的系统目录
+- 文件操作：Get-ChildItem / Copy-Item / Move-Item / Rename-Item / Set-Content / New-Item
+- 不输出命令让用户手敲，Agent 直接执行
+- Shell: bash / powershell
+
+## Python 环境
+- 本项目用 uv 管理 Python 环境与依赖
+- 运行脚本：uv run python xxx.py
+- 运行模块：uv run python -m xxx

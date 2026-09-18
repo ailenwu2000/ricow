@@ -91,7 +91,7 @@ Inspect: `ricow list` / `ricow info <name>`; stop: `ricow stop <name> [--close-a
 
 ### 4. Built-in AI assistant (optional)
 
-`ricow ai "which strategies do I have deployed?"` — natural-language status queries, backtests, and authoritative doc lookups (all **read-only**). Running bare `ricow` opens the same assistant as an interactive session (`chat`); on a fresh install it walks you through first-run setup instead. Anything that writes to disk, starts live trading, or closes a position is **not in the tool surface**: the model can only register a pending action, and the host runs it after **you** type the exact confirmation phrase yourself (e.g. `确认实盘 <name>`). Slash commands: `/help` `/keys` `/market` `/exit`. `--plain` disables streaming output.
+`ricow ai "which strategies do I have deployed?"` — natural-language status queries, backtests, and authoritative doc lookups (all **read-only**). Running bare `ricow` opens the same assistant as an interactive session (`chat`); on a fresh install it walks you through first-run setup instead (Chinese or English). Anything that writes to disk or changes a running state — deploy, replace, edit params, delete, start/stop dry run, demo & live — is **not in the tool surface**: the model can only register a pending action, and the host runs it only after **you** confirm. In the chat session a single word in the session language is enough (`确认` / `confirm`); terminal commands keep the exact verbatim phrase (e.g. `确认实盘 <name>`). Slash commands: `/help` `/history` `/lang` `/keys` `/market` `/exit`. `--plain` disables streaming output.
 
 ### 5. Use your own AI agent (optional)
 

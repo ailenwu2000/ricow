@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use chrono::{Datelike, Timelike};
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
-use ricow_core::{Kline, OrderFill, OrderRequest, OrderSide, OrderType, OrderUpdate};
+use ricow_core::{Kline, OrderFill, OrderRequest, OrderSide, OrderType, OrderUpdate, Position};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
@@ -288,6 +288,20 @@ impl std::fmt::Debug for LuaStrategy {
     }
 }
 
+/// 净仓 → 策略可见方向标签 (纯函数, 便于单测)。
+///
+/// 下游契约: 净仓数量 `size <= 0` 一律报 `"none"` (与 `ctx:position_side` 文档一致);
+/// 否则按建仓方向报 `"long"` / `"short"`。
+fn position_side_label(pos: &Position) -> &'static str {
+    if pos.size <= Decimal::ZERO {
+        "none"
+    } else if pos.side == OrderSide::Buy {
+        "long"
+    } else {
+        "short"
+    }
+}
+
 impl LuaStrategy {
     /// 从源码构建策略: 沙箱引擎 + 编译 + 执行模块级语句 (函数定义/模块级状态)。
     /// 统一注册 exec 执行组件库 (Rust 实现): 所有 Lua 策略 (CLI/MCP/TOML/回测) 均可用 exec.*;
@@ -342,13 +356,7 @@ impl LuaStrategy {
                 }
             }
             if let Some(pos) = ctx.position(&pair) {
-                let side = if pos.size <= Decimal::ZERO {
-                    "none"
-                } else if pos.side == OrderSide::Buy {
-                    "long"
-                } else {
-                    "short"
-                };
+                let side = position_side_label(&pos);
                 data.position_sides.insert(pair.clone(), side.to_string());
                 data.position_sizes.insert(pair.clone(), pos.size.to_f64().unwrap_or(0.0));
                 data.position_entries.insert(pair.clone(), pos.entry_price.to_f64().unwrap_or(0.0));
@@ -581,7 +589,7 @@ impl Strategy for LuaStrategy {
 mod tests {
     use super::*;
     use crate::backtest::BacktestContext;
-    use ricow_core::{Balance, Kline};
+    use ricow_core::{Balance, Kline, Position};
     use rust_decimal_macros::dec;
 
     fn sample_kline() -> Kline {
@@ -1044,5 +1052,25 @@ mod tests {
         let _ = strategy.on_tick(&mut ctx);
         let n: i64 = strategy.lua.globals().get("n").expect("n 已置位");
         assert_eq!(n, 100, "单标的 klines 仍 cap 100, got {n}");
+    }
+
+    /// FR-005 (024): 净仓归零后, 策略侧 `ctx:position_side` 必须报 `none` (size<=0 契约)。
+    #[test]
+    fn test_position_side_label_contract() {
+        let mk = |side, size: Decimal| Position {
+            pair: "ETHUSDT".into(),
+            side,
+            size,
+            entry_price: dec!(2500),
+            mark_price: dec!(2500),
+            liquidation_price: None,
+            unrealized_pnl: Decimal::ZERO,
+            leverage: None,
+        };
+        assert_eq!(position_side_label(&mk(OrderSide::Buy, dec!(0.5))), "long");
+        assert_eq!(position_side_label(&mk(OrderSide::Sell, dec!(0.5))), "short");
+        // 平仓归零: 记录里即便残留平仓方向, 也必须报 none。
+        assert_eq!(position_side_label(&mk(OrderSide::Sell, Decimal::ZERO)), "none");
+        assert_eq!(position_side_label(&mk(OrderSide::Buy, Decimal::ZERO)), "none");
     }
 }

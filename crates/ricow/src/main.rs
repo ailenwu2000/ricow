@@ -2,6 +2,7 @@
 
 mod ai;
 mod commands;
+mod i18n;
 mod supervisor;
 
 use clap::{Parser, Subcommand};

@@ -97,6 +97,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   —— 编译门禁 → 真实 K 线沙箱回测 → 打印报告 + `preview_id`(**不写任何策略文件**);
   `ricow approve <preview_id>`(人工批准: 打印**确认块**(动作/目标/关键参数/后果), 要求**逐字输入** `确认部署 <策略名>` —— 裸 `y` 不接受, **且必须来自交互终端**(stdin 非终端即拒绝: 管道/脚本/agent 工具调用喂入的短语一律无效, 019 spec §七 R2 已实现); 通过后发一次性 token, 15 分钟有效)→ `ricow deploy <preview_id> --token <t>`
   —— 落盘 `strategies/<name>.toml`(`params.script_path` 指向)+ `strategies/<name>.lua`; 同名策略存在即拒绝(不覆盖)
+  > **确认渠道(023)**: 上述逐字短语**仅终端渠道**; 对话渠道(`ricow` REPL / `ricow ai`)的确认词是**当前语言的单个口语词**(`确认`/`确定`/`同意` · `confirm`/`confirmed`, 只认当前语言, 刻意不含 `y`/`yes`/`ok`/空)。只读动作(回测 / 查询 / 预览)不需确认; 写操作(13 类)统一收敛到唯一入口 `request_write_confirmation`, 由用户当场确认后交宿主进程执行 —— LLM 的写实工具面仍为空。
 - 首次使用风险确认(018, product.md §十): 实盘启动前一次性确认 —— 未确认时**拒绝启动**并打印披露要点(仅供学习/无止损与选品责任/先 Dry Run + 子账号小额/不代管资金密钥)与确认方式; `--accept-risk` 确认一次后记入 `$RICOW_ROOT/risk_ack.json`(带 schema 版本, 披露实质变更可递增触发重新确认)。判定顺序: **风险确认 → Dry Run 时长门禁 → 时钟预检**(未确认时零交易所往返); Dry Run/回测不受影响
 - 交易对视野(019 R4/D5): `ricow pairs [--market spot|futures] [--all]` —— 默认视野 = bStock 现货(`<base>BUSDT`, XxxB × EQUITY 白名单交叉)+ 股票永续(`<base>USDT`, TRADIFI_PERPETUAL); `--all` 见全量。免 key 公共端点, 进程内 TTL 缓存 + 输出截断并报告总数; 同一视野由对话内 `/market` 与 L0 工具 `list_pairs` 共用
 - Dry Run 虚拟本金可配(016): `params.initial_cash`(缺省 100000) —— 用小资金同口径预演, Dry Run 的权益口径才与实盘可比; 非法值报错不静默回落; 启动打印本金额
@@ -145,6 +146,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   > **内部通道双条件(019 R4 收敛)**: 子进程认账要求 `--live-confirmed` 标志 **且** 环境变量 `RICOW_DAEMON_SPAWNED`(由 daemon spawn 时经 `cmd.env` 注入)同时成立 —— 单靠标志可被手工构造, 加环境变量后"用户自己敲命令加 flag"不成立, 只剩 daemon 派生链内部可信(`supervisor/procs.rs::DAEMON_SPAWN_ENV` / `spawned_by_daemon()`, 判定与单测在 `commands/run.rs::daemon_confirmation_accepted`)。
   实盘三判据(018 风险披露确认 → 002 Dry Run 时长门禁 → 008 时钟预检)顺序与判据**未改动**。
   > **R4(2026-09-16)**: 该短语现在也可在**对话内**输入(`ricow` REPL / `ricow ai`, 仍须交互式 tty); 执行由宿主进程内直调 `ctrl::live_preflight` → `start_daemon(live, confirmed)`, **三判据一条不少、顺序一字未改**。停 demo/实盘与 `--close-all` 平仓同理(短语见 019 spec §七 R4 表)。
+  > **R5-023(2026-09-18)**: 对话渠道的确认词由"逐字长短语"改为**当前语言的口语词**(`确认`/`确定`/`同意` · `confirm`/`confirmed`, 只认当前语言); 本节**终端门禁**的逐字短语与 `live_preflight` 三判据**一行不改**。执行链路不变: 宿主进程内直调 `ctrl::live_preflight` → `start_daemon(live, confirmed)`。
 - **demo 运行模式**(019 T062): `ricow run|start <name> --demo` —— 真实调用币安**模拟交易(demo)**平台下单接口(无真实资金),
   因此**不适用**实盘三判据, 但仍需 demo 凭据、并按 **demo 服务器**做时钟预检; `--demo --live` 同时给直接拒绝; 台账与 CLI 文案均标注 `测试网模拟盘(demo)`。
 - 实盘启动前**时钟预检**: 本机超前交易所服务器 >1000ms 或滞后 >4000ms → 拒绝启动并打印对齐步骤(币安对签名请求超前 >1s 直接拒绝, 见 `specs/testnet.md`); 取数走公共 `/api/v3/time`

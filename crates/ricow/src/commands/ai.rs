@@ -8,6 +8,7 @@ use clap::Args;
 use ricow_core::CoreResult;
 
 use crate::ai::session::{ChatSession, Options};
+use crate::i18n::{resolve, t};
 
 #[derive(Args)]
 pub struct AiArgs {
@@ -26,10 +27,11 @@ pub struct AiArgs {
 
 pub async fn run(args: AiArgs) -> CoreResult<()> {
     let root = crate::commands::project_root();
+    let lang = resolve(&crate::commands::config_file::load(&root)?);
 
     // 配置文件权限提示(含密钥, 只提示不自动改)
     if let Some(w) = crate::commands::config_file::permission_warning(&root) {
-        eprintln!("提示: {w}");
+        eprintln!("{}: {w}", t(lang, "提示", "note"));
     }
 
     // 单次模式即便 stdin 是 tty 也不开放对话内确认(没有第二轮输入可承接短语)。

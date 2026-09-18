@@ -1,13 +1,17 @@
 //! 工具注册表 (019): L0 只读 + L1 虚拟。
 //!
 //! **结构边界**(spec FR-008 / FR-009, 2026-09-16 R3 修订): 本模块只注册 **L0 只读**与 **L1 虚拟**工具 ——
-//! L1 虚拟可直调但**自身不产生写实结果**。写实动作分两类:
+//! L1 虚拟可直调但**自身不产生写实结果**。写实动作只有一条入口:
 //! - `preview_strategy`: 生成预览(写一条预览记录), 落盘需确认;
 //! - `request_write_confirmation`(R3): 只校验前提 + 渲染确认块 + 在会话内**登记**一条待确认动作,
-//!   **不落盘、不起进程**; 真正执行由 REPL 宿主在用户当场逐字输入短语后调用引擎内核(见 `ai::confirm`)。
+//!   **不落盘、不起进程**; 真正执行由 REPL 宿主在用户当场回一句话后调用引擎内核(见 `ai::confirm`)。
+//! - `show_menu`(023 F3): 只写会话菜单槽, 请宿主渲染编号菜单 —— 编号与文案由宿主单一来源产生,
+//!   模型自己复述一份就可能与用户看到的编号错位。
 //!
-//! 模型因此**始终没有写实工具调用面**(注册表里没有 deploy/start_demo/stop_live/close_all),
-//! 连"直接调用"的入口都不存在。审批门 `ToolGuard` 再按本表白名单 fail-closed 放行一次, 是第二道同向保证。
+//! 023 起 `start_dry_run` / `stop_run` 两个"模型可直接执行"的工具已删除: 写操作(含 Dry Run 启停)
+//! 一律经 `request_write_confirmation` 登记 + 用户确认。模型因此**始终没有写实工具调用面**
+//! (注册表里没有 deploy/start_demo/stop_live/close_all), 连"直接调用"的入口都不存在。
+//! 审批门 `ToolGuard` 再按本表白名单 fail-closed 放行一次, 是第二道同向保证。
 //!
 //! **与框架解耦**: 工具的 `name` / `description` / 参数 schema 与本模块的实现函数是唯一事实;
 //! `dynamic_tools()` 只做 rig 构造。Phase 7 的 `ricow mcp`(rmcp) 复用同一份定义,
@@ -23,10 +27,12 @@ use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
 
 use crate::ai::confirm::{ActionKind, PendingAction, PendingSlot};
+use crate::ai::menu;
 use crate::commands;
+use crate::i18n::{t, Lang};
 use crate::supervisor::ledger;
 
-/// 工具运行上下文(只读事实 + 会话 pending 句柄)。不含任何凭据。
+/// 工具运行上下文(只读事实 + 会话 pending/菜单句柄)。不含任何凭据。
 #[derive(Clone)]
 pub struct ToolCtx {
     pub root: PathBuf,
@@ -34,11 +40,21 @@ pub struct ToolCtx {
     pub interactive: bool,
     /// 与 REPL 共享的待确认动作句柄(非交互/单次模式下永不被登记)。
     pub pending: PendingSlot,
+    /// 与 REPL 共享的菜单句柄(023 F3): `show_menu` 只写这里, 渲染与序号解析都在宿主。
+    pub menu: menu::MenuSlot,
+    /// 当前界面语言(023 F0): 确认块等**用户可见**文案随它切换。
+    pub lang: Lang,
 }
 
 impl ToolCtx {
-    pub fn new(root: PathBuf, interactive: bool, pending: PendingSlot) -> Self {
-        Self { root, interactive, pending }
+    pub fn new(
+        root: PathBuf,
+        interactive: bool,
+        pending: PendingSlot,
+        menu: menu::MenuSlot,
+        lang: Lang,
+    ) -> Self {
+        Self { root, interactive, pending, menu, lang }
     }
 }
 
@@ -62,9 +78,12 @@ pub const READ_ONLY_TOOLS: [&str; 12] = [
 ///
 /// - `preview_strategy` 写一条预览记录(不落盘);
 /// - `request_write_confirmation` 只登记会话待确认(执行权在 REPL 宿主, 见 `ai::confirm`);
-/// - `start_dry_run`/`stop_run` 仅作用于本地虚拟撮合档。
-pub const VIRTUAL_TOOLS: [&str; 4] =
-    ["preview_strategy", "request_write_confirmation", "start_dry_run", "stop_run"];
+/// - `show_menu` 只写会话菜单槽(无盘面副作用, 渲染在宿主)。
+///
+/// 023 D12: 原 `start_dry_run` / `stop_run` 已删除 —— 写操作只有 `request_write_confirmation`
+/// 一条入口, 模型无法绕开确认。
+pub const VIRTUAL_TOOLS: [&str; 3] =
+    ["preview_strategy", "request_write_confirmation", "show_menu"];
 
 /// 工具是否被允许执行(L0 ∪ L1)。未列入一律拒绝(fail-closed)。
 pub fn is_allowed(name: &str) -> bool {
@@ -239,8 +258,9 @@ fn tool_list_strategies(ctx: ToolCtx) -> DynamicTool {
                 let names = list_toml_stems(&ctx.root.join("strategies"));
                 if names.is_empty() {
                     return Ok(ToolOutput::text(
-                        "当前没有任何已部署策略(strategies/ 目录为空)。新建需走三步: \
-                         `ricow create` → `ricow approve` → `ricow deploy`。",
+                        "当前没有任何已部署策略(strategies/ 目录为空)。\
+                         用户若想新建: 先与他确认策略思路, 再用 preview_strategy 生成预览(编译门禁 + 沙箱回测), \
+                         最后由他本人确认落盘 —— 你只能请求确认, 不能代为落盘。",
                     ));
                 }
                 let mut out =
@@ -678,16 +698,17 @@ fn tool_read_template(_ctx: ToolCtx) -> DynamicTool {
 
 /// L1 虚拟工具: 生成策略预览(编译门禁 → 真实 K 线沙箱回测 → preview_id)。
 ///
-/// **不落盘、不碰资金**(只写一条 previews 记录); 落盘必须由用户本人 `approve` + `deploy`。
-/// 与 CLI `ricow create` 共用 `commands::create::create_preview`(FR-016 同口径)。
+/// **不落盘、不碰资金**(只写一条 previews 记录); 落盘必须由用户在对话内回一句确认词,
+/// 由宿主执行(与 CLI `ricow create` 共用 `commands::create::create_preview`, FR-016 同口径)。
 fn tool_preview_strategy(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "preview_strategy",
         format!(
             "把一段 Lua 策略代码过一遍门禁并生成**预览**: 编译门禁 → 真实历史 K 线沙箱回测 → \
              preview_id({} 分钟一次性)。虚拟操作: 不写任何策略文件、不碰资金(会占用一条预览记录)。\
-             落盘**必须由用户本人**执行 `ricow approve <preview_id>` 与 \
-             `ricow deploy <preview_id> --token <token>`, 你只能把这两条命令告诉用户, 不得声称已部署。",
+             落盘**必须由用户本人确认**: 用户说\"部署/落盘\"时, 改调 \
+             request_write_confirmation(action=\"deploy\", preview_id=...), 宿主会渲染确认块; \
+             你没有落盘权限, 在用户确认前不得声称已部署。",
             // 与引擎 TTL 常量同源, 不手抄 15
             ricow_engine::PREVIEW_TTL_SECS / 60
         ),
@@ -715,7 +736,8 @@ fn tool_preview_strategy(_ctx: ToolCtx) -> DynamicTool {
                 }
                 let market =
                     args.get("market").and_then(|v| v.as_str()).unwrap_or("spot").to_string();
-                let days = args.get("days").and_then(|v| v.as_i64()).unwrap_or(90).clamp(1, 3650) as u32;
+                let days =
+                    args.get("days").and_then(|v| v.as_i64()).unwrap_or(90).clamp(1, 3650) as u32;
                 let interval =
                     args.get("interval").and_then(|v| v.as_str()).unwrap_or("1h").to_string();
                 let mut params: Vec<(String, ricow_strategy::ConfigValue)> = Vec::new();
@@ -743,7 +765,7 @@ fn tool_preview_strategy(_ctx: ToolCtx) -> DynamicTool {
                 .await
                 .map_err(|e| ToolExecutionError::other(format!("生成预览失败: {e}")))?;
                 let text = format!(
-                    "{}\n编译门禁 ✓  沙箱回测 ✓  —— **尚未部署**(未写入任何策略文件)\npreview_id: {}\n下一步: 若用户要落盘, 调 request_write_confirmation(action=\"deploy\", preview_id=\"{}\") 生成确认块, 由用户本人逐字确认; 你没有落盘权限, 不要替用户执行 approve/deploy。",
+                    "{}\n编译门禁 ✓  沙箱回测 ✓  —— **尚未部署**(未写入任何策略文件)\npreview_id: {}\n下一步: 用户要落盘时调 request_write_confirmation(action=\"deploy\", preview_id=\"{}\") 登记确认, 宿主会渲染确认块; 用户在对话里回一句确认词后, 才由**宿主**执行落盘。用户确认之前不能说\"已部署\"。",
                     out.report_text, out.preview_id, out.preview_id
                 );
                 Ok(ToolOutput::text(clamp_output(redact(&text))))
@@ -752,33 +774,67 @@ fn tool_preview_strategy(_ctx: ToolCtx) -> DynamicTool {
     )
 }
 
-/// L1 虚拟工具(019 R3/R4): 发起对话内确认块 —— **只校验前提 + 渲染确认块 + 登记会话待办, 不落盘、不起进程**。
+/// 当前语言的**口语确认词 / 拒绝词**(与 [`crate::ai::confirm::is_simple_confirmation`] 同一口径)。
+fn simple_words(lang: Lang) -> (&'static str, &'static str) {
+    (t(lang, "确认", "confirm"), t(lang, "拒绝", "reject"))
+}
+
+/// 确认块尾部的"怎么确认"段(023 FR-022/FR-023): 只给**口语词**, 不教任何终端命令。
+fn confirmation_footer(lang: Lang) -> String {
+    let (yes, no) = simple_words(lang);
+    // 与 `ai::confirm::PENDING_TTL` 同源, 不手抄 15
+    let ttl = crate::ai::confirm::PENDING_TTL.as_secs() / 60;
+    match lang {
+        Lang::Zh => format!(
+            "———— 怎么确认 ————\n\
+             回一句「{yes}」我就执行(也可以回「确定」或「同意」); 想作罢回「{no}」(或「取消」「放弃」)。\n\
+             确认词只能由你本人输入, 我不会代你回; 这条待确认 {ttl} 分钟内有效, 过后需要重新发起。"
+        ),
+        Lang::En => format!(
+            "———— How to confirm ————\n\
+             Reply \"{yes}\" and I'll go ahead (\"confirmed\" works too); reply \"{no}\" to call it off \
+             (\"cancel\" / \"abort\" also work).\n\
+             Only you can send this — I won't do it for you. It stays open for {ttl} minutes; \
+             after that you'll need to start over."
+        ),
+    }
+}
+
+/// L1 虚拟工具(019 R3/R4; 023 F4 扩为 **13 类写操作**): 发起对话内确认块 ——
+/// **只校验前提 + 渲染确认块 + 登记会话待办, 不落盘、不起进程**。
 ///
-/// 真正执行由 REPL 宿主在用户当场逐字输入短语后调用引擎内核(`ai::confirm` 状态机)。
-/// 单次模式与管道(stdin 非 tty)回退为终端命令指引。
+/// 真正执行由 REPL 宿主在用户当场回一句确认词后调用引擎内核(`ai::confirm` 状态机)。
+/// 单次模式与管道(stdin 非 tty)回退为终端命令指引(FR-012 例外)。
 fn tool_request_write_confirmation(ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "request_write_confirmation",
         "当用户要求执行任一**写实动作**时调用: 校验前提 → 生成确认块 → 在本对话登记一条待确认动作(虚拟操作, 不执行任何写实动作)。\
-七个 action: deploy=落盘部署某个 preview(需 preview_id); start_demo=以币安测试网启动已部署策略; \
-ack_risk=首次实盘风险确认(无 name); start_live=以真实资金启动已部署策略; stop_demo=停止测试网实例; \
-stop_live=停止实盘实例(不平仓); close_live=停止实盘并市价平仓(不可逆)。\
-改已部署策略的脚本(deploy 撞名): 默认被拒绝, 默认路径是**换个新名**部署; 只有用户明确要求就改这个策略, \
-才带 replace=true 走受控覆盖(覆盖前自动备份旧脚本, 用户须逐字输入 `确认覆盖 <name>`)。\
-成功后必须把确认块原文与期望短语转告用户, 请其**本人逐字输入**; 不要替用户输入短语, 也不要替用户回车。",
+         action 十三选一: deploy=落盘部署某个 preview(需 preview_id); deploy_replace=覆盖同名已部署策略(旧脚本先备份, 不可逆); \
+         update_params=改已部署策略的参数(需 params); delete_strategy=删除策略文件(不可逆); \
+         start_dry_run / stop_dry_run=启停 Dry Run(真实行情 + 本地虚拟成交, 不涉资金); \
+         start_demo / stop_demo=启停币安测试网实例(真实下单, 非真实资金); \
+         ack_risk=首次实盘风险确认(无需 name); start_live=以真实资金启动; stop_live=停止实盘(不平仓); \
+         close_live=停止实盘并市价平仓(不可逆); restart_live=重启实盘实例(改完参数让它生效, 重过三判据)。\
+         成功后宿主会渲染确认块, 用户回一句确认词即由宿主执行 —— 你**只如实说明会发生什么**, \
+         不要教用户敲任何命令, 也不要自己编确认词、更不要替用户输入。",
         json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["deploy", "start_demo", "ack_risk", "start_live", "stop_demo", "stop_live", "close_live"],
-                    "description": "要登记的动作种类(七选一); 实盘相关动作会跑与终端完全相同的三判据"
+                    "enum": [
+                        "deploy", "deploy_replace", "update_params", "delete_strategy",
+                        "start_dry_run", "stop_dry_run", "start_demo", "stop_demo",
+                        "ack_risk", "start_live", "stop_live", "close_live", "restart_live"
+                    ],
+                    "description": "要登记的动作种类(十三选一); 实盘相关动作会跑与终端完全相同的三判据"
                 },
-                "preview_id": { "type": "string", "description": "action=deploy 时必填: preview_strategy 返回的 preview_id" },
+                "preview_id": { "type": "string", "description": "action=deploy / deploy_replace 时必填: preview_strategy 返回的 preview_id" },
                 "name": { "type": "string", "description": "除 ack_risk 外均必填: 已部署策略名" },
-                "replace": {
-                    "type": "boolean",
-                    "description": "仅 action=deploy 有效, 默认 false。false=同名已存在则拒绝(默认路径是换个新名部署)。true=受控覆盖同名已部署策略: 会先把旧脚本备份为新名 .bak, 用户须逐字输入 `确认覆盖 <name>`(与普通部署短语不同)。只有在用户明确要求改某个已存在策略的脚本时才置 true。"
+                "params": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "仅 action=update_params 必填: \"键=值\" 形式, 如 [\"order_size=0.02\", \"grid_num=10\"](只有用户明确的键才写, 不要自行推断)"
                 }
             },
             "required": ["action"],
@@ -790,48 +846,58 @@ stop_live=停止实盘实例(不平仓); close_live=停止实盘并市价平仓(
                 let action = arg_str(&args, "action")?;
                 let kind = match action.as_str() {
                     "deploy" => ActionKind::Deploy,
+                    "deploy_replace" => ActionKind::DeployReplace,
+                    "update_params" => ActionKind::UpdateParams,
+                    "delete_strategy" => ActionKind::DeleteStrategy,
+                    "start_dry_run" => ActionKind::StartDryRun,
+                    "stop_dry_run" => ActionKind::StopDryRun,
                     "start_demo" => ActionKind::StartDemo,
+                    "stop_demo" => ActionKind::StopDemo,
                     "ack_risk" => ActionKind::AckRisk,
                     "start_live" => ActionKind::StartLive,
-                    "stop_demo" => ActionKind::StopDemo,
                     "stop_live" => ActionKind::StopLive,
                     "close_live" => ActionKind::CloseLive,
+                    "restart_live" => ActionKind::RestartLive,
                     other => {
                         return Err(ToolExecutionError::invalid_args(format!(
-                            "未知 action '{other}'; 仅支持 deploy / start_demo / ack_risk / start_live / stop_demo / stop_live / close_live"
+                            "未知 action '{other}'; 仅支持 deploy / deploy_replace / update_params / delete_strategy / \
+                             start_dry_run / stop_dry_run / start_demo / stop_demo / ack_risk / start_live / \
+                             stop_live / close_live / restart_live"
                         )))
                     }
                 };
 
                 // D5: 非交互(单次提问/管道)不登记 pending, 直接给终端命令
                 if !ctx.interactive {
-                    return Ok(ToolOutput::text(non_interactive_hint(kind, &args)));
+                    return Ok(ToolOutput::text(non_interactive_hint(kind, &args, ctx.lang)));
                 }
 
                 let action_entry = match kind {
-                    ActionKind::Deploy => prepare_deploy(&ctx, &args).await?,
-                    ActionKind::StartDemo => prepare_start_demo(&ctx, &args).await?,
-                    ActionKind::AckRisk => prepare_ack_risk()?,
-                    ActionKind::StartLive => prepare_start_live(&ctx, &args).await?,
-                    ActionKind::StopDemo | ActionKind::StopLive | ActionKind::CloseLive => {
-                        prepare_stop(&ctx, kind, &args).await?
+                    ActionKind::Deploy | ActionKind::DeployReplace => {
+                        prepare_deploy(&ctx, kind, &args).await?
                     }
+                    ActionKind::UpdateParams => prepare_update_params(&ctx, &args).await?,
+                    ActionKind::DeleteStrategy => prepare_delete_strategy(&ctx, &args).await?,
+                    ActionKind::StartDryRun => prepare_start_dry_run(&ctx, &args).await?,
+                    ActionKind::StartDemo => prepare_start_demo(&ctx, &args).await?,
+                    ActionKind::AckRisk => prepare_ack_risk(ctx.lang)?,
+                    ActionKind::StartLive => prepare_start_live(&ctx, &args).await?,
+                    ActionKind::RestartLive => prepare_restart_live(&ctx, &args).await?,
+                    ActionKind::StopDryRun
+                    | ActionKind::StopDemo
+                    | ActionKind::StopLive
+                    | ActionKind::CloseLive => prepare_stop(&ctx, kind, &args).await?,
                 };
 
-                let phrase = action_entry.action.expected_phrase();
                 let mut slot = ctx.pending.lock().await;
                 // 新请求覆盖旧 pending(旧的 deploy preview 未批准, 过了 PENDING_TTL 就自然过期)
                 *slot = Some(action_entry.action.clone());
                 drop(slot);
 
                 Ok(ToolOutput::text(format!(
-                    "{block}\n\
-                     ———— 请在本对话逐字输入(复制即可): {phrase}\n\
-                     放弃请输入: 拒绝\n\
-                     注意: 确认短语只能由你本人输入, 我不会代填; 该待确认 {ttl} 分钟内有效。",
+                    "{block}\n\n{footer}",
                     block = action_entry.block,
-                    // 与 `ai::confirm::PENDING_TTL` 同源, 不手抄 15
-                    ttl = crate::ai::confirm::PENDING_TTL.as_secs() / 60
+                    footer = confirmation_footer(ctx.lang)
                 )))
             })
         },
@@ -845,13 +911,17 @@ struct PreparedAction {
     block: String,
 }
 
-/// deploy 前提校验: preview 存在 / pending / 未过期 / 同名未部署。
+/// deploy / deploy_replace 前提校验: preview 存在 / pending / 未过期 / 同名未部署。
 ///
-/// **FR-044 受控覆盖**: 同名已部署时默认拒绝(默认路径 = 换个新名); 只有 `replace = true`
-/// (且用户在确认块里逐字输入 `确认覆盖 <name>`)才放行, 由宿主编排"先备份旧脚本再覆盖"。
-async fn prepare_deploy(ctx: &ToolCtx, args: &Value) -> Result<PreparedAction, ToolExecutionError> {
+/// **FR-044 受控覆盖**: 同名已部署时默认拒绝(默认路径 = 换个新名); 只有动作登记为
+/// [`ActionKind::DeployReplace`] 才放行, 由宿主编排"先备份旧脚本再覆盖"。
+async fn prepare_deploy(
+    ctx: &ToolCtx,
+    kind: ActionKind,
+    args: &Value,
+) -> Result<PreparedAction, ToolExecutionError> {
+    let replace = kind == ActionKind::DeployReplace;
     let preview_id = arg_str(args, "preview_id")?;
-    let replace = args.get("replace").and_then(|v| v.as_bool()).unwrap_or(false);
     let db = ricow_strategy::Database::open(&commands::db_path_in(&ctx.root))
         .await
         .map_err(|e| ToolExecutionError::other(format!("打开本地库失败: {e}")))?;
@@ -885,20 +955,32 @@ async fn prepare_deploy(ctx: &ToolCtx, args: &Value) -> Result<PreparedAction, T
     }
     let exists = list_toml_stems(&ctx.root.join("strategies")).iter().any(|n| n == &name);
     if exists && !replace {
-        return Err(ToolExecutionError::other(format!(
-            "策略 {name} 已存在: 同名部署默认被拒绝(不覆盖、不静默改名)。\
-             **默认路径是换个新名**: 例如 {suggested}。\
-             若用户确实要改这个策略的脚本, 请先把\"会覆盖 {name}, 且旧脚本会先备份为 \
-             {name}.lua.<时间戳>.bak\"讲清楚并征得明确同意, 再带 replace=true 重新调用本工具 \
-             (用户届时需逐字输入 `确认覆盖 {name}`, 与普通部署的短语不同)。",
-            suggested = ricow_strategy::suggest_strategy_name(&name)
-        )));
+        let suggested = ricow_strategy::suggest_strategy_name(&name);
+        let msg = match ctx.lang {
+            Lang::Zh => format!(
+                "策略 {name} 已存在: 同名部署默认被拒绝(不覆盖、不静默改名)。\
+                 **默认路径是换个新名**: 例如 {suggested}。\
+                 若用户确实要改这个策略的脚本, 先把\"会覆盖 {name}, 且旧脚本会先备份为 \
+                 {name}.lua.<时间戳>.bak\"讲清楚并征得明确同意, 再改调 \
+                 request_write_confirmation(action=\"deploy_replace\", preview_id=...) 登记 \
+                 (这是另一个动作, 确认词也与普通部署不同)。"
+            ),
+            Lang::En => format!(
+                "Strategy {name} already exists: deploying over it is refused by default \
+                 (no silent overwrite, no silent rename). **The default path is a new name**, \
+                 e.g. {suggested}. If the user really wants to replace this strategy's script, \
+                 first state clearly that \"it overwrites {name} and backs the old script up as \
+                 {name}.lua.<timestamp>.bak\" and get explicit consent, then call \
+                 request_write_confirmation(action=\"deploy_replace\", preview_id=...) instead \
+                 (a distinct action, with its own confirmation word)."
+            ),
+        };
+        return Err(ToolExecutionError::other(msg));
     }
-    let base = crate::commands::approve::confirmation_block(&preview.kind, &preview.payload_json);
     if !exists {
         return Ok(PreparedAction {
             action: PendingAction::new_deploy(name, preview_id),
-            block: base,
+            block: deploy_block(&cfg, ctx.lang),
         });
     }
     // FR-044: 覆盖是破坏性动作 —— 确认块必须写清"覆盖谁 / 旧脚本去哪 / 何时生效"。
@@ -906,25 +988,125 @@ async fn prepare_deploy(ctx: &ToolCtx, args: &Value) -> Result<PreparedAction, T
         .await
         .iter()
         .any(|v| v.name == name && v.running);
-    let running_note = if running {
-        format!(
-            "注意: {name} **正在运行** —— 运行中的实例执行的是启动时载入内存的**旧**代码, \
-             本次覆盖不会热更新; 要让新脚本生效须 `ricow restart {name}`(重启按原模式重过门禁)。\n"
-        )
+    Ok(PreparedAction {
+        action: PendingAction::new_deploy_replace(name.clone(), preview_id),
+        block: overwrite_block(&name, running, &cfg, ctx.lang),
+    })
+}
+
+/// `ConfigValue` → 展示字符串(确认块里的参数值; 与 `commands` 侧回执同口径)。
+fn render_value(v: &ricow_strategy::ConfigValue) -> String {
+    match v {
+        ricow_strategy::ConfigValue::String(s) => s.clone(),
+        ricow_strategy::ConfigValue::Float(f) => f.to_string(),
+        ricow_strategy::ConfigValue::Integer(i) => i.to_string(),
+        ricow_strategy::ConfigValue::Boolean(b) => b.to_string(),
+    }
+}
+
+/// 参数摘要(排除 script 正文; 最多 6 项, 超出以 `…` 标记; 与 `commands::approve` 同口径)。
+fn summarize_params(cfg: &ricow_strategy::StrategyConfig, lang: Lang) -> String {
+    let mut items: Vec<String> = cfg
+        .params
+        .iter()
+        .filter(|(k, _)| k.as_str() != "script")
+        .map(|(k, v)| format!("{k}={}", render_value(v)))
+        .collect();
+    items.sort();
+    let total = items.len();
+    items.truncate(6);
+    if total > items.len() {
+        items.push(match lang {
+            Lang::Zh => format!("… 共 {total} 项"),
+            Lang::En => format!("… {total} total"),
+        });
+    }
+    if items.is_empty() {
+        t(lang, "无", "none").to_string()
     } else {
-        String::new()
+        items.join(" ")
+    }
+}
+
+/// 落盘部署确认块(023 FR-010/FR-023): 只讲"会发生什么", **不出现任何终端命令**。
+fn deploy_block(cfg: &ricow_strategy::StrategyConfig, lang: Lang) -> String {
+    let name = cfg.name.trim();
+    let pair = cfg.get_str("pair").unwrap_or("-");
+    let script_len = cfg.get_str("script").map(|s| s.len()).unwrap_or(0);
+    let market = if cfg.market.eq_ignore_ascii_case("futures") {
+        t(lang, "合约 USDT-M", "USDT-M futures")
+    } else {
+        t(lang, "现货", "spot")
     };
-    let block = format!(
-        "———— 确认块(受控覆盖 FR-044)————\n\
-         动作: **覆盖**已部署策略 [{name}] 的脚本与参数\n\
-         备份: 覆盖前先把 strategies/{name}.lua → strategies/{name}.lua.<时间戳>.bak, \
-         strategies/{name}.toml → strategies/{name}.toml.<时间戳>.bak(**备份失败即中止, 不覆盖**)\n\
-         后果: strategies/{name}.toml 与 strategies/{name}.lua 被替换为新脚本; 旧脚本可从 .bak 恢复\n\
-         {running_note}\
-         建议: 若只是想保留旧策略对比, 请改用新名部署(默认路径)。\n\
-         {base}"
-    );
-    Ok(PreparedAction { action: PendingAction::new_deploy_replace(name, preview_id), block })
+    let params = summarize_params(cfg, lang);
+    match lang {
+        Lang::Zh => format!(
+            "———— 确认块 ————\n\
+             动作: **落盘部署** —— 生成策略 {name} (strategies/{name}.toml + strategies/{name}.lua)\n\
+             目标: 策略名 {name} · 交易对 {pair} · 市场 {market} · 脚本 {script_len} 字节\n\
+             参数: {params}\n\
+             后果: 落盘后 {name} 才存在, 可以回测 / 试跑 / 上测试网; \
+             这一步不会自动交易、不会下单、不碰资金。"
+        ),
+        Lang::En => format!(
+            "———— Confirmation ————\n\
+             Action: **deploy to disk** — creates strategy {name} (strategies/{name}.toml + strategies/{name}.lua)\n\
+             Target: strategy {name} · pair {pair} · market {market} · script {script_len} bytes\n\
+             Params: {params}\n\
+             Effect: only after this does {name} exist, ready for backtest / dry run / testnet; \
+             nothing trades, no orders are placed and no funds are touched by this step."
+        ),
+    }
+}
+
+/// 受控覆盖确认块(FR-044): 覆盖谁 / 旧脚本去哪 / 何时生效。
+fn overwrite_block(
+    name: &str,
+    running: bool,
+    cfg: &ricow_strategy::StrategyConfig,
+    lang: Lang,
+) -> String {
+    let params = summarize_params(cfg, lang);
+    match lang {
+        Lang::Zh => format!(
+            "———— 确认块(受控覆盖 FR-044)————\n\
+             动作: **覆盖**已部署策略 [{name}] 的脚本与参数\n\
+             目标: 策略名 {name} · 参数 {params}\n\
+             备份: 覆盖前先把 strategies/{name}.lua → strategies/{name}.lua.<时间戳>.bak, \
+             strategies/{name}.toml → strategies/{name}.toml.<时间戳>.bak(**备份失败即中止, 不覆盖**)\n\
+             后果: strategies/{name}.toml 与 strategies/{name}.lua 被替换为新脚本; 旧脚本可从 .bak 恢复\n\
+             {running_note}\
+             建议: 若只是想保留旧策略对比, 请改用新名部署(默认路径)。",
+            running_note = if running {
+                format!(
+                    "注意: {name} **正在运行** —— 运行中的实例执行的是启动时载入内存的**旧**代码, \
+                     本次覆盖不会热更新; 要让新脚本生效需重启该实例(重启按原模式重过门禁)。\n"
+                )
+            } else {
+                String::new()
+            }
+        ),
+        Lang::En => format!(
+            "———— Confirmation (controlled overwrite, FR-044) ————\n\
+             Action: **overwrite** the script and params of deployed strategy [{name}]\n\
+             Target: strategy {name} · params {params}\n\
+             Backup: before overwriting, strategies/{name}.lua → strategies/{name}.lua.<timestamp>.bak and \
+             strategies/{name}.toml → strategies/{name}.toml.<timestamp>.bak (**backup failure aborts it; nothing is overwritten**)\n\
+             Effect: strategies/{name}.toml and strategies/{name}.lua are replaced by the new script; \
+             the old one can be restored from the .bak copy\n\
+             {running_note}\
+             Tip: if you only want to keep the old strategy for comparison, deploy under a new name (the default path).",
+            running_note = if running {
+                format!(
+                    "Note: {name} is **currently running** — a running instance keeps the **old** code it loaded at start, \
+                     so this overwrite is not hot-swapped. Restart the instance for the new script to take effect \
+                     (a restart re-runs the gates for its current mode).\n"
+                )
+            } else {
+                String::new()
+            }
+        ),
+    }
 }
 
 /// start_demo 前提校验: 已部署 / 当前未运行 / demo 凭据已配置(缺则如实点名)。
@@ -954,39 +1136,379 @@ async fn prepare_start_demo(
     if let Err(e) = crate::commands::load_demo_credentials(&ctx.root) {
         return Err(ToolExecutionError::other(format!("测试网凭据未就绪, 无法启动 demo: {e}")));
     }
-    let block = format!(
-        "———— 确认块 ————\n\
-         动作: 启动测试网 demo [start_demo]\n\
-         目标: 策略 {name}\n\
-         端点: 现货 {spot} / 合约 {fapi}(币安测试网, 与主网完全隔离)\n\
-         后果: 会**真实向测试网下单/撤单**(用于验证下单链路), **不涉及真实资金**; \
-         不需要 live_enabled, 不适用实盘三判据。停机仍须你本人执行 `ricow stop {name}`(涉及撤单清理)。",
-        spot = crate::commands::DEMO_SPOT_URL,
-        fapi = crate::commands::DEMO_FAPI_URL
-    );
+    let block = match ctx.lang {
+        Lang::Zh => format!(
+            "———— 确认块 ————\n\
+             动作: 启动测试网实例 —— 目标: 策略 {name}\n\
+             端点: 现货 {spot} / 合约 {fapi}(币安测试网, 与主网完全隔离)\n\
+             后果: 会**真实向测试网下单/撤单**(用于验证下单链路), **不涉及真实资金**; \
+             不需要实盘开关, 不适用实盘三判据。停机涉及交易所侧撤单清理, 同样需要你本人回一句确认词。",
+            spot = crate::commands::DEMO_SPOT_URL,
+            fapi = crate::commands::DEMO_FAPI_URL
+        ),
+        Lang::En => format!(
+            "———— Confirmation ————\n\
+             Action: start a testnet instance — target: strategy {name}\n\
+             Endpoints: spot {spot} / futures {fapi} (Binance testnet, fully isolated from mainnet)\n\
+             Effect: it **really places and cancels orders on the testnet** (to validate the order path), \
+             and **no real funds are involved**; no live switch is needed and the three live gates do not apply. \
+             Stopping it involves exchange-side order cleanup, so that also needs your own confirmation reply.",
+            spot = crate::commands::DEMO_SPOT_URL,
+            fapi = crate::commands::DEMO_FAPI_URL
+        ),
+    };
     Ok(PreparedAction { action: PendingAction::new_start_demo(name), block })
+}
+
+/// update_params 前提校验(023 FR-024/D10): 已部署 + `params` 非空且逐项可解析。
+///
+/// 确认块里只**预览**"改前 → 改后"; 真正写盘(时间戳备份 + 重写 `[strategy.params]`)、
+/// 以及 dry_run/demo 的条件重启都在宿主执行时(`session::execute_confirmed`)。
+/// **实盘实例不在此确认内重启**(D10) —— 那需要另起一次「重启实盘」确认。
+async fn prepare_update_params(
+    ctx: &ToolCtx,
+    args: &Value,
+) -> Result<PreparedAction, ToolExecutionError> {
+    let name = arg_str(args, "name")?;
+    safe_strategy_name(&name)?;
+    let cfg = crate::commands::read_strategy_config_in(&ctx.root, &name).ok_or_else(|| {
+        ToolExecutionError::other(match ctx.lang {
+            Lang::Zh => format!(
+                "策略 {name} 尚未部署(strategies/ 下找不到 {name}.toml); 请先完成生成预览与落盘部署"
+            ),
+            Lang::En => format!(
+                "Strategy {name} is not deployed (no {name}.toml under strategies/); \
+                 finish a preview and deploy it first."
+            ),
+        })
+    })?;
+    let unset = t(ctx.lang, "<未设置>", "<unset>");
+    let items =
+        args.get("params").and_then(|v| v.as_array()).filter(|a| !a.is_empty()).ok_or_else(
+            || {
+                ToolExecutionError::invalid_args(
+                    "缺少参数 params(需为非空数组, 每项形如 \"key=value\")",
+                )
+            },
+        )?;
+    let mut raw: Vec<String> = Vec::new();
+    let mut diffs: Vec<String> = Vec::new();
+    for item in items {
+        let Some(s) = item.as_str() else {
+            return Err(ToolExecutionError::invalid_args(
+                "params 的每一项都必须是 \"key=value\" 字符串",
+            ));
+        };
+        let Some((key, value)) = crate::commands::backtest::parse_param(s) else {
+            return Err(ToolExecutionError::invalid_args(format!(
+                "参数 \"{s}\" 不是 key=value 形式(例: order_size=0.05)"
+            )));
+        };
+        let before = cfg.params.get(&key).map(render_value).unwrap_or_else(|| unset.to_string());
+        diffs.push(format!("  {key}: {before} → {}", render_value(&value)));
+        raw.push(s.trim().to_string());
+    }
+
+    // 条件重启提示(D10): 复用宿主同一条模式判定口径, 只描述会发生什么。
+    let mode = crate::commands::instances::views(&ctx.root)
+        .await
+        .iter()
+        .find(|v| v.name == name && v.running)
+        .and_then(|v| v.mode.clone());
+    let diff_text = diffs.join("\n");
+    let backup = format!("strategies/{name}.toml.<时间戳>.bak");
+    let block = match (mode.as_deref(), ctx.lang) {
+        (Some("live"), Lang::Zh) => format!(
+            "———— 确认块 ————\n\
+             动作: **修改参数** —— 目标: 策略 {name}\n\
+             改动:\n{diff_text}\n\
+             备份: 写前先把 strategies/{name}.toml 备份为 {backup}(备份失败即中止, 不写入)\n\
+             后果: 只改 [strategy.params] 里的这些键, 顶层开关(含实盘开关)一律不动。\n\
+             注意: {name} **正在以实盘运行** —— 本次确认**不会**重启它; \
+             要让新参数生效需再发起一次「重启实盘」并单独确认(真实资金, 重过三判据)。"
+        ),
+        (Some("live"), Lang::En) => format!(
+            "———— Confirmation ————\n\
+             Action: **update parameters** — target: strategy {name}\n\
+             Changes:\n{diff_text}\n\
+             Backup: strategies/{name}.toml is copied to {backup} first (a failed backup aborts the write)\n\
+             Effect: only these keys under [strategy.params] change; top-level switches \
+             (including the live switch) are never touched.\n\
+             Note: {name} is **running live** — this confirmation does **not** restart it; \
+             the new parameters take effect only via a separate \"restart live\" confirmation \
+             (real funds, all three gates re-applied)."
+        ),
+        (Some(other), Lang::Zh) => format!(
+            "———— 确认块 ————\n\
+             动作: **修改参数** —— 目标: 策略 {name}\n\
+             改动:\n{diff_text}\n\
+             备份: 写前先把 strategies/{name}.toml 备份为 {backup}(备份失败即中止, 不写入)\n\
+             后果: 只改 [strategy.params] 里的这些键, 顶层开关(含实盘开关)一律不动。\n\
+             注意: {name} 正在以「{}」运行 —— 确认后会先停再按**原模式**重启, 新参数随即生效\
+             (不会静默换成别的模式)。",
+            crate::commands::instances::mode_text(other)
+        ),
+        (Some(other), Lang::En) => format!(
+            "———— Confirmation ————\n\
+             Action: **update parameters** — target: strategy {name}\n\
+             Changes:\n{diff_text}\n\
+             Backup: strategies/{name}.toml is copied to {backup} first (a failed backup aborts the write)\n\
+             Effect: only these keys under [strategy.params] change; top-level switches \
+             (including the live switch) are never touched.\n\
+             Note: {name} is running as \"{other}\" — after you confirm it is stopped and restarted \
+             in the **same mode**, so the new parameters apply right away (no silent mode change)."
+        ),
+        (None, Lang::Zh) => format!(
+            "———— 确认块 ————\n\
+             动作: **修改参数** —— 目标: 策略 {name}\n\
+             改动:\n{diff_text}\n\
+             备份: 写前先把 strategies/{name}.toml 备份为 {backup}(备份失败即中止, 不写入)\n\
+             后果: 只改 [strategy.params] 里的这些键, 顶层开关(含实盘开关)一律不动。\n\
+             该策略当前未运行: 只改文件, 下次启动时生效。"
+        ),
+        (None, Lang::En) => format!(
+            "———— Confirmation ————\n\
+             Action: **update parameters** — target: strategy {name}\n\
+             Changes:\n{diff_text}\n\
+             Backup: strategies/{name}.toml is copied to {backup} first (a failed backup aborts the write)\n\
+             Effect: only these keys under [strategy.params] change; top-level switches \
+             (including the live switch) are never touched.\n\
+             It is not running right now: only the file changes, and the new values apply on the next start."
+        ),
+    };
+    Ok(PreparedAction { action: PendingAction::new_update_params(name, raw), block })
+}
+
+/// delete_strategy 前提校验(023 FR-024/D11): 策略文件存在(运行中则先停机, 见宿主执行)。
+///
+/// **不删 `logs/`** —— 日志与成交留痕保留, 供事后追溯。
+async fn prepare_delete_strategy(
+    ctx: &ToolCtx,
+    args: &Value,
+) -> Result<PreparedAction, ToolExecutionError> {
+    let name = arg_str(args, "name")?;
+    safe_strategy_name(&name)?;
+    let dir = ctx.root.join("strategies");
+    let toml = dir.join(format!("{name}.toml"));
+    let lua = dir.join(format!("{name}.lua"));
+    if !toml.is_file() && !lua.is_file() {
+        return Err(ToolExecutionError::other(match ctx.lang {
+            Lang::Zh => format!("策略 {name} 不存在(strategies/ 下没有 {name}.toml 或 {name}.lua)"),
+            Lang::En => {
+                format!("Strategy {name} does not exist (no {name}.toml or {name}.lua under strategies/)")
+            }
+        }));
+    }
+    let running = crate::commands::instances::views(&ctx.root)
+        .await
+        .iter()
+        .find(|v| v.name == name && v.running)
+        .map(|v| (v.mode.clone(), v.pid));
+    let running_note = match (&running, ctx.lang) {
+        (Some((mode, pid)), Lang::Zh) => format!(
+            "注意: {name} **正在运行**(模式={}, pid={pid:?}) —— 确认后会先把它停掉\
+             (不平仓, 交易所侧撤单兜底), 再删除文件。\n",
+            mode.as_deref().unwrap_or("?")
+        ),
+        (Some((mode, pid)), Lang::En) => format!(
+            "Note: {name} is **currently running** (mode={}, pid={pid:?}) — after you confirm it is stopped \
+             first (positions kept, exchange-side order cancellation as a fallback), then the files are deleted.\n",
+            mode.as_deref().unwrap_or("?")
+        ),
+        (None, _) => String::new(),
+    };
+    let block = match ctx.lang {
+        Lang::Zh => format!(
+            "———— 确认块 ————\n\
+             动作: **删除策略** —— 目标: 策略 {name}\n\
+             删除: strategies/{name}.toml 与 strategies/{name}.lua(存在才删)\n\
+             {running_note}\
+             保留: logs/ 下的日志与成交留痕**不会删除**(供事后追溯)\n\
+             后果(**不可逆**): 删除后平台内无法恢复; 如需留底请先把文件拷走。"
+        ),
+        Lang::En => format!(
+            "———— Confirmation ————\n\
+             Action: **delete strategy** — target: strategy {name}\n\
+             Removes: strategies/{name}.toml and strategies/{name}.lua (only the ones that exist)\n\
+             {running_note}\
+             Kept: logs under logs/ are **not deleted** (they stay for later review)\n\
+             Effect (**irreversible**): once deleted it cannot be restored from within ricow; \
+             copy the files elsewhere first if you want a backup."
+        ),
+    };
+    Ok(PreparedAction { action: PendingAction::new_delete_strategy(name), block })
+}
+
+/// start_dry_run 前提校验(023 FR-024): 已部署 + 当前未运行。
+///
+/// 必须告知用户"首次启动会记下开始时间 = 实盘时长门禁开始计时"。
+async fn prepare_start_dry_run(
+    ctx: &ToolCtx,
+    args: &Value,
+) -> Result<PreparedAction, ToolExecutionError> {
+    let name = arg_str(args, "name")?;
+    safe_strategy_name(&name)?;
+    if !list_toml_stems(&ctx.root.join("strategies")).iter().any(|n| n == &name) {
+        return Err(ToolExecutionError::other(match ctx.lang {
+            Lang::Zh => format!(
+                "策略 {name} 尚未部署(strategies/ 下找不到 {name}.toml); 请先完成生成预览与落盘部署"
+            ),
+            Lang::En => format!(
+                "Strategy {name} is not deployed (no {name}.toml under strategies/); \
+                 finish a preview and deploy it first."
+            ),
+        }));
+    }
+    if let Some(v) = crate::commands::instances::views(&ctx.root)
+        .await
+        .iter()
+        .find(|v| v.name == name && v.running)
+    {
+        return Err(ToolExecutionError::other(match ctx.lang {
+            Lang::Zh => format!(
+                "策略 {name} 已在运行(模式={}, pid={:?}); 请先停机再启动, 不要重复拉起",
+                v.mode.as_deref().unwrap_or("?"),
+                v.pid
+            ),
+            Lang::En => format!(
+                "Strategy {name} is already running (mode={}, pid={:?}); stop it before starting again",
+                v.mode.as_deref().unwrap_or("?"),
+                v.pid
+            ),
+        }));
+    }
+    let block = match ctx.lang {
+        Lang::Zh => format!(
+            "———— 确认块 ————\n\
+             动作: 启动试跑(Dry Run) —— 目标: 策略 {name}\n\
+             后果: 用**真实行情**在本地按策略规则虚拟撮合下单; **不连交易所、不下真单、不碰资金、不需要凭据**。\n\
+             注意(必须转告用户): 首次启动会记下开始时间 —— 实盘「时长门禁」从这一刻开始计时。\n\
+             停机同样需要你本人回一句确认词。"
+        ),
+        Lang::En => format!(
+            "———— Confirmation ————\n\
+             Action: start a dry run — target: strategy {name}\n\
+             Effect: it fills orders locally against **live market data** using the strategy rules; \
+             **no exchange connection, no real orders, no funds, no credentials needed**.\n\
+             Note (must be passed on to the user): the first start records a start time — \
+             the live-trading \"minimum dry-run duration\" gate counts from that moment.\n\
+             Stopping it also needs your own confirmation reply."
+        ),
+    };
+    Ok(PreparedAction { action: PendingAction::new_start_dry_run(name), block })
+}
+
+/// restart_live 前提校验(023 FR-024): 已部署 + 正在以**实盘**运行。
+///
+/// 重启 = 停(不平仓) → 实盘预检(fail-closed) → 以实盘重启; 三判据一条不少。
+async fn prepare_restart_live(
+    ctx: &ToolCtx,
+    args: &Value,
+) -> Result<PreparedAction, ToolExecutionError> {
+    let name = arg_str(args, "name")?;
+    safe_strategy_name(&name)?;
+    if !list_toml_stems(&ctx.root.join("strategies")).iter().any(|n| n == &name) {
+        return Err(ToolExecutionError::other(match ctx.lang {
+            Lang::Zh => format!(
+                "策略 {name} 尚未部署(strategies/ 下找不到 {name}.toml); 请先完成生成预览与落盘部署"
+            ),
+            Lang::En => format!(
+                "Strategy {name} is not deployed (no {name}.toml under strategies/); \
+                 finish a preview and deploy it first."
+            ),
+        }));
+    }
+    let views = crate::commands::instances::views(&ctx.root).await;
+    let Some(v) = views.iter().find(|v| v.name == name) else {
+        return Err(ToolExecutionError::other(match ctx.lang {
+            Lang::Zh => format!("没有名为 {name} 的实例; 重启只适用于**正在以实盘运行**的策略"),
+            Lang::En => format!(
+                "There is no instance named {name}; a restart only applies to a strategy **currently running live**"
+            ),
+        }));
+    };
+    if !v.running || v.mode.as_deref() != Some("live") {
+        return Err(ToolExecutionError::other(match ctx.lang {
+            Lang::Zh => format!(
+                "策略 {name} 当前不在实盘运行(运行中={}, 模式={}); \
+                 未运行请用 start_live, 试跑/测试网请用 stop_dry_run / stop_demo",
+                v.running,
+                v.mode.as_deref().unwrap_or("?")
+            ),
+            Lang::En => format!(
+                "Strategy {name} is not running live (running={}, mode={}); \
+                 use start_live to start it, or stop_dry_run / stop_demo for dry run / testnet",
+                v.running,
+                v.mode.as_deref().unwrap_or("?")
+            ),
+        }));
+    }
+    let pid = v.pid;
+    let block = match ctx.lang {
+        Lang::Zh => format!(
+            "———— 确认块 ————\n\
+             动作: **重启实盘** —— 目标: 策略 {name}(pid={pid:?})\n\
+             后果(**真实资金**): 先把当前实盘实例停下(不平仓, 交易所侧撤单兜底), 再以实盘重新启动。\n\
+             启动前会重过实盘三判据(首次风险确认 / Dry Run 时长门禁 / 时钟预检), 任一不过即拒绝启动 —— \
+             不会静默降级为试跑。\n\
+             新参数(或新脚本)在重启后生效。"
+        ),
+        Lang::En => format!(
+            "———— Confirmation ————\n\
+             Action: **restart live trading** — target: strategy {name} (pid={pid:?})\n\
+             Effect (**real funds**): the current live instance is stopped first (positions kept, \
+             exchange-side order cancellation as a fallback), then it is started live again.\n\
+             All three live gates are re-applied before it starts (first risk acknowledgement / \
+             minimum dry-run duration / clock precheck); if any fails the start is refused — \
+             it is never silently downgraded to a dry run.\n\
+             New parameters (or the new script) take effect after the restart."
+        ),
+    };
+    Ok(PreparedAction { action: PendingAction::new_restart_live(name), block })
 }
 
 /// ack_risk 前提校验 (019 R4): 018 风险确认**一次长期有效**, 已确认过就明确拒绝重复登记。
 ///
 /// 无参数, 也不读 ctx: 确认记录固定落在 [`crate::commands::risk_ack_path`](= project_root),
 /// 那是子进程 `run` 唯一会读的位置。
-fn prepare_ack_risk() -> Result<PreparedAction, ToolExecutionError> {
+fn prepare_ack_risk(lang: Lang) -> Result<PreparedAction, ToolExecutionError> {
+    let path = crate::commands::risk_ack_path();
     if crate::commands::risk_acked() {
-        return Err(ToolExecutionError::other(format!(
-            "已经完成过风险确认({}), 无需重复; 直接登记 start_live 即可。",
-            crate::commands::risk_ack_path().display()
-        )));
+        let msg = match lang {
+            Lang::Zh => format!(
+                "已经完成过风险确认({}), 无需重复; 直接登记 start_live 即可。",
+                path.display()
+            ),
+            Lang::En => format!(
+                "The risk acknowledgement is already on record ({}); no need to repeat it — \
+                 register start_live directly.",
+                path.display()
+            ),
+        };
+        return Err(ToolExecutionError::other(msg));
     }
-    let block = format!(
-        "———— 确认块 ————\n\
-         动作: 首次实盘风险确认 [ack_risk]\n\
-         风险披露全文(请用户读完再确认):\n{disclosure}\n\
-         后果: 确认后写入 {} —— 这是一次性长期记录, 之后启动实盘不再要求这一步。\n\
-         提示: 建议先用 Dry Run(真实行情/虚拟成交)与测试网 demo 验证策略, 再动真实资金。",
-        crate::commands::risk_ack_path().display(),
-        disclosure = ricow_engine::RISK_DISCLOSURE
-    );
+    let block = match lang {
+        Lang::Zh => format!(
+            "———— 确认块 ————\n\
+             动作: 首次实盘风险确认\n\
+             风险披露全文(请读完再确认):\n{disclosure}\n\
+             后果: 确认后写入 {} —— 这是一次性长期记录, 之后启动实盘不再要求这一步。\n\
+             提示: 建议先用试跑(真实行情/虚拟成交)与测试网验证策略, 再动真实资金。",
+            path.display(),
+            disclosure = ricow_engine::RISK_DISCLOSURE
+        ),
+        Lang::En => format!(
+            "———— Confirmation ————\n\
+             Action: first-time live-trading risk acknowledgement\n\
+             Full risk disclosure (please read it before confirming):\n{disclosure}\n\
+             Effect: on confirmation this is written to {} — a one-off, long-lived record, so live \
+             starts will not ask for this step again.\n\
+             Tip: validate the strategy with a dry run (real market data, simulated fills) and the \
+             testnet first, before putting real funds at risk.",
+            path.display(),
+            disclosure = ricow_engine::RISK_DISCLOSURE
+        ),
+    };
     Ok(PreparedAction { action: PendingAction::new_ack_risk(), block })
 }
 
@@ -1024,52 +1546,89 @@ async fn prepare_start_live(
         )));
     };
     if !config.live_enabled {
-        return Err(ToolExecutionError::other(format!(
-            "策略 {name} 的配置里 live_enabled = false: 按设计不会进实盘(会降级为 Dry Run)。\n\
-             实盘是**双条件**(live_enabled = true 且 显式要求实盘), 缺一不可。\n\
-             请让用户在 strategies/{name}.toml 中把它改为 true(改后 `ricow restart {name}` 生效), \
-             或先用测试网 demo 验证策略。"
-        )));
+        let msg = match ctx.lang {
+            Lang::Zh => format!(
+                "策略 {name} 的配置里 live_enabled = false: 按设计不会进实盘(会降级为试跑)。\n\
+                 实盘是**双条件**(live_enabled = true 且 显式要求实盘), 缺一不可。\n\
+                 请让用户在 strategies/{name}.toml 中把它改为 true(改后需重启该实例才生效), \
+                 或先用测试网验证策略。"
+            ),
+            Lang::En => format!(
+                "Strategy {name} has live_enabled = false: by design it will not go live \
+                 (it falls back to a dry run).\n\
+                 Live trading takes **two conditions** (live_enabled = true **and** an explicit live request); \
+                 both are required.\n\
+                 Ask the user to set it to true in strategies/{name}.toml (restart the instance for it to take \
+                 effect), or validate the strategy on the testnet first."
+            ),
+        };
+        return Err(ToolExecutionError::other(msg));
     }
     // 002 时长门禁与 018 风险确认都走**共享内核**(019 R4): 与命令行/子进程同一份取参默认值
     // 与判定, 只是这里必须"不过就不发确认块", 所以把拒绝说明转成工具错误。
     let min_hours = match crate::commands::ctrl::dry_run_gate_shared(&config) {
         Ok(h) => h,
         Err(msg) => {
-            return Err(ToolExecutionError::other(format!(
-                "实盘三判据之「Dry Run 时长门禁」尚未通过, 不发确认块(免得你白输短语):\n{msg}"
-            )))
+            let head = t(
+                ctx.lang,
+                "实盘三判据之「Dry Run 时长门禁」尚未通过, 不发确认块(免得你白输确认词):",
+                "The \"dry-run duration gate\" of the three live gates has not passed, so no confirmation \
+                 block is shown (to save you a pointless reply):",
+            );
+            return Err(ToolExecutionError::other(format!("{head}\n{msg}")));
         }
     };
     // 018: 本内核在 accept_risk=false 时等价于"是否已确认过"; 话术补上对话内该调哪个动作。
     if let Err(e) = crate::commands::ctrl::risk_gate_shared(false) {
-        return Err(ToolExecutionError::other(format!(
-            "实盘三判据之「首次风险确认」未完成: {e}\n\
-             对话内做法: 先调 request_write_confirmation(action=\"ack_risk\") \
-             让用户过一遍风险披露并逐字确认, 然后再来登记 start_live。"
-        )));
+        let msg = match ctx.lang {
+            Lang::Zh => format!(
+                "实盘三判据之「首次风险确认」未完成: {e}\n\
+                 对话内做法: 先调 request_write_confirmation(action=\"ack_risk\") \
+                 让用户过一遍风险披露并回一句确认词, 然后再来登记 start_live。"
+            ),
+            Lang::En => format!(
+                "The \"first-time risk acknowledgement\" of the three live gates is not done: {e}\n\
+                 In-chat approach: first call request_write_confirmation(action=\"ack_risk\") so the user can \
+                 read the risk disclosure and reply with a confirmation word, then register start_live."
+            ),
+        };
+        return Err(ToolExecutionError::other(msg));
     }
     if let Err(e) = crate::commands::load_live_credentials() {
         return Err(ToolExecutionError::other(format!("实盘凭据未就绪, 无法启动实盘: {e}")));
     }
-    let block = format!(
-        "———— 确认块 ————\n\
-         动作: 启动实盘 [start_live]\n\
-         目标: 策略 {name}(市场: {market})\n\
-         后果(**真实资金**): 启动后按你账户里的真实资金下单/撤单; 停机只做撤单兜底, 持仓保留。\n\
-         门禁: 018 风险确认 ✓ · 002 Dry Run 时长门禁 ✓({min} 小时)· 执行时再跑 FR-008 时钟预检(不过即拒绝)\n\
-         注意: 平台不做风控 —— 仓位与止损由策略自己负责。",
-        market = if config.market.eq_ignore_ascii_case("futures") { "合约 USDT-M" } else { "现货" },
-        min = min_hours
-    );
+    let market = if config.market.eq_ignore_ascii_case("futures") {
+        t(ctx.lang, "合约 USDT-M", "USDT-M futures")
+    } else {
+        t(ctx.lang, "现货", "spot")
+    };
+    let block = match ctx.lang {
+        Lang::Zh => format!(
+            "———— 确认块 ————\n\
+             动作: 启动实盘 —— 目标: 策略 {name}(市场: {market})\n\
+             后果(**真实资金**): 启动后按你账户里的真实资金下单/撤单; 停机只做撤单兜底, 持仓保留。\n\
+             门禁: 风险确认 ✓ · 试跑时长门禁 ✓({min_hours} 小时)· 执行时再跑一次时钟预检(不过即拒绝)\n\
+             注意: 平台不做风控 —— 仓位与止损由策略自己负责。"
+        ),
+        Lang::En => format!(
+            "———— Confirmation ————\n\
+             Action: start live trading — target: strategy {name} (market: {market})\n\
+             Effect (**real funds**): once started it places and cancels orders with the real funds in your \
+             account; stopping only cancels orders as a fallback and keeps positions open.\n\
+             Gates: risk acknowledgement ✓ · dry-run duration gate ✓ ({min_hours} hours) · a clock pre-check runs \
+             again at execution time (and refuses if it fails)\n\
+             Note: the platform does no risk management — position sizing and stop-losses are the strategy's job."
+        ),
+    };
     Ok(PreparedAction { action: PendingAction::new_start_live(name), block })
 }
 
 /// 停机动作与实例当前模式是否匹配(纯函数, 便于单测): `None` = 匹配。
 ///
 /// 误配的代价不对称: 拿 stop_demo 去停实盘会静默放过(反之亦然), 所以宁可直接拒绝并点名正确动作。
-fn stop_mode_mismatch(kind: ActionKind, mode: &str) -> Option<String> {
+fn stop_mode_mismatch(kind: ActionKind, mode: &str, lang: Lang) -> Option<String> {
     let want = match kind {
+        ActionKind::StopDryRun => "dry_run",
         ActionKind::StopDemo => "demo",
         ActionKind::StopLive | ActionKind::CloseLive => "live",
         _ => return None,
@@ -1077,11 +1636,25 @@ fn stop_mode_mismatch(kind: ActionKind, mode: &str) -> Option<String> {
     if mode == want {
         return None;
     }
-    Some(format!(
-        "该实例当前模式是「{}」, 与动作「{}」不匹配: 测试网实例用 stop_demo, 实盘实例用 stop_live(需一并平仓用 close_live)。",
-        crate::commands::instances::mode_text(mode),
-        kind.label()
-    ))
+    let shown = match (mode, lang) {
+        ("live", Lang::En) => "live".to_string(),
+        ("demo", Lang::En) => "testnet (demo)".to_string(),
+        ("dry_run", Lang::En) => "dry run".to_string(),
+        _ => crate::commands::instances::mode_text(mode),
+    };
+    Some(match lang {
+        Lang::Zh => format!(
+            "该实例当前模式是「{shown}」, 与要登记的动作「{}」不匹配: 试跑实例用 stop_dry_run, \
+             测试网实例用 stop_demo, 实盘实例用 stop_live(需一并平仓用 close_live)。",
+            kind.label(lang)
+        ),
+        Lang::En => format!(
+            "This instance is in mode \"{shown}\", which does not match the requested action \"{}\": \
+             use stop_dry_run for a dry run, stop_demo for a testnet instance and stop_live for a live one \
+             (close_live to also close positions).",
+            kind.label(lang)
+        ),
+    })
 }
 
 /// stop_demo / stop_live / close_live 前提校验: 实例存在 / 正在运行 / 模式与动作匹配。
@@ -1107,33 +1680,60 @@ async fn prepare_stop(
             v.mode.as_deref().unwrap_or("?")
         )));
     }
-    if let Some(msg) = stop_mode_mismatch(kind, v.mode.as_deref().unwrap_or_default()) {
+    if let Some(msg) = stop_mode_mismatch(kind, v.mode.as_deref().unwrap_or_default(), ctx.lang) {
         return Err(ToolExecutionError::other(msg));
     }
     let pid = v.pid;
-    let block = match kind {
-        ActionKind::StopDemo => format!(
+    let block = match (kind, ctx.lang) {
+        (ActionKind::StopDryRun, Lang::Zh) => format!(
             "———— 确认块 ————\n\
-             动作: 停止测试网 demo [stop_demo]\n\
-             目标: 策略 {name}(pid={pid:?})\n\
-             后果: 子进程优雅退出 + 交易所侧撤单兜底; **不平仓**(测试网持仓保留), 与真实资金无关。",
+             动作: 停止试跑 —— 目标: 策略 {name}(pid={pid:?})\n\
+             后果: 子进程优雅退出; 试跑只走虚拟撮合, 交易所侧没有任何挂单, 与真实资金无关。"
         ),
-        ActionKind::StopLive => format!(
+        (ActionKind::StopDryRun, Lang::En) => format!(
+            "———— Confirmation ————\n\
+             Action: stop the dry run — target: strategy {name} (pid={pid:?})\n\
+             Effect: the child process exits gracefully; a dry run only does simulated matching, \
+             so there are no exchange-side orders and no real funds are involved."
+        ),
+        (ActionKind::StopDemo, Lang::Zh) => format!(
             "———— 确认块 ————\n\
-             动作: 停止实盘 [stop_live]\n\
-             目标: 策略 {name}(pid={pid:?})\n\
+             动作: 停止测试网实例 —— 目标: 策略 {name}(pid={pid:?})\n\
+             后果: 子进程优雅退出 + 交易所侧撤单兜底; **不平仓**(测试网持仓保留), 与真实资金无关。"
+        ),
+        (ActionKind::StopDemo, Lang::En) => format!(
+            "———— Confirmation ————\n\
+             Action: stop the testnet instance — target: strategy {name} (pid={pid:?})\n\
+             Effect: the child process exits gracefully and orders are cancelled as a fallback; \
+             **positions are kept open** (they are testnet positions) and no real funds are involved."
+        ),
+        (ActionKind::StopLive, Lang::Zh) => format!(
+            "———— 确认块 ————\n\
+             动作: 停止实盘 —— 目标: 策略 {name}(pid={pid:?})\n\
              后果(**真实资金**): 子进程优雅退出 + 交易所侧撤单兜底; **持仓保留不自动平仓** —— \
-             如需一并市价平仓请改用 close_live。",
+             如需一并市价平仓请改用 close_live。"
         ),
-        ActionKind::CloseLive => format!(
+        (ActionKind::StopLive, Lang::En) => format!(
+            "———— Confirmation ————\n\
+             Action: stop live trading — target: strategy {name} (pid={pid:?})\n\
+             Effect (**real funds**): the child process exits gracefully and orders are cancelled as a fallback; \
+             **positions stay open** — use close_live instead if you also want them market-closed."
+        ),
+        (ActionKind::CloseLive, Lang::Zh) => format!(
             "———— 确认块 ————\n\
-             动作: 平仓停止实盘 [close_live]\n\
-             目标: 策略 {name}(pid={pid:?})\n\
-             后果(**不可逆**): 先市价平掉该策略名下持仓, 再停机退出; 成交价由市场决定, 可能产生滑点与亏损。",
+             动作: 平仓停止实盘 —— 目标: 策略 {name}(pid={pid:?})\n\
+             后果(**不可逆**): 先市价平掉该策略名下持仓, 再停机退出; 成交价由市场决定, 可能产生滑点与亏损。"
         ),
-        _ => unreachable!("prepare_stop 只服务 stop_demo / stop_live / close_live"),
+        (ActionKind::CloseLive, Lang::En) => format!(
+            "———— Confirmation ————\n\
+             Action: close positions and stop live trading — target: strategy {name} (pid={pid:?})\n\
+             Effect (**irreversible**): first market-close every position held by this strategy, then stop and exit; \
+             the fill price is set by the market, so slippage and losses are possible."
+        ),
+        _ => unreachable!("prepare_stop 只服务 stop_dry_run / stop_demo / stop_live / close_live"),
     };
     let action = match kind {
+        ActionKind::StopDryRun => PendingAction::new_stop_dry_run(name),
         ActionKind::StopDemo => PendingAction::new_stop_demo(name),
         ActionKind::StopLive => PendingAction::new_stop_live(name),
         _ => PendingAction::new_close_live(name),
@@ -1142,107 +1742,114 @@ async fn prepare_stop(
 }
 
 /// 非交互环境(单次 `ricow ai "..."` / 管道)的回退指引: 不登记、不执行, 只给终端命令。
-fn non_interactive_hint(kind: ActionKind, args: &Value) -> String {
-    let head = "当前是非交互环境(单次提问或管道), 对话内确认不开放。请在你自己的终端执行:\n  ";
-    let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("<策略名>");
-    match kind {
+///
+/// FR-012 例外: 这是**唯一**允许出现终端命令的用户可见文案 —— 单次模式的用户本身就是命令行
+/// 使用者; 末尾补一句"想用对话方式操作直接运行 `ricow ai`"。
+fn non_interactive_hint(kind: ActionKind, args: &Value, lang: Lang) -> String {
+    let name_ph = t(lang, "<策略名>", "<strategy-name>");
+    let id_ph = t(lang, "<preview_id>", "<preview_id>");
+    let name = args.get("name").and_then(|v| v.as_str()).unwrap_or(name_ph);
+    let head = t(
+        lang,
+        "当前是非交互环境(单次提问或管道), 对话内确认不开放。请在你自己的终端执行:\n  ",
+        "This is a non-interactive session (one-shot question or a pipe), so in-chat confirmation is unavailable. Run this in your own terminal:\n  ",
+    );
+    let tail = t(
+        lang,
+        "\n想用对话方式操作, 直接运行 `ricow ai` 进交互模式。",
+        "\nTo do this conversationally, just run `ricow ai` to enter interactive mode.",
+    );
+    let body = match kind {
         ActionKind::Deploy => {
-            let id = args.get("preview_id").and_then(|v| v.as_str()).unwrap_or("<preview_id>");
+            let id = args.get("preview_id").and_then(|v| v.as_str()).unwrap_or(id_ph);
             format!(
-                "{head}ricow approve {id}\n  ricow deploy {id} --token <approve 返回的一次性 token>"
+                "ricow approve {id}\n  ricow deploy {id} --token <approve 返回的一次性 token>"
             )
         }
-        ActionKind::StartDemo => format!("{head}ricow start {name} --demo"),
+        ActionKind::DeployReplace => t(
+            lang,
+            "覆盖同名策略只在对话内开放(终端不提供该路径); 用 `ricow ai` 进对话后再发起覆盖。",
+            "Overwriting an existing strategy is only available in the chat (the terminal has no such path); \
+             enter the chat with `ricow ai` and request the overwrite there.",
+        )
+        .to_string(),
+        ActionKind::UpdateParams => format!(
+            "ricow stop {name}\n  (编辑 strategies/{name}.toml 的 [strategy.params])\n  ricow start {name}"
+        ),
+        ActionKind::DeleteStrategy => {
+            format!("ricow stop {name}\n  (删除 strategies/{name}.toml 与 strategies/{name}.lua)")
+        }
+        ActionKind::StartDryRun => format!("ricow start {name}"),
+        ActionKind::StopDryRun => format!("ricow stop {name}"),
+        ActionKind::StartDemo => format!("ricow start {name} --demo"),
+        ActionKind::StopDemo => format!("ricow stop {name}"),
         ActionKind::AckRisk => format!(
-            "{head}ricow start {name} --live --accept-risk\n  \
-             (--accept-risk 只需一次: 读过风险披露即完成 018 确认, 之后记在数据目录)"
+            "ricow start {name} --live --accept-risk\n  \
+             (--accept-risk 只需一次: 读过风险披露即完成首次确认, 之后记在数据目录)"
         ),
         ActionKind::StartLive => format!(
-            "{head}ricow start {name} --live --accept-risk\n  \
+            "ricow start {name} --live --accept-risk\n  \
              实盘是双条件: 还需 strategies/{name}.toml 里 live_enabled = true"
         ),
-        ActionKind::StopDemo | ActionKind::StopLive => format!("{head}ricow stop {name}"),
-        ActionKind::CloseLive => format!("{head}ricow stop {name} --close-all"),
-    }
+        ActionKind::StopLive => format!("ricow stop {name}"),
+        ActionKind::CloseLive => format!("ricow stop {name} --close-all"),
+        ActionKind::RestartLive => format!("ricow restart {name}"),
+    };
+    format!("{head}{body}{tail}")
 }
 
-/// 代停实盘/demo 时的转介文案(纯函数, 便于单测): `stop_run` 只直停 Dry Run,
-/// 其余两档涉及交易所侧撤单/平仓清理, 必须改走对话内确认(stop_demo / stop_live / close_live)。
-fn stop_refusal(mode: &str, name: &str) -> Option<String> {
-    match mode {
-        "live" | "demo" => Some(format!(
-            "该实例当前模式是「{}」: 本工具只能直接停 Dry Run。\n\
-             这类停机涉及交易所侧的撤单/平仓清理, 必须由用户本人确认 —— 请改调 \
-             request_write_confirmation(action=\"{}\", name=\"{name}\") 生成确认块, 等用户逐字输入短语后由宿主执行。",
-            crate::commands::instances::mode_text(mode),
-            if mode == "live" { "stop_live" } else { "stop_demo" }
-        )),
-        _ => None,
-    }
-}
-
-/// L1 虚拟工具: 启动 Dry Run(本地虚拟撮合; 不碰资金、不需要凭据)。
+/// L1 虚拟工具(023 F3): 请宿主在会话里渲染一张**待选菜单** —— 只写会话菜单槽, 零写操作。
 ///
-/// 必须告知用户"首次启动会写 dry_run_started_at = 实盘时长门禁开始计时"(FR-024)。
-fn tool_start_dry_run(ctx: ToolCtx) -> DynamicTool {
+/// **编号与文案由宿主单一来源产生**: 模型自己再复述一份编号清单, 一旦与用户看到的错位,
+/// "用户选 3"就会被执行成第 4 项。所以这里只登记菜单, 并明确要求模型**不要复述选项**。
+///
+/// 菜单项本身不产生任何写操作(选中后只是转成一句自然语言请求), 误触最坏后果是多走一步确认。
+fn tool_show_menu(ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
-        "start_dry_run",
-        "把某个已部署策略以 **Dry Run**(本地虚拟撮合, 用真实行情但不动真钱)后台跑起来。需要该策略已在 strategies/ 下部署。返回 pid 与模式。",
+        "show_menu",
+        format!(
+            "请宿主在会话里展示一张待选菜单(编号由宿主渲染)。**不要自己复述编号或另列一份清单** —— \
+             你的复述可能与用户看到的编号错位; 用户回序号或原话都行, 宿主会把序号翻译回它看到的那一项。\
+             kind=\"{}\"(策略刚落盘, 接下来能做什么) / \"{}\"(管理一个已有策略); name 是策略名。\
+             菜单项不会直接执行任何动作, 用户选中后仍走正常确认。",
+            menu::KIND_STRATEGY_READY,
+            menu::KIND_MANAGE
+        ),
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "已部署策略名(不含 .toml)" }
+                "kind": {
+                    "type": "string",
+                    "enum": [menu::KIND_STRATEGY_READY, menu::KIND_MANAGE],
+                    "description": "菜单种类: strategy_ready = 策略刚就绪(回测/试跑/测试网/实盘/管理); manage = 管理已有策略(看状态/停止/改参数/删除)"
+                },
+                "name": { "type": "string", "description": "策略名(不含 .toml)" }
             },
-            "required": ["name"],
+            "required": ["kind", "name"],
             "additionalProperties": false
         }),
         move |_c, args| {
             let ctx = ctx.clone();
             Box::pin(async move {
+                let kind = arg_str(&args, "kind")?;
                 let name = arg_str(&args, "name")?;
-                let (pid, mode) = commands::ctrl::start_daemon(&ctx.root, &name, false, false, false)
-                    .await
-                    .map_err(|e| ToolExecutionError::other(format!("启动 Dry Run 失败: {e}")))?;
-                let text = format!(
-                    "已启动 {name}: pid={pid}, 模式={}\n注意(必须转告用户): Dry Run 首次启动会写入 dry_run_started_at —— 实盘「时长门禁」从这一刻开始计时。\n查看状态: ricow status {name} / 停机: ricow stop {name}",
-                    crate::commands::instances::mode_text(&mode)
+                let Some(built) = menu::build(&kind, &name, ctx.lang) else {
+                    return Err(ToolExecutionError::invalid_args(format!(
+                        "kind 只支持 {} / {}, 且 name 不能为空(收到 kind={kind:?}, name={name:?})",
+                        menu::KIND_STRATEGY_READY,
+                        menu::KIND_MANAGE
+                    )));
+                };
+                *ctx.menu.lock().await = Some(built);
+                let text = t(
+                    ctx.lang,
+                    "菜单已展示(编号由宿主渲染给用户)。等用户说序号或原话来选即可; \
+                     **不要自己再复述一份编号清单**, 也不要把菜单项当成已执行的动作。",
+                    "The menu is now shown (the host renders the numbering). Wait for the user to pick \
+                     by number or in their own words; **do not repeat the list yourself**, and do not \
+                     treat any menu item as an action already taken.",
                 );
-                Ok(ToolOutput::text(clamp_output(redact(&text))))
-            })
-        },
-    )
-}
-
-/// L1 虚拟工具: 停止**Dry Run**实例(实盘/demo 一律拒绝, 让用户自己敲命令)。
-fn tool_stop_run(ctx: ToolCtx) -> DynamicTool {
-    DynamicTool::new(
-        "stop_run",
-        "停止一个 **Dry Run** 实例(不下发 --close-all, 不做平仓)。实盘/测试网(demo)实例会被拒绝: 那类停机涉及交易所侧清理, 必须由用户自己执行。",
-        json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "运行中的策略名" }
-            },
-            "required": ["name"],
-            "additionalProperties": false
-        }),
-        move |_c, args| {
-            let ctx = ctx.clone();
-            Box::pin(async move {
-                let name = arg_str(&args, "name")?;
-                let views = commands::instances::views(&ctx.root).await;
-                let mode = views
-                    .iter()
-                    .find(|v| v.name == name)
-                    .and_then(|v| v.mode.clone())
-                    .unwrap_or_default();
-                if let Some(msg) = stop_refusal(&mode, &name) {
-                    return Ok(ToolOutput::text(msg));
-                }
-                let text = commands::ctrl::stop_daemon(&ctx.root, &name, false)
-                    .await
-                    .map_err(|e| ToolExecutionError::other(format!("停机失败: {e}")))?;
-                Ok(ToolOutput::text(clamp_output(redact(&text))))
+                Ok(ToolOutput::text(text.to_string()))
             })
         },
     )
@@ -1261,8 +1868,7 @@ pub fn build(ctx: ToolCtx) -> Vec<DynamicTool> {
         tool_market_ticker(ctx.clone()),
         tool_preview_strategy(ctx.clone()),
         tool_request_write_confirmation(ctx.clone()),
-        tool_start_dry_run(ctx.clone()),
-        tool_stop_run(ctx.clone()),
+        tool_show_menu(ctx.clone()),
         tool_market_orderbook(ctx.clone()),
         tool_list_pairs(ctx.clone()),
         tool_list_templates(ctx.clone()),
@@ -1282,12 +1888,10 @@ mod tests {
         // L1 虚拟工具可直调(自身不产生写实结果), 写实动作仍一律拒绝
         assert!(is_allowed("preview_strategy"));
         assert!(is_allowed("request_write_confirmation"));
-        assert!(is_allowed("start_dry_run"));
-        assert!(is_allowed("stop_run"));
-        // 代停实盘/demo 必须被拒绝(给用户命令, 不代劳)
-        assert!(stop_refusal("live", "g").is_some());
-        assert!(stop_refusal("demo", "g").is_some());
-        assert!(stop_refusal("dry_run", "g").is_none());
+        assert!(is_allowed("show_menu"));
+        // 023 D12: 原"模型可直接执行"的 start_dry_run / stop_run 已删除, 不得再被放行
+        assert!(!is_allowed("start_dry_run"));
+        assert!(!is_allowed("stop_run"));
         assert!(!VIRTUAL_TOOLS.is_empty());
         for v in VIRTUAL_TOOLS {
             assert!(!READ_ONLY_TOOLS.contains(&v), "L1 不应混进 L0 列表: {v}");
@@ -1408,6 +2012,7 @@ mod tests {
         let deploy = non_interactive_hint(
             ActionKind::Deploy,
             &json!({ "action": "deploy", "preview_id": "pv-9" }),
+            Lang::Zh,
         );
         assert!(deploy.contains("ricow approve pv-9"), "{deploy}");
         assert!(deploy.contains("ricow deploy pv-9"), "{deploy}");
@@ -1416,21 +2021,28 @@ mod tests {
         let demo = non_interactive_hint(
             ActionKind::StartDemo,
             &json!({ "action": "start_demo", "name": "g1" }),
+            Lang::Zh,
         );
         assert!(demo.contains("ricow start g1 --demo"), "{demo}");
 
         // 缺参数时给占位符而非 panic
-        let deploy_blank = non_interactive_hint(ActionKind::Deploy, &json!({ "action": "deploy" }));
+        let deploy_blank =
+            non_interactive_hint(ActionKind::Deploy, &json!({ "action": "deploy" }), Lang::Zh);
         assert!(deploy_blank.contains("<preview_id>"), "{deploy_blank}");
+
+        // 语言切换: 英文档位下正文换语言, 占位符也跟着换
+        let en = non_interactive_hint(ActionKind::Deploy, &json!({ "action": "deploy" }), Lang::En);
+        assert!(en.contains("non-interactive"), "{en}");
+        assert!(en.contains("<preview_id>"), "{en}");
     }
 
     #[test]
     fn test_registry_count_and_write_tool_boundary() {
-        // 注册总数 = 12 只读 + 4 虚拟; 对话内确认工具登记的是"请求确认"而非写实本身
+        // 注册总数 = 12 只读 + 3 虚拟(023 D12); 对话内确认工具登记的是"请求确认"而非写实本身
         assert_eq!(READ_ONLY_TOOLS.len(), 12);
         assert!(is_allowed("list_pairs"), "交易对视野是 L0 只读工具");
         assert!(is_allowed("list_templates") && is_allowed("read_template"), "模板面是 L0 只读");
-        assert_eq!(VIRTUAL_TOOLS.len(), 4);
+        assert_eq!(VIRTUAL_TOOLS.len(), 3);
         assert!(is_allowed("request_write_confirmation"));
         // 真正的写实名仍然一个都不在
         for forbidden in
@@ -1443,7 +2055,13 @@ mod tests {
     #[test]
     fn test_registry_matches_whitelist_exactly() {
         // 漂移闸: build() 注册的工具名必须与白名单逐字一致(增删工具必须同时改两处)
-        let ctx = ToolCtx::new(std::env::temp_dir(), true, crate::ai::confirm::new_slot());
+        let ctx = ToolCtx::new(
+            std::env::temp_dir(),
+            true,
+            crate::ai::confirm::new_slot(),
+            crate::ai::menu::new_slot(),
+            Lang::Zh,
+        );
         let mut registered: Vec<String> = build(ctx).iter().map(|t| t.name().to_string()).collect();
         registered.sort();
         let mut expected: Vec<String> =
@@ -1474,6 +2092,11 @@ mod tests {
 
     const LUA_STUB: &str = "function on_tick(ctx) return {} end";
 
+    /// 测试用 ToolCtx(中文界面 + 独立的菜单槽): 与 REPL 宿主的构造同口径。
+    fn test_ctx(root: &Path, slot: crate::ai::confirm::PendingSlot) -> ToolCtx {
+        ToolCtx::new(root.to_path_buf(), true, slot, crate::ai::menu::new_slot(), Lang::Zh)
+    }
+
     /// 在临时 root 里直接造一条 pending 的 strategy preview(不经网络/回测; 与正式载荷同构)。
     async fn seed_pending_preview(root: &Path, name: &str) -> String {
         seed_pending_preview_with_code(root, name, LUA_STUB).await
@@ -1490,20 +2113,22 @@ mod tests {
     }
 
     /// 模拟 REPL 确认后宿主执行 deploy, 返回执行回执。
-    async fn deploy_via_confirmation(root: &Path, name: &str, preview_id: &str) -> String {
+    ///
+    /// 023 FR-022: 对话渠道只认当前语言的**口语确认词**(`确认`), 逐字长短语留给终端门禁。
+    async fn deploy_via_confirmation(root: &Path, preview_id: &str) -> String {
         let slot = crate::ai::confirm::new_slot();
-        let ctx = ToolCtx::new(root.to_path_buf(), true, slot.clone());
-        let prepared = prepare_deploy(&ctx, &json!({ "preview_id": preview_id }))
-            .await
-            .expect("prepare_deploy 应通过");
+        let ctx = test_ctx(root, slot.clone());
+        let prepared =
+            prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": preview_id }))
+                .await
+                .expect("prepare_deploy 应通过");
         *slot.lock().await = Some(prepared.action);
-        let disposition =
-            crate::ai::confirm::consume_line(&slot, &format!("确认部署 {name}")).await;
+        let disposition = crate::ai::confirm::consume_line(&slot, "确认", Lang::Zh).await;
         let action = match disposition {
             crate::ai::confirm::LineDisposition::Confirm(a) => a,
-            other => panic!("逐字短语应判 Confirm, 实际 {other:?}"),
+            other => panic!("口语确认词应判 Confirm, 实际 {other:?}"),
         };
-        crate::ai::session::execute_confirmed(&action, root).await.expect("宿主执行落盘")
+        crate::ai::session::execute_confirmed(&action, root, Lang::Zh).await.expect("宿主执行落盘")
     }
 
     #[tokio::test]
@@ -1512,9 +2137,12 @@ mod tests {
         let name = "aidep01";
         let preview_id = seed_pending_preview(&root, name).await;
         let slot = crate::ai::confirm::new_slot();
-        let ctx = ToolCtx::new(root.clone(), true, slot.clone());
+        let ctx = test_ctx(&root, slot.clone());
 
-        let prepared = prepare_deploy(&ctx, &json!({ "preview_id": preview_id })).await.unwrap();
+        let prepared =
+            prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": preview_id }))
+                .await
+                .unwrap();
         assert!(prepared.block.contains("落盘部署"), "{block}", block = prepared.block);
         assert_eq!(prepared.action.kind, ActionKind::Deploy);
         assert_eq!(prepared.action.expected_phrase(), format!("确认部署 {name}"));
@@ -1524,7 +2152,7 @@ mod tests {
 
         // 错误短语/普通提问: pending 原样保留, 零副作用
         for line in ["好的部署吧", "确认部署", "y", "yes", "再解释一下风险?"] {
-            let d = crate::ai::confirm::consume_line(&slot, line).await;
+            let d = crate::ai::confirm::consume_line(&slot, line, Lang::Zh).await;
             assert!(
                 matches!(d, crate::ai::confirm::LineDisposition::Other),
                 "{line} 不应触发 Confirm: {d:?}"
@@ -1534,15 +2162,15 @@ mod tests {
         // 落盘前零文件
         assert!(!root.join("strategies").exists());
 
-        // 用外层同一个 slot 走完确认 → 宿主执行
-        let disposition =
-            crate::ai::confirm::consume_line(&slot, &format!("确认部署 {name}")).await;
+        // 用外层同一个 slot 走完确认(023 FR-022: 对话渠道 = 口语词) → 宿主执行
+        let disposition = crate::ai::confirm::consume_line(&slot, "确认", Lang::Zh).await;
         let action = match disposition {
             crate::ai::confirm::LineDisposition::Confirm(a) => a,
-            other => panic!("逐字短语应判 Confirm, 实际 {other:?}"),
+            other => panic!("口语确认词应判 Confirm, 实际 {other:?}"),
         };
-        let msg =
-            crate::ai::session::execute_confirmed(&action, &root).await.expect("宿主执行落盘");
+        let msg = crate::ai::session::execute_confirmed(&action, &root, Lang::Zh)
+            .await
+            .expect("宿主执行落盘");
         assert!(msg.contains("已确认并完成落盘"), "{msg}");
 
         // 双证据①: 真实落盘 toml + lua
@@ -1562,34 +2190,38 @@ mod tests {
         let root = r3_temp_root("dup");
         let name = "aidep02";
         let id1 = seed_pending_preview(&root, name).await;
-        deploy_via_confirmation(&root, name, &id1).await;
+        deploy_via_confirmation(&root, &id1).await;
 
         // 同名再来一条 preview: prepare 必须拦下(不覆盖、不静默改名)
         let id2 = seed_pending_preview(&root, name).await;
         let slot = crate::ai::confirm::new_slot();
-        let ctx = ToolCtx::new(root.clone(), true, slot);
-        let err = prepare_deploy(&ctx, &json!({ "preview_id": id2 })).await.unwrap_err();
+        let ctx = test_ctx(&root, slot);
+        let err = prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": id2 }))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("已存在"), "{err}");
         // 第二条 preview 仍 pending, 未被触碰
         let db = ricow_strategy::Database::open(&root.join("ricow.db")).await.unwrap();
         assert_eq!(ricow_engine::get_preview(&db, &id2).await.unwrap().status, "pending");
     }
 
-    /// FR-044: 撞名默认拒绝, 且拒绝文案必须同时指出"换个新名"(默认路径)与"受控覆盖"(replace=true)。
+    /// FR-044: 撞名默认拒绝, 且拒绝文案必须同时指出"换个新名"(默认路径)与"受控覆盖"(deploy_replace)。
     #[tokio::test]
     async fn fr044_same_name_refusal_points_to_both_paths() {
         let root = r3_temp_root("fr044-deny");
         let name = "aidp044a";
         let id1 = seed_pending_preview(&root, name).await;
-        deploy_via_confirmation(&root, name, &id1).await;
+        deploy_via_confirmation(&root, &id1).await;
 
         let id2 = seed_pending_preview(&root, name).await;
-        let ctx = ToolCtx::new(root.clone(), true, crate::ai::confirm::new_slot());
-        let msg =
-            prepare_deploy(&ctx, &json!({ "preview_id": id2 })).await.unwrap_err().to_string();
+        let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        let msg = prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": id2 }))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(msg.contains("已存在"), "{msg}");
-        assert!(msg.contains("replace=true"), "必须告诉模型受控覆盖这条路: {msg}");
-        assert!(msg.contains("确认覆盖"), "必须给出覆盖短语: {msg}");
+        assert!(msg.contains("deploy_replace"), "必须告诉模型受控覆盖这条路: {msg}");
+        assert!(msg.contains(".bak"), "必须讲明旧脚本会先备份: {msg}");
         assert!(msg.contains("新名"), "默认路径(换新名)也要讲明: {msg}");
     }
 
@@ -1602,38 +2234,61 @@ mod tests {
 
         // 先正常部署一版, 记下原文
         let id1 = seed_pending_preview(&root, name).await;
-        deploy_via_confirmation(&root, name, &id1).await;
+        deploy_via_confirmation(&root, &id1).await;
         let old_lua = std::fs::read_to_string(&lua_path).unwrap();
 
         // 再生成一版不同脚本的预览, 走受控覆盖
         let new_code = "function on_tick(ctx)\n    return { v = 2 }\nend\n";
         let id2 = seed_pending_preview_with_code(&root, name, new_code).await;
         let slot = crate::ai::confirm::new_slot();
-        let ctx = ToolCtx::new(root.clone(), true, slot.clone());
-        let prepared =
-            prepare_deploy(&ctx, &json!({ "preview_id": id2, "replace": true })).await.unwrap();
-        assert!(prepared.action.replace, "受控覆盖必须带 replace 标记");
+        let ctx = test_ctx(&root, slot.clone());
+        let prepared = prepare_deploy(
+            &ctx,
+            ActionKind::DeployReplace,
+            &json!({ "preview_id": id2, "replace": true }),
+        )
+        .await
+        .unwrap();
+        assert!(prepared.action.is_replace(), "受控覆盖必须带 replace 标记");
         assert_eq!(prepared.action.expected_phrase(), format!("确认覆盖 {name}"));
         assert!(prepared.block.contains("受控覆盖"), "{}", prepared.block);
         assert!(prepared.block.contains(".bak"), "确认块必须写明备份: {}", prepared.block);
 
-        // 普通部署短语不得放行覆盖(破坏性动作另用一句)
+        // 终端渠道(与 `approve.rs`/`ctrl.rs` 同源): 普通部署短语不得放行覆盖 —— 破坏性动作另用一句
+        assert!(
+            !crate::commands::is_explicit_confirmation(
+                &format!("确认部署 {name}"),
+                &prepared.action.expected_phrase()
+            ),
+            "旧短语不得放行覆盖"
+        );
+        assert!(
+            crate::commands::is_explicit_confirmation(
+                &format!("确认覆盖 {name}"),
+                &prepared.action.expected_phrase()
+            ),
+            "覆盖短语应命中"
+        );
+
+        // 对话渠道(023 FR-022): 长短语不是确认词 → pending 原样保留
         *slot.lock().await = Some(prepared.action);
-        let d = crate::ai::confirm::consume_line(&slot, &format!("确认部署 {name}")).await;
+        let d =
+            crate::ai::confirm::consume_line(&slot, &format!("确认部署 {name}"), Lang::Zh).await;
         assert!(
             matches!(d, crate::ai::confirm::LineDisposition::Other),
-            "旧短语不得放行覆盖: {d:?}"
+            "长短语在对话渠道不得放行: {d:?}"
         );
         assert!(slot.lock().await.is_some(), "错短语后 pending 必须保留");
 
-        // 覆盖短语 → 宿主执行
-        let d = crate::ai::confirm::consume_line(&slot, &format!("确认覆盖 {name}")).await;
+        // 口语确认词 → 宿主执行(单槽在握, 破坏性由确认块讲明)
+        let d = crate::ai::confirm::consume_line(&slot, "确认", Lang::Zh).await;
         let action = match d {
             crate::ai::confirm::LineDisposition::Confirm(a) => a,
             other => panic!("应判 Confirm: {other:?}"),
         };
-        let msg =
-            crate::ai::session::execute_confirmed(&action, &root).await.expect("宿主执行覆盖");
+        let msg = crate::ai::session::execute_confirmed(&action, &root, Lang::Zh)
+            .await
+            .expect("宿主执行覆盖");
         assert!(msg.contains("备份"), "回执必须如实给出备份路径: {msg}");
 
         // 新脚本已生效
@@ -1658,11 +2313,12 @@ mod tests {
         let name = "aidep03";
         let id = seed_pending_preview(&root, name).await;
         let slot = crate::ai::confirm::new_slot();
-        let ctx = ToolCtx::new(root.clone(), true, slot.clone());
-        let prepared = prepare_deploy(&ctx, &json!({ "preview_id": id })).await.unwrap();
+        let ctx = test_ctx(&root, slot.clone());
+        let prepared =
+            prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": id })).await.unwrap();
         *slot.lock().await = Some(prepared.action);
 
-        let disposition = crate::ai::confirm::consume_line(&slot, "拒绝").await;
+        let disposition = crate::ai::confirm::consume_line(&slot, "拒绝", Lang::Zh).await;
         let action = match disposition {
             crate::ai::confirm::LineDisposition::Reject(a) => a,
             other => panic!("应判 Reject: {other:?}"),
@@ -1680,7 +2336,7 @@ mod tests {
     async fn r3s6_start_demo_gates_in_order() {
         let root = r3_temp_root("demo");
         let slot = crate::ai::confirm::new_slot();
-        let ctx = ToolCtx::new(root.clone(), true, slot);
+        let ctx = test_ctx(&root, slot);
 
         // ① 未部署: 先于凭据检查报错
         let err = prepare_start_demo(&ctx, &json!({ "name": "ghost99" })).await.unwrap_err();
@@ -1689,7 +2345,7 @@ mod tests {
         // 部署一个策略到该 root
         let name = "aidemo01";
         let id = seed_pending_preview(&root, name).await;
-        deploy_via_confirmation(&root, name, &id).await;
+        deploy_via_confirmation(&root, &id).await;
 
         // ② 已部署但缺 demo 凭据: 不发确认块(避免用户白输短语)
         let err = prepare_start_demo(&ctx, &json!({ "name": name })).await.unwrap_err();
@@ -1715,12 +2371,121 @@ mod tests {
         let root = r3_temp_root("twice");
         let name = "aidep04";
         let id = seed_pending_preview(&root, name).await;
-        deploy_via_confirmation(&root, name, &id).await;
+        deploy_via_confirmation(&root, &id).await;
 
         let slot = crate::ai::confirm::new_slot();
-        let ctx = ToolCtx::new(root.clone(), true, slot);
+        let ctx = test_ctx(&root, slot);
         // 同一 preview 二次请求确认: 状态不是 pending, 必须失败(防 token 重放路径)
-        let err = prepare_deploy(&ctx, &json!({ "preview_id": id })).await.unwrap_err();
+        let err = prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": id }))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("pending"), "{err}");
+    }
+
+    // ── 023 F4: 13 类写操作的 prepare 前提校验(纯只读, 不落盘/不起进程)─────────────
+
+    /// update_params: 已部署 + params 非空可解析; 确认块给出"改前 → 改后"与备份路径, 且**不出现终端命令**。
+    #[tokio::test]
+    async fn fr024_update_params_prepare_shows_diff_and_backup() {
+        let root = r3_temp_root("fr024-upd");
+        let name = "aidp024a";
+        let id1 = seed_pending_preview(&root, name).await;
+        deploy_via_confirmation(&root, &id1).await;
+
+        let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        // ① 未部署: 先拒绝, 不发确认块
+        let err = prepare_update_params(&ctx, &json!({ "name": "ghost024", "params": ["a=1"] }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("尚未部署"), "{err}");
+        // ② 参数为空/非法: 拒绝
+        assert!(prepare_update_params(&ctx, &json!({ "name": name, "params": [] })).await.is_err());
+        assert!(prepare_update_params(&ctx, &json!({ "name": name, "params": ["没有等号"] }))
+            .await
+            .is_err());
+        // ③ 正常: 确认块含 diff 与备份路径, 且零终端命令
+        let prepared =
+            prepare_update_params(&ctx, &json!({ "name": name, "params": ["order_size=0.05"] }))
+                .await
+                .unwrap();
+        assert_eq!(prepared.action.kind, ActionKind::UpdateParams);
+        assert!(prepared.block.contains("order_size"), "{b}", b = prepared.block);
+        assert!(prepared.block.contains("→"), "必须给出改前→改后: {}", prepared.block);
+        assert!(prepared.block.contains(".bak"), "必须写明备份: {}", prepared.block);
+        assert!(!prepared.block.contains("ricow "), "确认块不得出现终端命令: {}", prepared.block);
+    }
+
+    /// delete_strategy: 未部署拒绝; 已部署时确认块必须写明"不可逆"且**日志保留**。
+    #[tokio::test]
+    async fn fr024_delete_strategy_prepare_keeps_logs() {
+        let root = r3_temp_root("fr024-del");
+        let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        let err = prepare_delete_strategy(&ctx, &json!({ "name": "ghost024b" })).await.unwrap_err();
+        assert!(err.to_string().contains("不存在"), "{err}");
+
+        let name = "aidp024b";
+        let id = seed_pending_preview(&root, name).await;
+        deploy_via_confirmation(&root, &id).await;
+        let prepared = prepare_delete_strategy(&ctx, &json!({ "name": name })).await.unwrap();
+        assert_eq!(prepared.action.kind, ActionKind::DeleteStrategy);
+        assert!(prepared.block.contains("不可逆"), "{b}", b = prepared.block);
+        assert!(prepared.block.contains("logs/"), "必须讲明日志不删: {}", prepared.block);
+        assert!(!prepared.block.contains("ricow "), "确认块不得出现终端命令: {}", prepared.block);
+    }
+
+    /// start_dry_run: 未部署拒绝 / 已在运行拒绝; 确认块必须转告"实盘时长门禁从这一刻开始计时"。
+    #[tokio::test]
+    async fn fr024_start_dry_run_prepare_mentions_gate_clock() {
+        let root = r3_temp_root("fr024-dry");
+        let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        let err = prepare_start_dry_run(&ctx, &json!({ "name": "ghost024c" })).await.unwrap_err();
+        assert!(err.to_string().contains("尚未部署"), "{err}");
+
+        let name = "aidp024c";
+        let id = seed_pending_preview(&root, name).await;
+        deploy_via_confirmation(&root, &id).await;
+        let prepared = prepare_start_dry_run(&ctx, &json!({ "name": name })).await.unwrap();
+        assert_eq!(prepared.action.kind, ActionKind::StartDryRun);
+        assert!(prepared.block.contains("门禁"), "{b}", b = prepared.block);
+        assert!(prepared.block.contains("不碰资金"), "必须说明不碰资金: {}", prepared.block);
+        assert!(!prepared.block.contains("ricow "), "确认块不得出现终端命令: {}", prepared.block);
+    }
+
+    /// restart_live: 只有"已部署且正在以实盘运行"才发确认块; 未运行/模式不符一律拒绝。
+    #[tokio::test]
+    async fn fr024_restart_live_prepare_requires_running_live() {
+        let root = r3_temp_root("fr024-rst");
+        let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        let err = prepare_restart_live(&ctx, &json!({ "name": "ghost024d" })).await.unwrap_err();
+        assert!(err.to_string().contains("尚未部署"), "{err}");
+
+        let name = "aidp024d";
+        let id = seed_pending_preview(&root, name).await;
+        deploy_via_confirmation(&root, &id).await;
+        // 已部署但没有任何实例 → 拒绝
+        let err = prepare_restart_live(&ctx, &json!({ "name": name })).await.unwrap_err();
+        assert!(err.to_string().contains("实例"), "{err}");
+    }
+
+    /// show_menu: 只注册菜单请求 —— schema 只认两种 kind, 且**不导出一个可直接执行的写操作**。
+    ///
+    /// 编号与文案由宿主渲染(见 `ai::menu`), 模型自造 kind / 空名一律返回 `None`, 工具侧报参数错误。
+    #[test]
+    fn fr013_show_menu_registers_kind_enum_only() {
+        let ctx = test_ctx(&std::env::temp_dir(), crate::ai::confirm::new_slot());
+        let tool = build(ctx)
+            .into_iter()
+            .find(|t| t.name() == crate::ai::menu::KIND_MANAGE || t.name() == "show_menu")
+            .filter(|t| t.name() == "show_menu")
+            .expect("show_menu 应已注册");
+        let params = tool.definition().parameters;
+        assert_eq!(
+            params["properties"]["kind"]["enum"],
+            json!([crate::ai::menu::KIND_STRATEGY_READY, crate::ai::menu::KIND_MANAGE])
+        );
+        assert_eq!(params["required"], json!(["kind", "name"]));
+        // 模型自造 kind / 空名: 构造不出菜单(工具据此报参数错误)
+        assert!(crate::ai::menu::build("nope", "g", Lang::Zh).is_none());
+        assert!(crate::ai::menu::build(crate::ai::menu::KIND_MANAGE, "   ", Lang::Zh).is_none());
     }
 }

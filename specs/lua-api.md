@@ -89,6 +89,8 @@ end
 > 持仓语义 (specs/backtest.md §五.6/§八 D9): 默认 `one-way` 模式同一交易对只有一个净仓, `position_*` 即全部信息;
 > `hedge` 模式下多空可并存, 净仓查询 (`position_*`) 合并多空后取净 (net = 0 时 side 为 `"none"`),
 > 精确的方向仓用 `pos_size` / `pos_entry` 查询。回测引擎 (BacktestContext) 支持方向仓; 实盘方向仓查询后续接入, 暂返回 0。
+> Dry Run 虚拟净仓 (DryRunContext) 遵循同一不变式: `position_size > 0` 时 `position_side` = 建仓方向, 归零即报 `"none"`;
+> 平仓归零后按原持仓方向再次开仓不会残留旧方向、数量不会累加 (2026-09-19 由 `specs/changes/024-dryrun-position-side/` 修复)。
 
 ### 配置参数（策略参数化）
 

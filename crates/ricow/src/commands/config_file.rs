@@ -60,12 +60,20 @@ pub struct MarketSection {
     pub show_all_pairs: bool,
 }
 
+/// 界面语言段(023): 对话宿主固定文案的语言。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiSection {
+    /// `None` = 尚未选择(首次向导会问一次); 仅接受 `"zh"` / `"en"`, 其它值硬失败。
+    pub lang: Option<String>,
+}
+
 /// 整个配置文件的内存表示。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct File {
     pub ai: AiSection,
     pub exchange: ExchangeSection,
     pub market: MarketSection,
+    pub ui: UiSection,
 }
 
 /// `ensure_template` 的结果。
@@ -111,7 +119,12 @@ pub fn template_text() -> String {
          # true: 显示币安全部 TRADING 交易对。\n\
          # 对话内可直接用 /market 切换, 无需手改本文件。\n\
          [market]\n\
-         show_all_pairs = false\n"
+         show_all_pairs = false\n\
+         \n\
+         # ── ④ 界面语言 / UI language ────────────────────────────────────\n\
+         # zh = 中文(默认) · en = English。对话内可用 /lang 切换。\n\
+         [ui]\n\
+         lang = \"zh\"\n"
     )
 }
 
@@ -208,6 +221,7 @@ pub(crate) fn harden_secret_file(path: &Path) -> Result<(), String> {
 const AI_KEYS: [&str; 5] = ["provider", "model", "base_url", "max_turns", "api_key"];
 const EXCHANGE_KEYS: [&str; 4] = ["demo_key", "demo_secret", "binance_key", "binance_secret"];
 const MARKET_KEYS: [&str; 1] = ["show_all_pairs"];
+const UI_KEYS: [&str; 1] = ["lang"];
 
 /// 读取配置; **文件不存在 → 生成模板并按内置默认继续**(缺什么由使用处给出可执行提示)。
 pub fn load(root: &Path) -> CoreResult<File> {
@@ -225,7 +239,7 @@ pub fn load(root: &Path) -> CoreResult<File> {
     for (section, value) in &table {
         let t = value.as_table().ok_or_else(|| {
             CoreError::Auth(format!(
-                "配置文件 {} 的 `{section}` 不是段(table): 配置请按 [ai] / [exchange] / [market] 分段书写",
+                "配置文件 {} 的 `{section}` 不是段(table): 配置请按 [ai] / [exchange] / [market] / [ui] 分段书写",
                 p.display()
             ))
         })?;
@@ -258,11 +272,24 @@ pub fn load(root: &Path) -> CoreResult<File> {
                     })?;
                 }
             }
+            "ui" => {
+                check_keys(&p, "ui", t, &UI_KEYS)?;
+                if let Some(v) = t.get("lang").and_then(|v| v.as_str()).map(str::trim) {
+                    if v != "zh" && v != "en" {
+                        return Err(CoreError::Auth(format!(
+                            "配置文件 {} 的 [ui].lang 仅接受 \"zh\" / \"en\", 实际为 \"{v}\"",
+                            p.display()
+                        )));
+                    }
+                    out.ui.lang = Some(v.to_string());
+                }
+            }
             other => {
-                return Err(CoreError::Auth(format!(
-                    "配置文件 {} 里有未知段 `[{other}]`; 允许的段: [ai] / [exchange] / [market]",
+                let msg = format!(
+                    "配置文件 {} 里有未知段 `[{other}]`; 允许的段: [ai] / [exchange] / [market] / [ui]",
                     p.display()
-                )))
+                );
+                return Err(CoreError::Auth(msg));
             }
         }
     }
@@ -321,7 +348,7 @@ impl SetValue {
 }
 
 /// 允许外科式更新的键白名单((段, 键))。
-const WRITABLE: [(&str, &str); 9] = [
+const WRITABLE: [(&str, &str); 10] = [
     ("ai", "provider"),
     ("ai", "model"),
     ("ai", "base_url"),
@@ -331,6 +358,7 @@ const WRITABLE: [(&str, &str); 9] = [
     ("exchange", "binance_key"),
     ("exchange", "binance_secret"),
     ("market", "show_all_pairs"),
+    ("ui", "lang"),
 ];
 
 fn assert_writable(section: &str, key: &str) -> CoreResult<()> {
@@ -674,6 +702,68 @@ mod tests {
         write(&root, "[market]\nshow_all_pairs = \"yes\"\n");
         let err = load(&root).unwrap_err().to_string();
         assert!(err.contains("show_all_pairs") && err.contains("true/false"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_template_includes_ui_section_with_lang() {
+        let t: toml::Table = toml::from_str(&template_text()).expect("模板必须合法");
+        assert!(t.contains_key("ui"));
+        let root = tmp_root("ui-tmpl");
+        write(&root, &template_text());
+        assert_eq!(load(&root).unwrap().ui.lang.as_deref(), Some("zh"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 023: `[ui].lang` 缺失 = 尚未选择(None), 不静默假定; 非法值硬失败。
+    #[test]
+    fn test_ui_lang_missing_is_none_and_invalid_value_fails() {
+        let root = tmp_root("ui-none");
+        write(&root, "[ai]\nprovider = \"deepseek\"\n");
+        assert_eq!(load(&root).unwrap().ui.lang, None, "缺失 = 尚未选择");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = tmp_root("ui-bad");
+        write(&root, "[ui]\nlang = \"fr\"\n");
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("[ui].lang") && err.contains("zh"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_ui_lang_roundtrip_and_surgical_write() {
+        let root = tmp_root("ui-write");
+        write(&root, "[ai]\nprovider = \"deepseek\"\n\n# 尾注释\n[ui]\nlang = \"zh\"\n");
+        set_values(&root, &[("ui", "lang", SetValue::Str("en".into()))]).unwrap();
+        let after = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(after.contains("# 尾注释"), "注释保留:\n{after}");
+        assert!(after.contains("lang = \"en\""));
+        assert_eq!(load(&root).unwrap().ui.lang.as_deref(), Some("en"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 段缺时 `[ui]` 也应能被追加(与 `[market]` 同路径)。
+    #[test]
+    fn test_ui_section_appended_when_missing() {
+        let root = tmp_root("ui-append");
+        write(&root, "[ai]\nprovider = \"deepseek\"\n");
+        set_values(&root, &[("ui", "lang", SetValue::Str("en".into()))]).unwrap();
+        let body = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(body.contains("[ui]") && body.contains("lang = \"en\""), "{body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_unknown_section_message_lists_ui() {
+        let root = tmp_root("badsec-ui");
+        write(&root, "[aii]\nprovider = \"deepseek\"\n");
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("[ui]"), "未知段报错应列出 [ui]: {err}");
+
+        let root = tmp_root("notable-ui");
+        write(&root, "ai = \"x\"\n");
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("[ui]"), "非段报错应列出 [ui]: {err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

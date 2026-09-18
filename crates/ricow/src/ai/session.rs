@@ -16,7 +16,19 @@ use ricow_strategy::Database;
 use rig::message::Message;
 
 use super::confirm::{self, ActionKind, LineDisposition, PendingAction, PendingSlot};
-use super::{config, prompt, provider, tools};
+use super::{config, menu, prompt, provider, tools};
+use crate::i18n::{t, Lang};
+
+/// 带占位符的文案: [`t`] 只选字面量, 这里选两条已 `format!` 好的串(与 `ai::menu` 同口径)。
+fn tf(lang: Lang, zh: impl Into<String>, en: impl Into<String>) -> String {
+    match lang {
+        Lang::Zh => zh.into(),
+        Lang::En => en.into(),
+    }
+}
+
+/// `/history` 单条往返的字符上限(超出即截断并标注, FR-008)。
+const HISTORY_ENTRY_MAX_CHARS: usize = 2_000;
 
 /// 会话输出出口(终端 = stdio; 将来网页端 = WS 帧)。
 ///
@@ -60,13 +72,20 @@ pub struct Options {
 pub struct ChatSession {
     root: PathBuf,
     resolved: config::Resolved,
-    is_local: bool,
     /// 是否可对话内确认 / 静默录入密钥(stdin 是 tty 且为 REPL); 重建客户端时要复用。
     interactive: bool,
     llm: provider::Llm,
     pending: PendingSlot,
+    /// 宿主菜单槽(与工具闭包共享): 编号与文案由宿主单一来源产生, 模型只能经 `show_menu` 请求。
+    active_menu: menu::MenuSlot,
     history: Vec<Message>,
     plain: bool,
+    /// 界面语言(023 F0): 固定文案取词 / 确认词判定 / AI 回复语言的唯一依据。
+    lang: Lang,
+    /// 已完成的问答轮次(FR-009: 斜杠命令与空行不计入)。
+    turn: u64,
+    /// 本会话问答往返(仅 [`ChatSession::reply`] 写入), 供 `/history` 回看(FR-008)。
+    transcript: Vec<(String, String)>,
 }
 
 impl ChatSession {
@@ -92,62 +111,77 @@ impl ChatSession {
         let env_model = opts.model.clone().or_else(|| std::env::var(config::ENV_MODEL).ok());
         let resolved = config::resolve(&cfg, env_base_url, env_model)?;
 
-        let is_local = provider::is_local_endpoint(&resolved.base_url);
         let api_key =
             provider::resolve_key(&resolved.base_url, config::api_key(&root, &resolved.provider))?;
+
+        // 界面语言: 首次向导写入的 `[ui].lang`; 未选择时 [`crate::i18n::resolve`] 兜底中文 (FR-001)。
+        let lang = crate::i18n::resolve(&file);
 
         // 工具集: L0 只读 + L1 虚拟。写实动作没有工具面 —— 对话内确认也只登记 pending,
         // 由本会话在用户逐字输入后执行(见 `execute_confirmed`)。
         let pending = confirm::new_slot();
+        let active_menu = menu::new_slot();
         let interactive = opts.interactive && std::io::stdin().is_terminal();
-        let tool_ctx = tools::ToolCtx::new(root.clone(), interactive, pending.clone());
+        let tool_ctx = tools::ToolCtx::new(
+            root.clone(),
+            interactive,
+            pending.clone(),
+            active_menu.clone(),
+            lang,
+        );
         let llm = provider::connect(
             resolved.clone(),
             &api_key,
-            &prompt::system_preamble(),
+            &prompt::system_preamble(lang),
             tools::build(tool_ctx),
         )?;
 
         Ok(Self {
             root,
             resolved,
-            is_local,
             interactive,
             llm,
             pending,
+            active_menu,
             history: Vec::new(),
             plain: opts.plain,
+            lang,
+            turn: 0,
+            transcript: Vec::new(),
         })
     }
 
-    /// 会话开始信息(通道 / 密钥来源 / 端点 / 上限 / 工具面); 不打印, 只走 sink。
+    /// 当前界面语言(薄壳渲染固定文案时要用, 例如 REPL 的帮助横幅)。
+    pub fn lang(&self) -> Lang {
+        self.lang
+    }
+
+    /// 会话开始信息(FR-011: 只有"用哪个模型 / 密钥从哪来"一行 + 一句边界); 不打印, 只走 sink。
     pub fn welcome(&self, sink: &mut dyn SessionSink) {
-        sink.line(&format!(
-            "ricow AI 助手 (供应商: {} / 模型: {})",
-            self.resolved.provider, self.resolved.model
-        ));
         let key_from_env =
             std::env::var(config::ENV_API_KEY).ok().is_some_and(|v| !v.trim().is_empty());
-        sink.line(&format!(
-            "  密钥: {} ([ai].api_key; 环境变量可覆盖)",
-            if key_from_env { "来自环境变量" } else { "来自 ricow.toml" }
+        sink.line(&tf(
+            self.lang,
+            format!(
+                "ricow AI 助手 (供应商: {} / 模型: {}) · 密钥: {}([ai].api_key; 环境变量可覆盖)",
+                self.resolved.provider,
+                self.resolved.model,
+                if key_from_env { "来自环境变量" } else { "来自 ricow.toml" }
+            ),
+            format!(
+                "ricow AI assistant (provider: {} / model: {}) · API key: {}([ai].api_key; env var overrides)",
+                self.resolved.provider,
+                self.resolved.model,
+                if key_from_env { "from environment" } else { "from ricow.toml" }
+            ),
         ));
-        sink.line(&format!(
-            "  端点: {}{}",
-            self.resolved.base_url,
-            if self.is_local { " (本机)" } else { "" }
+        // 一句边界: 写操作不在模型工具面内 —— 与 help / 确认块同一口径 (FR-010)。
+        sink.line(t(
+            self.lang,
+            "边界: 我能查资料 / 写策略 / 跑回测; 凡是会改文件或起停实例的动作, 都必须你本人回一句确认词。",
+            "Boundary: I can look things up, write strategies and run backtests; anything that changes files or starts/stops an instance needs your own confirmation.",
         ));
-        sink.line(&format!(
-            "  上限: 每轮最多 {} 次模型调用; 只发送你的问题与工具返回(不含密钥)",
-            self.resolved.max_turns
-        ));
-        sink.line(&format!(
-            "  工具: {} 个(只读 {} + 虚拟 {}); 写操作不在工具内, 必须你本人确认",
-            tools::READ_ONLY_TOOLS.len() + tools::VIRTUAL_TOOLS.len(),
-            tools::READ_ONLY_TOOLS.len(),
-            tools::VIRTUAL_TOOLS.len()
-        ));
-        if let Some(hint) = empty_state_hint(&self.root) {
+        if let Some(hint) = empty_state_hint(&self.root, self.lang) {
             sink.line("");
             sink.line(&hint);
         }
@@ -162,11 +196,19 @@ impl ChatSession {
         match classify(line) {
             LineInput::Empty => Ok(Step::Continue),
             LineInput::Exit => {
-                sink.line("再见。");
+                sink.line(t(self.lang, "再见。", "Bye."));
                 Ok(Step::Exit)
             }
             LineInput::Help => {
-                sink.line(&help_text());
+                sink.line(&help_text(self.lang));
+                Ok(Step::Continue)
+            }
+            LineInput::History => {
+                self.handle_history(sink);
+                Ok(Step::Continue)
+            }
+            LineInput::Lang(cmd) => {
+                self.handle_lang(cmd, sink)?;
                 Ok(Step::Continue)
             }
             LineInput::Market(cmd) => {
@@ -178,50 +220,223 @@ impl ChatSession {
                 Ok(Step::Continue)
             }
             LineInput::Unknown(name) => {
-                sink.line(&format!(
-                    "斜杠命令 /{name} 尚未接入; 当前可用: /help /exit /market /keys"
+                sink.line(&tf(
+                    self.lang,
+                    format!(
+                        "斜杠命令 /{name} 还没有接入; 现在能用: /help /exit /history /lang /market /keys"
+                    ),
+                    format!(
+                        "The /{name} command is not available; you can use: /help /exit /history /lang /market /keys"
+                    ),
                 ));
                 Ok(Step::Continue)
             }
             LineInput::Ask(q) => {
-                // 对话内确认状态机优先: 有 pending 时, 这行先判 确认 / 拒绝 / 过期 / 普通提问。
+                // 顺序 (FR-016): 对话内确认状态机优先 → 菜单序号 → 普通提问。
                 // 短语只认真实用户输入行, 不经过模型 —— 模型输出永远无法走到执行分支。
-                match confirm::consume_line(&self.pending, line).await {
+                match confirm::consume_line(&self.pending, line, self.lang).await {
                     LineDisposition::Confirm(action) => match self.execute(&action).await {
-                        Ok(msg) => sink.line(&msg),
-                        Err(e) => sink.line(&format!(
-                            "执行失败: {e}\n(确认块已消费; 若是落盘预览已被批准/消费, 请用 ricow status / 文件系统核对实际状态, 必要时重新发起)"
+                        Ok(msg) => {
+                            sink.line(&msg);
+                            self.flush_menu(sink).await;
+                        }
+                        Err(e) => sink.line(&tf(
+                            self.lang,
+                            format!(
+                                "执行失败: {e}\n(这次确认已用掉; 若预览已被批准或用过, 先看一下实际状态, 必要时重新来一次)"
+                            ),
+                            format!(
+                                "Failed: {e}\n(That confirmation is now spent; if the preview was already approved or used, check the current state and start over if needed.)"
+                            ),
                         )),
                     },
                     LineDisposition::Reject(action) => {
-                        // deploy: 尽力把 preview 置 rejected 终态(失败也不影响本地作废语义)
-                        if let (ActionKind::Deploy, Some(id)) = (action.kind, action.preview_id.as_deref())
-                        {
+                        // 落盘类: 尽力把 preview 置 rejected 终态(失败也不影响本地作废语义)
+                        if let (Some(id), true) = (
+                            action.preview_id.as_deref(),
+                            matches!(
+                                action.kind,
+                                ActionKind::Deploy | ActionKind::DeployReplace
+                            ),
+                        ) {
                             if let Ok(db) = Database::open(&crate::commands::db_path_in(&self.root))
                                 .await
                             {
                                 _ = ricow_engine::reject(&db, id).await;
                             }
                         }
-                        sink.line(&format!(
-                            "已放弃待确认动作「{}」, 未执行任何写实操作。",
-                            action_display(&action)
+                        let shown = action_display(&action, self.lang);
+                        sink.line(&tf(
+                            self.lang,
+                            format!("已放弃待确认动作「{shown}」, 未执行任何写实操作。"),
+                            format!(
+                                "Dropped the pending action \"{shown}\" — nothing was written or started."
+                            ),
                         ));
                     }
                     LineDisposition::Expired(action) => {
                         // 分钟数取自 `ai::confirm::PENDING_TTL`(与引擎 preview TTL 同源), 不手抄 15。
-                        sink.line(&format!(
-                            "待确认动作「{}」已超过 {} 分钟, 已作废; 如需继续请重新发起。",
-                            action_display(&action),
-                            crate::ai::confirm::PENDING_TTL.as_secs() / 60
+                        let minutes = crate::ai::confirm::PENDING_TTL.as_secs() / 60;
+                        let shown = action_display(&action, self.lang);
+                        sink.line(&tf(
+                            self.lang,
+                            format!(
+                                "待确认动作「{shown}」已超过 {minutes} 分钟, 已作废; 如需继续请重新发起。"
+                            ),
+                            format!(
+                                "The pending action \"{shown}\" expired after {minutes} minutes and was discarded; please start again if you still want it."
+                            ),
                         ));
                         self.reply(&q, sink).await;
                     }
-                    LineDisposition::Other | LineDisposition::NoPending => self.reply(&q, sink).await,
+                    LineDisposition::Other | LineDisposition::NoPending => {
+                        // 菜单序号只认"有菜单且在范围内"的纯数字行; 其余一律当普通提问 (FR-016)。
+                        match menu::parse_menu_choice(line) {
+                            Some(n) => self.handle_menu_choice(n, &q, sink).await,
+                            None => self.reply(&q, sink).await,
+                        }
+                    }
                 }
                 Ok(Step::Continue)
             }
         }
+    }
+
+    /// 菜单序号(FR-016): 命中 → 把该选项的 `request` 当作用户提问送出, 菜单随之结束;
+    /// 越界 → 提示可选范围并**保留菜单**; 没有菜单 → 该行按普通提问处理。
+    async fn handle_menu_choice(&mut self, n: usize, raw: &str, sink: &mut dyn SessionSink) {
+        let picked = {
+            let guard = self.active_menu.lock().await;
+            match guard.as_ref() {
+                None => None,
+                Some(m) if n >= 1 && n <= m.options.len() => {
+                    Some((m.options[n - 1].request.clone(), m.options.len()))
+                }
+                Some(m) => Some((String::new(), m.options.len())),
+            }
+        };
+        let Some((request, len)) = picked else {
+            // 没有菜单在等选择: 纯数字行也可能是正常提问, 不吞掉它。
+            self.reply(raw, sink).await;
+            return;
+        };
+        if request.is_empty() {
+            sink.line(&tf(
+                self.lang,
+                format!("没有第 {n} 项; 请选 1..{len}(或直接说你想做什么)。"),
+                format!("There is no option {n}; choose 1..{len} (or just say what you want)."),
+            ));
+            self.flush_menu(sink).await;
+            return;
+        }
+        // 选中即消费菜单(FR-015): 选项只是"替你说一句话", 写操作仍要过 F4 确认。
+        *self.active_menu.lock().await = None;
+        self.reply(&request, sink).await;
+    }
+
+    /// `/history`(别名 `/log`, FR-008): 渲染本会话全部往返; 不计轮次、不写 transcript。
+    fn handle_history(&self, sink: &mut dyn SessionSink) {
+        if self.transcript.is_empty() {
+            sink.line(t(
+                self.lang,
+                "本会话还没有问答记录(斜杠命令和空行不算)。",
+                "No exchanges in this session yet (slash commands and blank lines do not count).",
+            ));
+            return;
+        }
+        let (you, ai) = (t(self.lang, "你", "You"), t(self.lang, "助手", "AI"));
+        for (i, (q, a)) in self.transcript.iter().enumerate() {
+            sink.line("");
+            sink.line(&turn_divider(self.lang, i as u64 + 1));
+            sink.line(&format!("{you}: {}", clip_for_history(q, self.lang)));
+            sink.line(&format!("{ai}: {}", clip_for_history(a, self.lang)));
+        }
+    }
+
+    /// `/lang`(FR-005): 无参 → 当前语言 + 双语选项; 有参 → 写回 `[ui].lang` 并立即生效。
+    fn handle_lang(&mut self, cmd: LangCmd, sink: &mut dyn SessionSink) -> CoreResult<()> {
+        use crate::commands::config_file::SetValue;
+
+        match cmd {
+            LangCmd::Show => {
+                sink.line(&tf(
+                    self.lang,
+                    "当前语言: 中文 (zh)\n切换: /lang zh(中文) · /lang en(English)".to_string(),
+                    "Current language: English (en)\nSwitch: /lang zh (中文) · /lang en (English)"
+                        .to_string(),
+                ));
+            }
+            LangCmd::Bad(arg) => {
+                sink.line(&tf(
+                    self.lang,
+                    format!(
+                        "/lang 参数只支持 zh / en; 收到: {arg}\n\
+                         用法: /lang(查看当前) · /lang zh(中文) · /lang en(English)"
+                    ),
+                    format!(
+                        "/lang only accepts zh / en; got: {arg}\n\
+                         Usage: /lang (show current) · /lang zh (中文) · /lang en (English)"
+                    ),
+                ));
+            }
+            LangCmd::Set(lang) => {
+                crate::commands::config_file::set_values(
+                    &self.root,
+                    &[("ui", "lang", SetValue::Str(lang.code().to_string()))],
+                )?;
+                self.lang = lang;
+                // 回执用**新**语言(FR-005); 提示词里的语言纪律也随之重建 (FR-006)。
+                self.rebuild_llm()?;
+                sink.line(&tf(
+                    lang,
+                    format!(
+                        "已切换界面语言: 中文 (zh)\n  {} 已更新, 立即生效。",
+                        crate::commands::config_file::path(&self.root).display()
+                    ),
+                    format!(
+                        "Language switched to English (en)\n  {} updated; effective immediately.",
+                        crate::commands::config_file::path(&self.root).display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 渲染当前菜单(若有)并保留 —— 菜单生命周期只由"被选中"或"被新菜单替换"结束(FR-015)。
+    async fn flush_menu(&self, sink: &mut dyn SessionSink) -> bool {
+        let guard = self.active_menu.lock().await;
+        match guard.as_ref() {
+            Some(m) => {
+                sink.line("");
+                sink.line(&menu::render(m));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 用当前 root / lang 重建 LLM 客户端(改密钥或改语言后立即生效, 不必退出重开)。
+    fn rebuild_llm(&mut self) -> CoreResult<()> {
+        let resolved = self.resolved.clone();
+        let key = provider::resolve_key(
+            &resolved.base_url,
+            config::api_key(&self.root, &resolved.provider),
+        )?;
+        let ctx = tools::ToolCtx::new(
+            self.root.clone(),
+            self.interactive,
+            self.pending.clone(),
+            self.active_menu.clone(),
+            self.lang,
+        );
+        self.llm = provider::connect(
+            resolved,
+            &key,
+            &prompt::system_preamble(self.lang),
+            tools::build(ctx),
+        )?;
+        Ok(())
     }
 
     /// `/market` 交易对视野: 只读展示 / 切换默认与全量(切换**落盘** `[market] show_all_pairs`)。
@@ -356,15 +571,7 @@ impl ChatSession {
 
         // 环境变量覆盖时不重建(重建也只会用环境变量里的值, 报"已生效"就是撒谎)。
         if target == KeysTarget::Ai && !env_override {
-            let resolved = self.resolved.clone();
-            let key = provider::resolve_key(
-                &resolved.base_url,
-                config::api_key(&self.root, &resolved.provider),
-            )?;
-            let ctx =
-                tools::ToolCtx::new(self.root.clone(), self.interactive, self.pending.clone());
-            self.llm =
-                provider::connect(resolved, &key, &prompt::system_preamble(), tools::build(ctx))?;
+            self.rebuild_llm()?;
             sink.line("已用新密钥重建 LLM 客户端, 下一句话即生效。");
         }
         if let Some(w) = config_file::permission_warning(&self.root) {
@@ -384,7 +591,16 @@ impl ChatSession {
     }
 
     /// 把一轮普通提问送模型(流式/非流式), 用量与错误都如实走 sink, 维护 history。
+    ///
+    /// 轮次可读性(FR-007): 每轮先空行 + 分隔线, 回答后再补一个空行 —— 用户一眼看得出
+    /// "这一轮从哪开始、到哪结束"。斜杠命令与空行不经过这里, 自然不计轮次(FR-009)。
+    /// 往返同时记进 `transcript` 供 `/history` 回看; 失败也记(否则 `/history` 的轮次号
+    /// 会与实际看到的轮次号错位)。
     async fn reply(&mut self, q: &str, sink: &mut dyn SessionSink) {
+        self.turn += 1;
+        sink.line("");
+        sink.line(&turn_divider(self.lang, self.turn));
+
         let reply = if self.plain {
             self.llm.ask(q).await.inspect(|a| sink.line(&a.text))
         } else {
@@ -395,20 +611,38 @@ impl ChatSession {
                 if let Some(u) = &ans.usage {
                     sink.line(&format!("[用量] {u}"));
                 }
+                self.transcript.push((q.to_string(), ans.text.clone()));
                 self.history.push(Message::user(q.to_string()));
                 self.history.push(Message::assistant(ans.text));
             }
             // 如实报错, 不吞: 网络/鉴权/模型不支持工具调用都会走到这里
-            Err(e) => sink.line(&format!("错误: {e}")),
+            Err(e) => {
+                let shown = format!("错误: {e}");
+                sink.line(&shown);
+                self.transcript.push((q.to_string(), shown));
+            }
         }
+        sink.line("");
     }
 
     /// 宿主执行已确认动作(019 R3): 复用与终端完全相同的引擎内核, 不经 shell。
     ///
     /// - Deploy = `engine::approve` 取一次性 token → `engine::execute_strategy` 落盘(与 deploy.rs 同函数);
     /// - StartDemo = `ctrl::start_daemon(demo=true)`(daemon 对 demo 不校验 confirmed/live_enabled)。
-    pub async fn execute(&self, action: &PendingAction) -> CoreResult<String> {
-        execute_confirmed(action, &self.root).await
+    ///
+    /// 成功后就地更新菜单(FR-015 / FR-026): 落盘 → 菜单 A「策略就绪」; 删除 → 清空菜单。
+    /// 其余动作保持当前菜单(调用方 [`Self::flush_menu`] 会再渲一份), 不凭空造菜单。
+    pub async fn execute(&mut self, action: &PendingAction) -> CoreResult<String> {
+        let msg = execute_confirmed(action, &self.root, self.lang).await?;
+        let next = match action.kind {
+            ActionKind::Deploy | ActionKind::DeployReplace => {
+                menu::build(menu::KIND_STRATEGY_READY, &action.name, self.lang)
+            }
+            ActionKind::DeleteStrategy => None,
+            _ => return Ok(msg),
+        };
+        *self.active_menu.lock().await = next;
+        Ok(msg)
     }
 }
 
@@ -421,6 +655,10 @@ pub enum LineInput {
     Exit,
     /// 帮助。
     Help,
+    /// `/history`(别名 `/log`)—— 回看本会话问答往返。
+    History,
+    /// `/lang` 界面语言。
+    Lang(LangCmd),
     /// `/market` 交易对视野。
     Market(MarketCmd),
     /// `/keys` 密钥管理。
@@ -429,6 +667,17 @@ pub enum LineInput {
     Ask(String),
     /// 尚未接入的斜杠命令。
     Unknown(String),
+}
+
+/// `/lang` 的意图(纯解析, 不做 I/O)。
+#[derive(Debug, PartialEq, Eq)]
+pub enum LangCmd {
+    /// `/lang` — 只看当前语言(附双语切换提示)。
+    Show,
+    /// `/lang zh|en` — 切换界面语言(写回 `[ui].lang` 并立即生效)。
+    Set(Lang),
+    /// `/lang <其它>` — 参数不认(原样带出, 便于回报)。
+    Bad(String),
 }
 
 /// `/market` 的意图(纯解析, 不做 I/O)。
@@ -479,6 +728,14 @@ pub fn classify(line: &str) -> LineInput {
         return match name {
             "exit" | "quit" | "q" => LineInput::Exit,
             "help" | "?" => LineInput::Help,
+            "history" | "log" => LineInput::History,
+            "lang" => LineInput::Lang(match words.next() {
+                None => LangCmd::Show,
+                Some(w) => match Lang::parse(w) {
+                    Some(l) => LangCmd::Set(l),
+                    None => LangCmd::Bad(w.to_string()),
+                },
+            }),
             "market" => LineInput::Market(match words.next().map(|s| s.to_ascii_lowercase()) {
                 None => MarketCmd::Show,
                 Some(w) if w == "bstock" || w == "stock" || w == "default" => MarketCmd::Bstock,
@@ -501,17 +758,44 @@ pub fn classify(line: &str) -> LineInput {
 /// 空状态提示: 还没有任何策略(无 *.toml)时给"两条路"话术, 否则 None。
 ///
 /// 纯本地目录检查(不触网): 会话启动即打印, 语义是"策略是空的, 从哪开始"。
-pub fn empty_state_hint(root: &Path) -> Option<String> {
+/// 文案只讲"会发生什么"(FR-010): 不出现任何终端命令。
+pub fn empty_state_hint(root: &Path, lang: Lang) -> Option<String> {
     if !tools::list_toml_stems(&root.join("strategies")).is_empty() {
         return None;
     }
-    Some(
+    Some(tf(
+        lang,
         "现在还没有任何策略 —— 两条路都行:\n\
          ① 从模板起步: 说\"看看模板\", 我列出内置模板(如 shannon_grid 中轴再平衡), 你挑一个, 我再问交易对与参数;\n\
          ② 全新编写: 直接说需求(例: \"给 AAPL 做 50:50 再平衡, 每次 0.01\"), 我按 Lua API 写代码并先跑沙箱回测;\n\
-         两条路都要你本人逐字确认才落盘; 落盘后我可以带你跑 Dry Run(虚拟撮合) / 测试网 demo。\n\
+         两条路都要你本人回一句确认词才落盘; 落盘后我可以带你跑 Dry Run(虚拟撮合) / 测试网 demo。\n\
          不知道有哪些可交易对: 输入 /market 看当前视野。"
             .to_string(),
+        "There are no strategies yet — two ways to start:\n\
+         1) Start from a template: say \"show me the templates\", I'll list the built-in ones (e.g. shannon_grid, centre rebalancing), you pick one, then I'll ask for the pair and parameters.\n\
+         2) Write one from scratch: just describe what you want (e.g. \"50:50 rebalance on AAPL, 0.01 each time\"), I'll write it against the Lua API and run a sandbox backtest first.\n\
+         Either way nothing is written until you reply with a confirmation word; after that I can walk you through a dry run (simulated fills) or the testnet demo.\n\
+         Not sure which pairs you can trade? Type /market to see the current scope."
+            .to_string(),
+    ))
+}
+
+/// 轮次分隔线(FR-007): 让用户一眼看出"这一轮从哪开始"。
+fn turn_divider(lang: Lang, n: u64) -> String {
+    tf(lang, format!("── 第 {n} 轮 ──"), format!("── Turn {n} ──"))
+}
+
+/// `/history` 单条往返的渲染(FR-008): 超上限时**截断并标注**, 不静默丢内容。
+fn clip_for_history(s: &str, lang: Lang) -> String {
+    let total = s.chars().count();
+    if total <= HISTORY_ENTRY_MAX_CHARS {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(HISTORY_ENTRY_MAX_CHARS).collect();
+    tf(
+        lang,
+        format!("{head}…(已截断, 原文 {total} 字)"),
+        format!("{head}…(truncated; original {total} characters)"),
     )
 }
 
@@ -588,46 +872,90 @@ fn key_status(v: Option<&str>) -> String {
 }
 
 /// 待确认动作的显示名: 只有风险确认没有策略名, 不能渲染成「标签 / 」。
-fn action_display(action: &PendingAction) -> String {
+fn action_display(action: &PendingAction, lang: Lang) -> String {
+    let label = action.kind.label(lang);
     if action.name.is_empty() {
-        action.kind.label().to_string()
-    } else if action.replace {
-        format!("{}(受控覆盖) / {}", action.kind.label(), action.name)
+        label.to_string()
+    } else if action.is_replace() {
+        format!("{label}{} / {}", tf(lang, "(受控覆盖)", "(controlled overwrite)"), action.name)
     } else {
-        format!("{} / {}", action.kind.label(), action.name)
+        format!("{label} / {}", action.name)
     }
 }
 
-/// 帮助文案(与未接入提示共用的边界说明)。
+/// 帮助文案(与未接入提示共用的边界说明), 随界面语言。
 ///
+/// 面向用户只讲"会发生什么"(FR-010): 不给任何终端命令, 也不让用户去找不存在的子命令。
 /// 工具名取自白名单常量(019): 不手抄, 避免白名单扩容后这里静默过期。
-pub fn help_text() -> String {
-    format!(
-        "\
-命令: /help 帮助 · /exit 退出 · /market 交易对视野(查看 / 切 bstock / all) · /keys 密钥(查看 / ai / demo / live)
-可用自然语言提问, 例如: \"我部署了哪些策略\"
-只读工具({} 个, 可直接调用): {read}
-虚拟工具({} 个, 可直接调用但要告知副作用): {virt}
-边界: R4 起七类写实动作都能在对话内完成 —— 落盘部署 / 启动测试网 demo / 首次实盘风险确认 /
-启动实盘 / 停止测试网 / 停止实盘 / 平仓停止实盘, 但都必须由你本人逐字输入确认短语; 我(模型)只能登记待确认, 没有执行权。
-七类之外的常见事(平台没有对应子命令, 如实指引如下, 别让用户去找不存在的命令):
-改参数 = 用编辑器改 strategies/<名字>.toml 的 [strategy.params] 段, 再 `ricow restart <名字>` 生效(无热改);
-改配置 = 密钥用 `/keys`、交易对视野用 `/market`(就地改写 ricow.toml, 保留注释);
-删除策略 = 先 `ricow stop <名字>` 停机, 再手工删 strategies/<名字>.toml(与同名 .lua; 平台不代删)。",
-        tools::READ_ONLY_TOOLS.len(),
-        tools::VIRTUAL_TOOLS.len(),
-        read = tools::READ_ONLY_TOOLS.join(" / "),
-        virt = tools::VIRTUAL_TOOLS.join(" / ")
-    )
+pub fn help_text(lang: Lang) -> String {
+    match lang {
+        Lang::Zh => format!(
+            "\
+命令: /help 帮助 · /exit 退出 · /history 回看本会话(别名 /log) · /lang 切换语言 · \
+/market 交易对视野(查看 / 切 bstock / all) · /keys 密钥(查看 / ai / demo / live)
+也可以直接用自然语言提问, 例如: \"我部署了哪些策略\"
+只读工具({nread} 个, 我直接调用): {read}
+需确认工具({nvirt} 个, 我先说明再请你确认): {virt}
+边界: 凡是会改文件或起停实例的动作 —— 落盘部署 / 覆盖部署 / 改参数 / 删除策略 /
+启动试跑 / 停止试跑 / 启动测试网 / 停止测试网 / 实盘风险确认 / 启动实盘 / 停止实盘 /
+平仓停止实盘 / 重启实盘 —— 都必须由你本人回一句确认词; 我(模型)只能登记待确认, 没有执行权。
+常见事怎么办(别去找不存在的命令):
+改参数 = 直接说\"把 <策略> 的 <参数> 改成 <值>\", 我回报改前改后, 你确认后生效(会按原模式自动重启);
+删除策略 = 直接说\"删除 <策略>\", 你确认后我停实例并删掉策略文件(日志保留);
+改密钥 = 用 /keys; 改交易对视野 = 用 /market。",
+            nread = tools::READ_ONLY_TOOLS.len(),
+            nvirt = tools::VIRTUAL_TOOLS.len(),
+            read = tools::READ_ONLY_TOOLS.join(" / "),
+            virt = tools::VIRTUAL_TOOLS.join(" / ")
+        ),
+        Lang::En => format!(
+            "\
+Commands: /help · /exit · /history (alias /log) · /lang · /market (view / bstock / all) · \
+/keys (view / ai / demo / live)
+You can also just ask in plain language, e.g. \"which strategies do I have deployed?\"
+Read-only tools ({nread}, I run them right away): {read}
+Confirmation-required tools ({nvirt}, I explain first and ask you to confirm): {virt}
+Boundary: anything that changes files or starts/stops an instance — deploy / replace & deploy /
+update parameters / delete a strategy / start or stop a dry run / start or stop the testnet demo /
+accept live-trading risk / start live / stop live / close positions & stop / restart live — needs a
+confirmation word from you. I (the model) can only register a pending action; I cannot execute it.
+Common things, and how to ask (don't go looking for commands that do not exist):
+Change parameters = just say \"change <parameter> of <strategy> to <value>\"; I report before and after
+and it applies once you confirm (the instance restarts in its original mode).
+Delete a strategy = say \"delete <strategy>\"; once you confirm I stop the instance and remove the
+strategy files (logs are kept).
+Change API keys = use /keys. Change the pair scope = use /market.",
+            nread = tools::READ_ONLY_TOOLS.len(),
+            nvirt = tools::VIRTUAL_TOOLS.len(),
+            read = tools::READ_ONLY_TOOLS.join(" / "),
+            virt = tools::VIRTUAL_TOOLS.join(" / ")
+        ),
+    }
+}
+
+/// 当前**正在运行**实例的模式(没在跑 → `None`); 只查视图, 不触盘。
+///
+/// 用于"停机/重启前先判模式"(FR-024): 例如别把实盘实例当试跑停掉。
+async fn running_mode(root: &Path, name: &str) -> Option<String> {
+    crate::commands::instances::views(root)
+        .await
+        .into_iter()
+        .find(|v| v.name == name && v.running)
+        .and_then(|v| v.mode)
 }
 
 /// 宿主执行已确认动作(与终端同内核, 不经 shell); 供会话与测试共用。
 ///
-/// 七类动作全部落在同一处: 落盘 / 起停的**判据与内核**都与 CLI 共用
+/// **13 类动作**全部落在同一处: 落盘 / 改参数 / 删除 / 起停的**判据与内核**都与 CLI 共用
 /// ([`crate::commands::ctrl`]), 会话只负责把结果翻成给用户看的一段话。
-pub(crate) async fn execute_confirmed(action: &PendingAction, root: &Path) -> CoreResult<String> {
+/// 文案只讲"会发生什么"(FR-010): 不出现任何终端命令, 也不让用户去找不存在的子命令。
+pub(crate) async fn execute_confirmed(
+    action: &PendingAction,
+    root: &Path,
+    lang: Lang,
+) -> CoreResult<String> {
     match action.kind {
-        ActionKind::Deploy => {
+        ActionKind::Deploy | ActionKind::DeployReplace => {
             let id = action.preview_id.as_deref().ok_or_else(|| {
                 CoreError::InvalidArgument("内部状态错误: deploy 待办缺 preview_id".into())
             })?;
@@ -636,50 +964,222 @@ pub(crate) async fn execute_confirmed(action: &PendingAction, root: &Path) -> Co
                 .map_err(|e| CoreError::Exchange(e.to_string()))?;
             let dir = crate::commands::ensure_strategies_dir_in(root)?;
             let token = ricow_engine::approve(&db, id).await?;
-            // FR-044: replace=true 时引擎会先备份旧脚本再覆盖; 备份路径如实回报, 不省略。
-            let out = ricow_engine::execute_strategy(&db, id, &token, &dir, action.replace).await?;
+            // FR-044: 覆盖部署时引擎会先备份旧脚本再覆盖; 备份路径如实回报, 不省略。
+            let replace = action.is_replace();
+            let out = ricow_engine::execute_strategy(&db, id, &token, &dir, replace).await?;
             let backup_note = match out.backup.as_ref() {
-                Some(p) => format!(
-                    "受控覆盖(FR-044): 旧脚本已备份为\n  {}\n(需要回滚就把 .bak 复制回原文件名)\n",
-                    p.display()
+                Some(p) => tf(
+                    lang,
+                    format!(
+                        "受控覆盖(FR-044): 旧脚本已备份为\n  {}\n(需要回滚就把 .bak 复制回原文件名)\n",
+                        p.display()
+                    ),
+                    format!(
+                        "Controlled overwrite: the previous script was backed up to\n  {}\n(to roll back, copy the .bak back to the original file name)\n",
+                        p.display()
+                    ),
                 ),
                 None => String::new(),
             };
-            Ok(format!(
-                "已确认并完成落盘:\n  {}\n  {}\n{}{}\
-                 下一步:\n  Dry Run: ricow run {name}\n  测试网: ricow start {name} --demo",
-                out.toml_path.display(),
-                out.lua_path.display(),
-                backup_note,
-                if action.replace {
+            // 覆盖后旧实例仍跑旧脚本 —— 只讲"怎么让它生效"(对话口径), 不给终端命令。
+            let stale_note = if replace {
+                tf(
+                    lang,
                     format!(
-                        "注意: {} 若正在运行, 仍执行旧代码; 需 `ricow restart {}` 才换新脚本\n",
+                        "注意: {} 若正在运行, 执行的仍是旧脚本; 想让新脚本生效, 请在对话里说\
+                         \"重启实盘 {}\"(实盘), 或先停再启(试跑 / 测试网)。\n",
                         action.name, action.name
-                    )
-                } else {
-                    String::new()
-                },
-                name = action.name
+                    ),
+                    format!(
+                        "Note: if {} is running it still executes the old script; to pick up the new one \
+                         say \"restart live trading {}\" (live), or stop and start it again (dry run / testnet).\n",
+                        action.name, action.name
+                    ),
+                )
+            } else {
+                String::new()
+            };
+            Ok(format!(
+                "{head}\n  {toml}\n  {lua}\n{backup}{stale}",
+                head = tf(lang, "已确认并完成落盘:", "Confirmed — written to disk:"),
+                toml = out.toml_path.display(),
+                lua = out.lua_path.display(),
+                backup = backup_note,
+                stale = stale_note,
+            ))
+        }
+        ActionKind::UpdateParams => {
+            // 参数在写盘之前全部解析完: 任一非法 → 直接报错, 一个字节都不落盘 (FR-024)。
+            let mut updates = Vec::with_capacity(action.params.len());
+            for raw in &action.params {
+                let (k, v) = crate::commands::backtest::parse_param(raw).ok_or_else(|| {
+                    CoreError::InvalidArgument(format!(
+                        "参数 \"{raw}\" 不是 key=value 形式; 请说\"把 <参数> 改成 <值>\""
+                    ))
+                })?;
+                updates.push((k, v));
+            }
+            // 只动 `[strategy.params]`, 顶层 live_enabled 等原样保留 (FR-025)。
+            let diffs = crate::commands::update_strategy_params_in(root, &action.name, &updates)?;
+            let listing =
+                diffs.iter().map(|(k, d)| format!("  {k}: {d}")).collect::<Vec<_>>().join("\n");
+
+            // 原模式必须在停机**之前**读: 停机后台账/视图已被覆盖, 无从得知原本跑的是什么。
+            let prev_mode = running_mode(root, &action.name).await;
+            let restart_note = if matches!(prev_mode.as_deref(), Some("dry_run" | "demo")) {
+                // dry_run / demo 按原模式自动重启(FR-024, 不静默降级); 已确认过, 内核无需再要一次确认。
+                let demo = prev_mode.as_deref() == Some("demo");
+                crate::commands::ctrl::stop_daemon(root, &action.name, false).await?;
+                let (pid, mode) =
+                    crate::commands::ctrl::start_daemon(root, &action.name, false, demo, true)
+                        .await?;
+                tf(
+                    lang,
+                    format!(
+                        "\n已按原模式自动重启({}), pid={pid}, 新参数已生效。",
+                        crate::commands::instances::mode_text(&mode)
+                    ),
+                    format!(
+                        "\nRestarted in its original mode ({}), pid={pid}; the new parameters are live.",
+                        crate::commands::instances::mode_text(&mode)
+                    ),
+                )
+            } else if prev_mode.as_deref() == Some("live") {
+                // 实盘**不自动重启** (FR-024): 重启要重过三判据, 值得单独一次确认。
+                t(
+                    lang,
+                    "\n注意: 该策略正在实盘运行, 新参数**尚未生效**; 要让它生效请在对话里说\
+                     \"重启实盘 <策略名>\"(会重过实盘门禁)。",
+                    "\nNote: this strategy is running live, so the change is **not in effect yet**; \
+                     to apply it say \"restart live trading <strategy>\" (the live gates are re-checked).",
+                )
+                .to_string()
+            } else {
+                t(
+                    lang,
+                    "\n(该策略当前未运行; 下次启动即用新参数。)",
+                    "\n(This strategy is not running; the new parameters apply the next time it starts.)",
+                )
+                .to_string()
+            };
+            Ok(format!(
+                "{head}\n{listing}\n{note}",
+                head = tf(
+                    lang,
+                    "已确认并完成改参数(写前已留时间戳备份):",
+                    "Confirmed — parameters updated (a timestamped backup was kept):"
+                ),
+                note = restart_note,
+            ))
+        }
+        ActionKind::DeleteStrategy => {
+            // 运行中先停(close_all=false, 不平仓), 再删文件; **不删 logs/** (FR-024/FR-025)。
+            let stopped = if running_mode(root, &action.name).await.is_some() {
+                crate::commands::ctrl::stop_daemon(root, &action.name, false).await?
+            } else {
+                String::new()
+            };
+            let removed = crate::commands::delete_strategy_files_in(root, &action.name)?;
+            let listing = removed.iter().map(|f| format!("  {f}")).collect::<Vec<_>>().join("\n");
+            Ok(format!(
+                "{head}\n{stopped}{listing}",
+                head = tf(
+                    lang,
+                    "已确认并完成删除(日志保留在 logs/):",
+                    "Confirmed — deleted (logs are kept under logs/):"
+                ),
+            ))
+        }
+        ActionKind::StartDryRun => {
+            let (pid, mode) =
+                crate::commands::ctrl::start_daemon(root, &action.name, false, false, true).await?;
+            Ok(tf(
+                lang,
+                format!(
+                    "已确认: {} 正在以试跑(Dry Run)启动, pid={pid}(实时行情 + 虚拟下单, 不涉资金)。\n\
+                     停机: 在对话里说\"停止试跑 {}\"",
+                    crate::commands::instances::mode_text(&mode),
+                    action.name
+                ),
+                format!(
+                    "Confirmed: {} started as a dry run, pid={pid} (live market data, simulated fills, no funds).\n\
+                     To stop it, say \"stop the dry run {}\".",
+                    crate::commands::instances::mode_text(&mode),
+                    action.name
+                ),
+            ))
+        }
+        ActionKind::StopDryRun => {
+            // 停之前先判模式(FR-024): 别把测试网/实盘实例当成试跑停掉。
+            if let Some(m) = running_mode(root, &action.name).await {
+                if m != "dry_run" {
+                    return Err(CoreError::InvalidArgument(tf(
+                        lang,
+                        format!(
+                            "{} 当前以「{}」运行, 不是试跑; 要停它在对话里说\"停止测试网 {}\"或\"停止实盘 {}\"。",
+                            action.name,
+                            crate::commands::instances::mode_text(&m),
+                            action.name,
+                            action.name
+                        ),
+                        format!(
+                            "{} is currently running as \"{}\", not as a dry run; to stop it say \
+                             \"stop the testnet demo {}\" or \"stop live trading {}\".",
+                            action.name,
+                            crate::commands::instances::mode_text(&m),
+                            action.name,
+                            action.name
+                        ),
+                    )));
+                }
+            }
+            let report = crate::commands::ctrl::stop_daemon(root, &action.name, false).await?;
+            Ok(format!(
+                "{report}{}",
+                t(
+                    lang,
+                    "(试跑实例已停止; 与真实资金无关)",
+                    "(The dry run is stopped; no funds were involved.)"
+                )
             ))
         }
         ActionKind::StartDemo => {
             let (pid, mode) =
                 crate::commands::ctrl::start_daemon(root, &action.name, false, true, false).await?;
-            Ok(format!(
-                "已确认: {} 正在以测试网 demo 启动, pid={pid}(无真实资金; 会真实向测试网下单/撤单)。\n\
-                 停机: 在对话里说\"停止测试网 {name}\", 或终端 ricow stop {name}",
-                crate::commands::instances::mode_text(&mode),
-                name = action.name
+            Ok(tf(
+                lang,
+                format!(
+                    "已确认: {} 正在以测试网 demo 启动, pid={pid}(无真实资金; 会真实向测试网下单/撤单)。\n\
+                     停机: 在对话里说\"停止测试网 {}\"",
+                    crate::commands::instances::mode_text(&mode),
+                    action.name
+                ),
+                format!(
+                    "Confirmed: {} started on the testnet demo, pid={pid} (no real funds; orders are really \
+                     placed and cancelled on the testnet).\nTo stop it, say \"stop the testnet demo {}\".",
+                    crate::commands::instances::mode_text(&mode),
+                    action.name
+                ),
             ))
         }
         ActionKind::AckRisk => {
-            // 018: 用户已在确认块里读过披露全文并逐字输入"确认风险", 这里只落记录。
+            // 018: 用户已在确认块里读过披露全文并回过确认词, 这里只落记录。
             // 记录位置固定为 `project_root()`(子进程 run 读的是同一份, 见 commands::risk_ack_path)。
             let path = crate::commands::write_risk_ack()?;
             Ok(format!(
-                "{}\n\n已确认风险: {} (一次确认长期有效, 后续实盘不再重复要求)",
+                "{}\n\n{}",
                 ricow_engine::RISK_DISCLOSURE,
-                path.display()
+                tf(
+                    lang,
+                    format!(
+                        "已确认风险: {} (一次确认长期有效, 后续实盘不再重复要求)",
+                        path.display()
+                    ),
+                    format!(
+                        "Risk accepted: {} (a single acceptance stays valid; live trading will not ask again)",
+                        path.display()
+                    ),
+                )
             ))
         }
         ActionKind::StartLive => {
@@ -695,28 +1195,88 @@ pub(crate) async fn execute_confirmed(action: &PendingAction, root: &Path) -> Co
                 .map_err(|e| {
                     CoreError::InvalidArgument(format!(
                         "{e}\n(执行前复核发现实盘门禁未通过, 未发生任何下单; \
-                             若缺「首次风险确认」, 请在对话里先走一遍确认风险。)"
+                             若缺「首次风险确认」, 请在对话里先完成一次实盘风险确认。)"
                     ))
                 })?;
+            let notice_text = notice.map(|n| format!("{n}\n")).unwrap_or_default();
+            let (pid, mode) =
+                crate::commands::ctrl::start_daemon(root, &action.name, true, false, true).await?;
+            Ok(tf(
+                lang,
+                format!(
+                    "{notice_text}已确认: {} 正在以**实盘**启动, pid={pid}(真实资金, 会真实下单)。\n\
+                     停机: 在对话里说\"停止实盘 {}\"(保留持仓) 或\"平仓停止 {}\"(撤单并市价平仓)。",
+                    crate::commands::instances::mode_text(&mode),
+                    action.name,
+                    action.name
+                ),
+                format!(
+                    "{notice_text}Confirmed: {} started **live**, pid={pid} (real funds; orders are really placed).\n\
+                     To stop it say \"stop live trading {}\" (keeps positions) or \"close positions and stop {}\" \
+                     (cancels and market-closes).",
+                    crate::commands::instances::mode_text(&mode),
+                    action.name,
+                    action.name
+                ),
+            ))
+        }
+        ActionKind::RestartLive => {
+            // 与 CLI `ricow restart` 同一批内核: 先停(不平仓) → 重过实盘门禁(fail-closed) → 按实盘重启。
+            let report = crate::commands::ctrl::stop_daemon(root, &action.name, false).await?;
+            let notice = crate::commands::ctrl::live_preflight(root, &action.name, false)
+                .await
+                .map_err(|e| {
+                    CoreError::InvalidArgument(format!(
+                        "{e}\n(重启前复核发现实盘门禁未通过: 该实例已停止且**未重新启动**, \
+                         也未发生任何下单; 请先处理门禁再试。)"
+                    ))
+                })?;
+            let notice_text = notice.map(|n| format!("{n}\n")).unwrap_or_default();
             let (pid, mode) =
                 crate::commands::ctrl::start_daemon(root, &action.name, true, false, true).await?;
             Ok(format!(
-                "{}已确认: {} 正在以**实盘**启动, pid={pid}(真实资金, 会真实下单)。\n\
-                 停机: 在对话里说\"停止实盘 {name}\"(保留持仓) 或\"平仓停止 {name}\"(撤单并市价平仓)。",
-                notice.map(|n| format!("{n}\n")).unwrap_or_default(),
-                crate::commands::instances::mode_text(&mode),
-                name = action.name
+                "{report}{}",
+                tf(
+                    lang,
+                    format!(
+                        "{notice_text}已确认: {} 已按原模式重启为实盘, pid={pid}(真实资金, 会真实下单)。\n\
+                         停机: 在对话里说\"停止实盘 {}\"(保留持仓) 或\"平仓停止 {}\"(撤单并市价平仓)。",
+                        crate::commands::instances::mode_text(&mode),
+                        action.name,
+                        action.name
+                    ),
+                    format!(
+                        "{notice_text}Confirmed: {} restarted **live**, pid={pid} (real funds; orders are really placed).\n\
+                         To stop it say \"stop live trading {}\" (keeps positions) or \"close positions and stop {}\" \
+                         (cancels and market-closes).",
+                        crate::commands::instances::mode_text(&mode),
+                        action.name,
+                        action.name
+                    ),
+                )
             ))
         }
         ActionKind::StopDemo | ActionKind::StopLive | ActionKind::CloseLive => {
             let close_all = action.kind == ActionKind::CloseLive;
             let report = crate::commands::ctrl::stop_daemon(root, &action.name, close_all).await?;
             let tail = match action.kind {
-                ActionKind::StopDemo => "(测试网实例已停止; 与真实资金无关)",
-                ActionKind::StopLive => {
-                    "(实盘实例已停止; 持仓仍保留在交易所, 如需离场请说\"平仓停止\")"
-                }
-                _ => "(已请求撤单并市价平仓; 平仓结果以交易所回报为准, 见日志)",
+                ActionKind::StopDemo => t(
+                    lang,
+                    "(测试网实例已停止; 与真实资金无关)",
+                    "(The testnet instance is stopped; no real funds were involved.)",
+                ),
+                ActionKind::StopLive => t(
+                    lang,
+                    "(实盘实例已停止; 持仓仍保留在交易所, 如需离场请说\"平仓停止\")",
+                    "(The live instance is stopped; positions remain on the exchange — say \
+                     \"close positions and stop\" to exit.)",
+                ),
+                _ => t(
+                    lang,
+                    "(已请求撤单并市价平仓; 平仓结果以交易所回报为准, 见日志)",
+                    "(Cancellation and market close requested; the exchange report is authoritative — \
+                     see the logs.)",
+                ),
             };
             Ok(format!("{report}{tail}"))
         }
@@ -831,7 +1391,7 @@ mod tests {
 
     #[test]
     fn test_help_text_mentions_limits() {
-        let h = help_text();
+        let h = help_text(Lang::Zh);
         assert!(h.contains("/exit") && h.contains("确认"), "{h}");
         assert!(h.contains("/market"), "帮助要列出 /market: {h}");
         assert!(h.contains("/keys"), "帮助要列出 /keys: {h}");
@@ -849,7 +1409,7 @@ mod tests {
     #[test]
     fn test_empty_state_hint_only_when_no_strategy() {
         let root = temp_root("empty");
-        let hint = empty_state_hint(&root).expect("空目录须给两条路话术");
+        let hint = empty_state_hint(&root, Lang::Zh).expect("空目录须给两条路话术");
         for must in ["模板", "全新编写", "确认", "/market"] {
             assert!(hint.contains(must), "空状态话术缺少 {must}: {hint}");
         }
@@ -857,7 +1417,7 @@ mod tests {
         let dir = root.join("strategies");
         std::fs::create_dir_all(&dir).expect("建策略目录");
         std::fs::write(dir.join("g1.toml"), "enabled = true").expect("写策略占位");
-        assert!(empty_state_hint(&root).is_none(), "已有策略不该再提示两条路");
+        assert!(empty_state_hint(&root, Lang::Zh).is_none(), "已有策略不该再提示两条路");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

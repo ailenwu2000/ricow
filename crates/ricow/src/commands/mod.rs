@@ -272,7 +272,112 @@ pub(crate) fn read_strategy_config_in(
     StrategyConfig::from_toml(&text).ok()
 }
 
+/// 写文件类动作的策略名门禁(防目录穿越): 只接受单段名, 不得含路径分隔/上跳/隐藏前缀。
+///
+/// 与 `ai::tools::safe_strategy_name` 同一口径 —— 那一个在工具入口校验(模型入参),
+/// 这一个在**宿主内核**再校验一次(写盘/删除路径的最后一道, 不依赖上游是否校验过)。
+fn safe_strategy_file_stem(name: &str) -> CoreResult<()> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.starts_with('.')
+    {
+        return Err(CoreError::InvalidArgument(format!(
+            "策略名非法: \"{name}\" (不得为空、不得含路径分隔符/..)"
+        )));
+    }
+    Ok(())
+}
+
+/// 参数值渲染(回执用): 字符串原样, 数值/布尔按字面。
+fn render_config_value(v: &ConfigValue) -> String {
+    if let Some(s) = v.as_str() {
+        return s.to_string();
+    }
+    if let Some(f) = v.as_f64() {
+        return f.to_string();
+    }
+    if let Some(i) = v.as_i64() {
+        return i.to_string();
+    }
+    if let Some(b) = v.as_bool() {
+        return b.to_string();
+    }
+    "(未知类型)".into()
+}
+
+/// 改策略参数并落盘(023 FR-024/FR-025): 读 TOML → 合并 `[strategy.params]` → 时间戳备份 → 写回。
+///
+/// - **只动 `params`**: 顶层 `enabled` / `live_enabled` / `market` / `position_mode` 等原样保留 ——
+///   实盘开关由实盘门禁管辖, 不让"改参数"顺手把它打开;
+/// - 写前留同目录 `{name}.toml.<时间戳>.bak`(重写会丢注释, 留一份可回溯);
+/// - 返回逐键差异 `(键, "改前 → 改后")`, 找不到旧值记 `<未设置>`;
+/// - 前置校验全在写之前完成(名字/非空/可读/可解析), 任一失败即返回 `Err` 且**不落盘**。
+pub(crate) fn update_strategy_params_in(
+    root: &std::path::Path,
+    name: &str,
+    updates: &[(String, ConfigValue)],
+) -> CoreResult<Vec<(String, String)>> {
+    safe_strategy_file_stem(name)?;
+    if updates.is_empty() {
+        return Err(CoreError::InvalidArgument("没有需要修改的参数".into()));
+    }
+    let dir = root.join("strategies");
+    let path = dir.join(format!("{name}.toml"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| CoreError::InvalidArgument(format!("读取策略 {name} 失败: {e}")))?;
+    let mut config = StrategyConfig::from_toml(&text)
+        .map_err(|e| CoreError::InvalidArgument(format!("策略 {name} TOML 解析失败: {e}")))?;
+
+    let mut diffs = Vec::with_capacity(updates.len());
+    for (k, v) in updates {
+        let before =
+            config.params.get(k).map(render_config_value).unwrap_or_else(|| "<未设置>".to_string());
+        config.params.insert(k.clone(), v.clone());
+        diffs.push((k.clone(), format!("{before} → {}", render_config_value(v))));
+    }
+
+    let backup = dir.join(format!("{name}.toml.{}.bak", chrono::Utc::now().format("%Y%m%d%H%M%S")));
+    std::fs::copy(&path, &backup)
+        .map_err(|e| CoreError::Exchange(format!("备份 {} 失败: {e}", backup.display())))?;
+
+    let toml_str =
+        config.to_toml().map_err(|e| CoreError::Parse(format!("策略 TOML 序列化失败: {e}")))?;
+    std::fs::write(&path, toml_str)
+        .map_err(|e| CoreError::Exchange(format!("写 {} 失败: {e}", path.display())))?;
+    Ok(diffs)
+}
+
+/// 删除策略文件(023 FR-024): 只删 `strategies/{name}.toml` 与 `strategies/{name}.lua`(存在才删)。
+///
+/// **不动 `logs/`**: 停机与成交留痕要保留, 供事后追溯。返回被删文件的文件名列表。
+/// 前置校验全在删除之前完成(名字/至少命中一个文件), 避免"删了一半才发现名字非法"。
+pub(crate) fn delete_strategy_files_in(
+    root: &std::path::Path,
+    name: &str,
+) -> CoreResult<Vec<String>> {
+    safe_strategy_file_stem(name)?;
+    let dir = root.join("strategies");
+    let candidates = [dir.join(format!("{name}.toml")), dir.join(format!("{name}.lua"))];
+    let existing: Vec<&std::path::PathBuf> = candidates.iter().filter(|p| p.is_file()).collect();
+    if existing.is_empty() {
+        return Err(CoreError::InvalidArgument(format!("策略 {name} 不存在(没有找到 .toml/.lua)")));
+    }
+    let mut removed = Vec::with_capacity(existing.len());
+    for p in &existing {
+        std::fs::remove_file(p)
+            .map_err(|e| CoreError::Exchange(format!("删除 {} 失败: {e}", p.display())))?;
+        removed.push(p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+    }
+    removed.sort();
+    Ok(removed)
+}
+
 /// 是否为**明确确认**(裸 y/yes/ok/n/no/空 一律不算; 必须逐字等于 expected)。019 T026/T030 共用。
+///
+/// **仅终端渠道**(`approve.rs` / `run.rs` / `ctrl.rs`)在用; 对话渠道用当前语言的口语词,
+/// 见 [`crate::ai::confirm::is_simple_confirmation`](023 决策 D1/D2)。
 pub(crate) fn is_explicit_confirmation(input: &str, expected: &str) -> bool {
     let t = input.trim();
     if t.is_empty() {
@@ -666,6 +771,127 @@ script = "function on_tick(ctx) return {} end"
         let cfg = load_strategy_toml(&dir, "old").expect("should load");
         assert!(cfg.get_str("script").unwrap().contains("on_tick"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- 023: 改参数 / 删策略 宿主内核(写文件路径) ----
+
+    /// 临时数据目录(带 strategies/), 返回 (root, strategies_dir)。
+    fn temp_root(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("ricow-mod-023-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("strategies");
+        std::fs::create_dir_all(&dir).unwrap();
+        (root, dir)
+    }
+
+    fn write_strategy(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.join(format!("{name}.toml"));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    const SAMPLE: &str = r#"
+[strategy]
+name = "g1"
+type = "lua"
+enabled = true
+exchange = "binance"
+market = "futures"
+position_mode = "hedge"
+live_enabled = true
+
+[strategy.params]
+pair = "ETH"
+upper_price = 100.0
+script_path = "g1.lua"
+"#;
+
+    #[test]
+    fn test_update_strategy_params_keeps_other_fields_and_backs_up() {
+        let (root, dir) = temp_root("update");
+        write_strategy(&dir, "g1", SAMPLE);
+
+        let diffs = update_strategy_params_in(
+            &root,
+            "g1",
+            &[("upper_price".to_string(), ConfigValue::Float(120.0))],
+        )
+        .expect("应改成功");
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].0, "upper_price");
+        assert!(diffs[0].1.contains("100"), "改前值应回显: {:?}", diffs[0].1);
+        assert!(diffs[0].1.contains("120"), "改后值应回显: {:?}", diffs[0].1);
+
+        // 顶层字段一个不动(尤其 live_enabled: 实盘开关不归"改参数"管)
+        let after = std::fs::read_to_string(dir.join("g1.toml")).unwrap();
+        let cfg = StrategyConfig::from_toml(&after).unwrap();
+        assert!(cfg.live_enabled, "live_enabled 不得被改参数顺手打开/关掉");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.market, "futures");
+        assert_eq!(cfg.position_mode, "hedge");
+        assert_eq!(cfg.get_str("pair"), Some("ETH"), "未提到的参数保持原值");
+        assert_eq!(cfg.get_str("script_path"), Some("g1.lua"), "script_path 不得丢");
+        assert_eq!(cfg.params.get("upper_price").and_then(|v| v.as_f64()), Some(120.0));
+
+        // 时间戳备份留在同目录
+        let baks: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.starts_with("g1.toml.") && n.ends_with(".bak"))
+            .collect();
+        assert_eq!(baks.len(), 1, "应留一份 .bak: {baks:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_update_strategy_params_rejects_bad_input_without_writing() {
+        let (root, dir) = temp_root("update-reject");
+        let path = write_strategy(&dir, "g1", SAMPLE);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // 空更新
+        assert!(update_strategy_params_in(&root, "g1", &[]).is_err());
+        // 路径穿越名
+        assert!(update_strategy_params_in(
+            &root,
+            "../evil",
+            &[("a".to_string(), ConfigValue::Float(1.0))]
+        )
+        .is_err());
+        // 不存在的策略
+        assert!(update_strategy_params_in(
+            &root,
+            "nope",
+            &[("a".to_string(), ConfigValue::Float(1.0))]
+        )
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "拒绝路径不得落盘");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_delete_strategy_files_removes_toml_and_lua_only() {
+        let (root, dir) = temp_root("delete");
+        write_strategy(&dir, "g1", SAMPLE);
+        std::fs::write(dir.join("g1.lua"), "function on_tick(ctx) return {} end").unwrap();
+        // logs/ 不得被碰
+        let logs = root.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let log = logs.join("g1.log");
+        std::fs::write(&log, "trace").unwrap();
+
+        let removed = delete_strategy_files_in(&root, "g1").expect("应删成功");
+        assert_eq!(removed, vec!["g1.lua".to_string(), "g1.toml".to_string()]);
+        assert!(!dir.join("g1.toml").exists());
+        assert!(!dir.join("g1.lua").exists());
+        assert!(log.exists(), "logs/ 必须保留(追溯用)");
+
+        // 已删光后再删 → 明确报错, 不静默成功
+        assert!(delete_strategy_files_in(&root, "g1").is_err());
+        // 非法名 → 拒绝
+        assert!(delete_strategy_files_in(&root, "../x").is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

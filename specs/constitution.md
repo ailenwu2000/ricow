@@ -65,6 +65,8 @@ spec-kit 命令模板保持官方英文逻辑, 产物由本宪法与 zh preset �
 - 平台不做投资判断: 风控由策略自管(`ctx:net_pnl()` / `ctx:equity()`); 平台仅保留固定下单频率护栏(100 单/秒)。
   - 修订记录(2026-09-16, 019-ai-assistant R5): 原硬规则"RiskEngine 硬检查(最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点)"**删除** —— 平台只做执行 + 数据 + 门禁 + 状态, 赚赔政策属于策略; 依据见 `specs/changes/019-ai-assistant/spec.md` §七 R5。
 - Dry Run 默认, 确认后切实盘。
+- 所有写操作(会改磁盘或改运行态: 落盘 / 覆盖 / 改参数 / 删除 / 试跑与测试网启停 / 实盘全部动作)均须**用户本人当场确认**; 只读动作(回测 / 查询 / 预览)不需确认。
+  - 修订记录(2026-09-18, 023-ai-chat-ux): 确认**分渠道** —— **对话**渠道(`ricow` REPL / `ricow ai`)用**当前语言的单个口语词**(`确认`/`确定`/`同意` · `confirm`/`confirmed`, 只认当前语言, 刻意不含 `y`/`yes`/`ok`/空); **终端**渠道(`ricow approve` / `ricow start --live` / `ricow stop --live`)保持**逐字长短语一行不改**。确认面变宽(7 → 13 类写操作, 唯一入口 `request_write_confirmation`)而对话门槛变低, 依据: 真正的风险源是模型擅自动作(LLM 无写实工具面的结构性边界不变), 而非用户误回一个字。见 `specs/changes/023-ai-chat-ux/spec.md` FR-019 / FR-022。
 - Lua 沙箱: 无 os/io/require/loadstring/pcall; 指令预算 1M/tick; 内存 64MB。
 
 ## 分支与发布(2026-09-15)

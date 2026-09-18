@@ -3,6 +3,9 @@
 //! 与前台调试入口 `ricow run` 的分工:
 //! - `start/stop/restart`: 由 daemon 托管的唯一受管路径 (状态可查、日志落文件、停机走清理)
 //! - `run`: 前台调试, 进程内自带停机监听 (stdin `stop` / 管道 EOF / Ctrl-C), 不被 daemon 管理
+//!
+//! 023 D14: **终端渠道一行不改** —— 实盘启动仍要求逐字短语(`确认实盘 <名>`)。
+//! 对话渠道用当前语言的口语确认词, 见 [`crate::ai::confirm`]; 两条渠道各自独立, 不互相放宽。
 
 use clap::Args;
 use ricow_core::{CoreError, CoreResult};

@@ -3,14 +3,15 @@
 //! 本模块只有终端 I/O: 读一行、把 [`SessionSink`] 收到的东西写出去、判退出。
 //! **所有业务逻辑在 [`crate::ai::session`]** —— 将来接网页端换个 sink 即可, 这里零改动。
 //!
-//! 启动顺序(与计划 §二 A 一致): 打印数据目录 → 加载/生成 ricow.toml → 首次向导(缺密钥才问)
-//! → 开会话 → REPL。
+//! 启动顺序(与计划 §二 A 一致): 打印数据目录 → 加载/生成 ricow.toml → 首次向导(缺语言/密钥才问)
+//! → 开会话 → REPL; 固定文案按 `[ui].lang` 呈现(023: 向导里刚选定的语言立即生效)。
 
 use std::io::{IsTerminal, Write};
 
 use ricow_core::CoreResult;
 
 use crate::ai::session::{self, ChatSession, Options, SessionSink, Step};
+use crate::i18n::{self, t};
 
 use super::config_file;
 
@@ -38,15 +39,20 @@ impl SessionSink for StdioSink {
 /// 裸入口: `ricow`(无子命令)。
 pub async fn run() -> CoreResult<()> {
     let root = crate::commands::project_root();
-    println!("ricow 数据目录 / data dir: {}", root.display());
-    println!("配置文件 / config: {}", config_file::path(&root).display());
+    // 语言(023): 已有配置按 `[ui].lang`; 首次运行尚未选择 → 默认中文(向导最前会问一次, FR-002/FR-003)。
+    let lang = i18n::resolve(&config_file::load(&root)?);
+    println!("{}: {}", t(lang, "ricow 数据目录", "ricow data dir"), root.display());
+    println!("{}: {}", t(lang, "配置文件", "config"), config_file::path(&root).display());
 
-    // 首次向导: 缺 AI 密钥/demo 凭据时才问; 非交互式终端在这里双语报错并给出路径(strict)。
+    // 首次向导: 缺语言/AI 密钥/demo 凭据时才问; 非交互式终端在这里报错并给出路径(strict)。
     crate::commands::onboard::run_if_needed(&root, true).await?;
+
+    // 向导可能刚写入 `[ui].lang` → 之后一律用最新语言。
+    let lang = i18n::resolve(&config_file::load(&root)?);
 
     // 权限提示(含密钥, 只提示不自动改)
     if let Some(w) = config_file::permission_warning(&root) {
-        eprintln!("提示: {w}");
+        eprintln!("{}: {w}", t(lang, "提示", "note"));
     }
 
     let mut session = ChatSession::open(
@@ -59,7 +65,7 @@ pub async fn run() -> CoreResult<()> {
 
     // 非交互式 stdin(管道/CI): 只跑会话启动, 不进入读行循环(REPL 会立刻 EOF 退出)。
     if !std::io::stdin().is_terminal() {
-        sink.line("非交互式输入: 已退出会话。需要对话请在终端直接运行 ricow。");
+        sink.line(t(lang, "非交互式输入: 已退出会话。", "non-interactive input: session ended."));
         return Ok(());
     }
     repl(&mut session, &mut sink).await
@@ -68,12 +74,12 @@ pub async fn run() -> CoreResult<()> {
 /// 交互循环(裸入口与 `ricow ai` 共用): 读一行 → 交会话 → 判退出。
 pub async fn repl(session: &mut ChatSession, sink: &mut StdioSink) -> CoreResult<()> {
     sink.line("");
-    sink.line(&session::help_text());
+    sink.line(&session::help_text(session.lang()));
     sink.line("");
     loop {
-        let Some(line) = read_line("你 > ").await else {
+        let Some(line) = read_line(t(session.lang(), "你 > ", "you > ")).await else {
             sink.line("");
-            sink.line("输入结束, 退出。");
+            sink.line(t(session.lang(), "输入结束, 退出。", "end of input, exiting."));
             break;
         };
         if session.handle_line(&line, sink).await? == Step::Exit {

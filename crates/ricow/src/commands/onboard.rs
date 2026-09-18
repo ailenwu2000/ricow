@@ -18,6 +18,7 @@ use ricow_core::{CoreError, CoreResult};
 
 use super::config_file::{self, File, SetValue};
 use crate::ai::{config as ai_config, provider};
+use crate::i18n::{self, t, Lang};
 
 /// 连通校验的等待上限: 超时按"校验失败"处理(用户可选择仍然保存), 不无限挂住向导。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -36,6 +37,8 @@ pub enum Outcome {
 /// 需要补齐的缺口(纯数据, 便于单测与打印)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gaps {
+    /// `[ui].lang` 尚未选择(023/FR-001: 缺失 = 尚未选择, 不静默假定)。
+    pub lang: bool,
     /// 缺 AI 密钥(本机端点或环境变量已提供 → 不算缺口)。
     pub ai_key: bool,
     /// demo(测试网)凭据不完整。
@@ -44,7 +47,12 @@ pub struct Gaps {
 
 impl Gaps {
     pub fn any(&self) -> bool {
-        self.ai_key || self.demo_creds
+        self.lang || self.ai_key || self.demo_creds
+    }
+
+    /// **只**缺语言: 非交互式下无内容可问(FR-003), 既不报错也不打扰。
+    pub fn only_lang(&self) -> bool {
+        self.lang && !self.ai_key && !self.demo_creds
     }
 }
 
@@ -67,6 +75,7 @@ pub fn detect_gaps(f: &File, env_key_present: bool) -> Gaps {
     let base_url = effective_base_url(f);
     let local = !base_url.is_empty() && provider::is_local_endpoint(&base_url);
     Gaps {
+        lang: f.ui.lang.is_none(),
         ai_key: !has_text(&f.ai.api_key) && !env_key_present && !local,
         demo_creds: !(has_text(&f.exchange.demo_key) && has_text(&f.exchange.demo_secret)),
     }
@@ -91,35 +100,77 @@ pub fn provider_choice(input: &str, current: &str) -> Option<String> {
     ai_config::preset_by_id(t).map(|p| p.id.to_string())
 }
 
-/// 欢迎语(中英对照; 安全与隐私口径一次说清)。
-fn welcome_text() -> String {
+/// 带占位符文案: 两侧各自 `format!` 好, 再按语言取一条(与 `menu.rs` 同一手法)。
+fn tf(lang: Lang, zh: String, en: String) -> String {
+    match lang {
+        Lang::Zh => zh,
+        Lang::En => en,
+    }
+}
+
+/// 语言选择(023/FR-002): 向导最前的一问; 回车 = 中文, 也接受 `zh` / `en`。
+/// EOF → `None`(调用方按"用户退出向导"处理)。
+async fn ask_language() -> Option<Lang> {
+    loop {
+        let line =
+            ask_line("请选择界面语言 / Choose your language: 1. 中文  2. English [回车=1]: ")
+                .await?;
+        match line.trim() {
+            "" | "1" => return Some(Lang::Zh),
+            "2" => return Some(Lang::En),
+            other => match Lang::parse(other) {
+                Some(l) => return Some(l),
+                None => println!(
+                    "没看懂 `{other}`: 请输入 1(中文)或 2(English)。\n\
+                     Not recognized: please enter 1 (中文) or 2 (English)."
+                ),
+            },
+        }
+    }
+}
+
+/// 欢迎语(023/FR-002: 按选定语言单语呈现, 不再中英叠排; 安全与隐私口径一次说清)。
+fn welcome_text(lang: Lang) -> String {
     let presets = ai_config::PRESETS
         .iter()
         .enumerate()
         .map(|(i, p)| format!("  {}. {} ({})", i + 1, p.id, p.label))
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "\
+    match lang {
+        Lang::Zh => format!(
+            "\
 ================================================================
- ricow 首次启动向导 / First-run setup
- 只问缺的东西, 一分钟录完; 之后直接用中文或英文对话即可。
- Only missing items are asked. Afterwards just chat in 中文 / English.
+ ricow 首次启动向导
+ 只问缺的东西, 一分钟录完; 之后直接用中文或英文跟我说话即可。
 
- 密钥只写进本机配置文件(不入 git),
- 不会发给模型、不写日志。向导里也请不要把密钥粘到对话提问里。
- Keys are stored in a local config file, never sent to the model.
+ 密钥只写进本机配置文件(不入 git), 不会发给模型、不写日志。
+ 向导里也请不要把密钥粘到对话提问里。
 
- 供应商预设 / provider presets:
+ 供应商预设:
 {presets}
 ================================================================"
-    )
+        ),
+        Lang::En => format!(
+            "\
+================================================================
+ ricow first-run setup
+ Only missing items are asked; it takes a minute. Then just talk to me.
+
+ Keys go into a local config file only (not in git); they are never sent to
+ the model and never logged. Please do not paste keys into chat either.
+
+ Provider presets:
+{presets}
+================================================================"
+        ),
+    }
 }
 
 /// 供应商选择提示语。
-fn provider_prompt(current: &str) -> String {
+fn provider_prompt(lang: Lang, current: &str) -> String {
     let def = if current.trim().is_empty() { ai_config::DEFAULT_PROVIDER } else { current.trim() };
-    format!("供应商 / provider [回车={def}]: ")
+    tf(lang, format!("供应商 [回车={def}]: "), format!("provider [enter={def}]: "))
 }
 
 /// 运行向导(仅在缺东西时打扰用户)。
@@ -136,6 +187,11 @@ pub async fn run_if_needed(root: &Path, strict: bool) -> CoreResult<Outcome> {
     }
 
     if !std::io::stdin().is_terminal() {
+        // FR-003: 非交互式 stdin(管道/CI)**不写** `lang`(运行时按默认 `zh` 处理);
+        // 若只缺语言, 无内容可问 → 既不打扰也不报错(与"配置齐全"同样静默放行)。
+        if gaps.only_lang() {
+            return Ok(Outcome::Skipped);
+        }
         let hint = format!(
             "首次运行需要在交互式终端里录入密钥(当前输入不是终端, 无法安全录入)。\n\
              First-run setup needs an interactive terminal (stdin is not a TTY).\n\
@@ -150,24 +206,54 @@ pub async fn run_if_needed(root: &Path, strict: bool) -> CoreResult<Outcome> {
         return Ok(Outcome::Skipped);
     }
 
-    println!("{}", welcome_text());
-    println!("配置文件 / config: {}", config_file::path(root).display());
-
     let mut updates: Vec<(&'static str, &'static str, SetValue)> = Vec::new();
+
+    // ── ① 界面语言(023/FR-002): 向导最前的一问; 之后所有提示语按选定语言单语呈现 ──
+    let lang = if gaps.lang {
+        let Some(choice) = ask_language().await else {
+            return Ok(Outcome::Skipped);
+        };
+        updates.push(("ui", "lang", SetValue::Str(choice.code().into())));
+        choice
+    } else {
+        i18n::resolve(&file)
+    };
+
+    println!("{}", welcome_text(lang));
+    println!(
+        "{}",
+        tf(
+            lang,
+            format!("配置文件: {}", config_file::path(root).display()),
+            format!("config: {}", config_file::path(root).display())
+        )
+    );
 
     // ── ②③ AI 通道: 供应商 + 密钥(+ 可选最小连通校验) ────────────────────────
     if gaps.ai_key {
         let provider_id = loop {
-            let Some(line) = ask_line(&provider_prompt(&file.ai.provider)).await else {
+            let Some(line) = ask_line(&provider_prompt(lang, &file.ai.provider)).await else {
                 return Ok(Outcome::Skipped);
             };
             match provider_choice(&line, &file.ai.provider) {
                 Some(id) => break id,
                 None => println!(
-                    "没看懂 `{}`: 请输入序号(1..={})或预设名(如 deepseek)。\n\
-                     自定义/中转端点请直接编辑 ricow.toml 的 [ai] 段写 base_url。",
-                    line.trim(),
-                    ai_config::PRESETS.len()
+                    "{}",
+                    tf(
+                        lang,
+                        format!(
+                            "没看懂 `{}`: 请输入序号(1..={})或预设名(如 deepseek)。\n\
+                             自定义/中转端点请直接编辑 ricow.toml 的 [ai] 段写 base_url。",
+                            line.trim(),
+                            ai_config::PRESETS.len()
+                        ),
+                        format!(
+                            "Unrecognized `{}`: enter a number (1..={}) or a preset name (e.g. deepseek).\n\
+                             For a custom/relay endpoint, edit [ai] base_url in ricow.toml instead.",
+                            line.trim(),
+                            ai_config::PRESETS.len()
+                        )
+                    )
                 ),
             }
         };
@@ -181,9 +267,10 @@ pub async fn run_if_needed(root: &Path, strict: bool) -> CoreResult<Outcome> {
         } else {
             let cur = file.ai.model.clone().unwrap_or_default();
             loop {
-                let Some(line) = ask_line(&format!(
-                    "模型名 / model [回车={}]: ",
-                    if cur.is_empty() { "必填" } else { &cur }
+                let Some(line) = ask_line(&tf(
+                    lang,
+                    format!("模型名 [回车={}]: ", if cur.is_empty() { "必填" } else { &cur }),
+                    format!("model [enter={}]: ", if cur.is_empty() { "required" } else { &cur }),
                 ))
                 .await
                 else {
@@ -193,7 +280,14 @@ pub async fn run_if_needed(root: &Path, strict: bool) -> CoreResult<Outcome> {
                 if !m.is_empty() {
                     break m;
                 }
-                println!("该供应商没有推荐模型, 必须填写模型名(如 gpt-4o-mini)。");
+                println!(
+                    "{}",
+                    t(
+                        lang,
+                        "该供应商没有推荐模型, 必须填写模型名(如 gpt-4o-mini)。",
+                        "This provider has no recommended model; please type one (e.g. gpt-4o-mini)."
+                    )
+                );
             }
         };
         if !model.trim().is_empty() {
@@ -209,14 +303,30 @@ pub async fn run_if_needed(root: &Path, strict: bool) -> CoreResult<Outcome> {
             .or_else(|| ai_config::preset_by_id(&provider_id).map(|p| p.base_url.to_string()))
             .unwrap_or_default();
 
-        let key = match ask_secret("粘贴 API Key / paste API key (输入不回显, 回车=暂不填): ").await
+        let key = match ask_secret(t(
+            lang,
+            "粘贴 API Key(输入不回显, 回车=暂不填): ",
+            "paste API key (input hidden, enter=skip for now): ",
+        ))
+        .await
         {
             Some(k) if !k.trim().is_empty() => Some(k.trim().to_string()),
             Some(_) => {
                 println!(
-                    "已跳过密钥: 稍后可在对话里用 /keys ai 补录, 或编辑 ricow.toml 的 [ai].api_key, \
-                     或临时设环境变量 {}。",
-                    ai_config::ENV_API_KEY
+                    "{}",
+                    tf(
+                        lang,
+                        format!(
+                            "已跳过密钥: 稍后可在对话里用 /keys ai 补录, 或编辑 ricow.toml 的 [ai].api_key, \
+                             或临时设环境变量 {}。",
+                            ai_config::ENV_API_KEY
+                        ),
+                        format!(
+                            "Key skipped: add it later in chat with /keys ai, or edit [ai].api_key in \
+                             ricow.toml, or set the {} environment variable.",
+                            ai_config::ENV_API_KEY
+                        )
+                    )
                 );
                 None
             }
@@ -228,31 +338,78 @@ pub async fn run_if_needed(root: &Path, strict: bool) -> CoreResult<Outcome> {
             let mut current_key = k;
             if base_url.is_empty() {
                 println!(
-                    "provider `{provider_id}` 不是内置预设且未配 base_url: 已保存, 但对话前请在 ricow.toml 的 [ai] 段补 base_url。"
+                    "{}",
+                    tf(
+                        lang,
+                        format!(
+                            "provider `{provider_id}` 不是内置预设且未配 base_url: 已保存, 但对话前请在 ricow.toml 的 [ai] 段补 base_url。"
+                        ),
+                        format!(
+                            "provider `{provider_id}` is not a built-in preset and has no base_url: saved, but set [ai].base_url in ricow.toml before chatting."
+                        )
+                    )
                 );
-            } else if ask_yes_no("现在验证连通 / verify now (会发一次最小请求)? [Y/n]: ").await
+            } else if ask_yes_no(t(
+                lang,
+                "现在验证连通(会发一次最小请求)? [Y/n]: ",
+                "verify connectivity now (sends one minimal request)? [Y/n]: ",
+            ))
+            .await
             {
                 loop {
                     match probe(&provider_id, &base_url, &model, &current_key).await {
                         Ok(()) => {
-                            println!("连通正常 / connection OK(端点可达, 密钥有效, 模型可用)。");
+                            println!(
+                                "{}",
+                                t(
+                                    lang,
+                                    "连通正常(端点可达, 密钥有效, 模型可用)。",
+                                    "connection OK (endpoint reachable, key valid, model available)."
+                                )
+                            );
                             break;
                         }
                         Err(e) => {
-                            println!("连通校验未通过 / verification failed: {e}");
-                            match ask_choice(
-                                "怎么处理? / what next?  [1] 重新输入密钥  [2] 仍然保存  [3] 退出: ",
-                            )
+                            println!(
+                                "{}",
+                                tf(
+                                    lang,
+                                    format!("连通校验未通过: {e}"),
+                                    format!("verification failed: {e}")
+                                )
+                            );
+                            match ask_choice(t(
+                                lang,
+                                "怎么处理?  [1] 重新输入密钥  [2] 仍然保存  [3] 退出: ",
+                                "what next?  [1] re-enter key  [2] save anyway  [3] quit: ",
+                            ))
                             .await
                             {
-                                Some(1) => match ask_secret("重新粘贴 API Key / retry: ").await {
-                                    Some(k) if !k.trim().is_empty() => {
-                                        current_key = k.trim().to_string();
+                                Some(1) => {
+                                    match ask_secret(t(lang, "重新粘贴 API Key: ", "retry: ")).await
+                                    {
+                                        Some(k) if !k.trim().is_empty() => {
+                                            current_key = k.trim().to_string();
+                                        }
+                                        _ => println!(
+                                            "{}",
+                                            t(
+                                                lang,
+                                                "未重新输入, 保留原密钥继续。",
+                                                "No new key entered; keeping the previous one."
+                                            )
+                                        ),
                                     }
-                                    _ => println!("未重新输入, 保留原密钥继续。"),
-                                },
+                                }
                                 Some(2) => {
-                                    println!("已按你的选择保存(连通性待运行时确认)。");
+                                    println!(
+                                        "{}",
+                                        t(
+                                            lang,
+                                            "已按你的选择保存(连通性待运行时确认)。",
+                                            "Saved as requested (connectivity to be confirmed at runtime)."
+                                        )
+                                    );
                                     break;
                                 }
                                 _ => return Ok(Outcome::Skipped),
@@ -268,19 +425,44 @@ pub async fn run_if_needed(root: &Path, strict: bool) -> CoreResult<Outcome> {
     // ── ④ 币安测试网(demo)凭据: 可跳过 ────────────────────────────────────────
     if gaps.demo_creds {
         println!();
-        println!("币安测试网(demo)凭据 —— 可跳过, 之后在对话里用 /keys demo 补录即可。");
-        println!("Binance demo credentials — optional; add them later in chat with /keys demo.");
-        println!("获取方式: demo.binance.com 登录 → API 管理 → 创建 Key(只勾选交易, 不要提现)");
-        if let Some(k) = ask_line("demo_key [回车=跳过 / skip]: ").await {
+        println!(
+            "{}",
+            t(
+                lang,
+                "币安测试网(demo)凭据 —— 可跳过, 之后在对话里用 /keys demo 补录即可。",
+                "Binance demo credentials — optional; add them later in chat with /keys demo."
+            )
+        );
+        println!(
+            "{}",
+            t(
+                lang,
+                "获取方式: demo.binance.com 登录 → API 管理 → 创建 Key(只勾选交易, 不要提现)",
+                "How to get them: log in at demo.binance.com → API Management → create a key (enable trading only, never withdrawals)"
+            )
+        );
+        if let Some(k) =
+            ask_line(t(lang, "demo_key [回车=跳过]: ", "demo_key [enter=skip]: ")).await
+        {
             let k = k.trim().to_string();
             if !k.is_empty() {
-                if let Some(s) = ask_secret("demo_secret(输入不回显): ").await {
+                if let Some(s) =
+                    ask_secret(t(lang, "demo_secret(输入不回显): ", "demo_secret (input hidden): "))
+                        .await
+                {
                     let s = s.trim().to_string();
                     if !s.is_empty() {
                         updates.push(("exchange", "demo_key", SetValue::Str(k)));
                         updates.push(("exchange", "demo_secret", SetValue::Str(s)));
                     } else {
-                        println!("secret 为空 → 本次不保存(两者必须成对)。");
+                        println!(
+                            "{}",
+                            t(
+                                lang,
+                                "secret 为空 → 本次不保存(两者必须成对)。",
+                                "Empty secret → nothing saved (both must be provided together)."
+                            )
+                        );
                     }
                 }
             }
@@ -289,24 +471,44 @@ pub async fn run_if_needed(root: &Path, strict: bool) -> CoreResult<Outcome> {
 
     // ── ⑤ 落盘 ──────────────────────────────────────────────────────────────
     if updates.is_empty() {
-        println!("\n本次未写入任何配置 / nothing saved。");
+        println!("{}", t(lang, "\n本次未写入任何配置。", "\nnothing saved."));
         return Ok(Outcome::Skipped);
     }
     config_file::set_values(root, &updates)?;
     println!(
-        "\n已保存 / saved → {}({}, 不入 git)。",
-        config_file::path(root).display(),
-        config_file::permission_summary(root)
+        "{}",
+        tf(
+            lang,
+            format!(
+                "\n已保存 → {}({}, 不入 git)。",
+                config_file::path(root).display(),
+                config_file::permission_summary(root)
+            ),
+            format!(
+                "\nsaved → {} ({}, not in git).",
+                config_file::path(root).display(),
+                config_file::permission_summary(root)
+            )
+        )
     );
     if let Some(w) = config_file::permission_warning(root) {
-        eprintln!("提示: {w}");
+        eprintln!("{}", tf(lang, format!("提示: {w}"), format!("note: {w}")));
     }
     println!(
-        "下一步 / next: 直接对话即可, 例如\n  \
-         - 帮我用香农网格模板建一个 AAPL 网格策略 / build an AAPL grid from the shannon template\n  \
-         - 完全新写一个 TWAP 策略 / write a brand-new TWAP strategy\n  \
-         - 回测我刚部署的策略 / backtest the strategy I just deployed\n\
-         随时输入 /help 看可用命令与边界。"
+        "{}",
+        t(
+            lang,
+            "下一步: 直接对话即可, 例如\n  \
+             - 帮我用香农网格模板建一个 AAPL 网格策略\n  \
+             - 完全新写一个 TWAP 策略\n  \
+             - 回测我刚部署的策略\n\
+             随时输入 /help 看可用命令与边界。",
+            "next: just start chatting, for example\n  \
+             - build an AAPL grid strategy from the shannon template\n  \
+             - write a brand-new TWAP strategy\n  \
+             - backtest the strategy I just deployed\n\
+             Type /help anytime to see available commands and boundaries."
+        )
     );
     Ok(Outcome::Saved)
 }
@@ -374,7 +576,7 @@ async fn ask_choice(prompt: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::config_file::{AiSection, ExchangeSection, MarketSection};
+    use crate::commands::config_file::{AiSection, ExchangeSection, MarketSection, UiSection};
 
     fn file_with(api_key: Option<&str>, provider: &str, base_url: Option<&str>) -> File {
         File {
@@ -387,6 +589,7 @@ mod tests {
             },
             exchange: ExchangeSection::default(),
             market: MarketSection::default(),
+            ui: UiSection { lang: Some("zh".into()) },
         }
     }
 
@@ -394,9 +597,26 @@ mod tests {
     fn test_detect_gaps_missing_key_and_demo() {
         let f = file_with(None, "deepseek", None);
         let g = detect_gaps(&f, false);
+        assert!(!g.lang, "file_with 已选 zh → 不算语言缺口");
         assert!(g.ai_key, "无密钥 → 缺");
         assert!(g.demo_creds, "无 demo 凭据 → 缺");
         assert!(g.any());
+        assert!(!g.only_lang(), "另有密钥/demo 缺口");
+    }
+
+    #[test]
+    fn test_detect_gaps_lang_unset_is_gap_and_only_lang() {
+        let mut f = file_with(Some("sk-x"), "deepseek", None);
+        f.exchange.demo_key = Some("DK".into());
+        f.exchange.demo_secret = Some("DS".into());
+        f.ui.lang = None;
+        let g = detect_gaps(&f, false);
+        assert!(g.lang, "[ui].lang 缺失 = 尚未选择(FR-001)");
+        assert!(g.any(), "仅语言未选择也要进向导(FR-002)");
+        assert!(g.only_lang(), "只缺语言: 非交互式下静默放行(FR-003)");
+        // 补上语言后彻底无缺口
+        f.ui.lang = Some("en".into());
+        assert!(!detect_gaps(&f, false).any());
     }
 
     #[test]
@@ -456,15 +676,22 @@ mod tests {
     }
 
     #[test]
-    fn test_welcome_text_is_bilingual_and_lists_presets() {
-        let w = welcome_text();
-        assert!(w.contains("首次启动向导") && w.contains("First-run setup"), "{w}");
-        assert!(w.contains("deepseek") && w.contains("ollama"), "{w}");
+    fn test_welcome_text_follows_language_and_lists_presets() {
+        let zh = welcome_text(Lang::Zh);
+        assert!(zh.contains("首次启动向导"), "{zh}");
+        assert!(!zh.contains("first-run setup"), "应按语言单语呈现, 不再中英叠排: {zh}");
+        assert!(zh.contains("deepseek") && zh.contains("ollama"), "{zh}");
+        let en = welcome_text(Lang::En);
+        assert!(en.contains("first-run setup"), "{en}");
+        assert!(!en.contains("首次启动向导"), "应按语言单语呈现, 不再中英叠排: {en}");
+        assert!(en.contains("deepseek") && en.contains("ollama"), "{en}");
     }
 
     #[test]
-    fn test_provider_prompt_has_default() {
-        assert!(provider_prompt("deepseek").contains("回车=deepseek"));
-        assert!(provider_prompt("").contains(ai_config::DEFAULT_PROVIDER));
+    fn test_provider_prompt_has_default_and_follows_language() {
+        assert!(provider_prompt(Lang::Zh, "deepseek").contains("回车=deepseek"));
+        assert!(provider_prompt(Lang::En, "deepseek").contains("enter=deepseek"));
+        assert!(provider_prompt(Lang::Zh, "").contains(ai_config::DEFAULT_PROVIDER));
+        assert!(provider_prompt(Lang::En, "").contains(ai_config::DEFAULT_PROVIDER));
     }
 }

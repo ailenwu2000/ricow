@@ -97,9 +97,14 @@ fn run_ai(root: &std::path::Path, prompt: &str) -> CliOut {
     }
 }
 
-/// 从单次问答 stdout 抽出模型回答正文(跳过横幅, 横幅以 "  上限:" 行结束)。
+/// 从单次问答 stdout 抽出模型回答正文(跳过会话横幅与边界说明, 从轮次分隔线 "── …" 之后开始)。
 fn answer_body(stdout: &str) -> String {
-    stdout.lines().skip_while(|l| !l.starts_with("  上限:")).skip(1).collect::<Vec<_>>().join("\n")
+    stdout
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("── "))
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn require_ai_key() -> String {

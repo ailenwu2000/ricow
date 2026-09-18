@@ -256,6 +256,79 @@ fn net_position(long: Option<Position>, short: Option<Position>) -> Option<Posit
     }
 }
 
+/// 把一笔成交应用到 Dry Run 的**净仓**记录上 (纯函数, 便于单测), 返回该笔成交的**已实现盈亏**。
+///
+/// 净仓不变式: `size > 0` 时 `side` = 当前持仓方向; `size == 0` 时无方向
+/// (下游 `lua::position_side_label` 按 `size <= 0` 报 `none`)。
+///
+/// 分支语义:
+/// - 成交方向与持仓方向相反且持仓非空 → 平仓(可部分); 有剩余量则为**反手**, 按新方向建仓;
+/// - 否则(同向加仓 / 当前无持仓) → 加权平均开仓价累加。
+fn apply_fill_to_net_position(
+    entry: &mut Position,
+    side: OrderSide,
+    size: Decimal,
+    fill_price: Decimal,
+) -> Decimal {
+    let mut realized = Decimal::ZERO;
+    let old_side = entry.side;
+    match side {
+        OrderSide::Buy => {
+            if old_side == OrderSide::Sell && entry.size > Decimal::ZERO {
+                let close_size = size.min(entry.size);
+                if close_size > Decimal::ZERO && entry.entry_price > Decimal::ZERO {
+                    realized = (entry.entry_price - fill_price) * close_size;
+                }
+                entry.size -= close_size;
+                let remaining = size - close_size;
+                if remaining > Decimal::ZERO {
+                    entry.side = OrderSide::Buy;
+                    entry.entry_price = fill_price;
+                    entry.size = remaining;
+                } else if entry.size == Decimal::ZERO {
+                    entry.entry_price = Decimal::ZERO;
+                    entry.side = OrderSide::Buy;
+                }
+            } else {
+                // 净仓不变式: 平仓归零后残留的 side(= 平仓方向)不得污染本次开仓方向。
+                entry.side = OrderSide::Buy;
+                let old_notional = entry.entry_price * entry.size;
+                entry.size += size;
+                if entry.size != Decimal::ZERO {
+                    entry.entry_price = (old_notional + fill_price * size) / entry.size;
+                }
+            }
+        }
+        OrderSide::Sell => {
+            if old_side == OrderSide::Buy && entry.size > Decimal::ZERO {
+                let close_size = size.min(entry.size);
+                if close_size > Decimal::ZERO && entry.entry_price > Decimal::ZERO {
+                    realized = (fill_price - entry.entry_price) * close_size;
+                }
+                entry.size -= close_size;
+                let remaining = size - close_size;
+                if remaining > Decimal::ZERO {
+                    entry.side = OrderSide::Sell;
+                    entry.entry_price = fill_price;
+                    entry.size = remaining;
+                } else if entry.size == Decimal::ZERO {
+                    entry.entry_price = Decimal::ZERO;
+                    entry.side = OrderSide::Sell;
+                }
+            } else {
+                // 净仓不变式: 平仓归零后残留的 side(= 平仓方向)不得污染本次开仓方向。
+                entry.side = OrderSide::Sell;
+                let old_notional = entry.entry_price * entry.size;
+                entry.size += size;
+                if entry.size != Decimal::ZERO {
+                    entry.entry_price = (old_notional + fill_price * size) / entry.size;
+                }
+            }
+        }
+    }
+    realized
+}
+
 impl Context for LiveContext {
     fn price(&self, pair: &str) -> Option<Decimal> {
         let key = self.resolve_key(pair);
@@ -596,58 +669,9 @@ impl DryRunContext {
                 leverage: None,
             });
 
-            let old_side = entry.side;
-            match req.side {
-                OrderSide::Buy => {
-                    if old_side == OrderSide::Sell && entry.size > Decimal::ZERO {
-                        let close_size = req.size.min(entry.size);
-                        if close_size > Decimal::ZERO && entry.entry_price > Decimal::ZERO {
-                            let realized = (entry.entry_price - fill_price) * close_size;
-                            self.pnl.record_pnl(realized);
-                        }
-                        entry.size -= close_size;
-                        let remaining = req.size - close_size;
-                        if remaining > Decimal::ZERO {
-                            entry.side = OrderSide::Buy;
-                            entry.entry_price = fill_price;
-                            entry.size = remaining;
-                        } else if entry.size == Decimal::ZERO {
-                            entry.entry_price = Decimal::ZERO;
-                            entry.side = OrderSide::Buy;
-                        }
-                    } else {
-                        let old_notional = entry.entry_price * entry.size;
-                        entry.size += req.size;
-                        if entry.size != Decimal::ZERO {
-                            entry.entry_price = (old_notional + fill_price * req.size) / entry.size;
-                        }
-                    }
-                }
-                OrderSide::Sell => {
-                    if old_side == OrderSide::Buy && entry.size > Decimal::ZERO {
-                        let close_size = req.size.min(entry.size);
-                        if close_size > Decimal::ZERO && entry.entry_price > Decimal::ZERO {
-                            let realized = (fill_price - entry.entry_price) * close_size;
-                            self.pnl.record_pnl(realized);
-                        }
-                        entry.size -= close_size;
-                        let remaining = req.size - close_size;
-                        if remaining > Decimal::ZERO {
-                            entry.side = OrderSide::Sell;
-                            entry.entry_price = fill_price;
-                            entry.size = remaining;
-                        } else if entry.size == Decimal::ZERO {
-                            entry.entry_price = Decimal::ZERO;
-                            entry.side = OrderSide::Sell;
-                        }
-                    } else {
-                        let old_notional = entry.entry_price * entry.size;
-                        entry.size += req.size;
-                        if entry.size != Decimal::ZERO {
-                            entry.entry_price = (old_notional + fill_price * req.size) / entry.size;
-                        }
-                    }
-                }
+            let realized = apply_fill_to_net_position(entry, req.side, req.size, fill_price);
+            if realized != Decimal::ZERO {
+                self.pnl.record_pnl(realized);
             }
             entry.mark_price = fill_price;
         }
@@ -896,5 +920,114 @@ mod tests {
         assert_ne!(side_tag(OrderSide::Buy), side_tag(OrderSide::Sell));
         assert_eq!(side_tag(OrderSide::Buy), "buy");
         assert_eq!(side_tag(OrderSide::Sell), "sell");
+    }
+
+    // ---- 净仓方向记账 (024 F5): 平仓后残留 side 不得污染下一次开仓 ----
+
+    /// FR-007①: 平多归零后反向卖出 → 必须建空仓。
+    #[test]
+    fn test_open_short_after_closing_long() {
+        let mut p = pos(OrderSide::Buy, dec!(1));
+        let realized = apply_fill_to_net_position(&mut p, OrderSide::Sell, dec!(1), dec!(2600));
+        assert_eq!(realized, dec!(100));
+        assert_eq!(p.size, Decimal::ZERO);
+        assert_eq!(p.entry_price, Decimal::ZERO);
+
+        apply_fill_to_net_position(&mut p, OrderSide::Sell, dec!(0.4), dec!(2550));
+        assert_eq!(p.side, OrderSide::Sell);
+        assert_eq!(p.size, dec!(0.4));
+        assert_eq!(p.entry_price, dec!(2550));
+    }
+
+    /// FR-007②: 平空归零后反向买入 → 必须建多仓。
+    #[test]
+    fn test_open_long_after_closing_short() {
+        let mut p = pos(OrderSide::Sell, dec!(1));
+        let realized = apply_fill_to_net_position(&mut p, OrderSide::Buy, dec!(1), dec!(2400));
+        assert_eq!(realized, dec!(100));
+        assert_eq!(p.size, Decimal::ZERO);
+        assert_eq!(p.entry_price, Decimal::ZERO);
+
+        apply_fill_to_net_position(&mut p, OrderSide::Buy, dec!(0.4), dec!(2450));
+        assert_eq!(p.side, OrderSide::Buy);
+        assert_eq!(p.size, dec!(0.4));
+        assert_eq!(p.entry_price, dec!(2450));
+    }
+
+    /// FR-007③: 平多归零后同向再开多 → 方向必须翻回 Buy 且开仓价重算(修复前为伪空头)。
+    #[test]
+    fn test_reopen_long_after_closing_long() {
+        let mut p = pos(OrderSide::Buy, dec!(1));
+        let realized = apply_fill_to_net_position(&mut p, OrderSide::Sell, dec!(1), dec!(2400));
+        assert_eq!(realized, dec!(-100));
+        assert_eq!(p.size, Decimal::ZERO);
+
+        apply_fill_to_net_position(&mut p, OrderSide::Buy, dec!(0.5), dec!(2450));
+        assert_eq!(p.side, OrderSide::Buy);
+        assert_eq!(p.size, dec!(0.5));
+        assert_eq!(p.entry_price, dec!(2450));
+    }
+
+    /// FR-007③ 对称面: 平空归零后同向再开空。
+    #[test]
+    fn test_reopen_short_after_closing_short() {
+        let mut p = pos(OrderSide::Sell, dec!(1));
+        apply_fill_to_net_position(&mut p, OrderSide::Buy, dec!(1), dec!(2600));
+        assert_eq!(p.size, Decimal::ZERO);
+
+        apply_fill_to_net_position(&mut p, OrderSide::Sell, dec!(0.5), dec!(2550));
+        assert_eq!(p.side, OrderSide::Sell);
+        assert_eq!(p.size, dec!(0.5));
+        assert_eq!(p.entry_price, dec!(2550));
+    }
+
+    /// FR-007④: 部分平仓保留剩余方向与开仓价, 且记已实现盈亏。
+    #[test]
+    fn test_partial_close_keeps_side_and_entry() {
+        let mut p = pos(OrderSide::Buy, dec!(2));
+        let realized = apply_fill_to_net_position(&mut p, OrderSide::Sell, dec!(0.5), dec!(2600));
+        assert_eq!(realized, dec!(50));
+        assert_eq!(p.side, OrderSide::Buy);
+        assert_eq!(p.size, dec!(1.5));
+        assert_eq!(p.entry_price, dec!(2500));
+
+        let mut s = pos(OrderSide::Sell, dec!(2));
+        let realized = apply_fill_to_net_position(&mut s, OrderSide::Buy, dec!(0.5), dec!(2400));
+        assert_eq!(realized, dec!(50));
+        assert_eq!(s.side, OrderSide::Sell);
+        assert_eq!(s.size, dec!(1.5));
+        assert_eq!(s.entry_price, dec!(2500));
+    }
+
+    /// FR-007⑤: 反手(成交量 > 当前持仓量) → 余量按新方向建仓, 开仓价取新成交价。
+    #[test]
+    fn test_reversal_larger_than_position() {
+        let mut p = pos(OrderSide::Buy, dec!(1));
+        let realized = apply_fill_to_net_position(&mut p, OrderSide::Sell, dec!(1.5), dec!(2600));
+        assert_eq!(realized, dec!(100));
+        assert_eq!(p.side, OrderSide::Sell);
+        assert_eq!(p.size, dec!(0.5));
+        assert_eq!(p.entry_price, dec!(2600));
+
+        let mut s = pos(OrderSide::Sell, dec!(1));
+        let realized = apply_fill_to_net_position(&mut s, OrderSide::Buy, dec!(1.5), dec!(2400));
+        assert_eq!(realized, dec!(100));
+        assert_eq!(s.side, OrderSide::Buy);
+        assert_eq!(s.size, dec!(0.5));
+        assert_eq!(s.entry_price, dec!(2400));
+    }
+
+    /// 023 §七 现象 A 回归: 反复"平多 → 同向再开多"不得让 side 停在 Sell、也不得让 size 单调放大。
+    #[test]
+    fn test_repeated_open_close_never_leaves_stale_side() {
+        let mut p = pos(OrderSide::Buy, dec!(0.27));
+        for _ in 0..5 {
+            apply_fill_to_net_position(&mut p, OrderSide::Sell, dec!(0.27), dec!(2500));
+            assert_eq!(p.size, Decimal::ZERO);
+
+            apply_fill_to_net_position(&mut p, OrderSide::Buy, dec!(0.27), dec!(2500));
+            assert_eq!(p.side, OrderSide::Buy);
+            assert_eq!(p.size, dec!(0.27));
+        }
     }
 }
