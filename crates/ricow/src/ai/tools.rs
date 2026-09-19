@@ -301,7 +301,7 @@ fn tool_run_backtest(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "run_backtest",
         "对某个策略在真实历史 K 线上跑一次回测并返回报告(与 `ricow backtest` 同一条代码路径、同一份格式化)。\
-只读: 不动资金、不落盘、不改配置。策略名可以是已部署策略名, 或内置名 shannon_grid/dca/twap/vwap/pullback/ladder。",
+只读: 不动资金、不落盘、不改配置。策略名可以是已部署策略名, 或内置名 shannon_rebalance/dca/twap/vwap/pullback/ladder。",
         json!({
             "type": "object",
             "properties": {

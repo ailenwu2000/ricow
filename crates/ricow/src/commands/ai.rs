@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(classify("/status"), Input::Unknown("status".into()));
         assert_eq!(classify("回测 ETH 30 天"), Input::Ask("回测 ETH 30 天".into()));
         // 斜杠命令带参数时只取命令名
-        assert_eq!(classify("/stop shannon_grid"), Input::Unknown("stop".into()));
+        assert_eq!(classify("/stop shannon_rebalance"), Input::Unknown("stop".into()));
     }
 
     #[test]

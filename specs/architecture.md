@@ -67,7 +67,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **ctx.\*** API(冒号调用): 行情 / 持仓余额 / 配置参数(config_f64 等)/ 指标(基于已收盘 K 线, 无前视)/ 时间 `now()`(2026-09-11 新增, 供"每日固定时刻动作"的盘中策略)
 - **exec.\*** 执行组件(引擎内置 Rust 实现, 加载时注册全局表, 脚本内可覆盖): `levels` / `pullback_triggered` / `detect_quote` / `ticks_per` / `slice_due` / `side_order`
 - 内置资产(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/commands/mod.rs:BUILTIN_SCRIPTS`):
-  - `strategies/builtin/shannon_grid.lua` — 策略样板(香农 50:50 中轴再平衡, 单标的, `target_ratio` 中轴可调 + ATR 自适应 band)
+  - `strategies/builtin/shannon_rebalance.lua` — 策略样板(香农 50:50 中轴再平衡, 单标的, `target_ratio` 中轴可调 + ATR 自适应 band)
   - `strategies/builtin/executors/{dca,twap,vwap,pullback,ladder}.lua` — 执行模式示例(最简信号 + exec.* 执行, **非策略**; 复制改信号即自定义)
   - ~~`strategies/builtin/bs_momentum.lua`~~ — **已于 2026-09-11 删除** (真实 bStock 成交轨期望 ≈0:
     spot 91 天 每 bar −0.0198% / futures 220 天 +0.0367%; 七年 R1 数字含幸存者偏误不作证据);
@@ -104,7 +104,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - 前台调试: `ricow run <name>`(Dry Run; 进程内监听 stdin `stop` / 管道 EOF / Ctrl-C 优雅停机, 不被 daemon 管理)
 - 回测: `ricow backtest --strategy <名|类型> [--pair] [--days] [--interval] [--script] [--param k=v] [--market spot|futures] [--position-mode one-way|hedge] [--fee/--fee-maker/--fee-taker/--slippage-bps/--cash/--leverage/--max-leverage/--mmr-pct/--funding-rate]`(杠杆默认上限 10x,超限须 --max-leverage 显式放宽;MMR 默认按 symbol 内置首档表, 表外 1.0%)
   - 数据源按市场分支: 现货走交易所 REST; 合约 (futures) 走 fapi 公共数据源 (K 线; MMR 按 symbol 内置首档表,表外回落 1.0%)
-  - 直跑模式: `--strategy {shannon_grid|dca|twap|vwap|pullback|ladder|lua}` — 内置脚本经 BUILTIN_SCRIPTS 常量表注入(后五项为执行模式示例, 需 --pair)
+  - 直跑模式: `--strategy {shannon_rebalance|dca|twap|vwap|pullback|ladder|lua}` — 内置脚本经 BUILTIN_SCRIPTS 常量表注入(后五项为执行模式示例, 需 --pair)
   - 部署模式: `--strategy <name>` 命中 `strategies/<name>.toml` 加载(`script_path` 引用文件或内嵌 `script`)
 - 启动: `ricow start <name>`(经 daemon 后台运行) / `ricow run <name>`(前台调试; 默认 Dry Run, TOML `enabled=false` 拒绝启动)
 - ~~选币: `ricow scan …`~~ —— **已于 2026-09-15 删除**(020-platform-scope-trim: 选币/研究入口与"运行策略的平台"定位正交; 用户拍板删除, 不留废弃代码)
@@ -131,7 +131,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - RiskEngine 下单前硬检查 — 回测 / Dry Run / 实盘**同一引擎同一装配**(`RiskEngine::from_config`), 三条 `place_order` 顶部统一拦截:
   - 静态限额(用户显式配置才启用): 最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点 —— 平台不替用户定政策, 只执行用户写下的政策;
   - 工程护栏(默认启用): **下单频率上限**(滑动窗口 1s, 默认 100/s) —— 防风暴下单被交易所限流封禁;
-  - ~~两级亏损熔断~~ **已于 2026-09-15 删除**(020): 盈亏政策属于策略, 平台不再代做投资判断; 策略用 `ctx:net_pnl()` / `ctx:equity()` 自管 (内置 `shannon_grid` 的 `dd_stop_pct` 为参考写法);
+  - ~~两级亏损熔断~~ **已于 2026-09-15 删除**(020): 盈亏政策属于策略, 平台不再代做投资判断; 策略用 `ctx:net_pnl()` / `ctx:equity()` 自管 (内置 `shannon_rebalance` 的 `dd_stop_pct` 为参考写法);
   - 被拒请求返回 `Rejected` ack(与资金不足同形)并计入回测报告"拒单次数", 同时 `tracing::warn!(target: "risk")` 输出规则名与关键数值; 平仓/减仓不受熔断限制。详见 `specs/backtest.md` §二.6 与 `specs/changes/004-risk-guards/`。
   - > 修正记录(2026-09-12): 004 之前 RiskEngine 的唯一调用点是无消费者的 `StrategyScheduler`, 三条真实下单路径**均未过风控** —— 即上述四条规则当时实际从未生效; 已随 004 接入。
 - Dry Run 默认, 确认后切实盘(011 落地): 门禁**双条件** = TOML `live_enabled=true` **且** 命令行 `--live`(缺一即按 Dry Run 运行并打印原因; `ricow start` 同口径, 台账 `mode` 与实际运行器一致)

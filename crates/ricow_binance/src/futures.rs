@@ -222,6 +222,17 @@ impl Exchange for BnFuturesExchange {
     async fn get_klines(&self, pair: &str, interval: &str, limit: u32) -> CoreResult<Vec<Kline>> {
         self.client.get_klines(pair, interval, limit).await
     }
+    async fn get_klines_until(
+        &self,
+        pair: &str,
+        interval: &str,
+        limit: u32,
+        end_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        self.client
+            .get_klines_ending_at(pair, interval, limit, end_ms)
+            .await
+    }
 
     async fn get_orderbook(&self, pair: &str, depth: u32) -> CoreResult<OrderBook> {
         self.client.get_depth(pair, depth).await

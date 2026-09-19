@@ -62,7 +62,7 @@
 
 ### 内置参考实现(1 策略样板 + 1 执行组件库, 随版本发布)
 
-- **策略样板**: `strategies/builtin/shannon_grid.lua` — 香农动态网格(实时计算 + 主动成交 + 自适应波动), 唯一完整策略参考
+- **策略样板**: `strategies/builtin/shannon_rebalance.lua` — 香农动态网格(实时计算 + 主动成交 + 自适应波动), 唯一完整策略参考
 - **执行组件库**: exec — 用户 Lua 策略可直接调用的执行函数(引擎内置 Rust 实现, 加载时注册为全局 `exec` 表, 无需 require, 脚本内可覆盖): `exec.levels`(阶梯档位) / `exec.pullback_triggered`(回调触发) / `exec.ticks_per` + `exec.slice_due`(分批节奏) / `exec.detect_quote`(报价资产) / `exec.side_order`(对手价订单)
 - **执行模式示例**: `strategies/builtin/executors/{dca,twap,vwap,pullback,ladder}.lua` — 上述组件的独立可运行薄壳(CLI 直跑/旧 TOML 兼容), 复制即自定义
 
@@ -106,8 +106,8 @@
 
 - **D1** ✅ 目标用户优先序: **主用户优先, 纯 CLI 交付**(开源第一波用户必然是技术用户; MCP/TG 后置远期)
 - **D2** ✅ 产品形态: **一个引擎、CLI 单入口、共享下单路径**(confirm + RiskEngine + Dry Run 默认)
-- **D3** ✅ 功能范围: v1 = **内置参考实现(1 策略样板 shannon_grid + 5 执行模式示例) + CLI 入口**(~~横截面选币~~ 已于 2026-09-15 删除);
-  自定义策略走 Lua(exec.* 执行组件); 原"6 策略"口径作废(2026-09-11 复核: 内置策略本体只剩 shannon_grid,
+- **D3** ✅ 功能范围: v1 = **内置参考实现(1 策略样板 shannon_rebalance + 5 执行模式示例) + CLI 入口**(~~横截面选币~~ 已于 2026-09-15 删除);
+  自定义策略走 Lua(exec.* 执行组件); 原"6 策略"口径作废(2026-09-11 复核: 内置策略本体只剩 shannon_rebalance,
   bs_momentum / bs_intraday_top5 两个策略均已下线, 结论见 specs/roadmap.md "已终止的探索")。ricow alert 降为后续评估项(少而精)
 - **D4** ✅ 商业模式: **免费零费率 + 返佣主线(平台无关, 当前仅币安) + 定制技术开发/集成**(builder code 不做, Vault 降级远期)
 - **D5** ✅ 文档同步: 批准后改 requirements/product/roadmap 三处"MCP 明确不做", 补 `ricow scan` 命令(~~`ricow scan` 已于 2026-09-15 删除~~, 见下条)
@@ -122,7 +122,7 @@
 - **D15** ✅ **平台边界 = 执行者**(2026-09-15, 020-platform-scope-trim): 平台只做"执行 + 数据 + 门禁 + 状态",
   **赚赔政策属于策略**。据此: ① 删除平台级**两级亏损熔断**(一级连续亏损 / 二级峰值回撤)及其通知事件(003 的"熔断"事件);
   ② 保留工程护栏(下单频率上限 100/s)与**用户显式配置**的静态限额(最大持仓/单日亏损/最小订单/最大滑点);
-  ③ 新增只读 `ctx:net_pnl()` / `ctx:equity()`, 策略自管回撤(内置 `shannon_grid` 的 `dd_stop_pct` 为参考写法, 默认关闭)。
+  ③ 新增只读 `ctx:net_pnl()` / `ctx:equity()`, 策略自管回撤(内置 `shannon_rebalance` 的 `dd_stop_pct` 为参考写法, 默认关闭)。
 - **D16** ✅ **`ricow scan` 删除**(2026-09-15): 选币/研究入口与"运行策略的平台"定位正交(无 AI 工具面消费者、无集成测试);
   用户拍板删除且**不留废弃代码**。仍按 2026-09-11 明示保留的通用能力: 美股数据层(`nasdaq`/`us_tickers`/`market_class`/`us_klines`)、
   组合回测路径、`build_interval_ticks`、`ctx:now()`。
@@ -164,7 +164,7 @@
 **硬性纪律**: 交易流程必须用 testnet 真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单测试;
 纯逻辑用单元测试, 不属 mock; 数据缺失(未配 testnet key)时跳过该测试(`#[ignore]`)而非 fallback mock。
 
-## 十二、香农动态网格(shannon_grid)策略规格与风险提示(来源: 原 requirements 4.3.1, v4 扩写 2026-09-05)
+## 十二、香农动态网格(shannon_rebalance)策略规格与风险提示(来源: 原 requirements 4.3.1, v4 扩写 2026-09-05)
 
 **机制**: 建仓 = 一次市价买入 `target_ratio`(默认 0.5)权益;之后每 tick 按最新价计算总价值,
 目标 = `权益 × target_ratio`(一半币一半现金之外可调), 精确恢复"目标比例"——价格涨 → 卖出回平衡(锁利),

@@ -149,6 +149,21 @@ impl fmt::Display for OrderStatus {
 
 // ---- Order request / ack / fill / update ----
 
+/// 订单指令类型 (2026-09-17, 023 香农 ETF 指数增加策略)。
+///
+/// 策略层没有订单号通道 (`on_tick` 只回订单数组, 不回 ack, `on_order_update` 未接),
+/// 因此"成交后撤掉自己的其余挂单"只能按**本实例归属**整体撤: 回测/模拟盘清
+/// `pending_orders`(策略是 context 内唯一下单方), 实盘按 `clientOrderId` 归属前缀撤。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OrderAction {
+    /// 普通下单 (默认)。
+    #[default]
+    Place,
+    /// 撤销本策略当前全部挂单。**不占下单限频、不计 `rejected_count`**;
+    /// 必须在风控/对齐层之前短路 (该指令 size = 0, 走普通路径会被判"数量为 0"拒掉)。
+    CancelPending,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub client_order_id: String,
@@ -162,6 +177,9 @@ pub struct OrderRequest {
     /// Some("long")/Some("short") 显式指定持仓方向 (K7, specs/backtest.md §五.3)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position_side: Option<String>,
+    /// 订单指令 (默认 Place = 普通下单)。见 [`OrderAction`]。
+    #[serde(default)]
+    pub action: OrderAction,
 }
 
 impl OrderRequest {
@@ -180,6 +198,7 @@ impl OrderRequest {
             size,
             reduce_only: false,
             position_side: None,
+            action: OrderAction::Place,
         }
     }
 
@@ -193,6 +212,7 @@ impl OrderRequest {
             size,
             reduce_only: false,
             position_side: None,
+            action: OrderAction::Place,
         }
     }
 

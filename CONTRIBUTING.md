@@ -102,7 +102,7 @@ cargo test -p ricow_binance -- --ignored --test-threads=1
 git clone git@github.com:ailenwu2000/ricow.git && cd ricow
 cargo test --workspace                                    # 纯逻辑测试, 零配置
 cargo build --release && ./target/release/ricow --help     # 产物与命令面
-./target/release/ricow backtest --strategy shannon_grid --pair ETHUSDT --days 20   # 需能访问币安(国内配 HTTPS_PROXY)
+./target/release/ricow backtest --strategy shannon_rebalance --pair ETHUSDT --days 20   # 需能访问币安(国内配 HTTPS_PROXY)
 ```
 
 1. 读 [项目宪法](specs/constitution.md)(唯一权威)与本文;

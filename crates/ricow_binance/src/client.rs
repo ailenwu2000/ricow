@@ -120,8 +120,36 @@ impl BinanceClient {
         interval: &str,
         limit: u32,
     ) -> CoreResult<Vec<Kline>> {
-        fetch_klines_paged(&self.http, &self.base_url, "/api/v3/klines", symbol, interval, limit)
-            .await
+        fetch_klines_paged(
+            &self.http,
+            &self.base_url,
+            "/api/v3/klines",
+            symbol,
+            interval,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    /// 截止到 `end_ms` 的 K 线 (回测按自然年月分段); 与 `get_klines` 同源分页逻辑。
+    pub async fn get_klines_ending_at(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+        end_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        fetch_klines_paged(
+            &self.http,
+            &self.base_url,
+            "/api/v3/klines",
+            symbol,
+            interval,
+            limit,
+            Some(end_ms),
+        )
+        .await
     }
 
     pub async fn get_depth(&self, symbol: &str, limit: u32) -> CoreResult<OrderBook> {
@@ -350,19 +378,24 @@ pub(crate) async fn fetch_klines_paged(
     symbol: &str,
     interval: &str,
     limit: u32,
+    end_time: Option<i64>,
 ) -> CoreResult<Vec<Kline>> {
     const MAX_PAGE: u32 = 1000;
     let step = interval_ms(interval)
         .ok_or_else(|| CoreError::InvalidArgument(format!("unsupported interval: {interval}")))?;
 
     let mut all: Vec<Kline> = Vec::new();
-    let now_ms = Utc::now().timestamp_millis();
-    let mut start_time: Option<i64> = Some(now_ms - (limit as i64) * step);
+    // end_time = None 时窗口截止"现在"; Some(ms) 时截止到指定时刻 (回测按自然年月分段用)。
+    let end_ms = end_time.unwrap_or_else(|| Utc::now().timestamp_millis());
+    let mut start_time: Option<i64> = Some(end_ms - (limit as i64) * step);
     while (all.len() as u32) < limit {
         let page = (limit - all.len() as u32).min(MAX_PAGE);
         let mut url = format!("{base_url}{path}?symbol={symbol}&interval={interval}&limit={page}");
         if let Some(st) = start_time {
             url.push_str(&format!("&startTime={st}"));
+        }
+        if end_time.is_some() {
+            url.push_str(&format!("&endTime={end_ms}"));
         }
         let resp = http.get(&url).send().await.map_err(|e| CoreError::Network(e.to_string()))?;
         let status = resp.status();

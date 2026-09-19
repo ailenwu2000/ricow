@@ -56,7 +56,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/ailenwu2000/ricow/
   <table>
     <thead><tr><th>Mode</th><th>Command</th><th>Capital</th><th>Prerequisites</th></tr></thead>
     <tbody>
-      <tr><td>Backtest</td><td><code>ricow backtest --strategy shannon_grid --pair ETHUSDT --days 30</code></td><td>none</td><td>zero config</td></tr>
+      <tr><td>Backtest</td><td><code>ricow backtest --strategy shannon_rebalance --pair ETHUSDT --days 30</code></td><td>none</td><td>zero config</td></tr>
       <tr><td>Dry Run (local virtual matching)</td><td><code>ricow start &lt;name&gt;</code></td><td>none</td><td>zero config</td></tr>
       <tr><td>demo (Binance testnet, real orders)</td><td><code>ricow start &lt;name&gt; --demo</code></td><td>simulated</td><td><code>[exchange].demo_*</code></td></tr>
       <tr><td>Live (mainnet, real money)</td><td><code>live_enabled = true</code> + <code>ricow start &lt;name&gt; --live --accept-risk</code></td><td>real</td><td><code>[exchange].binance_*</code> + first-use risk acknowledgement + Dry Run duration gate</td></tr>
@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/ailenwu2000/ricow/
 <pre><code>ricow create --name my_strategy --pair ETHUSDT --script my_strategy.lua   # compile gate + real-K-line sandbox backtest
 ricow approve                                                             # you type the confirmation in your terminal
 ricow deploy &lt;preview_id&gt; --token &lt;token&gt;                                 # lands in strategies/</code></pre>
-  <p class="note">The only built-in strategy template is <code>strategies/builtin/shannon_grid.lua</code> — read it as a starting point.
+  <p class="note">The only built-in strategy template is <code>strategies/builtin/shannon_rebalance.lua</code> — read it as a starting point.
   Full API reference: <a href="https://github.com/ailenwu2000/ricow/blob/main/specs/lua-api.md">specs/lua-api.md</a>.</p>
 </section>
 

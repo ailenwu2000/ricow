@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use chrono::{Datelike, Timelike};
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
-use ricow_core::{Kline, OrderFill, OrderRequest, OrderSide, OrderType, OrderUpdate};
+use ricow_core::{Kline, OrderAction, OrderFill, OrderRequest, OrderSide, OrderType, OrderUpdate};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
@@ -76,6 +76,15 @@ pub(crate) struct LuaCtxData {
     /// 当前 tick 时间 (UTC); None = 通道不可用 (单标的/实盘未接)。ctx:now() 用。
     now: Option<chrono::DateTime<chrono::Utc>>,
     klines_map: HashMap<String, Vec<Kline>>,
+    /// 高周期 ATR 快照 (023): 键 = pair, 值 = 高周期 ATR(周期来自配置 `atr_interval` 与
+    /// `atr_period`)。引擎侧按高周期桶缓存, 同一根高周期 bar 内不会重算。
+    /// 未声明 `atr_interval` 或通道未就绪时不含该 pair(策略用 `if v then` guard)。
+    tf_atr: HashMap<String, f64>,
+    /// 高周期 EMA 快照 (2026-09-18 日线趋势判据): 键 = pair, 值 = `regime_interval` 序列
+    /// (缺省 "1d") 的 EMA(`regime_ema_period`, 缺省 200)。同款按桶缓存 + 无前视。
+    tf_ema: HashMap<String, f64>,
+    /// **上一根已收盘**高周期 bar 的 close 快照(序列同 `tf_ema`): 趋势判据的逐字输入。
+    tf_close: HashMap<String, f64>,
     /// 组合信号模式标志 (bs_momentum Lua 化, T3): true → ctx:klines 返回全段
     /// (引擎已截断至执行日, ≥253 根供 IBD RS/EMA200 打分), 不套单标的 100 根 cap;
     /// false (默认) → 单标的路径维持 cap 100 (行为边界, 回归约束)。
@@ -101,6 +110,9 @@ impl LuaCtxData {
             config_bool_map: HashMap::new(),
             now: None,
             klines_map: HashMap::new(),
+            tf_atr: HashMap::new(),
+            tf_ema: HashMap::new(),
+            tf_close: HashMap::new(),
             full_klines: false,
         }
     }
@@ -244,6 +256,19 @@ impl UserData for LuaCtxData {
             let k = data.klines(&pair).unwrap_or_default();
             Ok(indicators_api::atr(&k, period))
         });
+        // 高周期 (第二序列) ATR (023 香农 ETF 指数增加策略): 周期由策略配置决定
+        // (`atr_interval` 如 "1h" + `atr_period` 如 14), 不是每调用一次现算 ——
+        // 引擎按高周期桶缓存(每小时一次)。装配层须预装高周期序列: 回测声明
+        // `atr_interval` 即自动预热 24h + 重采样; 模拟盘/实盘由 K 线刷新任务装入。
+        // 未预装/数据不足(< period+1 根高周期 bar) → nil, 策略必须 `if v then` guard。
+        methods.add_method("atr_tf", |_, data, pair: String| Ok(data.tf_atr.get(&pair).copied()));
+        // 高周期 EMA 与"上一根已收盘 bar 的 close" (2026-09-18 日线趋势判据):
+        // 序列周期来自策略配置 `regime_interval`(缺省 "1d"), EMA 周期来自 `regime_ema_period`
+        // (缺省 200)。与 `atr_tf` 同一缓存与同一无前视口径, 每根高周期 bar 只算一次。
+        // 未预装/数据不足 → nil, 策略必须 `if v then` guard。
+        methods.add_method("ema_tf", |_, data, pair: String| Ok(data.tf_ema.get(&pair).copied()));
+        methods
+            .add_method("close_tf", |_, data, pair: String| Ok(data.tf_close.get(&pair).copied()));
         methods.add_method("adx", |_, data, (pair, period): (String, usize)| {
             let k = data.klines(&pair).unwrap_or_default();
             Ok(indicators_api::adx(&k, period))
@@ -292,6 +317,12 @@ impl LuaStrategy {
     /// 从源码构建策略: 沙箱引擎 + 编译 + 执行模块级语句 (函数定义/模块级状态)。
     /// 统一注册 exec 执行组件库 (Rust 实现): 所有 Lua 策略 (CLI/MCP/TOML/回测) 均可用 exec.*;
     /// 用户脚本后执行可覆盖库函数 (复制即自定义)。
+    /// 测试用: 读策略 Lua 全局数值变量(023 不变量 I1 与计数器的可断言入口)。
+    #[cfg(test)]
+    pub(crate) fn global_f64(&self, name: &str) -> Option<f64> {
+        self.lua.globals().get::<Option<f64>>(name).ok().flatten()
+    }
+
     pub fn from_source(code: &str, config: StrategyConfig) -> Result<Self, String> {
         let (lua, budget) = create_lua_sandbox();
         // 注册 exec 执行组件 (Rust 实现, 全局表): 所有 Lua 策略 (CLI/MCP/TOML/回测) 均可用
@@ -366,6 +397,31 @@ impl LuaStrategy {
             }
             if let Some(k) = ctx.klines(&pair) {
                 data.klines_map.insert(pair.clone(), k);
+            }
+            // 高周期 ATR (023): 仅在策略声明 `atr_interval` 时取, 周期取 `atr_period`
+            // (缺省 14)。引擎侧用 (pair, tf) 缓存 + 桶内记忆 → 每根高周期 bar 只算一次。
+            if ctx.config().get_str("atr_interval").is_some() {
+                let period = ctx.config().get_i64("atr_period").unwrap_or(14).max(0) as usize;
+                if period > 0 {
+                    if let Some(v) = ctx.atr_tf(&pair, period) {
+                        data.tf_atr.insert(pair.clone(), v);
+                    }
+                }
+            }
+            // 高周期 EMA + 上一根已收盘 close (2026-09-18 日线趋势判据): 仅在策略声明
+            // `regime_interval` 时取, EMA 周期取 `regime_ema_period`(缺省 200)。
+            // 同一根日线 bar 内不重算(TfCache 桶内记忆); 未就绪 → 不插入(策略读到 nil)。
+            if ctx.config().get_str("regime_interval").is_some() {
+                let period =
+                    ctx.config().get_i64("regime_ema_period").unwrap_or(200).max(0) as usize;
+                if period > 0 {
+                    if let Some(v) = ctx.ema_tf(&pair, period) {
+                        data.tf_ema.insert(pair.clone(), v);
+                    }
+                }
+                if let Some(c) = ctx.close_tf(&pair) {
+                    data.tf_close.insert(pair.clone(), c);
+                }
             }
         }
         // 同步常见报价资产余额 (Lua 策略经 balance() 读取; USDT 为 CLI 默认, USDC 为历史测试口径)。
@@ -455,6 +511,32 @@ impl LuaStrategy {
         for item in table.sequence_values::<Table>() {
             let Ok(t) = item else { continue };
             let pair = t.get::<String>("pair").unwrap_or_default();
+            // 撤单指令 (023): `{ pair = "X", action = "cancel_pending" }` —— 判定必须
+            // **先于** size 解析与丢弃守卫: 撤单没有 size, 走下面的路径会被 size<=0 丢掉。
+            if let Ok(Some(action)) = t.get::<Option<String>>("action") {
+                if action.eq_ignore_ascii_case("cancel_pending") {
+                    if pair.is_empty() {
+                        tracing::warn!(target: "lua_strategy", "撤单指令缺 pair, 丢弃");
+                        continue;
+                    }
+                    orders.push(OrderRequest {
+                        client_order_id: String::new(),
+                        pair,
+                        side: OrderSide::Buy,
+                        order_type: OrderType::Limit,
+                        price: None,
+                        size: Decimal::ZERO,
+                        reduce_only: false,
+                        position_side: None,
+                        action: OrderAction::CancelPending,
+                    });
+                    continue;
+                }
+                tracing::warn!(
+                    target: "lua_strategy", instance = %self.instance_id, action = %action,
+                    "未知 action, 按普通下单处理"
+                );
+            }
             let side = match t.get::<String>("side").as_deref() {
                 Ok(s) if s.eq_ignore_ascii_case("sell") => OrderSide::Sell,
                 Ok(_) => OrderSide::Buy,
@@ -506,6 +588,7 @@ impl LuaStrategy {
                 size,
                 reduce_only,
                 position_side,
+                action: OrderAction::Place,
             });
         }
         orders
@@ -778,6 +861,238 @@ mod tests {
             ctx.drain_fills();
         }
         assert!(ctx.report().total_trades >= 1, "ema 交叉应触发成交");
+    }
+
+    /// 023 测试用: 第 `minute` 分钟的 1m bar。
+    fn bar_1m_023(minute: i64) -> Kline {
+        let ms = minute * 60_000;
+        let open = dec!(100) + Decimal::from(minute) / dec!(100);
+        Kline {
+            open_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap(),
+            open,
+            high: open + dec!(0.5),
+            low: open - dec!(0.5),
+            close: open,
+            volume: dec!(1),
+            close_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms + 59_999)
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_atr_tf_exposed_to_lua() {
+        // 023: `ctx:atr_tf(pair)` —— 高周期(1h)ATR 暴露给 Lua, 周期来自配置
+        // (`atr_interval` + `atr_period`); 通道未就绪时必须是 nil(策略靠它 guard)。
+        let script = r#"
+            seen = -1
+            function on_tick(ctx)
+                local v = ctx:atr_tf("ETHUSDT")
+                if v then seen = v end
+                return {}
+            end
+        "#;
+        let mut params = std::collections::HashMap::new();
+        params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
+        params.insert("atr_interval".to_string(), crate::config::ConfigValue::String("1h".into()));
+        params.insert("atr_period".to_string(), crate::config::ConfigValue::Integer(14));
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_etf_accum".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params,
+            risk: None,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let mut strategy = LuaStrategy::from_source(script, config).expect("编译应通过");
+        let bars: Vec<Kline> = (0..20 * 60).map(bar_1m_023).collect();
+        let tf_ms = crate::tf_ms_of("1h").unwrap();
+        let mut ctx = BacktestContext::new(
+            strategy.config.clone(),
+            Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+        );
+        ctx.set_tf_klines("ETHUSDT", "1h", crate::resample_complete(&bars, tf_ms));
+
+        // 14:00(第 841 根): 可见 14 个 1h 桶 < 15 → Lua 侧 nil → seen 保持 -1。
+        for k in &bars[..=840] {
+            ctx.step_bar(k.clone());
+        }
+        let _ = strategy.on_tick(&mut ctx);
+        let seen: f64 = strategy.lua.globals().get("seen").unwrap();
+        assert_eq!(seen, -1.0, "通道未就绪必须是 nil, 不能给 0 或猜值");
+
+        // 15:00(第 901 根): 可见 15 桶 → 有值, 且等于对可见段独立重采样的直算结果。
+        for k in &bars[841..=900] {
+            ctx.step_bar(k.clone());
+        }
+        let _ = strategy.on_tick(&mut ctx);
+        let seen: f64 = strategy.lua.globals().get("seen").unwrap();
+        let expected =
+            indicators_api::atr(&crate::resample_complete(&bars[..900], tf_ms), 14).unwrap();
+        assert!((seen - expected).abs() < 1e-9, "lua 侧 seen={seen} expected={expected}");
+    }
+
+    #[test]
+    fn test_ema_tf_and_close_tf_exposed_to_lua() {
+        // 2026-09-18 日线趋势判据: `ctx:ema_tf(pair)`(`regime_interval` 序列的 EMA)与
+        // `ctx:close_tf(pair)`(上一根**已收盘**高周期 bar 的 close)必须暴露给 Lua, 且:
+        //   ① 未就绪时是 nil(不猜值); ② 无前视 —— 未收盘的那根不可见。
+        let script = r#"
+            seen_close = -1
+            seen_ema = -1
+            function on_tick(ctx)
+                local c = ctx:close_tf("ETHUSDT")
+                local e = ctx:ema_tf("ETHUSDT")
+                if c then seen_close = c end
+                if e then seen_ema = e end
+                return {}
+            end
+        "#;
+        let mut params = std::collections::HashMap::new();
+        params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
+        params
+            .insert("regime_interval".to_string(), crate::config::ConfigValue::String("1d".into()));
+        params.insert("regime_ema_period".to_string(), crate::config::ConfigValue::Integer(2));
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_etf_accum".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params,
+            risk: None,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let mut strategy = LuaStrategy::from_source(script, config).expect("编译应通过");
+        // 判据序列(日线, 手造): day0 close=100, day1 close=200。
+        let day = 86_400_000i64;
+        let daily: Vec<Kline> = [100i64, 200]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let ms = i as i64 * day;
+                let v = Decimal::from(*p);
+                Kline {
+                    open_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap(),
+                    open: v,
+                    high: v,
+                    low: v,
+                    close: v,
+                    volume: dec!(1),
+                    close_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                        ms + day - 1,
+                    )
+                    .unwrap(),
+                }
+            })
+            .collect();
+        let mut ctx = BacktestContext::new(
+            strategy.config.clone(),
+            Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+        );
+        ctx.set_tf_klines("ETHUSDT", "1d", daily);
+        let seen =
+            |strategy: &LuaStrategy, key: &str| -> f64 { strategy.lua.globals().get(key).unwrap() };
+
+        // day0 当天: 尚无已收盘日线 → 两个读数都是 nil。
+        ctx.step_bar(bar_1m_023(0));
+        let _ = strategy.on_tick(&mut ctx);
+        assert_eq!(seen(&strategy, "seen_close"), -1.0, "无已收盘日线时 close_tf 必须 nil");
+        assert_eq!(seen(&strategy, "seen_ema"), -1.0, "可见日线不足 period 时 ema_tf 必须 nil");
+
+        // day1 当天(day0 已收盘): close = 100, 但可见 1 根 < period=2 → ema 仍 nil。
+        ctx.step_bar(bar_1m_023(day / 60_000 + 1));
+        let _ = strategy.on_tick(&mut ctx);
+        assert_eq!(seen(&strategy, "seen_close"), 100.0, "close_tf = 上一根已收盘日线的 close");
+        assert_eq!(seen(&strategy, "seen_ema"), -1.0, "可见 1 根 < period 2 → nil");
+
+        // day2 当天(day0/day1 已收盘): close = 200, ema(2): 100 → 166.67 (k = 2/3)。
+        ctx.step_bar(bar_1m_023(2 * day / 60_000 + 1));
+        let _ = strategy.on_tick(&mut ctx);
+        assert_eq!(seen(&strategy, "seen_close"), 200.0, "close_tf 取最近已收盘日线");
+        let ema = seen(&strategy, "seen_ema");
+        // ta 的 EMA 系数 k = 2/(period+1) → period=2 时 k = 2/3: 100 → (100 + 2×200)/3。
+        assert!(
+            (ema - 166.66666666666666).abs() < 1e-9,
+            "ema_tf 应为可见日线的 EMA(2): 实得 {ema}"
+        );
+    }
+
+    #[test]
+    fn test_cancel_pending_parsed_without_size() {
+        // 023 Task 5: `{ pair = ..., action = "cancel_pending" }` 没有 size, 也必须能解析成
+        // 撤单指令 —— 旧的 parse_orders 会因 size<=0 直接丢弃(撤单永远到不了引擎)。
+        let script = r#"
+            function on_tick(ctx)
+                return {
+                    { pair = "ETHUSDT", action = "cancel_pending" },
+                    { pair = "ETHUSDT", side = "buy", size = 0.5, price = 90, order_type = "limit" },
+                }
+            end
+        "#;
+        let mut params = std::collections::HashMap::new();
+        params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_etf_accum".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params,
+            risk: None,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let mut strategy = LuaStrategy::from_source(script, config).expect("编译应通过");
+        let mut ctx = BacktestContext::new(
+            strategy.config.clone(),
+            Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+        );
+        ctx.step_bar(bar_1m_023(0));
+        let orders = strategy.on_tick(&mut ctx);
+        assert_eq!(orders.len(), 2, "撤单指令不能被丢弃");
+        assert_eq!(orders[0].action, OrderAction::CancelPending, "第一条应是撤单指令");
+        assert_eq!(orders[0].size, Decimal::ZERO);
+        assert_eq!(orders[0].pair, "ETHUSDT");
+        assert_eq!(orders[1].action, OrderAction::Place, "普通单默认 Place");
+        assert_eq!(orders[1].size, dec!(0.5));
+        // 未知 action: 不丢弃, 但按普通下单处理(告警), 尺寸为 0 时仍被丢弃。
+        let script2 = r#"
+            function on_tick(ctx)
+                return { { pair = "ETHUSDT", action = "bogus", side = "buy", size = 0.5, price = 90 } }
+            end
+        "#;
+        let cfg2 = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_etf_accum".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params: std::collections::HashMap::new(),
+            risk: None,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let mut s2 = LuaStrategy::from_source(script2, cfg2).expect("编译应通过");
+        let mut c2 = BacktestContext::new(
+            s2.config.clone(),
+            Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+        );
+        c2.step_bar(bar_1m_023(0));
+        let o2 = s2.on_tick(&mut c2);
+        assert_eq!(o2.len(), 1);
+        assert_eq!(o2[0].action, OrderAction::Place, "未知 action 按普通下单");
     }
 
     /// 死循环脚本被指令预算拦截, 不挂死。

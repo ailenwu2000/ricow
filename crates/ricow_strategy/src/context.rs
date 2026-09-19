@@ -5,14 +5,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use ricow_core::{
-    parse_pair, Balance, CoreError, CoreResult, Exchange, Kline, Market, OrderAck, OrderBook,
-    OrderFill, OrderRequest, OrderSide, OrderStatus, OrderType, Position,
+    parse_pair, Balance, CoreError, CoreResult, Exchange, Kline, Market, OrderAck, OrderAction,
+    OrderBook, OrderFill, OrderRequest, OrderSide, OrderStatus, OrderType, Position,
 };
 use rust_decimal::Decimal;
 
 use crate::align::{ownership_prefix, prepare_live_order};
 use crate::config::StrategyConfig;
 use crate::fee::FeeModel;
+use crate::multiframe::{tf_key, TfCache};
 use crate::pnl::PnlTracker;
 use crate::risk::RiskEngine;
 
@@ -54,6 +55,28 @@ pub trait Context: Send {
     fn now_utc(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         None
     }
+    /// 高周期 (第二序列) ATR: 由 [`Context::set_tf_klines`] 预装的高周期序列算出,
+    /// **按桶缓存**(同一根高周期 bar 内重复调用不重算)。未预装 / 数据不足 → None。
+    /// 用途: 策略在主序列(如 1m)上决策, 间距取自高周期(如 1h)ATR。默认无通道。
+    /// 序列周期由策略配置 `atr_interval` 决定(`set_tf_klines` 按 `pair|tf` 装)。
+    fn atr_tf(&self, _pair: &str, _period: usize) -> Option<f64> {
+        None
+    }
+    /// 高周期 (第二序列) EMA (2026-09-18, 日线趋势判据): 与 `atr_tf` 同一缓存,
+    /// 序列周期由策略配置 `regime_interval`(缺省 `"1d"`)决定, EMA 周期由调用参数给出。
+    /// 按桶缓存 + 无前视; 未预装 / 可见桶不足 period → None(策略须 guard)。默认无通道。
+    fn ema_tf(&self, _pair: &str, _period: usize) -> Option<f64> {
+        None
+    }
+    /// **上一根已收盘**高周期 bar 的收盘价(序列同 `ema_tf`): 趋势判据的逐字输入
+    /// "最近的日线 K 线的 close"。未预装 → None。默认无通道。
+    fn close_tf(&self, _pair: &str) -> Option<f64> {
+        None
+    }
+    /// 预装高周期 K 线 (第二序列)。`tf` = 周期标签(如 `"1h"`); 装配层须先用
+    /// [`crate::resample_complete`] 剔除不完整/缺口桶再装入。同一 `pair` 可装多套
+    /// (如 4h ATR + 日线趋势判据), 键 = `pair|tf`。默认 no-op。
+    fn set_tf_klines(&mut self, _pair: &str, _tf: &str, _bars: Vec<Kline>) {}
 }
 
 // ---- LiveContext ----
@@ -74,6 +97,10 @@ pub struct LiveContext {
     position_cache: RwLock<HashMap<String, Position>>,
     balance_cache: RwLock<HashMap<String, Balance>>,
     klines_cache: RwLock<HashMap<String, Vec<Kline>>>,
+    /// 高周期序列缓存 (023 香农 ETF 指数增加策略; 2026-09-18 扩为多套): 键 = `pair|tf`。
+    /// 由 `set_tf_klines` 预装(装配层已剔除不完整桶); `atr_tf`/`ema_tf`/`close_tf`
+    /// 按当前时刻取可见前缀(ATR 取 `atr_interval` 序列, EMA/close 取 `regime_interval` 序列)。
+    tf_cache: RwLock<HashMap<String, TfCache>>,
     rt: tokio::runtime::Handle,
 }
 
@@ -107,6 +134,7 @@ impl LiveContext {
             position_cache: RwLock::new(HashMap::new()),
             balance_cache: RwLock::new(HashMap::new()),
             klines_cache: RwLock::new(HashMap::new()),
+            tf_cache: RwLock::new(HashMap::new()),
             rt,
         }
     }
@@ -211,6 +239,48 @@ impl LiveContext {
         }
     }
 
+    /// 撤销本实例(`<策略名>-` 前缀归属)在某 pair 上的全部挂单 (023 撤单指令用)。
+    ///
+    /// 只撤自己的单: 同一账户上可能还有别的策略或手工单, 归属前缀是唯一判据。
+    /// 单张撤单失败不中断其余撤单, 但计入 failed 并告警 (不静默)。
+    pub fn cancel_owned_orders(&self, pair: &str) -> CoreResult<OrderAck> {
+        let (prefix, base) = parse_pair(pair);
+        let exchange = self.resolve_exchange(prefix)?;
+        let base = base.to_string();
+        let owned = self.order_prefix.clone();
+        self.run_async(async move {
+            let orders = exchange.get_open_orders(&base).await?;
+            let mut cancelled = 0usize;
+            let mut failed = 0usize;
+            for o in orders {
+                if !o.client_order_id.starts_with(&owned) {
+                    continue;
+                }
+                match exchange.cancel_order(&base, &o.exchange_order_id).await {
+                    Ok(()) => cancelled += 1,
+                    Err(e) => {
+                        failed += 1;
+                        tracing::warn!(
+                            target: "strategy.live", pair = %base, order = %o.exchange_order_id,
+                            "撤单失败: {e}"
+                        );
+                    }
+                }
+            }
+            tracing::info!(target: "strategy.live", pair = %base, cancelled, failed, "撤单指令执行");
+            Ok(OrderAck {
+                exchange_order_id: String::new(),
+                client_order_id: String::new(),
+                pair: base,
+                side: OrderSide::Buy,
+                price: Decimal::ZERO,
+                size: Decimal::ZERO,
+                filled_size: Decimal::ZERO,
+                status: OrderStatus::Cancelled,
+            })
+        })
+    }
+
     /// 从交易所刷新持仓 (覆盖式: 交易所返回的定向持仓为准, 空则清仓)。
     pub async fn refresh_position(&self, pair: &str) -> CoreResult<()> {
         let (prefix, base) = parse_pair(pair);
@@ -306,6 +376,11 @@ impl Context for LiveContext {
     }
 
     fn place_order(&mut self, req: OrderRequest) -> CoreResult<OrderAck> {
+        // 撤单指令 (023): 必须在**对齐层与风控之前**短路 —— size = 0 会被 `align` 判
+        // "对齐后数量为 0"直接拒单, 撤单永远执行不到; 撤单不占限频、不计 rejected_count。
+        if req.action == OrderAction::CancelPending {
+            return self.cancel_owned_orders(&req.pair);
+        }
         let (prefix, base) = parse_pair(&req.pair);
         let (prefix, base) = (prefix.to_string(), base.to_string());
         // 拒单 ack 模板 (对齐失败时返回, 与风控拒单同形: 策略循环不中断)
@@ -376,6 +451,36 @@ impl Context for LiveContext {
         self.klines_cache.read().ok()?.get(pair).cloned()
     }
 
+    fn atr_tf(&self, pair: &str, period: usize) -> Option<f64> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tf = self.config.get_str("atr_interval")?.to_string();
+        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.atr(period, now_ms)
+    }
+
+    /// 高周期 EMA (日线趋势判据): 序列 = `regime_interval`(缺省 "1d")。
+    fn ema_tf(&self, pair: &str, period: usize) -> Option<f64> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
+        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.ema(period, now_ms)
+    }
+
+    /// 上一根已收盘高周期 bar 的 close (趋势判据输入): 序列 = `regime_interval`。
+    fn close_tf(&self, pair: &str) -> Option<f64> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
+        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.close(now_ms)
+    }
+
+    fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
+        let Some(tf_ms) = crate::multiframe::tf_ms_of(tf) else {
+            tracing::warn!(target: "multiframe", tf, "未知高周期标签, 忽略预装");
+            return;
+        };
+        if let Ok(mut c) = self.tf_cache.write() {
+            c.insert(tf_key(pair, tf), TfCache::new(tf_ms, bars));
+        }
+    }
+
     /// 实盘当前时刻 (真实 UTC): 与风控窗口/结算周期、`ctx:now()` 同源。
     fn now_utc(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         Some(chrono::Utc::now())
@@ -404,6 +509,10 @@ pub struct DryRunContext {
     virtual_positions: RwLock<HashMap<String, Position>>,
     virtual_balance: RwLock<HashMap<String, Balance>>,
     klines_cache: RwLock<HashMap<String, Vec<Kline>>>,
+    /// 高周期序列缓存 (023 香农 ETF 指数增加策略; 2026-09-18 扩为多套): 键 = `pair|tf`。
+    /// 由 `set_tf_klines` 预装(装配层已剔除不完整桶); `atr_tf`/`ema_tf`/`close_tf`
+    /// 按当前时刻取可见前缀(ATR 取 `atr_interval` 序列, EMA/close 取 `regime_interval` 序列)。
+    tf_cache: RwLock<HashMap<String, TfCache>>,
     pending_orders: Vec<(String, OrderRequest)>,
     fill_queue: Vec<OrderFill>,
 }
@@ -440,6 +549,7 @@ impl DryRunContext {
             virtual_positions: RwLock::new(HashMap::new()),
             virtual_balance: RwLock::new(balance_map),
             klines_cache: RwLock::new(HashMap::new()),
+            tf_cache: RwLock::new(HashMap::new()),
             pending_orders: Vec::new(),
             fill_queue: Vec::new(),
         }
@@ -756,6 +866,32 @@ impl Context for DryRunContext {
     }
 
     fn place_order(&mut self, req: OrderRequest) -> CoreResult<OrderAck> {
+        // 撤单指令 (023): 在风控之前短路(size = 0 会被判无效); 清掉本策略挂单。
+        if req.action == OrderAction::CancelPending {
+            // 注意: `pending_orders` 的元素是 `(订单号, 请求)` —— 按**请求里的 pair** 过滤
+            // (先收集订单号再 retain, 避免闭包里再借 self)。
+            let key = self.resolve_key(&req.pair);
+            let ids: Vec<String> = self
+                .pending_orders
+                .iter()
+                .filter(|(_, o)| self.resolve_key(&o.pair) == key)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let before = self.pending_orders.len();
+            self.pending_orders.retain(|(id, _)| !ids.contains(id));
+            let cancelled = before - self.pending_orders.len();
+            tracing::info!(target: "strategy.dryrun", pair = %key, cancelled, "撤单指令: 清挂单");
+            return Ok(OrderAck {
+                exchange_order_id: String::new(),
+                client_order_id: String::new(),
+                pair: req.pair,
+                side: req.side,
+                price: Decimal::ZERO,
+                size: Decimal::ZERO,
+                filled_size: Decimal::ZERO,
+                status: OrderStatus::Cancelled,
+            });
+        }
         if let Some(rejected) = self.risk_reject(&req) {
             return Ok(rejected);
         }
@@ -850,6 +986,36 @@ impl Context for DryRunContext {
 
     fn klines(&self, pair: &str) -> Option<Vec<Kline>> {
         self.klines_cache.read().ok()?.get(pair).cloned()
+    }
+
+    fn atr_tf(&self, pair: &str, period: usize) -> Option<f64> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tf = self.config.get_str("atr_interval")?.to_string();
+        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.atr(period, now_ms)
+    }
+
+    /// 高周期 EMA (日线趋势判据): 序列 = `regime_interval`(缺省 "1d")。
+    fn ema_tf(&self, pair: &str, period: usize) -> Option<f64> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
+        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.ema(period, now_ms)
+    }
+
+    /// 上一根已收盘高周期 bar 的 close (趋势判据输入): 序列 = `regime_interval`。
+    fn close_tf(&self, pair: &str) -> Option<f64> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
+        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.close(now_ms)
+    }
+
+    fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
+        let Some(tf_ms) = crate::multiframe::tf_ms_of(tf) else {
+            tracing::warn!(target: "multiframe", tf, "未知高周期标签, 忽略预装");
+            return;
+        };
+        if let Ok(mut c) = self.tf_cache.write() {
+            c.insert(tf_key(pair, tf), TfCache::new(tf_ms, bars));
+        }
     }
 
     /// Dry Run 当前时刻 (真实 UTC, 与实盘同源): 风控窗口/结算周期与 `ctx:now()` 用。

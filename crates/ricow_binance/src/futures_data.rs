@@ -53,6 +53,18 @@ impl FuturesDataClient {
         interval: &str,
         limit: u32,
     ) -> CoreResult<Vec<Kline>> {
+        self.get_klines_ending_at(symbol, interval, limit, i64::MAX / 2)
+            .await
+    }
+
+    /// 截止到 `end_ms` 的 K 线 (回测按自然年月分段用); end_ms 取极大值时等价于"到最新"。
+    pub async fn get_klines_ending_at(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+        end_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
         const MAX_PAGE: u32 = 1000;
         let interval_ms = match interval {
             "1m" => 60_000_i64,
@@ -65,11 +77,9 @@ impl FuturesDataClient {
                 return Err(CoreError::InvalidArgument(format!("unsupported interval: {other}")))
             }
         };
-
         let mut all: Vec<Kline> = Vec::new();
-        // 起点 = now − limit×interval (不传 startTime 只回最新 1000 根)。
-        let now_ms = Utc::now().timestamp_millis();
-        let mut start_time: Option<i64> = Some(now_ms - (limit as i64) * interval_ms);
+        let end = end_ms.min(Utc::now().timestamp_millis());
+        let mut start_time: Option<i64> = Some(end - (limit as i64) * interval_ms);
         while (all.len() as u32) < limit {
             let page = (limit - all.len() as u32).min(MAX_PAGE);
             let mut url = format!(
@@ -79,6 +89,7 @@ impl FuturesDataClient {
             if let Some(st) = start_time {
                 url.push_str(&format!("&startTime={st}"));
             }
+            url.push_str(&format!("&endTime={end}"));
             let raw: Vec<Vec<Value>> = self.get_json(&url).await?;
             if raw.is_empty() {
                 break;

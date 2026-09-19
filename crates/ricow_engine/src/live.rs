@@ -6,7 +6,7 @@
 //! - 停机清理: 撤单兜底 → 可选平仓 → 残留复查, 顺序与幂等在此固化。
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use ricow_core::{Market, OrderInfo, OrderRequest, OrderSide, OrderType, Position};
+use ricow_core::{Market, OrderAction, OrderInfo, OrderRequest, OrderSide, OrderType, Position};
 use ricow_strategy::{floor_to_step, is_owned, MAX_CLIENT_ORDER_ID_LEN};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -356,6 +356,7 @@ pub fn plan_cleanup(
             size,
             reduce_only: market.is_perpetual && !hedge,
             position_side,
+            action: OrderAction::Place,
         });
     }
     plan

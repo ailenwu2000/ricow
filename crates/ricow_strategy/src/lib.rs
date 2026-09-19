@@ -1,6 +1,6 @@
 //! `ricow_strategy` — 策略引擎: Lua 策略运行时 / 调度 / 风控 / 回测 / 本地存储 / PnL。
 //!
-//! 策略层统一 Lua: 内置脚本(shannon_grid 策略样板 + executors/ 执行模式示例)与用户策略
+//! 策略层统一 Lua: 内置脚本(shannon_rebalance 策略样板 + executors/ 执行模式示例)与用户策略
 //! 均为 Lua 脚本, 参考实现见 `strategies/builtin/`, API 规范见 `specs/lua-api.md`。
 
 mod align;
@@ -14,6 +14,7 @@ mod indicators_api;
 pub mod lua;
 mod lua_sandbox;
 mod metrics;
+mod multiframe;
 mod name;
 mod pnl;
 mod risk;
@@ -30,6 +31,7 @@ pub use context::{Context, DryRunContext, LiveContext};
 pub use db::{Database, FillRecord, PreviewRecord};
 pub use fee::FeeModel;
 pub use lua::{validate_lua, validate_script_source, LuaStrategy};
+pub use multiframe::{resample_complete, tf_key, tf_ms_of, TfCache};
 pub use name::{
     prefix_conflict, suggest_strategy_name, validate_strategy_name, MAX_STRATEGY_NAME_LEN,
 };

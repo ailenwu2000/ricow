@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use ricow_core::{
-    parse_pair, Balance, CoreResult, Kline, OrderAck, OrderBook, OrderFill, OrderRequest,
-    OrderSide, OrderStatus, OrderType, Position,
+    parse_pair, Balance, CoreResult, Kline, OrderAck, OrderAction, OrderBook, OrderFill,
+    OrderRequest, OrderSide, OrderStatus, OrderType, Position,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -14,6 +14,7 @@ use rust_decimal_macros::dec;
 use crate::config::{BacktestParams, BacktestToml, ConfigValue, StrategyConfig};
 use crate::context::Context;
 use crate::fee::FeeModel;
+use crate::multiframe::{tf_key, TfCache};
 use crate::pnl::PnlTracker;
 use crate::risk::RiskEngine;
 
@@ -92,6 +93,23 @@ pub struct BacktestReport {
     pub final_notional: Option<Decimal>,
     /// 名义敞口变化 % (合约, 基准 = 建仓后; 现货 None)。
     pub nominal_exposure_pct: Option<f64>,
+    // ---- 基准对照 (023 T8): 以**首次成交价**为买入价、同时点同本金起算 ----
+    /// 首次成交价 (基准的买入价); 窗口内从未成交 → None。
+    pub benchmark_entry_price: Option<Decimal>,
+    /// 建仓时刻的策略权益 (apples-to-apples 起算点)。
+    pub entry_equity: Option<Decimal>,
+    /// 策略自建仓时点起的收益 % (= 期末权益 / 建仓权益 − 1)。
+    pub strategy_return_since_entry_pct: Option<f64>,
+    /// 满仓持有收益 % (同本金全额买入持有到期末); 只用于对照, 不是策略目标。
+    pub benchmark_return_pct: Option<f64>,
+    /// 满仓持有最大回撤 (比率)。
+    pub benchmark_max_drawdown: Option<Decimal>,
+    /// 满仓持有年化波动率 (比率)。
+    pub benchmark_annual_volatility: Option<f64>,
+    /// 敞口对齐基准收益 % (同 `target_ratio` 仓位买入持有, 不再平衡) —— **策略行为的正确对照**。
+    pub benchmark_exposure_return_pct: Option<f64>,
+    /// 敞口对齐基准最大回撤 (比率)。
+    pub benchmark_exposure_max_drawdown: Option<Decimal>,
     // ---- 组合回测口径 (M2; 单标的: equity_curve/turnover_ratio 亦填, holdings_snapshots 为空) ----
     /// 净值曲线 (quote; 起点 = 初始现金, 逐 bar/tick 收盘估值 + 末根补估)。
     pub equity_curve: Vec<Decimal>,
@@ -107,6 +125,13 @@ pub struct BacktestReport {
 /// 400 根留足递推与趋势确认余量。十年 (≈2514 根) 信号线每 tick 全量克隆会卡死,
 /// 超长段只保留最近 SIGNAL_TAIL 根 (升序) — 无前视不变 (截断仍按全局 tick 时间)。
 pub const SIGNAL_TAIL: usize = 400;
+
+/// 单标的路径 `ctx:klines` 的尾窗长度 (023 性能修复, 2026-09-17): 只回最近这么多根
+/// 已收盘 bar。此前每 tick 克隆**全部**已收盘 bar —— 1m × 79 天 ≈ 11.4 万根 × 11.4 万
+/// 次 tick = 10^9 级拷贝, 1m 回测根本跑不动。冻结为 100 根同时把"指标输入上限 =
+/// 100 根"固定成契约 (写入 specs/lua-api.md); 需要更长窗口的指标不走主序列。
+/// 组合信号模式 (full_klines) 不受影响, 仍用 SIGNAL_TAIL = 400。
+const KLINES_TAIL: usize = 100;
 
 /// 该 bar 覆盖时段 `[open, close)` 内的 8h 资金费结算点个数 (UTC 00/08/16)。
 ///
@@ -186,6 +211,15 @@ pub struct BacktestContext {
     /// 截断的已收盘段 (脚本永不见未来, 无前视); 容器空 = 信号通道关闭, 回落成交轨
     /// portfolio_klines/closed_klines (单标的与纯成交轨组合行为零改动)。
     signal_klines: HashMap<String, Vec<Kline>>,
+    /// 首次成交价/时刻/当时权益 (023 T8): 满仓持有基准的买入价与 apples-to-apples 起算点。
+    /// **无条件记录**(首笔可能是卖出 —— 现货先有持仓时; 用 `if size>0` 之类的守卫会漏)。
+    first_fill_price: Option<Decimal>,
+    first_fill_time: Option<chrono::DateTime<chrono::Utc>>,
+    entry_equity: Option<Decimal>,
+    /// 高周期序列 (第二序列, 023; 2026-09-18 扩为多套): 键 = `resolve_key(pair)|tf`,
+    /// 装配层预装(已剔除不完整桶)。`atr_tf`/`ema_tf`/`close_tf` 按当前 tick 时间取可见前缀
+    /// 计算, 每根高周期 bar 只算一次(TfCache 内部缓存)。
+    tf_caches: HashMap<String, TfCache>,
     default_exchange: String,
     slippage_bps: u32,
     initial_equity: Decimal,
@@ -285,6 +319,10 @@ impl BacktestContext {
             portfolio_prices: HashMap::new(),
             holdings_snapshots: Vec::new(),
             signal_klines: HashMap::new(),
+            tf_caches: HashMap::new(),
+            first_fill_price: None,
+            first_fill_time: None,
+            entry_equity: None,
             default_exchange: "bn".to_string(),
             slippage_bps,
             initial_equity: initial_cash,
@@ -339,6 +377,11 @@ impl BacktestContext {
         }
     }
 
+    /// 当前挂单数 (023 验收用: "任意时刻挂单 ≤ 2 张" 的可断言入口)。
+    pub fn pending_count(&self) -> usize {
+        self.pending_orders.len()
+    }
+
     /// 撮合参考 bar: 组合模式按 pair 路由 portfolio_bars, 单标的回落 current_bar。
     fn bar_for(&self, pair: &str) -> Option<&Kline> {
         if self.portfolio_bars.is_empty() {
@@ -389,7 +432,9 @@ impl BacktestContext {
             );
         }
         if self.portfolio_klines.is_empty() {
-            Some(self.closed_klines.clone())
+            // 尾窗 (023): 只克隆最近 KLINES_TAIL 根 —— 策略与指标的输入上限即此值。
+            let start = self.closed_klines.len().saturating_sub(KLINES_TAIL);
+            Some(self.closed_klines[start..].to_vec())
         } else {
             self.portfolio_klines
                 .get(&self.resolve_key(pair))
@@ -1036,6 +1081,15 @@ impl BacktestContext {
             turnover_ratio: self.turnover_ratio_of(&curve),
             equity_curve: curve,
             holdings_snapshots: self.holdings_snapshots.clone(),
+            // 基准对照 (023 T8) 只定义于单标的路径 —— 组合路径留 None, 不编造(见 plan Task 8)。
+            benchmark_entry_price: None,
+            entry_equity: None,
+            strategy_return_since_entry_pct: None,
+            benchmark_return_pct: None,
+            benchmark_max_drawdown: None,
+            benchmark_annual_volatility: None,
+            benchmark_exposure_return_pct: None,
+            benchmark_exposure_max_drawdown: None,
         }
     }
 
@@ -1138,6 +1192,62 @@ impl BacktestContext {
             gross_loss,
             self.pnl.losing_trades(),
         );
+        // ---- 023 T8: 基准对照 ----
+        // 口径(users 指定): 以**首次成交价同时点、同本金**满仓买入持有到期末; 建仓前策略空仓
+        // 不计入对比(排除择时运气)。另算「敞口对齐」基准 = 同 `target_ratio` 仓位买入持有,
+        // 它是判断"策略行为本身有没有加分"的正确对照(默认 50:50 下与满仓的差主要是敞口, 不是技能)。
+        // 回撤用价格序列直接算(比率与尺度无关); 混合组合序列 = (1−r)·p0 + r·p, 同样尺度无关。
+        let (bm_entry, bm_ret, bm_dd, bm_vol, bm_expo_ret, bm_expo_dd, strat_since_entry) =
+            match (self.first_fill_price, self.first_fill_time) {
+                (Some(p0), Some(t0)) if p0 > Decimal::ZERO => {
+                    let mut prices: Vec<Decimal> = vec![p0];
+                    prices.extend(
+                        self.closed_klines.iter().filter(|k| k.open_time >= t0).map(|k| k.close),
+                    );
+                    let last_time = match &self.current_bar {
+                        Some(cb) => {
+                            if cb.open_time >= t0 {
+                                prices.push(cb.close);
+                            }
+                            cb.open_time
+                        }
+                        None => t0,
+                    };
+                    let span = (last_time - t0).num_seconds().max(0) as f64;
+                    let px0 = p0.to_f64().unwrap_or(0.0);
+                    let px_last = prices.last().map(|p| p.to_f64().unwrap_or(px0)).unwrap_or(px0);
+                    let (ret, vol) = if px0 > 0.0 {
+                        (
+                            Some((px_last / px0 - 1.0) * 100.0),
+                            crate::metrics::annual_volatility(&prices, span),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let target = self.config.get_f64("target_ratio").unwrap_or(0.5).clamp(0.0, 1.0);
+                    let rt = Decimal::from_f64_retain(target).unwrap_or(Decimal::ZERO);
+                    let mixed: Vec<Decimal> =
+                        prices.iter().map(|p| (Decimal::ONE - rt) * p0 + rt * *p).collect();
+                    // 混合组合收益 = r × 满仓收益(线性, 现金腿零收益)。
+                    let expo_ret = ret.map(|v| v * target);
+                    (
+                        Some(p0),
+                        ret,
+                        Some(crate::pnl::max_drawdown(&prices)),
+                        vol,
+                        expo_ret,
+                        Some(crate::pnl::max_drawdown(&mixed)),
+                        match self.entry_equity {
+                            Some(e0) if e0 > Decimal::ZERO => {
+                                ((final_equity - e0) / e0).to_f64().map(|v| v * 100.0)
+                            }
+                            _ => None,
+                        },
+                    )
+                }
+                _ => (None, None, None, None, None, None, None),
+            };
+
         BacktestReport {
             total_bars: self.total_bars,
             total_trades: self.pnl.trade_count(),
@@ -1187,6 +1297,14 @@ impl BacktestContext {
             turnover_ratio: self.turnover_ratio_of(&curve),
             equity_curve: curve,
             holdings_snapshots: Vec::new(),
+            benchmark_entry_price: bm_entry,
+            entry_equity: self.entry_equity,
+            strategy_return_since_entry_pct: strat_since_entry,
+            benchmark_return_pct: bm_ret,
+            benchmark_max_drawdown: bm_dd,
+            benchmark_annual_volatility: bm_vol,
+            benchmark_exposure_return_pct: bm_expo_ret,
+            benchmark_exposure_max_drawdown: bm_expo_dd,
         }
     }
 
@@ -1492,6 +1610,14 @@ impl BacktestContext {
     /// 现货: 仓位 (恒 Buy 侧) + 资金簿, 手续费真实扣余额 (Bug B 修复)。
     /// 合约: 逐仓钱包转账 —— 平仓 wallet += realized − 平仓费; 开仓 cash −= M, wallet += M − 开仓费。
     fn execute_fill(&mut self, order_id: &str, req: &OrderRequest, fill_price: Decimal) {
+        // 023 T8: 首笔成交留痕 —— 成交价(基准买入价)/时刻(起算点)/当时权益(公平对照的起点)。
+        // 记录必须在仓位与现金变动**之前**。
+        if self.first_fill_price.is_none() {
+            let key = self.resolve_key(&req.pair);
+            self.first_fill_price = Some(fill_price);
+            self.first_fill_time = self.current_bar.as_ref().map(|b| b.open_time);
+            self.entry_equity = Some(self.cash() + self.net_size_of(&key) * fill_price);
+        }
         let (close, open) = self.split_fill(req);
         let is_maker = matches!(req.order_type, OrderType::Limit);
         let fee = self.fee_model.calc_fee(fill_price, req.size, is_maker);
@@ -1629,6 +1755,33 @@ impl Context for BacktestContext {
     }
 
     fn place_order(&mut self, req: OrderRequest) -> CoreResult<OrderAck> {
+        // 撤单指令 (023): 必须在风控**之前**短路 —— 该指令 size = 0, 走普通路径会被
+        // 判"数量无效/为 0"直接拒掉; 撤单也不占限频、不计 rejected_count。
+        if req.action == OrderAction::CancelPending {
+            // 注意: `pending_orders` 的元素是 `(订单号, 请求)` —— 按**请求里的 pair** 过滤
+            // (先收集订单号再 retain, 避免闭包里再借 self)。
+            let key = self.resolve_key(&req.pair);
+            let ids: Vec<String> = self
+                .pending_orders
+                .iter()
+                .filter(|(_, o)| self.resolve_key(&o.pair) == key)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let before = self.pending_orders.len();
+            self.pending_orders.retain(|(id, _)| !ids.contains(id));
+            let cancelled = before - self.pending_orders.len();
+            tracing::info!(target: "strategy.backtest", pair = %key, cancelled, "撤单指令: 清挂单");
+            return Ok(OrderAck {
+                exchange_order_id: String::new(),
+                client_order_id: String::new(),
+                pair: req.pair,
+                side: req.side,
+                price: Decimal::ZERO,
+                size: Decimal::ZERO,
+                filled_size: Decimal::ZERO,
+                status: OrderStatus::Cancelled,
+            });
+        }
         if let Some(rejected) = self.risk_reject(&req) {
             self.rejected_count += 1;
             return Ok(rejected);
@@ -1816,11 +1969,45 @@ impl Context for BacktestContext {
             self.current_bar.as_ref().map(|b| b.open_time)
         }
     }
+
+    /// 高周期 ATR (023): 无前视 —— 可见桶判据 = `桶起点 + tf ≤ 本 tick 时间`, 与
+    /// `now_utc`/`klines_for` 的截断口径同源(单标的 = 当前 bar open_time)。
+    /// 序列 = 配置 `atr_interval`(缺失 → None, 与"未预装"同处理)。
+    fn atr_tf(&self, pair: &str, period: usize) -> Option<f64> {
+        let now_ms = self.now_utc()?.timestamp_millis();
+        let tf = self.config.get_str("atr_interval")?.to_string();
+        self.tf_caches.get(&tf_key(&self.resolve_key(pair), &tf))?.atr(period, now_ms)
+    }
+
+    /// 高周期 EMA (2026-09-18 日线趋势判据): 序列 = 配置 `regime_interval`(缺省 "1d"),
+    /// 与 `atr_tf` 同一缓存与同一无前视口径; 可见桶不足 period → None。
+    fn ema_tf(&self, pair: &str, period: usize) -> Option<f64> {
+        let now_ms = self.now_utc()?.timestamp_millis();
+        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
+        self.tf_caches.get(&tf_key(&self.resolve_key(pair), &tf))?.ema(period, now_ms)
+    }
+
+    /// 上一根已收盘高周期 bar 的 close (趋势判据输入); 序列同 `ema_tf`。
+    fn close_tf(&self, pair: &str) -> Option<f64> {
+        let now_ms = self.now_utc()?.timestamp_millis();
+        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
+        self.tf_caches.get(&tf_key(&self.resolve_key(pair), &tf))?.close(now_ms)
+    }
+
+    fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
+        let Some(tf_ms) = crate::multiframe::tf_ms_of(tf) else {
+            tracing::warn!(target: "multiframe", tf, "未知高周期标签, 忽略预装");
+            return;
+        };
+        let key = tf_key(&self.resolve_key(pair), tf);
+        self.tf_caches.insert(key, TfCache::new(tf_ms, bars));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Context;
     use crate::Strategy;
     use rust_decimal_macros::dec;
 
@@ -1856,7 +2043,7 @@ mod tests {
     fn test_limit_buy_fills_when_low_crosses() {
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_grid".into(),
+            strategy_type: "shannon_rebalance".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
@@ -1884,7 +2071,7 @@ mod tests {
     fn test_limit_buy_rests_when_no_cross() {
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_grid".into(),
+            strategy_type: "shannon_rebalance".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
@@ -1911,7 +2098,7 @@ mod tests {
     fn test_balance_key_uses_base_asset_not_prefixed_pair() {
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_grid".into(),
+            strategy_type: "shannon_rebalance".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
@@ -1941,7 +2128,7 @@ mod tests {
         // 前视回归: on_tick 只能见当前 bar 的 open, 不能见未收盘的 close。
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_grid".into(),
+            strategy_type: "shannon_rebalance".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
@@ -1961,13 +2148,195 @@ mod tests {
         assert_eq!(ctx.price("ETH"), Some(dec!(100)));
     }
 
+    /// 023 测试用: 第 `minute` 分钟的 1m bar(价格随分钟单调上行, 幅度固定)。
+    fn bar_1m_023(minute: i64) -> Kline {
+        let ms = minute * 60_000;
+        let open = dec!(100) + Decimal::from(minute) / dec!(100);
+        Kline {
+            open_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap(),
+            open,
+            high: open + dec!(0.5),
+            low: open - dec!(0.5),
+            close: open,
+            volume: dec!(1),
+            close_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms + 59_999)
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_atr_tf_preloaded_visibility_and_cache() {
+        // 023: 高周期 (1h) ATR 通道 —— 装配层用全段(含预热)重采样预装; 可见桶判据 =
+        // `桶起点 + tf ≤ 本 tick 时间`(无前视, 与 now_utc/klines_for 同源); 同桶只算一次。
+        let mut params = std::collections::HashMap::new();
+        params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
+        // 2026-09-18: 高周期缓存键改为 `pair|tf`, 且 `atr_tf` 的序列由配置 `atr_interval`
+        // 决定 → 单测同样要声明它(与装配层一致)。
+        params.insert("atr_interval".to_string(), crate::config::ConfigValue::String("1h".into()));
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_etf_accum".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params,
+            risk: None,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let bars: Vec<Kline> = (0..20 * 60).map(bar_1m_023).collect();
+        let tf_ms = crate::tf_ms_of("1h").unwrap();
+        let mut ctx = BacktestContext::new(
+            config,
+            Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+        );
+        // 装配层语义: 用全段(20 桶, 含"未来")预装 —— 可见性必须由 tick 时间卡住。
+        ctx.set_tf_klines("ETHUSDT", "1h", crate::resample_complete(&bars, tf_ms));
+
+        // 推进到 14:00(即第 841 根) → 已收盘 1m bar = 0..839 分钟 → 完整桶 0..13 共 14 个
+        // < period+1 = 15 → None(不能猜)。注: 当前 bar 自己那一分钟尚未收盘, 故 14:00 只能
+        // 看到 0..13 桶 —— 这个 off-by-one 是本单测第一次跑红抓出来的。
+        for k in &bars[..=840] {
+            ctx.step_bar(k.clone());
+        }
+        assert_eq!(ctx.atr_tf("ETHUSDT", 14), None, "可见桶不足必须 None");
+
+        // 推进到 15:00(第 901 根) → 完整桶 0..14 共 15 个 → 有值, 且等于对"可见段"
+        // (前 900 根 = 0..899 分钟)独立重采样的直算结果。
+        for k in &bars[841..=900] {
+            ctx.step_bar(k.clone());
+        }
+        let got = ctx.atr_tf("ETHUSDT", 14).expect("15 桶应有 ATR");
+        let expected =
+            crate::indicators_api::atr(&crate::resample_complete(&bars[..900], tf_ms), 14)
+                .expect("独立重采样应可算 ATR");
+        assert!((got - expected).abs() < 1e-9, "got={got} expected={expected}");
+
+        // 同桶内重复调用不重算; 跨入下一桶重算一次。
+        let key = "bn:ETHUSDT|1h";
+        assert_eq!(ctx.tf_caches.get(key).unwrap().computes(), 1);
+        for _ in 0..3 {
+            let _ = ctx.atr_tf("ETHUSDT", 14);
+        }
+        assert_eq!(ctx.tf_caches.get(key).unwrap().computes(), 1, "同桶内只算一次");
+        for k in &bars[901..=960] {
+            ctx.step_bar(k.clone());
+        }
+        assert!(ctx.atr_tf("ETHUSDT", 14).is_some());
+        assert_eq!(ctx.tf_caches.get(key).unwrap().computes(), 2, "跨桶重算一次");
+    }
+
+    #[test]
+    #[ignore = "性能对照用例: cargo test -p ricow_strategy --lib klines_tail_perf -- --ignored --nocapture"]
+    fn test_klines_tail_perf_30k_bars() {
+        // 023 Task 4: 单标的路径 klines 尾窗化。3 万根历史下每 tick 克隆量必须 ≤ 100 根,
+        // 1 万次调用应在毫秒~百毫秒级(尾窗化前是每次克隆 3 万根 → 秒级)。
+        let mut params = std::collections::HashMap::new();
+        params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_etf_accum".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params,
+            risk: None,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let mut ctx = BacktestContext::new(
+            config,
+            Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+        );
+        for i in 0..30_000i64 {
+            ctx.step_bar(bar_1m_023(i));
+        }
+        // 末根仍是 current_bar(未收盘), 故 closed_klines = 29999 根 —— 引擎既有语义。
+        assert_eq!(ctx.closed_klines.len(), 29_999, "历史确实堆积到近 3 万根");
+        let t0 = std::time::Instant::now();
+        for _ in 0..10_000 {
+            let k = ctx.klines("ETHUSDT").expect("应有尾窗");
+            assert_eq!(k.len(), 100, "尾窗长度必须封顶 100");
+        }
+        let dt = t0.elapsed();
+        println!("1 万次 ctx.klines(3 万根历史) 耗时 {dt:?}");
+        // 对照: 旧行为 = 每 tick 克隆**全量**历史, 直接测同一份历史的 1 千次全量克隆。
+        let t1 = std::time::Instant::now();
+        for _ in 0..1_000 {
+            let all = ctx.closed_klines.clone();
+            assert!(all.len() > 29_000);
+        }
+        let old = t1.elapsed();
+        println!(
+            "对照(旧行为) 1 千次全量克隆 {old:?} → 等效 1 万次 ≈ {:.1}s(即尾窗化前 1m 回测不可行)",
+            old.as_secs_f64() * 10.0
+        );
+        assert!(dt.as_secs_f64() < 2.0, "尾窗克隆过慢: {dt:?} (尾窗化回归?)");
+    }
+
+    #[test]
+    fn test_cancel_pending_instruction_clears_resting_orders() {
+        // 023 Task 5: 撤单指令 (action = CancelPending) —— ①在风控之前短路(不被 size=0 拒掉);
+        // ②清掉本策略挂单; ③返 Cancelled 而不是 Rejected; ④不计 rejected_count。
+        let mut params = std::collections::HashMap::new();
+        params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_etf_accum".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params,
+            risk: None,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let mut ctx = BacktestContext::new(
+            config,
+            Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+        );
+        ctx.step_bar(bar_1m_023(0));
+        let px = ctx.price("ETHUSDT").expect("有价");
+        // 两张远离现价的限价单 → 不成交, 进挂单队列。
+        let buy = OrderRequest::new_limit("ETHUSDT", OrderSide::Buy, px * dec!(0.5), dec!(1));
+        let sell = OrderRequest::new_limit("ETHUSDT", OrderSide::Sell, px * dec!(2), dec!(1));
+        assert_eq!(ctx.place_order(buy).unwrap().status, OrderStatus::Open);
+        assert_eq!(ctx.place_order(sell).unwrap().status, OrderStatus::Open);
+        assert_eq!(ctx.pending_orders.len(), 2);
+
+        let cancel = OrderRequest {
+            action: OrderAction::CancelPending,
+            ..OrderRequest::new_limit("ETHUSDT", OrderSide::Buy, px, Decimal::ZERO)
+        };
+        let ack = ctx.place_order(cancel).unwrap();
+        assert_eq!(ack.status, OrderStatus::Cancelled, "撤单必须返 Cancelled");
+        assert!(ctx.pending_orders.is_empty(), "挂单应被清空");
+        assert_eq!(ctx.rejected_count, 0, "撤单不该计 rejected_count");
+
+        // 只撤指定 pair: 另一个 pair 的挂单不受影响。
+        let other = OrderRequest::new_limit("BNBUSDT", OrderSide::Buy, px * dec!(0.5), dec!(1));
+        assert_eq!(ctx.place_order(other).unwrap().status, OrderStatus::Open);
+        let cancel_eth = OrderRequest {
+            action: OrderAction::CancelPending,
+            ..OrderRequest::new_limit("ETHUSDT", OrderSide::Buy, px, Decimal::ZERO)
+        };
+        let _ = ctx.place_order(cancel_eth).unwrap();
+        assert_eq!(ctx.pending_orders.len(), 1, "非目标 pair 的挂单必须保留");
+    }
+
     #[test]
     fn test_realized_pnl_lifo_matching() {
         // 网格 LIFO 语义: 买 100/90/80 各 1 份, 卖 84 平 1 份 → 配对最近买入 80 → +4。
         // 均价口径 (84 - 90 = -6) 在深跌反弹场景失真, LIFO 是网格真实口径。
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_grid".into(),
+            strategy_type: "shannon_rebalance".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
@@ -1991,6 +2360,7 @@ mod tests {
             size: dec!(1),
             reduce_only: false,
             position_side: None,
+            action: OrderAction::Place,
         };
         let sell = |_p: i64| OrderRequest {
             client_order_id: "t".into(),
@@ -2001,6 +2371,7 @@ mod tests {
             size: dec!(1),
             reduce_only: false,
             position_side: None,
+            action: OrderAction::Place,
         };
         ctx.execute_fill("b1", &buy(0), dec!(100));
         ctx.execute_fill("b2", &buy(0), dec!(90));

@@ -20,10 +20,48 @@ pub fn run_backtest(
     klines: &[Kline],
     strategy: &mut dyn Strategy,
 ) -> BacktestReport {
+    // 023 高周期序列预装: 策略声明 `atr_interval`(网格间距) 与/或 `regime_interval`(趋势判据) 时,
+    // 用**全段** klines(含预热段)重采样一次装入 ctx —— 键 = `pair|tf`, 同一 pair 可同时装多套;
+    // 重采样在装配层只做一次, 引擎不逐 tick 重算。预热段(前 `warmup_bars` 根)只喂高周期指标,
+    // 不进 tick 循环与报告。
+    let tf_pair = config.get_str("pair").map(str::to_string);
+    let mut tf_labels: Vec<String> = Vec::new();
+    for key in ["atr_interval", "regime_interval"] {
+        if let Some(tf) = config.get_str(key) {
+            if !tf_labels.iter().any(|t| t == tf) {
+                tf_labels.push(tf.to_string());
+            }
+        }
+    }
+    let warmup = config.get_i64("warmup_bars").unwrap_or(0).max(0) as usize;
     let mut ctx = BacktestContext::new(config, initial_balance);
+    if let Some(pair) = tf_pair.as_deref() {
+        for tf in &tf_labels {
+            match ricow_strategy::tf_ms_of(tf) {
+                Some(tf_ms) => {
+                    let bars = ricow_strategy::resample_complete(klines, tf_ms);
+                    tracing::info!(
+                        target: "multiframe",
+                        pair = pair,
+                        tf = tf.as_str(),
+                        buckets = bars.len(),
+                        "高周期序列预装"
+                    );
+                    ctx.set_tf_klines(pair, tf, bars);
+                }
+                None => tracing::warn!(
+                    target: "multiframe",
+                    tf = tf.as_str(),
+                    "高周期标签不是受支持周期, 该通道关闭"
+                ),
+            }
+        }
+    }
     strategy.on_init(&mut ctx);
 
-    for k in klines {
+    // 预热段跳过(仅当预热段短于全段时; 数据不足时退化为整段回测, 不静默丢数据)。
+    let skip = if warmup > 0 && warmup < klines.len() { warmup } else { 0 };
+    for k in &klines[skip..] {
         ctx.step_bar(k.clone());
         let orders = strategy.on_tick(&mut ctx);
         for req in orders {
@@ -37,6 +75,10 @@ pub fn run_backtest(
 
     // 尾 bar 补结算 (013 FR-005): 最后一根 bar 的资金费/强平不由 push 路径触发
     ctx.finalize();
+    // 023: 回测收尾也跑一次 `on_stop` —— 策略的统计输出(跳过计数/重挂次数/末次方向)必须能在
+    // 回测里看到, 否则"跳过占比"这类验收数字无处可取。语义是"收尾回调", 与实盘停机清理
+    // 无关(回测没有交易所资源可清); 当前无内置策略在 on_stop 里下单。
+    strategy.on_stop(&mut ctx);
     ctx.report()
 }
 

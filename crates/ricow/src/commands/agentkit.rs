@@ -95,7 +95,7 @@ pub fn manual() -> String {
    报 `network error` 时先确认代理(或 `RICOW_BN_BASE_URL` 指向可用域名), 不要把失败当「策略有问题」。
    `RICOW_BN_BASE_URL`/`RICOW_FAPI_BASE_URL` 是**整体域名替换**(公开数据 + 签名下单都变); 公开数据镜像域(如 `data-api.binance.vision`)只能回测看行情, 下单会失败。
 9. **盈亏政策属于策略**(2026-09-15 起): 平台**不再**代做亏损熔断/峰值回撤; 策略用 `ctx:net_pnl()` / `ctx:equity()` 自己实现回撤与止损
-   (内置 `shannon_grid` 的 `dd_stop_pct` 是参考写法)。平台只保留工程护栏(下单频率上限)与你显式配置的静态限额。\n\
+   (内置 `shannon_rebalance` 的 `dd_stop_pct` 是参考写法)。平台只保留工程护栏(下单频率上限)与你显式配置的静态限额。\n\
 \n\
 ## 五、准则(与内置 AI 系统提示同源, 逐字)\n\
 {rules}\n\

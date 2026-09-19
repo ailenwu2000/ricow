@@ -136,5 +136,5 @@
 
 > 本轮同时按 §十一 记录了三处 CLI 残留(不改代码, 列入"下一步"第 3 项):
 > `backtest --market` 帮助文本含不可用的 `us`、`--dump-dir` 无消费方、`scan` 帮助文本仍写"P2 骨架"。
-> 真实命令冒烟已复核: `ricow --help` 命令集与 §五 一致; `ricow backtest --strategy shannon_grid --pair ETHUSDT --days 20` 真实数据跑通
+> 真实命令冒烟已复核: `ricow --help` 命令集与 §五 一致; `ricow backtest --strategy shannon_rebalance --pair ETHUSDT --days 20` 真实数据跑通
 > (480 根 1h K 线、8 笔成交、报告字段与 backtest.md §六 一致), 同时发现文档示例 `--pair ETH` 无效(交易所 `Invalid symbol`)已修正。

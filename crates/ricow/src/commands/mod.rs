@@ -27,6 +27,7 @@ use std::io::IsTerminal;
 
 use ricow_core::{CoreError, CoreResult};
 use ricow_strategy::{ConfigValue, StrategyConfig};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 /// 创建 Binance 现货交易所 (公开行情 API, 免 key)。
@@ -294,7 +295,8 @@ pub(crate) fn ensure_strategies_dir() -> CoreResult<std::path::PathBuf> {
 /// 内置脚本表 (策略样板 + 执行模式示例), 编译期嵌入, 路径在表内集中维护。
 /// 新增内置脚本只需加一行: 名字 → strategies/builtin/ 下路径。
 const BUILTIN_SCRIPTS: &[(&str, &str)] = &[
-    ("shannon_grid", include_str!("../../../../strategies/builtin/shannon_grid.lua")),
+    ("shannon_rebalance", include_str!("../../../../strategies/builtin/shannon_rebalance.lua")),
+    ("shannon_etf_accum", include_str!("../../../../strategies/builtin/shannon_etf_accum.lua")),
     ("dca", include_str!("../../../../strategies/builtin/executors/dca.lua")),
     ("twap", include_str!("../../../../strategies/builtin/executors/twap.lua")),
     ("vwap", include_str!("../../../../strategies/builtin/executors/vwap.lua")),
@@ -325,7 +327,7 @@ pub(crate) fn resolve_builtin_script(mut config: StrategyConfig) -> CoreResult<S
 ///
 /// lua 策略: `params.script_path` 存在则读文件内容填入 `script` (相对 dir 或绝对路径);
 /// 无 `script_path` 才用内嵌 `script` (旧 create_strategy 部署兼容); 两者皆无报错。
-/// 内置名 type (如 shannon_grid) 经 `resolve_builtin_script` Lua 化。
+/// 内置名 type (如 shannon_rebalance) 经 `resolve_builtin_script` Lua 化。
 pub(crate) fn load_strategy_toml(dir: &std::path::Path, name: &str) -> CoreResult<StrategyConfig> {
     let path = dir.join(format!("{name}.toml"));
     let content = std::fs::read_to_string(&path)
@@ -482,7 +484,7 @@ mod tests {
         params.insert("pair".into(), ConfigValue::String("ETH".into()));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_grid".into(),
+            strategy_type: "shannon_rebalance".into(),
             enabled: true,
             exchange: "binance".into(),
             params,
@@ -722,6 +724,40 @@ pub(crate) fn format_backtest_report(
             report.final_equity,
             report.equity_change_pct
         );
+    }
+    // ---- 023 T8: 基准对照 (以首次成交价、同时点、同本金起算) ----
+    match (report.benchmark_entry_price, report.benchmark_return_pct) {
+        (Some(px), Some(ret)) => {
+            line!(out, "  --- 基准对照 (从首次成交价 {px} 起算) ---");
+            match report.strategy_return_since_entry_pct {
+                Some(s) => line!(out, "  策略 (自建仓起算): {:+.2}%", s),
+                None => line!(out, "  策略 (自建仓起算): n/a"),
+            }
+            line!(
+                out,
+                "  满仓持有 (同本金全额买入): {:+.2}%  最大回撤 {}",
+                ret,
+                fmt_opt(
+                    report.benchmark_max_drawdown.map(|v| v.to_f64().unwrap_or(0.0) * 100.0),
+                    2
+                )
+            );
+            match (report.benchmark_exposure_return_pct, report.benchmark_exposure_max_drawdown) {
+                (Some(er), Some(ed)) => {
+                    line!(
+                        out,
+                        "  敞口对齐 (同 target_ratio 买入持有): {:+.2}%  最大回撤 {:.2}%",
+                        er,
+                        ed.to_f64().unwrap_or(0.0) * 100.0
+                    );
+                    if let Some(s) = report.strategy_return_since_entry_pct {
+                        line!(out, "  → 策略行为净贡献 (策略 − 敞口对齐): {:+.2} 个百分点", s - er);
+                    }
+                }
+                _ => line!(out, "  敞口对齐基准: n/a"),
+            }
+        }
+        _ => line!(out, "  基准对照: 窗口内无成交(未建仓), 无满仓持有基准可比"),
     }
     out
 }
