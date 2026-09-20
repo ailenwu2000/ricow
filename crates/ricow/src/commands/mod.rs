@@ -25,6 +25,7 @@ pub mod onboard;
 pub mod pairs;
 pub mod run;
 pub mod templates;
+pub mod web;
 
 use std::fmt::Write as _;
 use std::io::IsTerminal;

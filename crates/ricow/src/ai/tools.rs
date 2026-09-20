@@ -59,13 +59,16 @@ impl ToolCtx {
 }
 
 /// L0 只读工具白名单 —— 无副作用。
-pub const READ_ONLY_TOOLS: [&str; 12] = [
+pub const READ_ONLY_TOOLS: [&str; 15] = [
     "list_strategies",
     "strategy_read",
     "read_doc",
     "run_backtest",
     "instance_status",
     "fills",
+    "positions",
+    "open_orders",
+    "pnl",
     "logs_tail",
     "market_ticker",
     "market_orderbook",
@@ -493,6 +496,128 @@ fn tool_fills(_ctx: ToolCtx) -> DynamicTool {
     )
 }
 
+/// 三态提示 (026 D10 / FR-014 / FR-020): 把 [`Source`](crate::supervisor::Source) 如实翻成
+/// 模型读得到的一句话。
+///
+/// **不允许**把 `daemon_down` / `unreadable` 说成"没有" —— 前者是"只是最后一次快照, 此刻不可知",
+/// 后者是"读不到"。这正是「daemon 连不上被说成已经停着」那一类假阴性。
+fn render_source(source: &crate::supervisor::Source, body: Option<String>) -> String {
+    match (source, body) {
+        // 读不到(带实证原因)优先级最高, 且**先于** body 判断 —— 否则原因永远说不出口
+        (crate::supervisor::Source::Unreadable(msg), _) => format!(
+            "无法判断: 本地库读不到 ({msg})。这不是「没有」而是查不到 —— \
+请先确认数据库路径与文件权限, 不要据此断定没有持仓/挂单/成交。"
+        ),
+        // 没读到、也没说清是哪一步读不到: 仍只能如实说"无法判断", 不能说"没有"
+        (_, None) => "无法判断: 本地库没有返回数据。".to_string(),
+        (crate::supervisor::Source::Ok, Some(text)) => text,
+        (crate::supervisor::Source::DaemonDown, Some(text)) => format!(
+            "[注意] daemon 未运行 —— 以下只是**最后一次落库的快照**, 不代表此刻状态; \
+此刻是否有持仓/挂单**不可知**(要准确状态请先 `ricow daemon start`)。\n{text}"
+        ),
+    }
+}
+
+/// 只读工具的参数提取: `name`(可选, 空串视为未给) + `limit`(缺省 `default_limit`, 夹到 1..=200)。
+fn trade_args(
+    args: &serde_json::Value,
+    default_limit: i64,
+) -> Result<(Option<String>, i64), ToolExecutionError> {
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(n) = &name {
+        safe_strategy_name(n)?;
+    }
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(default_limit).clamp(1, 200);
+    Ok((name, limit))
+}
+
+fn tool_positions(ctx: ToolCtx) -> DynamicTool {
+    DynamicTool::new(
+        "positions",
+        "查看策略当前持仓(本地库落库记录; 每策略每交易对一行, 带模式与更新时间)。\
+可按策略名过滤, 省略为全部策略, 默认最多 200 行。只读。\
+daemon 未运行时返回的是最后一次快照, 会明确标注为「此刻不可知」, 不会说成「无持仓」。",
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "策略名(省略则全部策略)" },
+                "limit": { "type": "integer", "description": "最多行数, 默认 200, 上限 200" }
+            },
+            "additionalProperties": false
+        }),
+        move |_c, args| {
+            let ctx = ctx.clone();
+            Box::pin(async move {
+                let (name, limit) = trade_args(&args, 200)?;
+                let read = commands::instances::format_positions(&ctx.root, name.as_deref(), limit)
+                    .await
+                    .map_err(|e| e.to_string());
+                let (source, body) = crate::supervisor::classify(&ctx.root, read).await;
+                Ok(ToolOutput::text(clamp_output(redact(&render_source(&source, body)))))
+            })
+        },
+    )
+}
+
+fn tool_open_orders(ctx: ToolCtx) -> DynamicTool {
+    DynamicTool::new(
+        "open_orders",
+        "查看本地库里**未终结**的订单(状态 open / partially_filled), 带委托价、委托量、已成交量、模式。\
+可按策略名过滤, 省略为全部策略, 默认最近 20 条。只读。",
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "策略名(省略则全部策略)" },
+                "limit": { "type": "integer", "description": "最多条数, 默认 20, 上限 200" }
+            },
+            "additionalProperties": false
+        }),
+        move |_c, args| {
+            let ctx = ctx.clone();
+            Box::pin(async move {
+                let (name, limit) = trade_args(&args, 20)?;
+                let read =
+                    commands::instances::format_open_orders(&ctx.root, name.as_deref(), limit)
+                        .await
+                        .map_err(|e| e.to_string());
+                let (source, body) = crate::supervisor::classify(&ctx.root, read).await;
+                Ok(ToolOutput::text(clamp_output(redact(&render_source(&source, body)))))
+            })
+        },
+    )
+}
+
+fn tool_pnl(ctx: ToolCtx) -> DynamicTool {
+    DynamicTool::new(
+        "pnl",
+        "查看策略的 PnL 快照流水(每笔成交后一条: 已实现盈亏 / 手续费 / 净盈亏 / 成交笔数), \
+按时间倒序。可按策略名过滤, 省略为全部策略, 默认最近 20 条。只读。",
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "策略名(省略则全部策略)" },
+                "limit": { "type": "integer", "description": "最多条数, 默认 20, 上限 200" }
+            },
+            "additionalProperties": false
+        }),
+        move |_c, args| {
+            let ctx = ctx.clone();
+            Box::pin(async move {
+                let (name, limit) = trade_args(&args, 20)?;
+                let read = commands::instances::format_pnl(&ctx.root, name.as_deref(), limit)
+                    .await
+                    .map_err(|e| e.to_string());
+                let (source, body) = crate::supervisor::classify(&ctx.root, read).await;
+                Ok(ToolOutput::text(clamp_output(redact(&render_source(&source, body)))))
+            })
+        },
+    )
+}
+
 fn tool_logs_tail(ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "logs_tail",
@@ -520,9 +645,18 @@ fn tool_logs_tail(ctx: ToolCtx) -> DynamicTool {
                 let path = ledger::log_path(&ctx.root, &name);
                 let raw = match std::fs::read_to_string(&path) {
                     Ok(t) => t,
-                    Err(_) => {
+                    // 文件不存在 = 确实"从未启动过"; 只有这一种情况才允许说"无日志"
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         return Ok(ToolOutput::text(format!(
-                            "无日志文件: {} (该策略从未启动过?)",
+                            "无日志文件: {} (该策略从未启动过, 因此没有日志)",
+                            path.display()
+                        )))
+                    }
+                    // 其余 IO 错误 = "读不到" —— 不得说成"没有日志"(FR-020)
+                    Err(e) => {
+                        return Ok(ToolOutput::text(format!(
+                            "无法读取日志: {} ({e})。这不是「没有日志」而是读不到 —— \
+请检查该路径与文件权限, 不要据此断定策略没跑过。",
                             path.display()
                         )))
                     }
@@ -780,6 +914,10 @@ fn simple_words(lang: Lang) -> (&'static str, &'static str) {
 }
 
 /// 确认块尾部的"怎么确认"段(023 FR-022/FR-023): 只给**口语词**, 不教任何终端命令。
+///
+/// 必须写明「整行只有这两个字」: 匹配是**整行全等**(见 [`crate::ai::confirm::is_simple_confirmation`]),
+/// 「确认一下」「确认!」这类近似输入不会放行 —— 旧文案只说"回一句「确认」", 用户很容易带上标点
+/// 或语气词, 结果确认没生效又看不出为什么。
 fn confirmation_footer(lang: Lang) -> String {
     let (yes, no) = simple_words(lang);
     // 与 `ai::confirm::PENDING_TTL` 同源, 不手抄 15
@@ -787,13 +925,16 @@ fn confirmation_footer(lang: Lang) -> String {
     match lang {
         Lang::Zh => format!(
             "———— 怎么确认 ————\n\
-             回一句「{yes}」我就执行(也可以回「确定」或「同意」); 想作罢回「{no}」(或「取消」「放弃」)。\n\
+             单独回一行「{yes}」我就执行(「确定」「同意」也行); 想作罢回一行「{no}」(「取消」「放弃」也行)。\n\
+             这一行必须只有这两个字, 不能带标点或其它字 —— 像「{yes}一下」「{yes}!」都不算数。\n\
              确认词只能由你本人输入, 我不会代你回; 这条待确认 {ttl} 分钟内有效, 过后需要重新发起。"
         ),
         Lang::En => format!(
             "———— How to confirm ————\n\
-             Reply \"{yes}\" and I'll go ahead (\"confirmed\" works too); reply \"{no}\" to call it off \
-             (\"cancel\" / \"abort\" also work).\n\
+             Send a line that is just \"{yes}\" and I'll go ahead (\"confirmed\" works too); send a line \
+             that is just \"{no}\" to call it off (\"cancel\" / \"abort\" also work).\n\
+             That line must be only that one word — no punctuation, no extra words; \
+             \"{yes} please\" or \"{yes}!\" will not count.\n\
              Only you can send this — I won't do it for you. It stays open for {ttl} minutes; \
              after that you'll need to start over."
         ),
@@ -909,6 +1050,28 @@ fn tool_request_write_confirmation(ctx: ToolCtx) -> DynamicTool {
 struct PreparedAction {
     action: PendingAction,
     block: String,
+}
+
+/// 「启动」类动作的 daemon 前置校验: 构建确认块**之前**先探一次 daemon 是否可达。
+///
+/// 与 [`crate::supervisor::client::Client::connect`] 同一探活口径(读 `run/daemon.json` + TCP 连接),
+/// 但这里只探不用: 不可达就**不发确认块**, 免得用户白输一句确认词
+/// (与 `prepare_start_demo` 的「凭据前置」同一条原则)。探活失败分两种(从未启动 / daemon 已退出而
+/// 文件尚在), 文案不细分, 都如实给出恢复动作。
+async fn ensure_daemon_running(ctx: &ToolCtx) -> Result<(), ToolExecutionError> {
+    if crate::supervisor::client::Client::connect(&ctx.root).await.is_ok() {
+        return Ok(());
+    }
+    let msg = match ctx.lang {
+        Lang::Zh => "daemon 未运行(或已退出): 启停策略由 daemon 持有子进程, 没有它无法执行。\n\
+                     请先启动 daemon(终端执行 ricow daemon start)后再说一次 —— \
+                     本次**没有登记任何待确认动作, 你的确认词没有被消耗**。",
+        Lang::En => "The daemon is not running (or has exited): starting/stopping strategies is done by the \
+                     daemon, which holds the child processes, so this cannot run without it.\n\
+                     Start the daemon first (run ricow daemon start in a terminal) and ask again — \
+                     **no pending action was registered, so your confirmation word was not consumed**.",
+    };
+    Err(ToolExecutionError::other(msg))
 }
 
 /// deploy / deploy_replace 前提校验: preview 存在 / pending / 未过期 / 同名未部署。
@@ -1109,13 +1272,14 @@ fn overwrite_block(
     }
 }
 
-/// start_demo 前提校验: 已部署 / 当前未运行 / demo 凭据已配置(缺则如实点名)。
+/// start_demo 前提校验: **daemon 在跑** / 已部署 / 当前未运行 / demo 凭据已配置(缺则如实点名)。
 async fn prepare_start_demo(
     ctx: &ToolCtx,
     args: &Value,
 ) -> Result<PreparedAction, ToolExecutionError> {
     let name = arg_str(args, "name")?;
     safe_strategy_name(&name)?;
+    ensure_daemon_running(ctx).await?;
     if !list_toml_stems(&ctx.root.join("strategies")).iter().any(|n| n == &name) {
         return Err(ToolExecutionError::other(format!(
             "策略 {name} 尚未部署(strategies/ 下找不到 {name}.toml); 请先完成生成预览与落盘部署"
@@ -1339,7 +1503,7 @@ async fn prepare_delete_strategy(
     Ok(PreparedAction { action: PendingAction::new_delete_strategy(name), block })
 }
 
-/// start_dry_run 前提校验(023 FR-024): 已部署 + 当前未运行。
+/// start_dry_run 前提校验(023 FR-024): **daemon 在跑** + 已部署 + 当前未运行。
 ///
 /// 必须告知用户"首次启动会记下开始时间 = 实盘时长门禁开始计时"。
 async fn prepare_start_dry_run(
@@ -1348,6 +1512,7 @@ async fn prepare_start_dry_run(
 ) -> Result<PreparedAction, ToolExecutionError> {
     let name = arg_str(args, "name")?;
     safe_strategy_name(&name)?;
+    ensure_daemon_running(ctx).await?;
     if !list_toml_stems(&ctx.root.join("strategies")).iter().any(|n| n == &name) {
         return Err(ToolExecutionError::other(match ctx.lang {
             Lang::Zh => format!(
@@ -1398,7 +1563,7 @@ async fn prepare_start_dry_run(
     Ok(PreparedAction { action: PendingAction::new_start_dry_run(name), block })
 }
 
-/// restart_live 前提校验(023 FR-024): 已部署 + 正在以**实盘**运行。
+/// restart_live 前提校验(023 FR-024): daemon 在线 + 已部署 + 正在以**实盘**运行。
 ///
 /// 重启 = 停(不平仓) → 实盘预检(fail-closed) → 以实盘重启; 三判据一条不少。
 async fn prepare_restart_live(
@@ -1407,6 +1572,9 @@ async fn prepare_restart_live(
 ) -> Result<PreparedAction, ToolExecutionError> {
     let name = arg_str(args, "name")?;
     safe_strategy_name(&name)?;
+    // 同 prepare_stop: 重启 = 停机 + 启动, 两步都需要 daemon; daemon 不在时先如实说,
+    // 不拿台账里的 `running=false` 去下"不在实盘运行"的结论。
+    ensure_daemon_running(ctx).await?;
     if !list_toml_stems(&ctx.root.join("strategies")).iter().any(|n| n == &name) {
         return Err(ToolExecutionError::other(match ctx.lang {
             Lang::Zh => format!(
@@ -1512,8 +1680,8 @@ fn prepare_ack_risk(lang: Lang) -> Result<PreparedAction, ToolExecutionError> {
     Ok(PreparedAction { action: PendingAction::new_ack_risk(), block })
 }
 
-/// start_live 前提校验 (019 R4): 已部署 / 未运行 / TOML `live_enabled` / 002 时长门禁 /
-/// 018 风险确认 / 实盘凭据。
+/// start_live 前提校验 (019 R4): **daemon 在跑** / 已部署 / 未运行 / TOML `live_enabled` /
+/// 002 时长门禁 / 018 风险确认 / 实盘凭据。
 ///
 /// 这里**只做本地确定性检查**(不联网), 目的是"门禁不过就不发确认块", 避免用户白输一遍逐字短语。
 /// 权威判定仍在宿主执行时经 [`crate::commands::ctrl::live_preflight`] 原样再跑一遍三判据
@@ -1524,6 +1692,7 @@ async fn prepare_start_live(
 ) -> Result<PreparedAction, ToolExecutionError> {
     let name = arg_str(args, "name")?;
     safe_strategy_name(&name)?;
+    ensure_daemon_running(ctx).await?;
     if !list_toml_stems(&ctx.root.join("strategies")).iter().any(|n| n == &name) {
         return Err(ToolExecutionError::other(format!(
             "策略 {name} 尚未部署(strategies/ 下找不到 {name}.toml); 实盘只能启动已部署策略"
@@ -1657,7 +1826,7 @@ fn stop_mode_mismatch(kind: ActionKind, mode: &str, lang: Lang) -> Option<String
     })
 }
 
-/// stop_demo / stop_live / close_live 前提校验: 实例存在 / 正在运行 / 模式与动作匹配。
+/// stop_demo / stop_live / close_live 前提校验: daemon 在线 / 实例存在 / 正在运行 / 模式与动作匹配。
 ///
 /// 停机走的是与终端 `ricow stop` 完全相同的内核([`crate::commands::ctrl::stop_daemon`]),
 /// 区别只在"谁来敲这一下"。
@@ -1668,10 +1837,25 @@ async fn prepare_stop(
 ) -> Result<PreparedAction, ToolExecutionError> {
     let name = arg_str(args, "name")?;
     safe_strategy_name(&name)?;
+    // daemon 不在时必须先报"daemon 未运行": 此时 `views()` 只能退回台账, 其 `running=false`
+    // 不具权威性 —— 若拿它去说"策略未在运行", 就把"连不上 daemon"说成了"策略已经停着"
+    // (用户会以为停机已完成, 且不知道确认词有没有被消耗)。
+    ensure_daemon_running(ctx).await?;
     let views = crate::commands::instances::views(&ctx.root).await;
-    let Some(v) = views.iter().find(|v| v.name == name) else {
+    let found = views.iter().find(|v| v.name == name);
+    // 名字判定与终端 `ricow stop` 同源 (027 FR-013 / D8): `strategies/<name>.toml` ∪ 实例台账。
+    // 两侧若各用一套口径, 同一个名字会在终端与对话里得到相反结论 —— 而这里的判定直接决定
+    // 一次确认词要不要被消耗。判否时沿用 CLI 的同一文案基底, 只把"下一步"换成对话里的 instance_status。
+    if found.is_none() && !crate::commands::instances::strategy_name_exists(&ctx.root, &name) {
         return Err(ToolExecutionError::other(format!(
-            "没有名为 {name} 的实例(既未在运行, 也没有退出台账); 可用 instance_status 确认现状"
+            "{}; 可用 instance_status 确认现状",
+            crate::commands::instances::unknown_name_message(&name)
+        )));
+    }
+    let Some(v) = found else {
+        // 名字存在(有 TOML)但从未启动过(无运行台账): 归入"未在运行", 不是未知名字 (027 D8)
+        return Err(ToolExecutionError::other(format!(
+            "策略 {name} 当前未在运行(从未启动, 无运行台账); 无需停机"
         )));
     };
     if !v.running {
@@ -1864,6 +2048,9 @@ pub fn build(ctx: ToolCtx) -> Vec<DynamicTool> {
         tool_run_backtest(ctx.clone()),
         tool_instance_status(ctx.clone()),
         tool_fills(ctx.clone()),
+        tool_positions(ctx.clone()),
+        tool_open_orders(ctx.clone()),
+        tool_pnl(ctx.clone()),
         tool_logs_tail(ctx.clone()),
         tool_market_ticker(ctx.clone()),
         tool_preview_strategy(ctx.clone()),
@@ -1923,6 +2110,35 @@ mod tests {
         for name in forbidden {
             assert!(!is_allowed(name), "{name} 是写实/越权动作, 绝不能被放行");
         }
+    }
+
+    /// 确认块尾部文案必须**与匹配逻辑对得上**(023 FR-022): 它点名的词要真的放行, 它暗示
+    /// "随便回一句也行"的反例要真的不放行 —— 否则文案在骗用户。并写明"整行只有这两个字":
+    /// 用户实测踩过这个坑(回「确认一下」没生效, 又看不出为什么)。
+    #[test]
+    fn test_confirmation_footer_matches_the_matching_rule() {
+        use crate::ai::confirm::{is_simple_confirmation, is_simple_rejection};
+
+        for lang in [Lang::Zh, Lang::En] {
+            let footer = confirmation_footer(lang);
+            let (yes, no) = simple_words(lang);
+            // 文案点名的词必须真的能被匹配放行
+            assert!(is_simple_confirmation(yes, lang), "{lang:?} 点名了 {yes} 却不放行");
+            assert!(is_simple_rejection(no, lang), "{lang:?} 点名了 {no} 却不放行");
+            // 反向声明: 带上标点 / 语气词就不算(与整行全等的匹配一致)
+            for near_miss in [format!("{yes}!"), format!("{yes}一下"), format!("{yes} please")] {
+                assert!(
+                    !is_simple_confirmation(&near_miss, lang),
+                    "{lang:?}: {near_miss} 不该放行, 文案要求它不放行"
+                );
+            }
+            // TTL 与 `PENDING_TTL` 同源, 不手抄
+            let ttl = crate::ai::confirm::PENDING_TTL.as_secs() / 60;
+            assert!(footer.contains(&ttl.to_string()), "{lang:?} 未写出有效期: {footer}");
+        }
+        // 必须把"整行限制"说清楚 —— 这正是旧文案缺的一句
+        assert!(confirmation_footer(Lang::Zh).contains("必须只有这两个字"));
+        assert!(confirmation_footer(Lang::En).contains("only that one word"));
     }
 
     #[test]
@@ -2038,8 +2254,9 @@ mod tests {
 
     #[test]
     fn test_registry_count_and_write_tool_boundary() {
-        // 注册总数 = 12 只读 + 3 虚拟(023 D12); 对话内确认工具登记的是"请求确认"而非写实本身
-        assert_eq!(READ_ONLY_TOOLS.len(), 12);
+        // 注册总数 = 15 只读(026 新增 positions/open_orders/pnl) + 3 虚拟(023 D12);
+        // 对话内确认工具登记的是"请求确认"而非写实本身
+        assert_eq!(READ_ONLY_TOOLS.len(), 15);
         assert!(is_allowed("list_pairs"), "交易对视野是 L0 只读工具");
         assert!(is_allowed("list_templates") && is_allowed("read_template"), "模板面是 L0 只读");
         assert_eq!(VIRTUAL_TOOLS.len(), 3);
@@ -2095,6 +2312,48 @@ mod tests {
     /// 测试用 ToolCtx(中文界面 + 独立的菜单槽): 与 REPL 宿主的构造同口径。
     fn test_ctx(root: &Path, slot: crate::ai::confirm::PendingSlot) -> ToolCtx {
         ToolCtx::new(root.to_path_buf(), true, slot, crate::ai::menu::new_slot(), Lang::Zh)
+    }
+
+    /// 造一个"daemon 在线"的最小替身: 绑一个本地端口 + 落 `run/daemon.json`, 并对每条连接
+    /// 回一行 `{"ok":true,"data":{"instances":[]}}`(空实例视图)。
+    ///
+    /// `Client::connect` 的探活 = 读 `run/daemon.json` + TCP connect, 但 `instances::views()`
+    /// 还会真发一条 `List` 请求并**等响应** —— 所以替身必须应答, 只 bind 不 accept 会把调用方挂住。
+    /// 这里不校验 token: 用例关心的是"daemon 是否可达", 鉴权另有 server 侧单测覆盖。
+    async fn seed_fake_daemon(root: &Path) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        write_daemon_json(root, port);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (reader, mut writer) = sock.into_split();
+                    // 读掉请求行(内容不关心), 按协议回一行 JSON 即可
+                    let _ = BufReader::new(reader).lines().next_line().await;
+                    let resp = crate::supervisor::proto::Response::ok(Some(json!({
+                        "instances": []
+                    })));
+                    let _ =
+                        writer.write_all(crate::supervisor::proto::encode(&resp).as_bytes()).await;
+                    let _ = writer.flush().await;
+                });
+            }
+        });
+    }
+
+    /// 落一份指向**无人监听**端口的 `run/daemon.json`(= daemon 已退出但文件尚在)。
+    fn write_daemon_json(root: &Path, port: u16) {
+        let dir = root.join("run");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("daemon.json"),
+            format!(
+                "{{\"pid\": 1, \"port\": {port}, \"token\": \"test-token\", \
+                  \"started_at\": \"2026-01-01T00:00:00+00:00\"}}"
+            ),
+        )
+        .unwrap();
     }
 
     /// 在临时 root 里直接造一条 pending 的 strategy preview(不经网络/回测; 与正式载荷同构)。
@@ -2337,6 +2596,8 @@ mod tests {
         let root = r3_temp_root("demo");
         let slot = crate::ai::confirm::new_slot();
         let ctx = test_ctx(&root, slot);
+        // daemon 前置校验在最前, 故下游各项都得有个"在线 daemon"替身
+        seed_fake_daemon(&root).await;
 
         // ① 未部署: 先于凭据检查报错
         let err = prepare_start_demo(&ctx, &json!({ "name": "ghost99" })).await.unwrap_err();
@@ -2364,6 +2625,128 @@ mod tests {
         // 确认块必须点明 demo 端点与"真实下单"事实
         assert!(prepared.block.contains("demo-api.binance.com"), "{b}", b = prepared.block);
         assert!(prepared.block.contains("真实"), "{}", prepared.block);
+    }
+
+    /// daemon 前置校验: daemon 不在(或已退出)时, 三个"启动"动作都在**发确认块之前**被拒 ——
+    /// 既不登记 pending, 也不消耗用户的确认词(收口「确认后才发现 daemon 没起」)。
+    #[tokio::test]
+    async fn daemon_down_blocks_start_actions_before_confirmation() {
+        let root = r3_temp_root("daemon-down");
+        let name = "aidaemon01";
+        let id = seed_pending_preview(&root, name).await;
+        deploy_via_confirmation(&root, &id).await;
+
+        // ① 从未启动: 连 run/daemon.json 都没有
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = test_ctx(&root, slot.clone());
+        for (label, r) in [
+            ("start_dry_run", prepare_start_dry_run(&ctx, &json!({ "name": name })).await),
+            ("start_demo", prepare_start_demo(&ctx, &json!({ "name": name })).await),
+            ("start_live", prepare_start_live(&ctx, &json!({ "name": name })).await),
+        ] {
+            let msg = r
+                .err()
+                .unwrap_or_else(|| panic!("{label}: daemon 不在时必须拒绝, 不得发确认块"))
+                .to_string();
+            assert!(msg.contains("daemon 未运行"), "{label}: {msg}");
+            assert!(msg.contains("没有被消耗"), "{label}: 必须讲明确认词没被消耗: {msg}");
+        }
+        assert!(slot.lock().await.is_none(), "daemon 不在时不得登记任何待确认动作");
+
+        // ② daemon 已退出但文件尚在: 探活(TCP 连接)不通, 同样拒
+        let stale_port = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        write_daemon_json(&root, stale_port);
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = test_ctx(&root, slot.clone());
+        let err = prepare_start_dry_run(&ctx, &json!({ "name": name })).await.unwrap_err();
+        assert!(err.to_string().contains("daemon 未运行"), "{err}");
+        assert!(slot.lock().await.is_none(), "陈旧 daemon.json 下同样不得登记待确认动作");
+    }
+
+    /// 停机类动作的 daemon 前置校验: daemon 不在时**不得**拿台账里那句 `running=false` 说
+    /// "策略当前未在运行/无需停机" —— 那是把"连不上 daemon"说成了"已经停着"(用户会以为停机
+    /// 已完成)。必须如实报 daemon 未运行, 并讲明确认词没被消耗。
+    #[tokio::test]
+    async fn daemon_down_blocks_stop_actions_before_confirmation() {
+        let root = r3_temp_root("daemon-down-stop");
+        let name = "aidaemon02";
+        let id = seed_pending_preview(&root, name).await;
+        deploy_via_confirmation(&root, &id).await;
+        // 台账留一条"启动过、但无退出记录"的实例: daemon 不在时 views() 只能读成 running=false
+        let dir = root.join("run");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.json")),
+            format!(
+                "{{\"name\": \"{name}\", \"pid\": 4242, \
+                  \"started_at\": \"2026-01-01T00:00:00+00:00\", \"mode\": \"demo\"}}"
+            ),
+        )
+        .unwrap();
+
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = test_ctx(&root, slot.clone());
+        for (label, kind) in [
+            ("stop_dry_run", ActionKind::StopDryRun),
+            ("stop_demo", ActionKind::StopDemo),
+            ("stop_live", ActionKind::StopLive),
+            ("close_live", ActionKind::CloseLive),
+        ] {
+            let msg = prepare_stop(&ctx, kind, &json!({ "name": name }))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{label}: daemon 不在时必须拒绝, 不得发确认块"))
+                .to_string();
+            assert!(msg.contains("daemon 未运行"), "{label}: {msg}");
+            assert!(msg.contains("没有被消耗"), "{label}: 必须讲明确认词没被消耗: {msg}");
+            assert!(
+                !msg.contains("无需停机"),
+                "{label}: 不得把'连不上 daemon'说成'策略已经停着': {msg}"
+            );
+        }
+        assert!(slot.lock().await.is_none(), "daemon 不在时不得登记任何待确认动作");
+    }
+
+    /// 027 T016 / FR-013: 停机类动作的名字判定必须与终端 `ricow stop` **同源** ——
+    /// (a) 根本不存在 → 同一文案基底 + 对话里的下一步 `instance_status`;
+    /// (b) 已部署(有 TOML)但从未启动 → 归入"未在运行", 不得误报成未知名字。
+    #[tokio::test]
+    async fn stop_name_verdict_matches_cli() {
+        let root = r3_temp_root("stop-name");
+        seed_fake_daemon(&root).await;
+
+        // (a) 不存在: 台账与 TOML 都没有
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = test_ctx(&root, slot.clone());
+        let msg = prepare_stop(&ctx, ActionKind::StopDemo, &json!({ "name": "ghost-xyz" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("未找到策略或实例 ghost-xyz"), "{msg}");
+        assert!(msg.contains("strategies/ghost-xyz.toml 不存在"), "与 CLI 同一基底: {msg}");
+        assert!(msg.contains("instance_status"), "要给出对话里的下一步: {msg}");
+        assert!(!msg.contains("无需停机"), "未知名字不得说成'已经停着': {msg}");
+
+        // (b) 半存在: 只有 strategies/<n>.toml, 从未启动(无 run/<n>.json)
+        let name = "aidep027a";
+        std::fs::create_dir_all(root.join("strategies")).unwrap();
+        std::fs::write(
+            root.join("strategies").join(format!("{name}.toml")),
+            format!("name = \"{name}\"\n"),
+        )
+        .unwrap();
+        let msg = prepare_stop(&ctx, ActionKind::StopDemo, &json!({ "name": name }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("当前未在运行") && msg.contains("无需停机"), "{msg}");
+        assert!(!msg.contains("未找到策略或实例"), "半存在不是未知名字: {msg}");
+        assert!(slot.lock().await.is_none(), "两种拒绝都不得登记待确认动作");
     }
 
     #[tokio::test]
@@ -2438,6 +2821,8 @@ mod tests {
     async fn fr024_start_dry_run_prepare_mentions_gate_clock() {
         let root = r3_temp_root("fr024-dry");
         let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        // daemon 前置校验在最前, 故下游各项都得有个"在线 daemon"替身
+        seed_fake_daemon(&root).await;
         let err = prepare_start_dry_run(&ctx, &json!({ "name": "ghost024c" })).await.unwrap_err();
         assert!(err.to_string().contains("尚未部署"), "{err}");
 
@@ -2456,6 +2841,8 @@ mod tests {
     async fn fr024_restart_live_prepare_requires_running_live() {
         let root = r3_temp_root("fr024-rst");
         let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        // daemon 前置校验在最前, 故下游各项都得有个"在线 daemon"替身
+        seed_fake_daemon(&root).await;
         let err = prepare_restart_live(&ctx, &json!({ "name": "ghost024d" })).await.unwrap_err();
         assert!(err.to_string().contains("尚未部署"), "{err}");
 
@@ -2487,5 +2874,65 @@ mod tests {
         // 模型自造 kind / 空名: 构造不出菜单(工具据此报参数错误)
         assert!(crate::ai::menu::build("nope", "g", Lang::Zh).is_none());
         assert!(crate::ai::menu::build(crate::ai::menu::KIND_MANAGE, "   ", Lang::Zh).is_none());
+    }
+
+    // ── 026 T022: 只读工具无假阴性(SC-006 / FR-020 / R3)─────────────────────
+
+    /// 直调一个只读工具, 取回**模型真正读到的那段文本**。
+    ///
+    /// 走 Agent 同一条执行路径(`DynamicTool` → `ToolSet::execute`), 因此
+    /// `redact` / `clamp_output` / `render_source` 都在链上, 不是只测纯函数。
+    async fn call_tool_text(ctx: ToolCtx, name: &str, args: serde_json::Value) -> String {
+        let tool = build(ctx)
+            .into_iter()
+            .find(|t| t.name() == name)
+            .unwrap_or_else(|| panic!("{name} 应已注册"));
+        let set = rig::tool::ToolSet::from_dynamic_tools(vec![tool]);
+        let mut tctx = rig::tool::ToolContext::new();
+        let result = set.execute(name, args.to_string(), &mut tctx).await;
+        assert!(result.is_success(), "{name} 应执行成功: {result:?}");
+        result.output().as_text().unwrap_or_else(|| panic!("{name} 应返回纯文本")).to_string()
+    }
+
+    /// SC-006 / FR-020: "读不到"与"确实没有"必须分开说。
+    ///
+    /// 读库与探活都锚在 `ctx.root`(019 R4 口径), 所以整例只需临时 root, **不碰进程级
+    /// env** —— 否则会顺着并行测试泄漏给别人。
+    #[tokio::test]
+    async fn sc006_daemon_down_never_means_no_positions() {
+        let root = r3_temp_root("sc006-down");
+
+        // ① daemon 未运行(无 run/daemon.json) + 库读得到(空表): 必须标注"此刻不可知"
+        let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        let out = call_tool_text(ctx, "positions", json!({})).await;
+        let caveat =
+            out.find("daemon 未运行").unwrap_or_else(|| panic!("必须点明 daemon 未运行: {out}"));
+        assert!(out.contains("不可知"), "必须说此刻不可知, 而不是'没有持仓': {out}");
+        // 快照可以给(最后一次落库的内容), 但标注必须在它**之前** ——
+        // 第一眼就看见"无持仓"正是用户遇到的假阴性。
+        let snapshot = out.find("无持仓").unwrap_or_else(|| panic!("快照内容仍应给出: {out}"));
+        assert!(caveat < snapshot, "标注必须先于快照, 否则读成'确实没有': {out}");
+
+        // ② daemon 在线 + 库确实空: 这时才可以说"无持仓"
+        seed_fake_daemon(&root).await;
+        let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        let out = call_tool_text(ctx, "positions", json!({})).await;
+        assert_eq!(out.trim(), "无持仓", "确认真空时才说'无'");
+        assert!(!out.contains("不可知"), "库确实空时不该再挂'不可知': {out}");
+    }
+
+    /// SC-006 / FR-020 (第三态): 库**读不到** —— 必须说"无法判断", 且不得给出任何
+    /// "无持仓"结论(优先级高于 daemon 探活: 读不到时连快照都没有)。
+    #[tokio::test]
+    async fn sc006_unreadable_db_says_cannot_tell() {
+        let root = r3_temp_root("sc006-unreadable");
+        // 把一个**目录**放在库路径上 → 必然打开失败(= "读不到"的实证, 而不是"空")
+        std::fs::create_dir_all(root.join("ricow.db")).unwrap();
+
+        let ctx = test_ctx(&root, crate::ai::confirm::new_slot());
+        let out = call_tool_text(ctx, "positions", json!({})).await;
+        assert!(out.contains("无法判断"), "库读不到时必须说'无法判断': {out}");
+        assert!(out.contains("不是「没有」"), "必须点明这不是'没有': {out}");
+        assert!(!out.contains("无持仓"), "读不到时不得给出'无持仓'结论: {out}");
     }
 }

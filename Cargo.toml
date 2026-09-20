@@ -43,6 +43,8 @@ mlua = { version = "0.11", features = ["lua54", "send", "vendored"] }
 ta = "0.5"
 # 019: AI 助手 LLM 编排 (工具循环 / 审批门 / 流式 / 多供应商)。0.42 线锁定; 走 OpenAI 兼容通道
 rig = "0.42"
+# 025: Web UI 服务端 (内置 axum 只绑 127.0.0.1, 走 SSE 推流)
+axum = "0.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -16,9 +16,18 @@ install-updater = false
 # .zip) so they sit next to the binary: 启动-ricow-AI助手.cmd on Windows,
 # 启动-ricow-AI助手.sh on Linux/macOS, and 启动-ricow-AI助手.command for the macOS
 # double-click (Finder runs .command files; the shim just execs the .sh).
+# 025 FR-033 adds the Web UI twins of the same three files (启动-ricow-Web.*):
+# same lookup logic, launch line "ricow web".
 # They are **not** in the msi payload: the msi installs ricow.exe only (see
 # crates/ricow/wix/main.wxs and README "Windows — msi"). Paths are relative to
 # this file; no glob support.
-include = ["packaging/启动-ricow-AI助手.cmd", "packaging/启动-ricow-AI助手.sh", "packaging/启动-ricow-AI助手.command"]
+include = [
+    "packaging/启动-ricow-AI助手.cmd",
+    "packaging/启动-ricow-AI助手.sh",
+    "packaging/启动-ricow-AI助手.command",
+    "packaging/启动-ricow-Web.cmd",
+    "packaging/启动-ricow-Web.sh",
+    "packaging/启动-ricow-Web.command",
+]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

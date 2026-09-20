@@ -41,7 +41,7 @@ There is **no tap** yet, so `brew install ricow` does not work: the formula itse
 
 **Any platform — manual archive**
 
-Download the archive matching your platform, extract it, and run `./ricow` (Windows: `ricow.exe`). Every archive also carries a launcher for the built-in assistant: `启动-ricow-AI助手.cmd` on Windows (double-click it; it switches the console to UTF-8, which is what keeps the Chinese output readable), `启动-ricow-AI助手.sh` on Linux/macOS (`./启动-ricow-AI助手.sh`), and `启动-ricow-AI助手.command` on macOS, which is the same thing in a double-clickable wrapper. The launchers go through ricow's bare entry point, so the first run asks you *in the conversation* for the provider and the API key (typed silently, never echoed) and writes them into `ricow.toml` — no environment variable to set beforehand.
+Download the archive matching your platform, extract it, and run `./ricow` (Windows: `ricow.exe`). Every archive also carries a launcher for the built-in assistant: `启动-ricow-AI助手.cmd` on Windows (double-click it; it switches the console to UTF-8, which is what keeps the Chinese output readable), `启动-ricow-AI助手.sh` on Linux/macOS (`./启动-ricow-AI助手.sh`), and `启动-ricow-AI助手.command` on macOS, which is the same thing in a double-clickable wrapper. The launchers go through ricow's bare entry point, so the first run asks you *in the conversation* for the provider and the API key (typed silently, never echoed) and writes them into `ricow.toml` — no environment variable to set beforehand. For the web version, double-click `启动-ricow-Web.cmd` / `启动-ricow-Web.command` (`./启动-ricow-Web.sh` on Linux/macOS) instead: it starts the local web page and opens your browser — see §5.
 
 **Updates.** Nothing we ship contains an auto-updater: the app never rewrites itself from the network, so upgrading is your explicit action — download the newer archive/msi or re-run the installer. `winget` and `scoop` packages are **not** provided; use the PowerShell installer, the msi, or the `.zip`.
 
@@ -55,7 +55,7 @@ cargo build --release        # artifact: target/release/ricow
 
 Data directory (`$RICOW_ROOT`) resolution order: env var `RICOW_ROOT` → current directory (if it contains `ricow.db` / `strategies/`) → platform default data directory.
 
-From a checkout you start the assistant exactly the way the archives do: double-click `packaging\启动-ricow-AI助手.cmd` on Windows, or run `packaging/启动-ricow-AI助手.sh` on Linux/macOS. It looks for a binary next to itself first, then in `target/` (whichever of `release`/`debug` was built last), then on `PATH`; when it falls back to `target/` it also `cd`s to the repository root, so the assistant uses this checkout's `strategies/` instead of a second, empty data directory. `cargo ai` is a repository-local alias for `cargo run -p ricow -- ai` (`.cargo/config.toml`) — `ai` is a ricow subcommand, not a cargo one, so that spelling only exists inside this checkout.
+From a checkout you start the assistant exactly the way the archives do: double-click `packaging\启动-ricow-AI助手.cmd` on Windows, or run `packaging/启动-ricow-AI助手.sh` on Linux/macOS. It looks for a binary next to itself first, then in `target/` (whichever of `release`/`debug` was built last), then on `PATH`; when it falls back to `target/` it also `cd`s to the repository root, so the assistant uses this checkout's `strategies/` instead of a second, empty data directory. `cargo ai` is a repository-local alias for `cargo run -p ricow -- ai` (`.cargo/config.toml`) — `ai` is a ricow subcommand, not a cargo one, so that spelling only exists inside this checkout. The web version works the same way: double-click `packaging\启动-ricow-Web.cmd` / run `packaging/启动-ricow-Web.sh`, or simply `cargo run -p ricow -- web`.
 
 ### 2. Configuration: exactly one file
 
@@ -93,7 +93,13 @@ Inspect: `ricow list` / `ricow info <name>`; stop: `ricow stop <name> [--close-a
 
 `ricow ai "which strategies do I have deployed?"` — natural-language status queries, backtests, and authoritative doc lookups (all **read-only**). Running bare `ricow` opens the same assistant as an interactive session (`chat`); on a fresh install it walks you through first-run setup instead (Chinese or English). Anything that writes to disk or changes a running state — deploy, replace, edit params, delete, start/stop dry run, demo & live — is **not in the tool surface**: the model can only register a pending action, and the host runs it only after **you** confirm. In the chat session a single word in the session language is enough (`确认` / `confirm`); terminal commands keep the exact verbatim phrase (e.g. `确认实盘 <name>`). Slash commands: `/help` `/history` `/lang` `/keys` `/market` `/exit`. `--plain` disables streaming output.
 
-### 5. Use your own AI agent (optional)
+### 5. Web UI (optional)
+
+`ricow web` starts a built-in web page on your machine's `127.0.0.1` (random port), prints the URL with a one-time token, and tries to open your browser; from then on every conversation and action happens in the page. **The server is the very same session engine as the CLI**, just with a second front end: conversation history on the left (create / switch / delete; reopening an old session restores the last 20 turns as context), the transcript above and the input box below on the right; keywords / warnings / errors are coloured by severity, and quant terms open an explanation when clicked; the UI toggles between Chinese and English (sharing `ricow.toml`'s `[ui].lang` with the CLI). The token is random per launch and **never written to disk or logs**, and the page plus every API endpoint sit behind it (missing or wrong token always gets a `401` with no session content in the body) — in other words it is **local-only** and never exposed to your LAN or the internet.
+
+The archives ship double-click launchers too: `启动-ricow-Web.cmd` on Windows, `启动-ricow-Web.command` on macOS (or `./启动-ricow-Web.sh`), `./启动-ricow-Web.sh` on Linux — same lookup logic as the assistant launchers, with the start line swapped to `ricow web`.
+
+### 6. Use your own AI agent (optional)
 
 If you already use Claude Code / Codex / Cursor, you don't need the built-in assistant:
 
@@ -104,7 +110,7 @@ ricow agent-kit                  # just print the manual to the terminal
 
 It writes 4 files: `AGENTS.md` (operating manual) / `SKILL.md` (Agent Skills format) / `CLAUDE.md` (one-line import) / `lua-api.md` (strategy API reference). The manual shares its source with the built-in assistant's system prompt and states that write actions (deploy / go live / close positions / change params) **must be executed by you in a terminal**. Existing files with different content are **refused**, writing nothing, so your own `AGENTS.md` is never clobbered.
 
-### 6. Network and data sources
+### 7. Network and data sources
 
 ricow **always needs to reach Binance** (public market data + signed endpoints). From mainland China use a proxy/VPN — the CLI uses `reqwest` and honours the standard proxy env vars:
 
@@ -116,7 +122,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # your proxy (or HTTP_PROXY / ALL_PRO
 - `RICOW_BN_BASE_URL` / `RICOW_FAPI_BASE_URL` replace the whole REST domain (spot / futures): **public data and signed orders both move with it**; Binance's public-data-only domain `https://data-api.binance.vision` has **no trading endpoints** — fine for pure backtests, but orders will fail there.
 - demo (`--demo`) needs no domain config: the CLI uses `demo-api.binance.com` / `demo-fapi.binance.com`.
 
-### 7. Security notes
+### 8. Security notes
 
 - Credentials are stored in **plaintext** in `ricow.toml` (local-only, never committed; `0600` on Unix, current-user-only ACL on Windows): encryption only moves the problem ("where do you keep the decryption key?" — same file = security theatre, machine fingerprint = breaks on hardware change).
 - Never share your keys with anyone (including AI assistants) and never commit them.

@@ -19,3 +19,7 @@ ricow.db-wal
 libchat.rlib
 ai.toml
 ricow.toml
+logs/
+run/
+risk_ack.json
+.trae/

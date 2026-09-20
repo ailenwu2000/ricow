@@ -247,18 +247,36 @@ pub fn new_slot() -> PendingSlot {
     Arc::new(Mutex::new(None))
 }
 
-/// 输入是否命中该语言的**口语确认词**(023 FR-022)。
+/// 当前语言的**确认词全集**(与 [`is_simple_confirmation`] 同一份数据): 文案与"近似输入提示"
+/// 都从这一处取, 不各自手抄一遍词表。
 ///
 /// - `zh` → `确认` / `确定` / `同意`
-/// - `en` → `confirm` / `confirmed`(忽略大小写)
+/// - `en` → `confirm` / `confirmed`
+pub fn confirmation_words(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Zh => &["确认", "确定", "同意"],
+        Lang::En => &["confirm", "confirmed"],
+    }
+}
+
+/// 输入是否命中该语言的**口语确认词**(023 FR-022)。
 ///
 /// **只认当前语言**: `en` 模式下「确认」不放行, 反之亦然 —— 避免双语混杂削弱门槛。
 /// 刻意**不含** `y` / `yes` / `ok` / 空行(保留防肌肉记忆误触的最低门槛)。
 pub fn is_simple_confirmation(input: &str, lang: Lang) -> bool {
-    match lang {
-        Lang::Zh => is_one_of(input, &["确认", "确定", "同意"]),
-        Lang::En => is_one_of(input, &["confirm", "confirmed"]),
+    is_one_of(input, confirmation_words(lang))
+}
+
+/// 是否像"确认词但整行不全等"的**近似误输**(不参与匹配, 只用于补一句提示)。
+///
+/// 判定 = 不是合法确认词, 但以某个确认词开头。实测里用户最容易这么写: 回「确认一下」「确认!」
+/// 想确认却带了语气词/标点。匹配是整行全等 → 不放行且**不给任何反馈**, 最难查。
+pub fn looks_like_near_miss_confirmation(input: &str, lang: Lang) -> bool {
+    if is_simple_confirmation(input, lang) {
+        return false;
     }
+    let s = input.trim().to_lowercase();
+    !s.is_empty() && confirmation_words(lang).iter().any(|w| s.starts_with(&w.to_lowercase()))
 }
 
 /// 输入是否命中该语言的**口语拒绝词**(023 FR-022/FR-023)。
@@ -521,6 +539,32 @@ mod tests {
                     "'{bad}' 不得放行({lang:?})"
                 );
             }
+        }
+    }
+
+    /// 近似误输判定**只用于补提示, 不放宽匹配**: 合法确认词与无关输入都不该被判为"近似"。
+    #[test]
+    fn test_near_miss_detection_is_narrow() {
+        for near in ["确认一下", "确认！", "确认!", "确认确认", "同意吧", "确定吗"]
+        {
+            assert!(looks_like_near_miss_confirmation(near, Lang::Zh), "'{near}' 应判为近似");
+        }
+        for not_near in ["确认", "确定", "同意", "  确认  ", "帮我看看行情", "", "   ", "yes", "好"]
+        {
+            assert!(
+                !looks_like_near_miss_confirmation(not_near, Lang::Zh),
+                "'{not_near}' 不该判为近似"
+            );
+        }
+        // en: 忽略大小写; 合法词(含 CONFIRMED)不算近似; 另一种语言的词也不算
+        for near in ["confirm please", "Confirmed!", "confirmation"] {
+            assert!(looks_like_near_miss_confirmation(near, Lang::En), "'{near}' 应判为近似");
+        }
+        for not_near in ["confirm", "CONFIRMED", "   confirm  ", "确认一下", "ok"] {
+            assert!(
+                !looks_like_near_miss_confirmation(not_near, Lang::En),
+                "'{not_near}' 不该判为近似"
+            );
         }
     }
 

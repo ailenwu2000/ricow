@@ -43,7 +43,7 @@ brew install ./ricow.rb
 
 **任意平台 —— 手动解压**
 
-下载对应平台的压缩包, 解压后运行 `./ricow`(Windows 是 `ricow.exe`)。每个压缩包都带内置助手的启动脚本: Windows 双击 `启动-ricow-AI助手.cmd`(它替你切到 UTF-8 —— 中文不乱码就是靠这一步); Linux/macOS 执行 `./启动-ricow-AI助手.sh`; macOS 上也可直接双击 `启动-ricow-AI助手.command`, 它只是同一个脚本的双击外壳。启动脚本走的是 ricow 的裸入口, 所以第一次启动会在**对话里**问你要供应商与 API Key(输入不回显), 写进 `ricow.toml` 之后直接进入会话 —— 事先不需要设任何环境变量。
+下载对应平台的压缩包, 解压后运行 `./ricow`(Windows 是 `ricow.exe`)。每个压缩包都带内置助手的启动脚本: Windows 双击 `启动-ricow-AI助手.cmd`(它替你切到 UTF-8 —— 中文不乱码就是靠这一步); Linux/macOS 执行 `./启动-ricow-AI助手.sh`; macOS 上也可直接双击 `启动-ricow-AI助手.command`, 它只是同一个脚本的双击外壳。启动脚本走的是 ricow 的裸入口, 所以第一次启动会在**对话里**问你要供应商与 API Key(输入不回显), 写进 `ricow.toml` 之后直接进入会话 —— 事先不需要设任何环境变量。想用网页版就双击同目录的 `启动-ricow-Web.cmd` / `启动-ricow-Web.command`(Linux/macOS 执行 `./启动-ricow-Web.sh`): 它会起本机网页并自动打开浏览器, 见 §5。
 
 **升级方式。** 我们发布的产物里**不含自动更新组件**: 程序不会从网络改写自己, 升级是你主动的动作 —— 下载新的压缩包/msi, 或重跑安装脚本。**不提供** winget / scoop 包; 请用 PowerShell 脚本、msi 或 `.zip`。
 
@@ -57,7 +57,7 @@ cargo build --release        # 产物: target/release/ricow
 
 数据目录(`$RICOW_ROOT`)解析顺序: 环境变量 `RICOW_ROOT` → 当前目录(含 `ricow.db` / `strategies/`) → 平台默认数据目录。
 
-在源码检出里启动助手, 与压缩包里的方式完全一致: Windows 双击 `packaging\启动-ricow-AI助手.cmd`, Linux/macOS 执行 `packaging/启动-ricow-AI助手.sh`。它按「脚本同目录 → `target/`(release 与 debug 中较新的那个)→ `PATH`」查找二进制; 回落到 `target/` 时会先 `cd` 到仓库根, 因此助手用的是本检出里的 `strategies/`, 而不是另建一个空数据目录。`cargo ai` 是本仓库的 alias(见 `.cargo/config.toml`, 等价于 `cargo run -p ricow -- ai`)—— `ai` 是 ricow 的子命令而非 cargo 子命令, 所以这种写法只在检出内存在。
+在源码检出里启动助手, 与压缩包里的方式完全一致: Windows 双击 `packaging\启动-ricow-AI助手.cmd`, Linux/macOS 执行 `packaging/启动-ricow-AI助手.sh`。它按「脚本同目录 → `target/`(release 与 debug 中较新的那个)→ `PATH`」查找二进制; 回落到 `target/` 时会先 `cd` 到仓库根, 因此助手用的是本检出里的 `strategies/`, 而不是另建一个空数据目录。`cargo ai` 是本仓库的 alias(见 `.cargo/config.toml`, 等价于 `cargo run -p ricow -- ai`)—— `ai` 是 ricow 的子命令而非 cargo 子命令, 所以这种写法只在检出内存在。网页版同理: 双击 `packaging\启动-ricow-Web.cmd` / 执行 `packaging/启动-ricow-Web.sh`, 或直接 `cargo run -p ricow -- web`。
 
 ### 2. 配置: 只有一个文件
 
@@ -95,7 +95,13 @@ demo 与实盘都真实调用交易所接口, 差别只在域名(`demo-api`/`dem
 
 `ricow ai "我部署了哪些策略?"` —— 用自然语言查状态、跑回测、读权威文档(全是**只读**操作)。裸 `ricow` 进入同一助手的交互会话(`chat`); 全新安装时会先走首次配置向导(可选中文 / 英文)。落盘部署、覆盖、改参数、删除、启停试跑与测试网、实盘全部动作等**写操作不在工具面内**: 模型只能登记一条待确认动作, 由**你本人确认**后宿主进程才执行 —— 对话里回一个当前语言的口语词即可(`确认`/`确定`/`同意` · `confirm`/`confirmed`), 终端命令才需要逐字长短语(如 `确认实盘 <名字>`)。斜杠命令: `/help` `/history` `/lang` `/keys` `/market` `/exit`。`--plain` 关闭流式输出。
 
-### 5. 用你自己的 AI agent(可选)
+### 5. Web UI(可选)
+
+`ricow web` —— 在你本机 `127.0.0.1` 上起一个内置网页(端口随机), 启动时打印带一次性 token 的网址并尝试自动打开浏览器, 之后所有对话与操作都在页面里完成。**服务端与 CLI 是同一个会话引擎**, 只是换了前端: 左侧是会话历史(可新建/切换/删除, 重开旧会话带上最近 20 轮作上下文), 右侧上为对话输出区、下为输入区; 关键字/警告/出错按级别着色, 量化术语点击弹解释; 界面可中英切换(与 CLI 共用 `ricow.toml` 的 `[ui].lang`)。token 每次启动随机生成、**不落盘不进日志**, 页面与所有接口都在 token 门禁之后(无 token 或错 token 一律 `401` 且不回任何会话内容)—— 换句话说**它只给本机用**, 不暴露到局域网或公网。
+
+压缩包里也带双击入口: Windows 双击 `启动-ricow-Web.cmd`, macOS 双击 `启动-ricow-Web.command`(或执行 `./启动-ricow-Web.sh`), Linux 执行 `./启动-ricow-Web.sh` —— 与 AI 助手那三个脚本同一套查找逻辑, 只是把启动行换成 `ricow web`。
+
+### 6. 用你自己的 AI agent(可选)
 
 你已经在用 Claude Code / Codex / Cursor 的话, 不需要 ricow 内置助手:
 
@@ -108,7 +114,7 @@ ricow agent-kit                  # 只在终端打印手册
 手册内容与内置 AI 的系统提示**同源**, 命令速查由 CLI 自己生成; 它写明写实动作(落盘/实盘/平仓/改参)**只能由你本人在终端执行**。
 已存在且内容不同的文件会被**拒绝覆盖**(一个都不写), 免得冲掉你自己的 `AGENTS.md`。
 
-### 6. 网络与数据源
+### 7. 网络与数据源
 
 ricow **全程需要访问币安**(公开行情 + 签名端点)。国内网络通常不可直连, 请自备代理/VPN —— CLI 走 `reqwest`, 认标准代理环境变量:
 
@@ -121,7 +127,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_P
   币安官方公开数据域名 `https://data-api.binance.vision` **只提供公开数据**, 适合纯回测/看行情, **下单会失败** —— 别把它当常规解法。
 - demo(`--demo`)无需手配域名: CLI 自动走 `demo-api.binance.com` / `demo-fapi.binance.com`。
 
-### 7. 安全须知
+### 8. 安全须知
 
 - 凭据以**明文**存放于 `ricow.toml`(本机私有, 不入 git; Unix 为 `0600`, Windows 为仅当前用户的 ACL): 加密需要回答"解密密钥放哪"(绕回本文件=安全剧场, 绑机器指纹=换机即废)。
 - 不要把密钥发给任何人(包括 AI 助手), 不要提交进仓库。

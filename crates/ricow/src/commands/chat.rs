@@ -10,7 +10,7 @@ use std::io::{IsTerminal, Write};
 
 use ricow_core::CoreResult;
 
-use crate::ai::session::{self, ChatSession, Options, SessionSink, Step};
+use crate::ai::session::{self, ChatSession, Options, SessionSink, Severity, Step};
 use crate::i18n::{self, t};
 
 use super::config_file;
@@ -24,8 +24,21 @@ impl SessionSink for StdioSink {
         let _ = std::io::stdout().flush();
     }
 
-    fn line(&mut self, text: &str) {
+    /// 终端不分级(025 / FR-014): 级别供网页端着色, 这里逐字保持 019 的输出行为。
+    fn line_sev(&mut self, text: &str, _sev: Severity) {
         println!("{text}");
+    }
+
+    /// 读一行用户输入(阻塞读 stdin; EOF / 读失败 → `None`, REPL 据此退出)。
+    /// 与 019 的 `read_line` 逐字等价: 打印提示符 + flush, 返回去掉行尾换行的一行。
+    fn input_line(&mut self, prompt: &str) -> Option<String> {
+        print!("{prompt}");
+        let _ = std::io::stdout().flush();
+        let mut s = String::new();
+        match std::io::stdin().read_line(&mut s) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(s.trim_end().to_string()),
+        }
     }
 
     /// 密钥静默录入: `rpassword`(Windows/Linux/macOS 同一实现), 不回显、不进日志。
@@ -57,7 +70,14 @@ pub async fn run() -> CoreResult<()> {
 
     let mut session = ChatSession::open(
         root,
-        Options { plain: false, model: None, base_url: None, interactive: true },
+        Options {
+            plain: false,
+            model: None,
+            base_url: None,
+            interactive: true,
+            // 终端前端: 输入通道 = stdin 是 tty(与 019 的 tty 门禁等价)。
+            has_input_channel: std::io::stdin().is_terminal(),
+        },
     )
     .await?;
     let mut sink = StdioSink;
@@ -72,12 +92,13 @@ pub async fn run() -> CoreResult<()> {
 }
 
 /// 交互循环(裸入口与 `ricow ai` 共用): 读一行 → 交会话 → 判退出。
-pub async fn repl(session: &mut ChatSession, sink: &mut StdioSink) -> CoreResult<()> {
+/// 读行经 [`SessionSink::input_line`](025 / D7): 终端仍传 [`StdioSink`], 网页端传自己的 sink。
+pub async fn repl(session: &mut ChatSession, sink: &mut dyn SessionSink) -> CoreResult<()> {
     sink.line("");
     sink.line(&session::help_text(session.lang()));
     sink.line("");
     loop {
-        let Some(line) = read_line(t(session.lang(), "你 > ", "you > ")).await else {
+        let Some(line) = sink.input_line(t(session.lang(), "你 > ", "you > ")) else {
             sink.line("");
             sink.line(t(session.lang(), "输入结束, 退出。", "end of input, exiting."));
             break;
@@ -87,21 +108,4 @@ pub async fn repl(session: &mut ChatSession, sink: &mut StdioSink) -> CoreResult
         }
     }
     Ok(())
-}
-
-/// 读一行(阻塞读放 spawn_blocking, 不阻塞 tokio runtime; EOF/读失败 → None)。
-pub async fn read_line(prompt: &str) -> Option<String> {
-    print!("{prompt}");
-    let _ = std::io::stdout().flush();
-    tokio::task::spawn_blocking(|| {
-        let mut s = String::new();
-        match std::io::stdin().read_line(&mut s) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(s),
-        }
-    })
-    .await
-    .ok()
-    .flatten()
-    .map(|s| s.trim_end().to_string())
 }

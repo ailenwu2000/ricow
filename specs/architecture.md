@@ -32,7 +32,7 @@ ricow_core: Exchange trait ─► ricow_binance
 | ricow_binance | Binance 现货 REST/HMAC/WS (place_order/cancel/account) + USDT-M 公共数据源 (`FuturesDataClient`: fapi K 线 / 首档 MMR 表) + **fapi 签名交易客户端 `FuturesClient`** (下单/账户/持仓/杠杆/双向持仓, 2026-09-04 testnet 联调新增; 域名 RICOW_BN_BASE_URL / RICOW_FAPI_BASE_URL 可配 demo 测试网) |
 | ricow_strategy | 策略引擎: Lua 沙箱 / ctx 与 exec 注册 / 指标(ta)/ 回测 / PnL / SQLite / **固定 100 单·秒⁻¹ 护栏 `order_guard`(2026-09-16 019-R5: 原 `risk.rs` 四条静态限额与装配器已删除)** |
 | ricow_engine | headless 核心: Engine 命令分发 / backtest_runner(单标的 + 组合) / confirm(preview+approve)/ loader / market / **美股层 `nasdaq`(Nasdaq 日线客户端) / `us_tickers`(bStock↔美股映射, 70 只快照) / `market_class`(bStock 现货池识别, 通用能力保留: 当前无内置消费者)** |
-| ricow | 二进制 `ricow`: clap 子命令分发 + **AI 助手 `ai/`(019: 提示词、工具白名单 L0 只读 + L1 虚拟、审批门 `ToolGuard`; 会话缝 `ai/session.rs`(`ChatSession` + `SessionSink`, 零 stdio); R3/R4 对话内确认状态机 `ai/confirm.rs` 7 动作)** + 首次向导 `commands/onboard.rs` + 单一配置文件读写 `commands/config_file.rs`(含 `set_values` 白名单 9 键) |
+| ricow | 二进制 `ricow`: clap 子命令分发 + **AI 助手 `ai/`(019: 提示词、工具白名单 L0 只读 + L1 虚拟、审批门 `ToolGuard`; 会话缝 `ai/session.rs`(`ChatSession` + `SessionSink`, 零 stdio); R3/R4 对话内确认状态机 `ai/confirm.rs` 7 动作)** + **Web UI `web/`(025: axum + SSE 骨架 `mod.rs` / 第二个 sink `sink.rs` / 会话历史 `store.rs` / 术语表 `terms.rs`; 只绑 `127.0.0.1`, 一次性 token)** + 首次向导 `commands/onboard.rs` + 单一配置文件读写 `commands/config_file.rs`(含 `set_values` 白名单 9 键) |
 
 > **内置 AI 助手已落地**(019-ai-assistant): `ricow ai` 调用用户自配的 LLM(`ricow.toml [ai]` provider+api_key)。
 > **LLM 接口统一为 rig 0.42 的 OpenAI 兼容通道**(2026-09-16 重审): 7 个预设(deepseek 首项, 默认模型 `deepseek-flash`; 其余为 OpenAI 兼容的主流厂商)+ custom 自定义 base_url, 供应商差异只收敛在 `ai/provider.rs` 一个文件, 无需 Anthropic 等第二通道; 不支持工具调用的模型如实报错, 不自动降级。
@@ -84,12 +84,21 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 ## 五、CLI
 
-命令集(**以 `ricow --help` 实测为准**, 2026-09-16):
+命令集(**以 `ricow --help` 实测为准**, 2026-09-19):
 `start [--demo]` / `stop [--close-all]` / `restart` / `list` / `status [name]` / `info` / `fills` / `logs` / `run [--live|--demo]` /
 `backtest` / `ticker` / `orderbook` / `pairs [--market] [--all]` / `create` / `approve` / `deploy` / `db` / `daemon {start|stop|status|run}` /
-**`ai`**(019: 内置 AI 助手, 交互 / 单次 / `--plain`)/ **`agent-kit`**(019: `ricow agent-kit [--install [目录]]` 生成给外部 agent 的手册 —— AGENTS.md / SKILL.md / CLAUDE.md / lua-api.md, 与内置 AI 同源); `mcp` **不做**(2026-09-15 定案)。
+**`ai`**(019: 内置 AI 助手, 交互 / 单次 / `--plain`)/ **`agent-kit`**(019: `ricow agent-kit [--install [目录]]` 生成给外部 agent 的手册 —— AGENTS.md / SKILL.md / CLAUDE.md / lua-api.md, 与内置 AI 同源)/ **`web`**(025: Web UI 模式 —— 启动内置网页, 浏览器里完成全部对话与操作); `mcp` **不做**(2026-09-15 定案)。
 
 **裸入口(019 R4)**: `ricow` 不带子命令 → 直接进对话(`commands::chat`); 缺 AI key 且非本地 ollama 时先走首次向导(`commands::onboard`: 供应商选择 → 静默录入密钥 → 可选连通校验 → 外科式写回 `ricow.toml`), 币安凭据可跳过后用 `/keys demo` 补录。非 tty 一律双语报错 + 打印配置路径, exit 1(不静默降级)。原 clap 子命令全部保留, 变成同一 `ChatSession` 的薄壳。对话内斜杠命令: `/keys [ai|demo|live]` 查看/静默录入密钥(只回显尾 4 位)、`/market [bstock|all]` 查看/切换交易对视野(`[market] show_all_pairs`)。
+
+**Web UI 接入点(025)**: `ricow web` 在 `127.0.0.1` 上起内置 axum 服务(端口 0 = 系统分配空闲端口), 启动时生成**一次性 token**(`uuid` v4, 不落盘、不进日志, 进程退出即失效)并把带 token 的 URL 打印到终端, 同时尝试打开浏览器(Windows `cmd /C start` / macOS `open` / Linux `xdg-open`, 打开失败只 warn 不影响服务)。**全部端点(含静态资源)都在 token 中间件之后** —— 无 token 或错 token 一律 `401` 且**响应体不含任何会话内容**(D3 / FR-002); token 走 `Authorization: Bearer` 或 `?token=`, 页面里 `style.css` / `app.js` 的 URL 由服务端按本次请求的 token 回填。
+
+- **与 CLI 同源(D2 / D5)**: 每个会话线程里跑的仍是 `commands::chat::repl`, 助手增量仍由 `provider::ask_stream` 逐段产出 —— 本层只做 HTTP 骨架、线程登记与帧转发, 不复制任何会话/LLM 路径。
+- **会话缝的第二个 sink**: `web/sink.rs` 的 `WebSink` 实现 `SessionSink`, 把宿主输出转成 SSE 帧 `delta{text}` / `line{text,sev}` / `secret_prompt{prompt}` / `turn_end` / `closed`; `Severity` 由宿主显式标注, 前端只按级别着色(不做关键字猜测)。`turn_end` 是唯一轮次分界线, `closed` 在 sink 析构时必发。
+- **输入侧**: 浏览器一行 → `POST /api/sessions/{id}/input` → 入站通道 → REPL。密钥走**独立通道**(`InputChannel` 的 `awaiting_secret` 标志 + 专用队列), 绕开普通输入路由; 明文密钥**不落库、不进对话流、不写浏览器存储**。
+- **会话历史持久化**: `web/store.rs` 把流水落 `ricow.db`(左侧列表可新建/切换/删除), 重开旧会话按写入顺序整屏回放并恢复最近 **20 轮**作 AI 上下文, 单条超 2000 字截断并标注原文长度。
+- **前端三件套编译期嵌入**(D4): `index.html` / `app.js` / `style.css` 经 `include_str!` 进二进制, 运行期不依赖工作目录与外部 CDN; 界面**中英双语**, 语言与 CLI 共用 `ricow.toml [ui].lang`; 量化术语点击弹解释由 `web/terms.rs` 静态表提供。
+- **不做(D18)**: WebSocket / 公网访问 / 多用户 / 账号体系 / 图表可视化 / 会话导出 / 前端构建链。
 
 ~~`keyring`~~ / ~~`setup`~~ / ~~`credentials`~~ / ~~`config`~~ —— 2026-09-14 随单一配置文件方案**全部删除**(019 D31: 文件即界面)。
 
@@ -119,11 +128,21 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - `RICOW_ROOT`(数据目录, 决策 D4): 显式覆盖 > 当前目录已有 `ricow.db`/`strategies/` 时沿用现状 > 平台标准目录
   (Windows `%APPDATA%\ricow` / macOS `~/Library/Application Support/ricow` / Linux `$XDG_DATA_HOME|~/.local/share`+`/ricow`)
-- `RICOW_DB`(默认 `RICOW_ROOT/ricow.db`): SQLite — `klines`(交易所 K 线缓存)/ `fills`(成交, 含 `strategy_id`)/ `pnl_snapshots`(盈亏快照)/ `previews`(写操作预览)/ `us_klines`(美股 Nasdaq 日线, 信号轨与交易日历; **缓存不回源, 需手工增量补最后若干天**)
+- `RICOW_DB`(默认 `RICOW_ROOT/ricow.db`): SQLite, **共 10 张表** — `klines`(交易所 K 线缓存)/ `fills`(成交, 含 `strategy_id`)/ `pnl_snapshots`(盈亏快照)/ `previews`(写操作预览)/ `us_klines`(美股 Nasdaq 日线, 信号轨与交易日历; **缓存不回源, 需手工增量补最后若干天**)/ `funding_fees`(资金费流水, `tran_id` 幂等)/ `web_sessions` + `web_messages`(025: 会话与对话流水, 外键级联删除)/ `orders` + `positions`(026: 订单与当前持仓, 各带 `mode`)
 - `RICOW_ROOT/run/`: `daemon.json`(daemon pid/端口/token, Unix 0600 / Windows 仅当前用户 ACL)/ `<name>.json`(实例台账: pid/启动时间/模式/上次退出码与原因)
   > ⚠️ 多进程共享同一 `ricow.db` 的并发写依赖 WAL + `busy_timeout`(sqlx 默认 5s): 实测 3 进程 × 200 事务在 busy_timeout=5s 下全部成功, =0 时失败 83%(`.hermes`→已归档 `specs/research/process-model-probe-2026-09.md` §四)。**不得把 `busy_timeout` 设为 0, 也不得把数据目录放在网络盘/云同步盘**(SQLite WAL 明确不支持网络文件系统)
 - `RICOW_ROOT/logs/`: `<name>.log`(策略进程 stdout/stderr 追加日志; 启动时 >10MB 轮转 `.log.1`)与 `daemon.log`
 - 密钥: 单一明文配置文件 `ricow.toml`(Unix 0600 / Windows 仅当前用户 ACL; 019 D31/R4; OS Keyring 与 headless 加密文件 fallback 已于 2026-09-14 移除)
+
+### 交易可见性(026, 2026-09-19)
+
+- **落库时点**(引擎侧, 与下单/回报同一处调用): `orders` 在下单提交 / 订单状态变化 / 成交回报时 `upsert_order`; `positions` 在成交后刷新持仓时 `upsert_position`; `pnl_snapshots` 在**每笔成交后**写一条(`insert_pnl_snapshot`), 永久保留 —— 面板与 AI 都由这些行重建, 不做二次推断。
+- **数据源口径(D1)**: **本地库是唯一来源**。`/api/trades/*` 只读 `ricow.db`, 不直连交易所; 运行中与已停机一视同仁(停机后仍能看最后状态, 并标注"截至 <时间>")。
+- **三态如实(D10)**: 每条回复带 `source` ∈ `ok` / `daemon_down` / `unreadable`(读库报错优先, 其次 daemon 不在)。后两者**不把"连不上 daemon"说成"没有交易"**, `reason` 给出原因, 前端按三态分开呈现。
+- **mode 关联(D5)**: `fills` 表**不加列**(守住既有 8 张表结构零改动); 成交的 `mode`(∈ `dry_run` / `demo` / `live`)由 `fills.exchange_order_id` ⟕ `orders.exchange_order_id` 带出。026 之前的历史成交在 `orders` 里无对应行 → 面板与 AI **如实**显示"未知", 不猜。
+- **端点**(全部**只读**, 挂在同一道 token 中间件之内): `GET /api/trades/{fills,orders,positions,pnl}`(查询串 `strategy_id` / `limit`) + `GET /api/logs`(策略日志清单) / `GET /api/logs/{name}/tail?lines=`(尾读, 缺省 50、一律夹到 200) / `GET /api/logs/{name}/stream`(SSE, 服务端 500ms 尾读驱动, **独立通道**不共用会话 SSE)。日志**原样返回** —— 不解析、不改写、不做着色推断; 策略未运行也能看历史日志。
+- **前端只读(D17)**: 交易面板与日志面板只做展示 + 轮询/订阅, **没有任何直连交易所的写按钮** —— 撤单 / 平仓 / 停机仍走既有的对话确认。
+- **AI 回流(FR-019 ~ FR-024)**: 新增三个只读工具(`positions` / `open_orders` / `pnl`); 写操作执行结果注入对话 history, 使下一轮 LLM 看得到"刚才那步真做了什么"。
 
 ## 七、安全模型
 

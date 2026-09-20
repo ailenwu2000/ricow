@@ -4,6 +4,8 @@
 //! (`ChatSession` + [`crate::commands::chat::StdioSink`]), 与裸入口 `ricow` 完全同一条路径。
 //! 工具集(T009+)、确认块、斜杠命令的边界说明见 session 模块头。
 
+use std::io::IsTerminal;
+
 use clap::Args;
 use ricow_core::CoreResult;
 
@@ -38,7 +40,14 @@ pub async fn run(args: AiArgs) -> CoreResult<()> {
     let interactive = args.prompt.is_none();
     let mut session = ChatSession::open(
         root,
-        Options { plain: args.plain, model: args.model, base_url: args.base_url, interactive },
+        Options {
+            plain: args.plain,
+            model: args.model,
+            base_url: args.base_url,
+            interactive,
+            // 终端前端: 输入通道 = stdin 是 tty(与 019 的 tty 门禁等价)。
+            has_input_channel: std::io::stdin().is_terminal(),
+        },
     )
     .await?;
 

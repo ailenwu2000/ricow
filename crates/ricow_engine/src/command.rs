@@ -9,11 +9,12 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::{Stream, StreamExt};
 use ricow_core::{
-    Balance, CoreError, CoreResult, Exchange, Kline, Market, OrderSide, OrderStatus, Position,
-    UserEvent,
+    Balance, CoreError, CoreResult, Exchange, Kline, Market, OrderAck, OrderFill, OrderSide,
+    OrderStatus, OrderUpdate, Position, UserEvent,
 };
 use ricow_strategy::{
-    is_owned, ConfigValue, Context, Database, DryRunContext, LiveContext, Strategy, StrategyConfig,
+    is_owned, ConfigValue, Context, Database, DryRunContext, LiveContext, OrderRecord,
+    PnlSnapshotRecord, PnlTracker, PositionRecord, Strategy, StrategyConfig,
 };
 use rust_decimal::Decimal;
 
@@ -63,6 +64,37 @@ pub struct StopRequest {
 
 /// 停机信号接收端: `Some(req)` 表示请求停机。
 pub type StopSignal = tokio::sync::watch::Receiver<Option<StopRequest>>;
+
+/// 引擎运行模式 (026 FR-002/D5)。
+///
+/// `as_str()` 是**落库口径** (`orders.mode` / `positions.mode`): 稳定短串, 与界面文案解耦;
+/// `label()` 是**面向用户的标签**, 与 CLI `Mode::label()` 逐字一致 (日志文案零变化)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    DryRun,
+    Demo,
+    Live,
+}
+
+impl RunMode {
+    /// 落库口径。改动它会打断既有数据, 不得随文案调整。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunMode::DryRun => "dry_run",
+            RunMode::Demo => "demo",
+            RunMode::Live => "live",
+        }
+    }
+
+    /// 面向用户的模式名 (打印时必须如实, 绝不把 demo 说成实盘)。
+    pub fn label(self) -> &'static str {
+        match self {
+            RunMode::DryRun => "dry run",
+            RunMode::Demo => "测试网模拟盘(demo)",
+            RunMode::Live => "实盘",
+        }
+    }
+}
 
 /// 停机清理后吸干用户流的窗口: 兜底平仓的成交只能靠用户流送达 (少了它会漏记成交)。
 const CLEANUP_DRAIN_WINDOW: Duration = Duration::from_secs(5);
@@ -184,6 +216,7 @@ async fn drain_user_events(
     outcome: &mut RunOutcome,
     window: Duration,
     notifier: Option<&Notifier>,
+    mode: RunMode,
 ) -> u64 {
     let deadline = tokio::time::Instant::now() + window;
     let mut n = 0u64;
@@ -207,6 +240,8 @@ async fn drain_user_events(
                         tracing::error!(target: "engine", name = %strategy_name, "清理成交落库失败: {msg}");
                         outcome.last_error = Some(format!("清理成交落库失败: {msg}"));
                     }
+                    // 026 时点②: 订单状态 + PnL 快照 (与成交同批落库)
+                    persist_fill_facts(db, outcome, strategy_name, &fill, ctx.pnl(), mode).await;
                 }
                 if let Some(n) = notifier {
                     n.notify(NotifyEvent::Fill {
@@ -219,7 +254,15 @@ async fn drain_user_events(
                 }
                 strategy.on_fill(ctx, fill);
             }
-            Ok(Some(_)) => {}
+            // 026 时点③: 清理期间的订单状态变化 (撤单/过期) 同样要可见 —— 此前被静默丢弃
+            Ok(Some(UserEvent::Order(upd))) => {
+                if !is_owned(&upd.client_order_id, prefix) {
+                    continue;
+                }
+                if let Some(db) = db {
+                    persist_order_update(db, outcome, strategy_name, &upd, mode).await;
+                }
+            }
             Ok(None) => break,
             // 窗口用尽 (无更多事件)
             Err(_) => break,
@@ -240,7 +283,208 @@ fn describe_positions(positions: &[Position]) -> String {
         .join(" / ")
 }
 
+/// 时点① 下单回执 → 订单当前状态行 (026 FR-003/T010)。
+///
+/// `price` / `size` 就是**委托价 / 委托量**: 只有此刻拿得到, 之后各时点不得改写 (见 `upsert_order`)。
+fn order_row_of_ack(
+    strategy_name: &str,
+    ack: &OrderAck,
+    mode: RunMode,
+    now_ms: i64,
+) -> OrderRecord {
+    OrderRecord {
+        strategy_id: strategy_name.to_string(),
+        exchange_order_id: ack.exchange_order_id.clone(),
+        client_order_id: ack.client_order_id.clone(),
+        pair: ack.pair.clone(),
+        side: ack.side.to_string(),
+        price: ack.price,
+        size: ack.size,
+        filled_size: ack.filled_size,
+        status: ack.status.to_string(),
+        mode: mode.as_str().to_string(),
+        created_at: now_ms,
+        updated_at: now_ms,
+    }
+}
+
+/// 时点② 成交回报 → 订单当前状态行 (026 FR-003/T011)。
+///
+/// **如实登记的局限 (plan P2)**: 成交消息不带委托价/委托量, 交易所原文里的累计成交量与订单状态
+/// 在 `Exchange::subscribe_user_events` 就已被丢弃 —— 故此处按本次成交写 `filled`,
+/// `filled_size` = 本次成交量。市价单/全额成交正确; **分笔部分成交**会显示为已全成且累计量偏小,
+/// 随后由时点③ 的 `OrderUpdate`(带累计量) 纠正。行不存在时(早于本特性下的单 / 重启后)
+/// `price`/`size` 只能以成交价/成交量为近似。
+fn order_row_of_fill(
+    strategy_name: &str,
+    fill: &OrderFill,
+    mode: RunMode,
+    now_ms: i64,
+) -> OrderRecord {
+    OrderRecord {
+        strategy_id: strategy_name.to_string(),
+        exchange_order_id: fill.exchange_order_id.clone(),
+        client_order_id: fill.client_order_id.clone(),
+        pair: fill.pair.clone(),
+        side: fill.side.to_string(),
+        price: fill.fill_price,
+        size: fill.fill_size,
+        filled_size: fill.fill_size,
+        status: OrderStatus::Filled.to_string(),
+        mode: mode.as_str().to_string(),
+        created_at: now_ms,
+        updated_at: fill.timestamp.timestamp_millis(),
+    }
+}
+
+/// 时点③ 订单状态变化 → 订单当前状态行 (026 FR-003/T012): 撤单/过期/部分成交此前完全不可见。
+///
+/// `OrderUpdate` 不带方向/委托价/委托量: `side` 留空(空串 = 未知, upsert 不改写既有行的 `side`),
+/// `price` 取成交均价, `size` 取 `filled_size + remaining_size`(该单总量)。
+fn order_row_of_update(
+    strategy_name: &str,
+    upd: &OrderUpdate,
+    mode: RunMode,
+    now_ms: i64,
+) -> OrderRecord {
+    OrderRecord {
+        strategy_id: strategy_name.to_string(),
+        exchange_order_id: upd.exchange_order_id.clone(),
+        client_order_id: upd.client_order_id.clone(),
+        pair: upd.pair.clone(),
+        side: String::new(),
+        price: upd.avg_price.unwrap_or(Decimal::ZERO),
+        size: upd.filled_size + upd.remaining_size,
+        filled_size: upd.filled_size,
+        status: upd.status.to_string(),
+        mode: mode.as_str().to_string(),
+        created_at: now_ms,
+        updated_at: upd.timestamp.timestamp_millis(),
+    }
+}
+
+/// 时点④ 持仓事实 → 净持仓行 (026 FR-003/T013)。
+///
+/// 净仓 = 多 − 空 (与 `LiveContext::position` 同口径, 空为负); 多空并存时 `entry_price`
+/// 取首个非零成本价 (如实近似, 不虚构加权算法)。空切片 = 已平仓 → 落一行 `size = 0`。
+fn position_row_of(
+    strategy_name: &str,
+    pair: &str,
+    positions: &[Position],
+    mode: RunMode,
+    now_ms: i64,
+) -> PositionRecord {
+    let mut size = Decimal::ZERO;
+    let mut entry_price = Decimal::ZERO;
+    for p in positions {
+        match p.side {
+            OrderSide::Buy => size += p.size,
+            OrderSide::Sell => size -= p.size,
+        }
+        if entry_price.is_zero() && !p.entry_price.is_zero() {
+            entry_price = p.entry_price;
+        }
+    }
+    PositionRecord {
+        strategy_id: strategy_name.to_string(),
+        pair: pair.to_string(),
+        size,
+        entry_price,
+        mode: mode.as_str().to_string(),
+        updated_at: now_ms,
+    }
+}
+
+/// 时点① 落库 (T010)。错误处置与 `insert_fill` 逐字同构 (T014):
+/// 只计数 + error 日志 + 记 `last_error`, 不上抛、不阻塞、不改执行结果。
+async fn persist_order_ack(
+    db: &Database,
+    outcome: &mut RunOutcome,
+    strategy_name: &str,
+    ack: &OrderAck,
+    mode: RunMode,
+) {
+    let rec = order_row_of_ack(strategy_name, ack, mode, Utc::now().timestamp_millis());
+    if let Err(e) = db.upsert_order(&rec).await {
+        outcome.persist_errors += 1;
+        let msg = e.to_string();
+        tracing::error!(target: "engine", name = %strategy_name, "下单落库失败: {msg}");
+        outcome.last_error = Some(format!("下单落库失败: {msg}"));
+    }
+}
+
+/// 时点② 落库 (T011): 订单状态 + PnL 快照 (取 `ctx.pnl()`, **同源不重算**)。
+async fn persist_fill_facts(
+    db: &Database,
+    outcome: &mut RunOutcome,
+    strategy_name: &str,
+    fill: &OrderFill,
+    pnl: &PnlTracker,
+    mode: RunMode,
+) {
+    let now_ms = Utc::now().timestamp_millis();
+    let rec = order_row_of_fill(strategy_name, fill, mode, now_ms);
+    if let Err(e) = db.upsert_order(&rec).await {
+        outcome.persist_errors += 1;
+        let msg = e.to_string();
+        tracing::error!(target: "engine", name = %strategy_name, "成交订单落库失败: {msg}");
+        outcome.last_error = Some(format!("成交订单落库失败: {msg}"));
+    }
+    let snap = PnlSnapshotRecord {
+        strategy_id: strategy_name.to_string(),
+        timestamp: now_ms,
+        realized_pnl: pnl.realized_pnl(),
+        fees: pnl.total_fees(),
+        net_pnl: pnl.net_pnl(),
+        trade_count: pnl.trade_count() as i64,
+    };
+    if let Err(e) = db.insert_pnl_snapshot(&snap).await {
+        outcome.persist_errors += 1;
+        let msg = e.to_string();
+        tracing::error!(target: "engine", name = %strategy_name, "盈亏快照落库失败: {msg}");
+        outcome.last_error = Some(format!("盈亏快照落库失败: {msg}"));
+    }
+}
+
+/// 时点③ 落库 (T012)。
+async fn persist_order_update(
+    db: &Database,
+    outcome: &mut RunOutcome,
+    strategy_name: &str,
+    upd: &OrderUpdate,
+    mode: RunMode,
+) {
+    let rec = order_row_of_update(strategy_name, upd, mode, Utc::now().timestamp_millis());
+    if let Err(e) = db.upsert_order(&rec).await {
+        outcome.persist_errors += 1;
+        let msg = e.to_string();
+        tracing::error!(target: "engine", name = %strategy_name, "订单状态落库失败: {msg}");
+        outcome.last_error = Some(format!("订单状态落库失败: {msg}"));
+    }
+}
+
+/// 时点④ 落库 (T013)。
+async fn persist_position(
+    db: &Database,
+    outcome: &mut RunOutcome,
+    strategy_name: &str,
+    pair: &str,
+    positions: &[Position],
+    mode: RunMode,
+) {
+    let rec = position_row_of(strategy_name, pair, positions, mode, Utc::now().timestamp_millis());
+    if let Err(e) = db.upsert_position(&rec).await {
+        outcome.persist_errors += 1;
+        let msg = e.to_string();
+        tracing::error!(target: "engine", name = %strategy_name, "持仓落库失败: {msg}");
+        outcome.last_error = Some(format!("持仓落库失败: {msg}"));
+    }
+}
+
 /// 成交后刷新持仓: 合约走定向持仓覆盖; 现货走 base 可用余额包装 (空余额 = 清仓, 不留陈旧仓)。
+///
+/// 返回**已写入上下文的持仓事实**: `Some(空切片)` = 确实无仓(已平), `None` = 查询失败
+/// (无法确定, 调用方据此**不落库**, 绝不把"查不到"写成本地"已平仓")。
 #[allow(clippy::too_many_arguments)] // 参数聚合重构另行立项(021 只清存量告警, 不改结构)
 async fn refresh_positions(
     exchange: &Arc<dyn Exchange>,
@@ -251,15 +495,17 @@ async fn refresh_positions(
     strategy_name: &str,
     liq_warn_threshold: f64,
     notifier: Option<&Notifier>,
-) {
+) -> Option<Vec<Position>> {
     if is_futures {
         match exchange.get_positions_directional(pair).await {
             Ok(ps) => {
                 warn_near_liquidation(&ps, strategy_name, pair, liq_warn_threshold, notifier);
-                ctx.set_positions(pair, &ps)
+                ctx.set_positions(pair, &ps);
+                Some(ps)
             }
             Err(e) => {
-                tracing::warn!(target: "engine", pair = %pair, "成交后刷新合约持仓失败: {e}")
+                tracing::warn!(target: "engine", pair = %pair, "成交后刷新合约持仓失败: {e}");
+                None
             }
         }
     } else {
@@ -279,6 +525,7 @@ async fn refresh_positions(
                 ),
             }
         }
+        Some(positions)
     }
 }
 
@@ -318,7 +565,7 @@ pub struct RunOutcome {
     pub fills: u64,
     /// 被拒订单数 (风控拒单 / 交易所最小数量与名义不足的对齐拒单)
     pub rejections: u64,
-    /// 成交落库失败数
+    /// 落库失败数 (成交 / 订单 / 持仓 / 盈亏快照)
     pub persist_errors: u64,
     /// 最近一次错误信息 (如实反映, 不夸大)
     pub last_error: Option<String>,
@@ -349,6 +596,8 @@ impl Engine {
         let notifier = Notifier::from_config(&config);
         let pair = config.get_str("pair").unwrap_or("ETH").to_string();
         let strategy_name = config.name.clone();
+        // 026: dry run 的模式是固定的 —— 不对外暴露 mode 参数 (调用方无从传错), 落库口径由 RunMode 决定
+        let mode = RunMode::DryRun;
 
         let mut ctx = DryRunContext::new(exchange.clone(), config.clone(), initial_balance);
         let mut strategy = load_strategy(&config)?;
@@ -391,9 +640,14 @@ impl Engine {
                 match ctx.place_order(req) {
                     Ok(ack) if ack.status == OrderStatus::Rejected => {
                         // 风控/参数对齐拒单: 与"下单失败"区分计数 (策略循环不中断)
+                        // 026 时点① 只记**已提交**的单 —— 拒单未到交易所, 不产生订单行
                         outcome.rejections += 1;
                     }
-                    Ok(_) => {}
+                    Ok(ack) => {
+                        if let Some(db) = db {
+                            persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode).await;
+                        }
+                    }
                     Err(e) => {
                         // 下单失败如实记录并计数 (不再静默吞掉)
                         outcome.order_errors += 1;
@@ -414,6 +668,9 @@ impl Engine {
                         tracing::error!(target: "engine", name = %strategy_name, "成交落库失败: {msg}");
                         outcome.last_error = Some(format!("成交落库失败: {msg}"));
                     }
+                    // 026 时点②: 订单状态 + PnL 快照 (与成交同批落库)
+                    persist_fill_facts(db, &mut outcome, &strategy_name, &fill, ctx.pnl(), mode)
+                        .await;
                 }
                 if let Some(n) = &notifier {
                     n.notify(NotifyEvent::Fill {
@@ -425,6 +682,18 @@ impl Engine {
                     });
                 }
                 strategy.on_fill(&mut ctx, fill);
+                // 026 时点④: dry run 的持仓事实 = 虚拟持仓 (None = 已平 → 落 size 0)
+                if let Some(db) = db {
+                    persist_position(
+                        db,
+                        &mut outcome,
+                        &strategy_name,
+                        &pair,
+                        ctx.position(&pair).as_slice(),
+                        mode,
+                    )
+                    .await;
+                }
             }
         }
 
@@ -442,6 +711,8 @@ impl Engine {
                     tracing::error!(target: "engine", name = %strategy_name, "清理成交落库失败: {msg}");
                     outcome.last_error = Some(format!("清理成交落库失败: {msg}"));
                 }
+                // 026 时点②: 订单状态 + PnL 快照 (与成交同批落库)
+                persist_fill_facts(db, &mut outcome, &strategy_name, &fill, ctx.pnl(), mode).await;
             }
             if let Some(n) = &notifier {
                 n.notify(NotifyEvent::Fill {
@@ -453,6 +724,18 @@ impl Engine {
                 });
             }
             strategy.on_fill(&mut ctx, fill);
+            // 026 时点④: 清理后的持仓事实同样是虚拟持仓
+            if let Some(db) = db {
+                persist_position(
+                    db,
+                    &mut outcome,
+                    &strategy_name,
+                    &pair,
+                    ctx.position(&pair).as_slice(),
+                    mode,
+                )
+                .await;
+            }
         }
 
         if outcome.stop_reason.is_none() {
@@ -481,8 +764,8 @@ impl Engine {
         db: Option<&Database>,
         stop: Option<StopSignal>,
         close_all: bool,
-        // 运行模式标签(如 "实盘" / "测试网模拟盘(demo)"): 日志必须如实标注, 不得把 demo 说成实盘
-        mode_label: &str,
+        // 运行模式: 日志标签(`label()`)必须如实标注, 不得把 demo 说成实盘; 落库口径走 `as_str()`
+        mode: RunMode,
     ) -> CoreResult<RunOutcome> {
         let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();
         let strategy_name = config.name.clone();
@@ -519,6 +802,8 @@ impl Engine {
         // ② 账户快照 (真实事实源; 不生成虚拟资金)
         //    现货: base/quote 余额 + base 可用余额包装为多头持仓
         //    合约: 报价资产可用余额 + 定向持仓(one-way 一条 / hedge 两侧)
+        // 026: 结果台账提前声明 —— 账户快照 (时点④ 起始持仓) 也要落库
+        let mut outcome = RunOutcome::default();
         let base_asset = market.base_asset.clone();
         let quote_asset = market.quote_asset.clone();
         let quote_free = match exchange.get_balance(&quote_asset).await {
@@ -543,6 +828,11 @@ impl Engine {
                         notifier.as_ref(),
                     );
                     ctx.set_positions(&pair, &positions);
+                    // 026 时点④: 启动快照即当前真实持仓 (查询失败分支不落库 —— 不把"查不到"写成"已平仓")
+                    if let Some(db) = db {
+                        persist_position(db, &mut outcome, &strategy_name, &pair, &positions, mode)
+                            .await;
+                    }
                     desc
                 }
                 Err(e) => {
@@ -558,6 +848,11 @@ impl Engine {
                         spot_position_of(&exchange, &market, &pair).await.into_iter().collect();
                     let desc = describe_positions(&positions);
                     ctx.set_positions(&pair, &positions);
+                    // 026 时点④: 现货起始持仓 (空 = 确实无仓)
+                    if let Some(db) = db {
+                        persist_position(db, &mut outcome, &strategy_name, &pair, &positions, mode)
+                            .await;
+                    }
                     desc
                 }
                 Err(e) => {
@@ -607,9 +902,8 @@ impl Engine {
         }
         let mut funding_tick = tokio::time::interval(Duration::from_secs(FUNDING_POLL_SECS));
         funding_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(target: "engine", name = %strategy_name, pair = %pair, mode = %mode_label, "live run started");
+        tracing::info!(target: "engine", name = %strategy_name, pair = %pair, mode = %mode.label(), "live run started");
 
-        let mut outcome = RunOutcome::default();
         let mut stop_rx = stop;
         // 停机时是否平仓: 启动参数与停机指令二者取或 (`start --live` 后 `stop --close-all` 也生效)
         let mut close_all_at_stop = close_all;
@@ -676,6 +970,11 @@ impl Engine {
                                 outcome.rejections += 1;
                             }
                             Ok(ack) => {
+                                // 026 时点①: 委托价/委托量在提交时落库
+                                if let Some(db) = db {
+                                    persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode)
+                                        .await;
+                                }
                                 if ack.filled_size > Decimal::ZERO {
                                     any_filled = true;
                                 }
@@ -691,7 +990,7 @@ impl Engine {
                     // 下单即有成交 → 立刻对齐本地快照 (016 FR-B): 成交回写走用户流有延迟, 期间策略会按陈旧
                     // 持仓/现金重复下单 (demo 实测: 1.4s 内同价同量 3 次 → 2 成交 + 1 次资金不足报错)。
                     if any_filled {
-                        refresh_positions(
+                        let refreshed = refresh_positions(
                             &exchange,
                             &market,
                             &pair,
@@ -702,6 +1001,18 @@ impl Engine {
                             notifier.as_ref(),
                         )
                         .await;
+                        // 026 时点④: 只落**查到的事实**; None = 查询失败 → 不落库 (不拿陈旧快照冒充现状)
+                        if let (Some(db), Some(positions)) = (db, refreshed) {
+                            persist_position(
+                                db,
+                                &mut outcome,
+                                &strategy_name,
+                                &pair,
+                                &positions,
+                                mode,
+                            )
+                            .await;
+                        }
                     }
                 }
                 LiveEvent::User(None) => {
@@ -710,8 +1021,8 @@ impl Engine {
                     outcome.last_error = Some("用户数据流中断: 成交无法回灌, 已按异常停机".into());
                     break;
                 }
-                LiveEvent::User(Some(ev)) => {
-                    if let UserEvent::Fill(fill) = ev {
+                LiveEvent::User(Some(ev)) => match ev {
+                    UserEvent::Fill(fill) => {
                         if !is_owned(&fill.client_order_id, &prefix) {
                             // 用户流是全账户的: 非本实例成交不参与本策略 PnL/落库
                             tracing::debug!(
@@ -729,6 +1040,16 @@ impl Engine {
                                 tracing::error!(target: "engine", name = %strategy_name, "成交落库失败: {msg}");
                                 outcome.last_error = Some(format!("成交落库失败: {msg}"));
                             }
+                            // 026 时点②: 订单状态 + PnL 快照 (与成交同批落库)
+                            persist_fill_facts(
+                                db,
+                                &mut outcome,
+                                &strategy_name,
+                                &fill,
+                                ctx.pnl(),
+                                mode,
+                            )
+                            .await;
                         }
                         if let Some(n) = &notifier {
                             n.notify(NotifyEvent::Fill {
@@ -741,7 +1062,7 @@ impl Engine {
                         }
                         strategy.on_fill(&mut ctx, fill);
                         // 成交后刷新持仓 (P3: 不做高频轮询, 只在成交后刷; 覆盖式避免陈旧仓位)
-                        refresh_positions(
+                        let refreshed = refresh_positions(
                             &exchange,
                             &market,
                             &pair,
@@ -752,8 +1073,30 @@ impl Engine {
                             notifier.as_ref(),
                         )
                         .await;
+                        // 026 时点④: 只落**查到的事实**; None = 查询失败 → 不落库 (不拿陈旧快照冒充现状)
+                        if let (Some(db), Some(positions)) = (db, refreshed) {
+                            persist_position(
+                                db,
+                                &mut outcome,
+                                &strategy_name,
+                                &pair,
+                                &positions,
+                                mode,
+                            )
+                            .await;
+                        }
                     }
-                }
+                    // 026 时点③: 撤单/过期/部分成交此前完全不可见 —— 交易所回报的订单状态变化必须落到本地库
+                    UserEvent::Order(upd) => {
+                        if !is_owned(&upd.client_order_id, &prefix) {
+                            continue;
+                        }
+                        if let Some(db) = db {
+                            persist_order_update(db, &mut outcome, &strategy_name, &upd, mode)
+                                .await;
+                        }
+                    }
+                },
             }
         }
 
@@ -778,6 +1121,8 @@ impl Engine {
                     tracing::error!(target: "engine", name = %strategy_name, "清理成交落库失败: {msg}");
                     outcome.last_error = Some(format!("清理成交落库失败: {msg}"));
                 }
+                // 026 时点②: 订单状态 + PnL 快照 (与成交同批落库)
+                persist_fill_facts(db, &mut outcome, &strategy_name, &fill, ctx.pnl(), mode).await;
             }
             strategy.on_fill(&mut ctx, fill);
         }
@@ -838,7 +1183,17 @@ impl Engine {
             for req in plan.closes {
                 let cid = req.client_order_id.clone();
                 match exchange.place_order(req).await {
-                    Ok(ack) => cleanup.close_done.push(ack.client_order_id),
+                    Ok(ack) => {
+                        // 026 时点①: 兜底平仓同样是本实例的委托, 委托价/委托量在提交时落库。
+                        // 拒单 ack 的 `exchange_order_id` 是空串(会撞主键) → 与非拒单同判据, 拒单不产生订单行
+                        if ack.status != OrderStatus::Rejected {
+                            if let Some(db) = db {
+                                persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode)
+                                    .await;
+                            }
+                        }
+                        cleanup.close_done.push(ack.client_order_id)
+                    }
                     Err(e) => cleanup.close_error.push((cid, e.to_string())),
                 }
             }
@@ -889,6 +1244,7 @@ impl Engine {
                     &mut outcome,
                     CLEANUP_DRAIN_WINDOW,
                     notifier.as_ref(),
+                    mode,
                 )
                 .await;
                 tracing::info!(
@@ -1069,5 +1425,199 @@ mod tests {
         // 空策略无成交无费用 → 期末现金 = 建仓后现金 = 传入本金。
         assert_eq!(report.final_cash, dec!(50_000), "期末现金须等于传入本金");
         assert_eq!(report.base_cash, dec!(50_000), "现金变化基准须等于传入本金");
+    }
+
+    // ---- 026 T015: 四时点落库 ----
+
+    fn sample_ack() -> OrderAck {
+        OrderAck {
+            exchange_order_id: "EX-1".into(),
+            client_order_id: "cid-1".into(),
+            pair: "ETHUSDT".into(),
+            side: OrderSide::Buy,
+            price: dec!(3000),
+            size: dec!(2),
+            filled_size: Decimal::ZERO,
+            status: OrderStatus::Open,
+        }
+    }
+
+    fn sample_fill() -> OrderFill {
+        OrderFill {
+            trade_id: Some("T-1".into()),
+            exchange_order_id: "EX-1".into(),
+            client_order_id: "cid-1".into(),
+            pair: "ETHUSDT".into(),
+            side: OrderSide::Buy,
+            fill_price: dec!(3001),
+            fill_size: dec!(2),
+            fee: dec!(1.2),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn sample_update() -> OrderUpdate {
+        OrderUpdate {
+            exchange_order_id: "EX-1".into(),
+            client_order_id: "cid-1".into(),
+            pair: "ETHUSDT".into(),
+            status: OrderStatus::Cancelled,
+            filled_size: dec!(0.5),
+            remaining_size: dec!(1.5),
+            avg_price: Some(dec!(3000)),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn sample_position(side: OrderSide, size: Decimal, entry: Decimal) -> Position {
+        Position {
+            pair: "ETHUSDT".into(),
+            side,
+            size,
+            entry_price: entry,
+            mark_price: entry,
+            liquidation_price: None,
+            unrealized_pnl: Decimal::ZERO,
+            leverage: None,
+        }
+    }
+
+    /// 落库口径 = 稳定短串 (`dry_run`/`demo`/`live`), 与界面文案解耦 (D5)。
+    #[test]
+    fn test_run_mode_db_tag_is_stable_short_string() {
+        assert_eq!(RunMode::DryRun.as_str(), "dry_run");
+        assert_eq!(RunMode::Demo.as_str(), "demo");
+        assert_eq!(RunMode::Live.as_str(), "live");
+        // 面向用户的标签必须如实 (绝不把 demo 说成实盘)
+        assert_eq!(RunMode::Demo.label(), "测试网模拟盘(demo)");
+        assert_eq!(RunMode::Live.label(), "实盘");
+    }
+
+    /// 时点①: 委托价/委托量只有此刻拿得到 → 原样落库 (P1)。
+    #[test]
+    fn test_order_row_of_ack_keeps_delegation_price_and_size() {
+        let rec = order_row_of_ack("s1", &sample_ack(), RunMode::Demo, 1000);
+        assert_eq!(rec.price, dec!(3000), "price = 委托价");
+        assert_eq!(rec.size, dec!(2), "size = 委托量");
+        assert_eq!(rec.side, "buy");
+        assert_eq!(rec.status, "open");
+        assert_eq!(rec.mode, "demo");
+    }
+
+    /// 时点③: `OrderUpdate` 不带方向/委托价 → `side` 留空(未知), `size` = 该单总量 (P2)。
+    #[test]
+    fn test_order_row_of_update_is_honest_about_missing_fields() {
+        let rec = order_row_of_update("s1", &sample_update(), RunMode::Live, 1000);
+        assert_eq!(rec.side, "", "方向未知 → 留空, 不编造");
+        assert_eq!(rec.size, dec!(2), "size = filled + remaining");
+        assert_eq!(rec.filled_size, dec!(0.5));
+        assert_eq!(rec.status, "cancelled");
+        assert_eq!(rec.mode, "live");
+    }
+
+    /// 时点④: 净仓 = 多 − 空; 空切片 = 已平 → 落 `size = 0` (不是不落库)。
+    #[test]
+    fn test_position_row_of_nets_long_minus_short() {
+        let long = sample_position(OrderSide::Buy, dec!(3), dec!(3000));
+        let short = sample_position(OrderSide::Sell, dec!(1), dec!(3100));
+        let rec = position_row_of("s1", "ETHUSDT", &[long, short], RunMode::Demo, 1000);
+        assert_eq!(rec.size, dec!(2), "净仓 = 多头 3 − 空头 1");
+        assert_eq!(rec.entry_price, dec!(3000), "取首个非零成本价");
+        assert_eq!(rec.mode, "demo");
+
+        let flat = position_row_of("s1", "ETHUSDT", &[], RunMode::Demo, 1000);
+        assert_eq!(flat.size, Decimal::ZERO, "空切片 = 确实无仓");
+    }
+
+    /// SC-003 / FR-008: 四时点依次落库后, 四表行数与数值符合预期; PnL 快照与 `PnlTracker` 同源。
+    #[tokio::test]
+    async fn test_four_timepoints_persist_expected_rows() {
+        let db = Database::open_in_memory().await.expect("open in-memory db");
+        let mut outcome = RunOutcome::default();
+        let name = "t-026";
+
+        // 时点① 下单提交
+        persist_order_ack(&db, &mut outcome, name, &sample_ack(), RunMode::Demo).await;
+        let orders = db.recent_orders(Some(name), 10).await.unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].price, dec!(3000));
+        assert_eq!(orders[0].size, dec!(2));
+        assert_eq!(orders[0].status, "open");
+
+        // 时点② 成交回报 (与既有 insert_fill 同批)
+        let fill = sample_fill();
+        db.insert_fill(name, &fill).await.unwrap();
+        let mut pnl = PnlTracker::default();
+        pnl.record_fill(&fill);
+        pnl.record_pnl(dec!(12.5));
+        persist_fill_facts(&db, &mut outcome, name, &fill, &pnl, RunMode::Demo).await;
+
+        assert_eq!(db.fill_count().await.unwrap(), 1, "fills 表一行");
+        let orders = db.recent_orders(Some(name), 10).await.unwrap();
+        assert_eq!(orders.len(), 1, "一单一行 (upsert, 不是流水)");
+        assert_eq!(orders[0].status, "filled");
+        assert_eq!(orders[0].filled_size, dec!(2));
+
+        let snaps = db.recent_pnl_snapshots(Some(name), 10).await.unwrap();
+        assert_eq!(snaps.len(), 1, "每笔成交后一条快照");
+        assert_eq!(snaps[0].realized_pnl, pnl.realized_pnl(), "与 PnlTracker 同源 (不重算)");
+        assert_eq!(snaps[0].fees, pnl.total_fees());
+        assert_eq!(snaps[0].net_pnl, pnl.net_pnl());
+        assert_eq!(snaps[0].trade_count, pnl.trade_count() as i64);
+
+        let with_mode = db.recent_fills_with_mode(Some(name), 10).await.unwrap();
+        assert_eq!(with_mode.len(), 1);
+        assert_eq!(with_mode[0].mode.as_deref(), Some("demo"), "mode 由 orders 关联带出");
+
+        // 时点③ 订单状态变化 (撤单): 覆盖状态, 但**不得**抹掉已知方向, 也不得改写委托价
+        persist_order_update(&db, &mut outcome, name, &sample_update(), RunMode::Demo).await;
+        let orders = db.recent_orders(Some(name), 10).await.unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].status, "cancelled");
+        assert_eq!(orders[0].filled_size, dec!(0.5));
+        assert_eq!(orders[0].side, "buy", "未知方向不得覆盖已知方向");
+        assert_eq!(orders[0].price, dec!(3000), "委托价一经提交不再改写 (P1)");
+
+        // 时点④ 持仓变化
+        let long = sample_position(OrderSide::Buy, dec!(2), dec!(3000));
+        persist_position(&db, &mut outcome, name, "ETHUSDT", &[long], RunMode::Demo).await;
+        let positions = db.current_positions(Some(name)).await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].size, dec!(2));
+        assert_eq!(positions[0].entry_price, dec!(3000));
+
+        // 平仓 → size 归零 (仍是"已平", 不是"不落库")
+        persist_position(&db, &mut outcome, name, "ETHUSDT", &[], RunMode::Demo).await;
+        let positions = db.current_positions(Some(name)).await.unwrap();
+        assert_eq!(positions.len(), 1, "已平也留一行 (面板才能显示「已无持仓」)");
+        assert_eq!(positions[0].size, Decimal::ZERO);
+
+        assert_eq!(outcome.persist_errors, 0, "正常路径无落库失败");
+    }
+
+    /// FR-004 / SC-003: 写库失败**只**计数 + 记 `last_error`, 不上抛、不改变交易台账。
+    #[tokio::test]
+    async fn test_persist_failures_do_not_break_trading_flow() {
+        let db = Database::open_in_memory().await.expect("open in-memory db");
+        db.close_pool_for_test().await; // 注入写库错误: 连接池已关闭 → 任何读写都失败
+
+        // 主流程台账: 写库失败不得改动它
+        let mut outcome = RunOutcome { fills: 3, ..RunOutcome::default() };
+        let pnl = PnlTracker::default();
+
+        persist_order_ack(&db, &mut outcome, "t-026", &sample_ack(), RunMode::Demo).await;
+        persist_fill_facts(&db, &mut outcome, "t-026", &sample_fill(), &pnl, RunMode::Demo).await;
+        persist_order_update(&db, &mut outcome, "t-026", &sample_update(), RunMode::Demo).await;
+        persist_position(&db, &mut outcome, "t-026", "ETHUSDT", &[], RunMode::Demo).await;
+
+        // 时点① 1 次 + 时点② 订单与快照各 1 次 + 时点③ 1 次 + 时点④ 1 次
+        assert_eq!(outcome.persist_errors, 5, "每次失败都如实计数");
+        assert!(
+            outcome.last_error.as_deref().unwrap_or("").contains("落库失败"),
+            "如实记录最近一次失败原因: {:?}",
+            outcome.last_error
+        );
+        assert_eq!(outcome.fills, 3, "写库失败不改变交易台账");
+        assert_eq!(outcome.order_errors, 0, "落库失败不计入下单失败");
     }
 }

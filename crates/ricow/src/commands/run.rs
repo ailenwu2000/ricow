@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use clap::Args;
 use ricow_core::{Balance, CoreError, CoreResult, Exchange};
-use ricow_engine::{live_gate, Engine, LiveGate, RunOutcome, StopReason, StopRequest};
+use ricow_engine::{live_gate, Engine, LiveGate, RunMode, RunOutcome, StopReason, StopRequest};
 use ricow_strategy::{ConfigValue, Database, StrategyConfig};
 use rust_decimal::Decimal;
 
@@ -128,7 +128,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                 Some(&db),
                 Some(stop_rx),
                 args.close_all,
-                crate::commands::Mode::Demo.label(),
+                RunMode::Demo,
             )
             .await?;
         print_run_outcome(&outcome);
@@ -178,7 +178,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                     Some(&db),
                     Some(stop_rx),
                     args.close_all,
-                    crate::commands::Mode::Live.label(),
+                    RunMode::Live,
                 )
                 .await?;
             print_run_outcome(&outcome);

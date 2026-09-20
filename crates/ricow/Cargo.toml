@@ -38,6 +38,8 @@ toml = "0.8"
 futures.workspace = true
 rig.workspace = true
 rustls.workspace = true
+# 025: Web UI 服务端骨架
+axum.workspace = true
 # 019: 向导/`/keys` 静默录入密钥 (Win=winapi Console, Unix=termios); 纯 Rust 无异步依赖
 rpassword = "7"
 

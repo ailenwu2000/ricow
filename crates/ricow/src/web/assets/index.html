@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ricow</title>
+    <!--
+      两个静态资源的 URL 里带 `__RICOW_TOKEN__`: 服务端只在 `/` 处替换它(见 `web/mod.rs`)。
+      浏览器取 `<link>` / `<script>` 无法自定请求头, 只能把 token 挂在查询串上 —— 与
+      `EventSource` 走同一条取值路径(`token_of`)。
+    -->
+    <link rel="stylesheet" href="/style.css?token=__RICOW_TOKEN__" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- 左: 竖长会话列表 (FR-006 / FR-007) -->
+      <aside id="sidebar">
+        <div class="side-head">
+          <span class="brand">Ricow</span>
+          <button id="new-session" class="icon-btn" type="button" data-zh="+ 新建" data-en="+ New">
+            + 新建
+          </button>
+        </div>
+        <ul id="session-list"></ul>
+      </aside>
+
+      <main id="main">
+        <header id="topbar">
+          <span id="session-title" class="muted"></span>
+          <span id="status" class="status"></span>
+          <button id="lang-toggle" class="ghost-btn" type="button" title="中 / EN">EN</button>
+        </header>
+
+        <!-- 右上: 对话流 (用户与 AI 输出; 按级别着色 FR-013 / FR-023) -->
+        <section id="stream" aria-live="polite"></section>
+
+        <!-- 右下: 输入区 (FR-009 / FR-010) -->
+        <form id="composer" autocomplete="off">
+          <div
+            class="hint"
+            data-zh="Enter 发送 · Shift+Enter 换行"
+            data-en="Enter to send · Shift+Enter for newline"
+          >
+            Enter 发送 · Shift+Enter 换行
+          </div>
+          <div class="composer-row">
+            <textarea
+              id="input"
+              rows="1"
+              spellcheck="false"
+              data-zh-placeholder="说点什么…(也可以用 /help /history /lang /keys 这类命令)"
+              data-en-placeholder="Say something… (slash commands like /help /history /lang /keys work too)"
+            ></textarea>
+            <button id="send" type="submit" data-zh="发送" data-en="Send">发送</button>
+          </div>
+        </form>
+      </main>
+
+      <!--
+        右: 交易面板 + 日志面板 (026 FR-012 / FR-016)。两块都**只读** —— 页面上没有任何直连交易所的
+        按钮; 撤单 / 平仓 / 停机仍然只能走上面的对话确认流程(D17 / FR-013)。
+      -->
+      <aside id="panels">
+        <section class="panel" id="trade-panel">
+          <div class="panel-head">
+            <span data-zh="交易" data-en="Trades">交易</span>
+            <span id="trade-asof" class="muted small"></span>
+          </div>
+          <!-- 三态如实呈现(FR-014): "确实没有" / "daemon 未运行, 此刻状态不可知" / "读不到(原因)"。 -->
+          <div id="trade-source" class="source"></div>
+          <div class="block">
+            <div class="block-title" data-zh="当前持仓" data-en="Positions">当前持仓</div>
+            <div id="positions" class="rows"></div>
+          </div>
+          <div class="block">
+            <div class="block-title" data-zh="挂单" data-en="Open orders">挂单</div>
+            <div id="orders" class="rows"></div>
+          </div>
+          <div class="block">
+            <div class="block-title" data-zh="最近成交" data-en="Recent fills">最近成交</div>
+            <div id="fills" class="rows"></div>
+          </div>
+        </section>
+
+        <section class="panel" id="log-panel">
+          <div class="panel-head">
+            <span data-zh="策略日志" data-en="Strategy log">策略日志</span>
+            <select id="log-name" class="mini-select"></select>
+          </div>
+          <div id="log-lines" class="log-lines"></div>
+        </section>
+      </aside>
+    </div>
+    <script src="/app.js?token=__RICOW_TOKEN__"></script>
+  </body>
+</html>

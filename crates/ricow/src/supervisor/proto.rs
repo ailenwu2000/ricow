@@ -104,6 +104,11 @@ pub struct StopReport {
     pub waited_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// 名字存在但**本来就没在跑** (027): true 表示本次未下发停机指令、未等待退出、未写台账、
+    /// 未触发清理 —— 回执只陈述"该策略未在运行 (无需停止)"这一个事实。
+    /// `#[serde(default)]` 使缺该字段的旧 daemon 回执解析为 false (行为与今日一致, 不产生反向假阴性)。
+    #[serde(default)]
+    pub already_stopped: bool,
 }
 
 pub fn encode<T: Serialize>(value: &T) -> String {
@@ -232,9 +237,32 @@ mod tests {
             exit_code: Some(0),
             waited_ms: 123,
             note: Some("策略未实现清理 (on_stop): 如仍有挂单/持仓请手工处理".into()),
+            already_stopped: false,
         };
         let s = encode(&r);
         let back: StopReport = serde_json::from_str(&s).unwrap();
         assert_eq!(back, r);
+    }
+
+    /// 027: `already_stopped` 必须**始终序列化**(新 daemon → 新 CLI 靠它区分"本来就没在跑"
+    /// 与"刚刚停掉"); 而**缺该字段的旧格式**必须解析为 false(新 CLI 遇旧 daemon 行为不变)。
+    #[test]
+    fn stop_report_already_stopped_defaults_false_for_old_format() {
+        let new = StopReport {
+            name: "grid".into(),
+            exited: true,
+            graceful: true,
+            exit_code: None,
+            waited_ms: 0,
+            note: Some("该策略未在运行 (无需停止)".into()),
+            already_stopped: true,
+        };
+        let s = encode(&new);
+        assert!(s.contains("\"already_stopped\":true"), "新字段必须出现在线上格式里: {s}");
+
+        let old =
+            "{\"name\":\"grid\",\"exited\":true,\"graceful\":true,\"waited_ms\":0,\"note\":\"n\"}";
+        let back: StopReport = serde_json::from_str(old).expect("旧格式应可解析");
+        assert!(!back.already_stopped, "缺字段必须缺省为 false");
     }
 }

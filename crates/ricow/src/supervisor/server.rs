@@ -209,10 +209,21 @@ impl Server {
         Response::ok(Some(serde_json::json!(view)))
     }
 
-    /// 停止策略: 下发停机指令 → 等待退出 → 台账记录; 超时如实报告且不静默强杀。
+    /// 停止策略: 名字判定 → 下发停机指令 → 等待退出 → 台账记录; 超时如实报告且不静默强杀。
     async fn stop(&self, name: &str, close_all: bool) -> Response {
         let handle = { self.state().children.remove(name) };
         let Some(mut handle) = handle else {
+            // 句柄缺失分两种: 名字根本不存在, 或存在但本来就没在跑 (027)。
+            // 停机是风险动作: 名字不存在时一律如实失败 —— 绝不回"已停止"这种可能被误读为
+            // "风险已解除"的假成功回执。判定与文案取自唯一来源 `commands::instances`。
+            let root = self.state().root.clone();
+            if !crate::commands::instances::strategy_name_exists(&root, name) {
+                return Response::err(format!(
+                    "{}; 可用 ricow list 查看现有实例",
+                    crate::commands::instances::unknown_name_message(name)
+                ));
+            }
+            // 存在但没在跑: 只陈述"未在运行 (无需停止)"这一个事实 (未下发指令 / 未等待 / 未写台账 / 未清理)
             let report = StopReport {
                 name: name.to_string(),
                 exited: true,
@@ -220,6 +231,7 @@ impl Server {
                 exit_code: None,
                 waited_ms: 0,
                 note: Some("该策略未在运行 (无需停止)".into()),
+                already_stopped: true,
             };
             return Response::ok(Some(serde_json::json!(report)));
         };
@@ -241,12 +253,7 @@ impl Server {
 
         let root = self.state().root.clone();
         // 清理提示: 依据运行模式与脚本是否定义 on_stop 如实说明 (不臆测清理结果)
-        let cleanup_hint = cleanup_hint_for(
-            &root,
-            name,
-            matches!(handle.view.mode.as_deref(), Some("live") | Some("demo")),
-            close_all,
-        );
+        let cleanup_hint = cleanup_hint_for(&root, name, handle.view.mode.as_deref(), close_all);
         let note = if !exited {
             Some(format!(
                 "停机超时 ({}s) 未观测到退出; 未强制终止, 请手工核对 (pid {:?})",
@@ -271,6 +278,7 @@ impl Server {
             exit_code: code,
             waited_ms: waited.as_millis() as u64,
             note: note.clone(),
+            already_stopped: false,
         };
         if let Some(n) = note {
             tracing::warn!(target: "supervisor", name = %name, "{n}");
@@ -429,21 +437,36 @@ fn stop_all(state: &Arc<Mutex<State>>) -> (usize, usize) {
 
 /// 停机清理提示 (如实说明, 不臆测清理结果)。
 ///
-/// - 实盘: 引擎按订单号前缀撤单兜底, `close_all` 时平仓; 真实结果以日志与交易所状态为准;
+/// - 实盘 / 测试网(demo): 引擎按订单号前缀撤单兜底, `close_all` 时平仓; 真实结果以日志与
+///   交易所状态为准 —— demo 走测试网、与真实资金无关, 措辞必须与实盘分开 (否则跑测试网的人
+///   会以为动了真钱);
 /// - Dry Run: 订单是虚拟撮合, 交易所侧无本策略挂单, 只有脚本自身 `on_stop` 的逻辑。
 ///
 /// `root` = daemon 自己的数据根: 脚本要从**同一份**策略目录读, 否则会去判断另一份 TOML
 /// 有没有 `on_stop`(提示与实际运行的策略不符)。
-fn cleanup_hint_for(root: &std::path::Path, name: &str, live: bool, close_all: bool) -> String {
-    if live {
-        let action = if close_all {
-            "撤单兜底 + 平掉策略持仓"
-        } else {
-            "撤单兜底 (未带 --close-all, 持仓保留)"
-        };
-        return format!(
-            "实盘停机: 引擎执行{action}; 详细结果见 logs/{name}.log 的停机清理段落, 请以交易所账户实际状态为准"
-        );
+fn cleanup_hint_for(
+    root: &std::path::Path,
+    name: &str,
+    mode: Option<&str>,
+    close_all: bool,
+) -> String {
+    let action = if close_all {
+        "撤单兜底 + 平掉策略持仓"
+    } else {
+        "撤单兜底 (未带 --close-all, 持仓保留)"
+    };
+    match mode {
+        Some("live") => {
+            return format!(
+                "实盘停机(**真实资金**): 引擎执行{action}; 详细结果见 logs/{name}.log 的停机清理段落, 请以交易所账户实际状态为准"
+            )
+        }
+        Some("demo") => {
+            return format!(
+                "测试网停机(模拟盘, 与真实资金无关): 引擎执行{action}; 详细结果见 logs/{name}.log 的停机清理段落, 请以测试网账户实际状态为准"
+            )
+        }
+        _ => {}
     }
     let dir = root.join("strategies");
     match crate::commands::load_strategy_toml(&dir, name) {
@@ -521,12 +544,31 @@ mod tests {
         let err = bad.call_ok(Request::Ping).await.expect_err("错 token 应被拒");
         assert!(err.to_string().contains("令牌不匹配"), "实际错误: {err}");
 
-        // 未运行的策略: stop 幂等返回 ok
+        // 不存在的名字: stop 必须如实失败 (027) —— 旧实现在这里回 "已停止" 的假成功
+        for close_all in [false, true] {
+            let err = client
+                .call_ok(Request::Stop { name: "nope".into(), close_all })
+                .await
+                .expect_err("不存在的名字必须失败 (--close-all 不改变名字判定)");
+            let msg = err.to_string();
+            assert!(msg.contains("未找到策略或实例 nope"), "实际错误: {msg}");
+            assert!(msg.contains("ricow list"), "报错要给可执行的下一步: {msg}");
+            for forbidden in ["已停止", "未在运行", "无需停止"] {
+                assert!(!msg.contains(forbidden), "不存在分支不得出现 {forbidden}: {msg}");
+            }
+        }
+
+        // 名字存在但从未启动 (仅有 strategies/<n>.toml): 成功且只陈述"未在运行 (无需停止)" (027)
+        std::fs::create_dir_all(root.join("strategies")).unwrap();
+        std::fs::write(root.join("strategies").join("only-toml.toml"), "name = \"only-toml\"\n")
+            .unwrap();
         let data = client
-            .call_ok(Request::Stop { name: "nope".into(), close_all: false })
+            .call_ok(Request::Stop { name: "only-toml".into(), close_all: false })
             .await
-            .expect("stop 幂等");
+            .expect("名字存在时必须成功");
         assert_eq!(data["exited"], true);
+        assert_eq!(data["already_stopped"], true);
+        assert_eq!(data["note"], "该策略未在运行 (无需停止)");
 
         // 停机: serve 应返回且清理 daemon.json
         client.call_ok(Request::Shutdown).await.expect("shutdown");
@@ -534,6 +576,31 @@ mod tests {
         assert!(served.is_ok(), "serve 应在收到 shutdown 后退出");
         assert_eq!(ledger::read_daemon_info(&root), None, "退出后应清理 daemon.json");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 停机清理提示必须按**真实模式**措辞: 测试网(demo)不得印"实盘停机" (跑测试网的人会以为
+    /// 动了真钱), 实盘必须点明真实资金; 未定义 `on_stop` 的 Dry Run 走"该策略未实现清理"分支。
+    #[test]
+    fn cleanup_hint_wording_matches_mode() {
+        let root = tmp_root("cleanup-hint");
+        let demo = cleanup_hint_for(&root, "s1", Some("demo"), false);
+        assert!(demo.contains("测试网停机"), "{demo}");
+        assert!(demo.contains("与真实资金无关"), "{demo}");
+        assert!(!demo.contains("实盘"), "demo 不得出现实盘措辞: {demo}");
+
+        let live = cleanup_hint_for(&root, "s1", Some("live"), false);
+        assert!(live.contains("实盘停机"), "{live}");
+        assert!(live.contains("真实资金"), "{live}");
+
+        let live_close = cleanup_hint_for(&root, "s1", Some("live"), true);
+        assert!(live_close.contains("平掉策略持仓"), "{live_close}");
+        let demo_close = cleanup_hint_for(&root, "s1", Some("demo"), true);
+        assert!(demo_close.contains("平掉策略持仓"), "{demo_close}");
+
+        // 无策略 TOML → 走 Dry Run 分支 (如实说明无法判定, 不臆测)
+        let dry = cleanup_hint_for(&root, "s1", Some("dry_run"), false);
+        assert!(dry.contains("无法判定清理实现"), "{dry}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

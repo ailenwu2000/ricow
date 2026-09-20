@@ -4,6 +4,7 @@ mod ai;
 mod commands;
 mod i18n;
 mod supervisor;
+mod web;
 
 use clap::{Parser, Subcommand};
 
@@ -62,6 +63,8 @@ enum Command {
     Ai(commands::ai::AiArgs),
     /// 生成外部 agent 操作手册 (019): AGENTS.md / SKILL.md / CLAUDE.md / lua-api.md; 内容与内置 AI 同源
     AgentKit(agentkit::AgentKitArgs),
+    /// Web UI 模式 (025): 启动内置网页, 浏览器里完成全部对话与操作
+    Web(commands::web::WebArgs),
 }
 
 #[tokio::main]
@@ -108,6 +111,7 @@ async fn main() {
         Some(Command::Deploy(args)) => deploy::run(args).await,
         Some(Command::Ai(args)) => commands::ai::run(args).await,
         Some(Command::AgentKit(args)) => commands::agentkit::run(args),
+        Some(Command::Web(args)) => commands::web::run(args).await,
     };
 
     if let Err(e) = result {

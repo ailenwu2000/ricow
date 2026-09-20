@@ -220,40 +220,53 @@ pub(crate) async fn stop_daemon(
     name: &str,
     close_all: bool,
 ) -> CoreResult<String> {
-    use std::fmt::Write as _;
     let client = Client::connect(root).await?;
     let data = client.call_ok(Request::Stop { name: name.to_string(), close_all }).await?;
     let report: StopReport = serde_json::from_value(data)
         .map_err(|e| CoreError::Parse(format!("停机结果解析失败: {e}")))?;
+    Ok(format_stop_report(&report))
+}
+
+/// 停机回执 → 面向用户的说明文本 (纯函数, 便于单测; 027 T012)。
+///
+/// 分派规则见 [contracts/cli-stop.md](../../../specs/changes/027-stop-unknown-instance/contracts/cli-stop.md) §二。
+fn format_stop_report(report: &StopReport) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
-    if report.exited {
-        match report.exit_code {
-            Some(0) => {
-                let _ = writeln!(
-                    out,
-                    "策略 {} 已停止 (exit=0, 用时 {}ms)",
-                    report.name, report.waited_ms
-                );
+    // 名字存在但本来就没在跑 (027): 只陈述"未在运行 (无需停止)"这一个事实, 不套"已停止"头衔 ——
+    // 同一份回执里"已停止"与"未在运行"互相打架会摧毁用户对停机通道的信任。
+    if !report.already_stopped {
+        if report.exited {
+            match report.exit_code {
+                Some(0) => {
+                    let _ = writeln!(
+                        out,
+                        "策略 {} 已停止 (exit=0, 用时 {}ms)",
+                        report.name, report.waited_ms
+                    );
+                }
+                Some(code) => {
+                    let _ = writeln!(
+                        out,
+                        "策略 {} 已停止, 但退出码 {code} (非正常退出; 详见 logs/{}.log)",
+                        report.name, report.name
+                    );
+                }
+                None => {
+                    let _ =
+                        writeln!(out, "策略 {} 已停止 (用时 {}ms)", report.name, report.waited_ms);
+                }
             }
-            Some(code) => {
-                let _ = writeln!(
-                    out,
-                    "策略 {} 已停止, 但退出码 {code} (非正常退出; 详见 logs/{}.log)",
-                    report.name, report.name
-                );
-            }
-            None => {
-                let _ = writeln!(out, "策略 {} 已停止 (用时 {}ms)", report.name, report.waited_ms);
-            }
+        } else {
+            let _ =
+                writeln!(out, "策略 {} 未观测到退出 (用时 {}ms)", report.name, report.waited_ms);
         }
-    } else {
-        let _ = writeln!(out, "策略 {} 未观测到退出 (用时 {}ms)", report.name, report.waited_ms);
     }
-    if let Some(note) = report.note {
+    if let Some(note) = &report.note {
         let _ = writeln!(out, "{note}");
     }
     // 清理结果由策略进程如实写入日志; 这里不臆测结果
-    Ok(out)
+    out
 }
 
 /// 重启 = 停止 (等清理完成) + 启动。
@@ -296,7 +309,56 @@ fn restart_flags(prev_mode: Option<&str>) -> (bool, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::restart_flags;
+    use super::{format_stop_report, restart_flags};
+    use crate::supervisor::proto::StopReport;
+
+    /// 027 T012: 停机回执文案分派 4 组合 —— 一条"本来就没在跑"不得套"已停止"头衔;
+    /// 其余三条**逐字**等于改动前 (contracts/cli-stop.md §2.3 / §2.2)。
+    #[test]
+    fn stop_report_text_dispatch() {
+        let base =
+            |exited: bool, exit_code: Option<i32>, note: Option<&str>, already_stopped: bool| {
+                StopReport {
+                    name: "grid".into(),
+                    exited,
+                    graceful: true,
+                    exit_code,
+                    waited_ms: 12,
+                    note: note.map(str::to_string),
+                    already_stopped,
+                }
+            };
+
+        // ① 名字存在但本来就没在跑: 只陈述一个事实, 不含"已停止"
+        let already =
+            format_stop_report(&base(true, None, Some("该策略未在运行 (无需停止)"), true));
+        assert_eq!(already, "该策略未在运行 (无需停止)\n", "只输出 note 一行");
+        assert!(!already.contains("已停止"), "{already}");
+        assert!(!already.contains("未观测到退出"), "{already}");
+
+        // ② 优雅退出 exit=0 (逐字, 含 note)
+        let zero = format_stop_report(&base(true, Some(0), Some("测试网停机"), false));
+        assert_eq!(zero, "策略 grid 已停止 (exit=0, 用时 12ms)\n测试网停机\n", "{zero}");
+
+        // ③ 退出码非 0 (逐字)
+        let bad = format_stop_report(&base(true, Some(7), None, false));
+        assert_eq!(bad, "策略 grid 已停止, 但退出码 7 (非正常退出; 详见 logs/grid.log)\n", "{bad}");
+
+        // ④ 退出码未知 / 超时未观测到退出 (逐字)
+        let unknown = format_stop_report(&base(true, None, None, false));
+        assert_eq!(unknown, "策略 grid 已停止 (用时 12ms)\n", "{unknown}");
+        let timeout = format_stop_report(&base(
+            false,
+            None,
+            Some("停机超时 (30s) 未观测到退出; 未强制终止, 请手工核对 (pid 123)"),
+            false,
+        ));
+        assert_eq!(
+            timeout,
+            "策略 grid 未观测到退出 (用时 12ms)\n停机超时 (30s) 未观测到退出; 未强制终止, 请手工核对 (pid 123)\n",
+            "{timeout}"
+        );
+    }
 
     #[test]
     fn test_restart_flags_keeps_previous_mode() {

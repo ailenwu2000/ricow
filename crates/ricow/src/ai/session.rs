@@ -4,11 +4,11 @@
 //! 本模块**不碰 stdin/stdout**, 也不打印任何东西。`commands::ai`(薄壳)与
 //! `commands::chat`(裸入口)只负责"读一行 → 交给 session → 把 sink 收到的东西写出去"。
 //!
-//! 将来接网页端 = 新写一个 WS/HTTP sink 并复用本文件, 业务逻辑零复制。
+//! **网页端已落地(025)**: `web/sink.rs` 的 `WebSink` 就是这条缝上的第二个 sink(SSE 帧 + 浏览器
+//! 输入区), 会话线程里跑的仍是本模块 —— 业务逻辑零复制。
 //! 安全口径不变: 写实动作**没有工具调用面**; 模型只能登记 pending, 执行权在宿主
 //! (见 [`super::confirm`])。
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use ricow_core::{CoreError, CoreResult};
@@ -30,15 +30,67 @@ fn tf(lang: Lang, zh: impl Into<String>, en: impl Into<String>) -> String {
 /// `/history` 单条往返的字符上限(超出即截断并标注, FR-008)。
 const HISTORY_ENTRY_MAX_CHARS: usize = 2_000;
 
-/// 会话输出出口(终端 = stdio; 将来网页端 = WS 帧)。
+/// 宿主输出级别(025 / FR-013): **由宿主显式标注**, 前端只按级别着色, 不做关键字猜测。
 ///
-/// 两个输出方法(流式文本增量与完整一行) + 一个**密钥录入**方法。新增前端不必理解
-/// 会话内部状态, 但必须能安全地拿到用户粘贴的密钥(不回显、不进日志、不进模型上下文)。
+/// 终端 sink 忽略级别(输出与 019 逐字一致); 网页端按级别给不同颜色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// 普通正文(对话内容 / 列表 / 空行)。
+    Normal,
+    /// 提示(用量、菜单、可操作建议)。
+    Notice,
+    /// 警告(需留意的边界或可能造成损失的动作)。
+    Warn,
+    /// 错误(失败、被拒绝、配置问题)。
+    Error,
+}
+
+impl Severity {
+    /// 落库与 SSE 帧共用的级别标识(唯一编码来源; 终端 sink 不用)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Normal => "normal",
+            Severity::Notice => "notice",
+            Severity::Warn => "warn",
+            Severity::Error => "error",
+        }
+    }
+}
+
+/// 会话 I/O 出口(终端 = stdio; 网页端 = SSE 帧 + 浏览器输入区)。
+///
+/// 前端至少要提供四件事: 流式文本增量、**带级别**的一整行输出、**读一行**用户输入、
+/// **不回显**的密钥录入。新增前端不必理解会话内部状态, 但必须能安全地拿到用户粘贴的密钥
+/// (不回显、不进日志、不进模型上下文)。
 pub trait SessionSink {
     /// 助手文本增量(不保证以换行结尾, 终端实现要 flush)。
     fn text(&mut self, chunk: &str);
-    /// 一整行宿主输出(提示 / 用量 / 空行 / 错误)。
-    fn line(&mut self, text: &str);
+    /// 一整行宿主输出 + 级别(FR-013)。文案由宿主给出, 实现不得改写。
+    fn line_sev(&mut self, text: &str, sev: Severity);
+    /// 一整行**普通**输出(正文 / 列表 / 空行)。
+    fn line(&mut self, text: &str) {
+        self.line_sev(text, Severity::Normal);
+    }
+    /// 提示级一行(用量 / 菜单 / 可操作建议)。
+    fn notice(&mut self, text: &str) {
+        self.line_sev(text, Severity::Notice);
+    }
+    /// 警告级一行(需留意的边界 / 已作废的动作)。
+    fn warn(&mut self, text: &str) {
+        self.line_sev(text, Severity::Warn);
+    }
+    /// 错误级一行(失败 / 配置问题)。
+    fn error(&mut self, text: &str) {
+        self.line_sev(text, Severity::Error);
+    }
+    /// 读一行用户输入(REPL 主循环的输入侧)。
+    ///
+    /// `prompt` 只对**能显示提示符**的前端有意义(终端); 网页端可忽略(输入框自带提示),
+    /// 但两侧都必须返回**去掉行尾换行**的一行。
+    ///
+    /// 返回 `None` = 输入通道已关闭(`Ctrl-D` / 页面关闭) → REPL 据此退出, 与终端 EOF 同义。
+    /// 允许阻塞等待(与 [`SessionSink::secret`] 同口径)。
+    fn input_line(&mut self, prompt: &str) -> Option<String>;
     /// 读一行**不回显**的密钥输入(`/keys` 用; 实现可以是阻塞读, 与终端语义一致)。
     ///
     /// 返回 `None` = 本前端无法安全录入(无输入通道); 会话据此**放弃本次修改且不写文件**。
@@ -66,13 +118,18 @@ pub struct Options {
     /// 是否允许**对话内确认**: 单次模式(false)没有第二轮输入承接确认短语,
     /// 因此工具侧不登记 pending(tty 门禁的另一半)。
     pub interactive: bool,
+    /// 前端是否已具备可用的**交互式输入通道**(025 / D6): 终端 = `stdin` 是 tty;
+    /// 网页端 = 浏览器输入区 + 密钥表单, 不受本机 tty 影响。
+    ///
+    /// 与 [`Options::interactive`] 取与: 真正的门禁 = 用户主动要求交互 **且** 前端接得住第二轮输入。
+    pub has_input_channel: bool,
 }
 
 /// 一次会话的全部可变状态。
 pub struct ChatSession {
     root: PathBuf,
     resolved: config::Resolved,
-    /// 是否可对话内确认 / 静默录入密钥(stdin 是 tty 且为 REPL); 重建客户端时要复用。
+    /// 是否可对话内确认 / 静默录入密钥(前端声明有输入通道且为 REPL); 重建客户端时要复用。
     interactive: bool,
     llm: provider::Llm,
     pending: PendingSlot,
@@ -121,7 +178,7 @@ impl ChatSession {
         // 由本会话在用户逐字输入后执行(见 `execute_confirmed`)。
         let pending = confirm::new_slot();
         let active_menu = menu::new_slot();
-        let interactive = opts.interactive && std::io::stdin().is_terminal();
+        let interactive = opts.interactive && opts.has_input_channel;
         let tool_ctx = tools::ToolCtx::new(
             root.clone(),
             interactive,
@@ -156,6 +213,23 @@ impl ChatSession {
         self.lang
     }
 
+    /// 恢复旧会话的 AI 上下文(025 / D10 / FR-020): 装入最近若干轮往返, 单条按 [`clip_for_history`]
+    /// 同口径截断(不撑爆 token)。
+    ///
+    /// 除 `history` 外还要接续两处, 否则恢复后的观感与命令自相矛盾:
+    /// - `turn` = **页面流水里出现过的最大轮次号**(由调用方从分隔线解析, 见
+    ///   [`parse_turn_divider`]); 不能用 `rounds.len()`: 那里丢掉了失败轮 / 斜杠命令
+    ///   这类没有 assistant 行的 user 消息, 会比页面刚显示的号小, 新一轮就会重号或倒退;
+    /// - `transcript` 补上同一批往返, 否则 `/history` 会声称"本会话还没有问答记录"。
+    pub fn resume_history(&mut self, rounds: &[(String, String)], turn: u64) {
+        for (q, a) in rounds {
+            self.history.push(Message::user(clip_for_history(q, self.lang)));
+            self.history.push(Message::assistant(clip_for_history(a, self.lang)));
+            self.transcript.push((q.clone(), a.clone()));
+        }
+        self.turn = turn;
+    }
+
     /// 会话开始信息(FR-011: 只有"用哪个模型 / 密钥从哪来"一行 + 一句边界); 不打印, 只走 sink。
     pub fn welcome(&self, sink: &mut dyn SessionSink) {
         let key_from_env =
@@ -176,14 +250,14 @@ impl ChatSession {
             ),
         ));
         // 一句边界: 写操作不在模型工具面内 —— 与 help / 确认块同一口径 (FR-010)。
-        sink.line(t(
+        sink.notice(t(
             self.lang,
             "边界: 我能查资料 / 写策略 / 跑回测; 凡是会改文件或起停实例的动作, 都必须你本人回一句确认词。",
             "Boundary: I can look things up, write strategies and run backtests; anything that changes files or starts/stops an instance needs your own confirmation.",
         ));
         if let Some(hint) = empty_state_hint(&self.root, self.lang) {
             sink.line("");
-            sink.line(&hint);
+            sink.notice(&hint);
         }
     }
 
@@ -220,7 +294,7 @@ impl ChatSession {
                 Ok(Step::Continue)
             }
             LineInput::Unknown(name) => {
-                sink.line(&tf(
+                sink.warn(&tf(
                     self.lang,
                     format!(
                         "斜杠命令 /{name} 还没有接入; 现在能用: /help /exit /history /lang /market /keys"
@@ -237,36 +311,45 @@ impl ChatSession {
                 match confirm::consume_line(&self.pending, line, self.lang).await {
                     LineDisposition::Confirm(action) => match self.execute(&action).await {
                         Ok(msg) => {
-                            sink.line(&msg);
+                            sink.notice(&msg);
+                            // 026 T020 / FR-021~FR-023: 执行结果回流 AI 上下文 —— 否则模型看不到
+                            // 自己刚确认的动作实际做了什么, 下一轮只能凭空猜(甚至重做)。
+                            // 与 sink **同源**: 就是上面显示的那份 `msg`, 只按 history 上限裁剪。
+                            self.history
+                                .push(Message::assistant(clip_for_history(&msg, self.lang)));
                             self.flush_menu(sink).await;
                         }
-                        Err(e) => sink.line(&tf(
-                            self.lang,
-                            format!(
-                                "执行失败: {e}\n(这次确认已用掉; 若预览已被批准或用过, 先看一下实际状态, 必要时重新来一次)"
-                            ),
-                            format!(
-                                "Failed: {e}\n(That confirmation is now spent; if the preview was already approved or used, check the current state and start over if needed.)"
-                            ),
-                        )),
+                        Err(e) => {
+                            // 失败同样注入 (FR-024): 模型必须知道动作失败了, 而不是以为成功。
+                            // 先拼好一份, 显示与入 history 用同一份文本(同源, FR-022), 显示文案不变。
+                            let shown = tf(
+                                self.lang,
+                                format!(
+                                    "执行失败: {e}\n(这次确认已用掉; 若预览已被批准或用过, 先看一下实际状态, 必要时重新来一次)"
+                                ),
+                                format!(
+                                    "Failed: {e}\n(That confirmation is now spent; if the preview was already approved or used, check the current state and start over if needed.)"
+                                ),
+                            );
+                            sink.error(&shown);
+                            self.history
+                                .push(Message::assistant(clip_for_history(&shown, self.lang)));
+                        }
                     },
                     LineDisposition::Reject(action) => {
                         // 落盘类: 尽力把 preview 置 rejected 终态(失败也不影响本地作废语义)
                         if let (Some(id), true) = (
                             action.preview_id.as_deref(),
-                            matches!(
-                                action.kind,
-                                ActionKind::Deploy | ActionKind::DeployReplace
-                            ),
+                            matches!(action.kind, ActionKind::Deploy | ActionKind::DeployReplace),
                         ) {
-                            if let Ok(db) = Database::open(&crate::commands::db_path_in(&self.root))
-                                .await
+                            if let Ok(db) =
+                                Database::open(&crate::commands::db_path_in(&self.root)).await
                             {
                                 _ = ricow_engine::reject(&db, id).await;
                             }
                         }
                         let shown = action_display(&action, self.lang);
-                        sink.line(&tf(
+                        sink.warn(&tf(
                             self.lang,
                             format!("已放弃待确认动作「{shown}」, 未执行任何写实操作。"),
                             format!(
@@ -278,7 +361,7 @@ impl ChatSession {
                         // 分钟数取自 `ai::confirm::PENDING_TTL`(与引擎 preview TTL 同源), 不手抄 15。
                         let minutes = crate::ai::confirm::PENDING_TTL.as_secs() / 60;
                         let shown = action_display(&action, self.lang);
-                        sink.line(&tf(
+                        sink.warn(&tf(
                             self.lang,
                             format!(
                                 "待确认动作「{shown}」已超过 {minutes} 分钟, 已作废; 如需继续请重新发起。"
@@ -289,8 +372,21 @@ impl ChatSession {
                         ));
                         self.reply(&q, sink).await;
                     }
-                    LineDisposition::Other | LineDisposition::NoPending => {
-                        // 菜单序号只认"有菜单且在范围内"的纯数字行; 其余一律当普通提问 (FR-016)。
+                    LineDisposition::Other => {
+                        // 有待确认动作在, 而这行"像确认词但不全等"(实测「确认一下」): 匹配是整行
+                        // 全等, 不会放行且本来毫无反馈 —— 先补一行提示, 把静默失败变成看得见。
+                        // 匹配逻辑不变, 这行照旧按菜单序号 / 普通提问处理(FR-016)。
+                        if confirm::looks_like_near_miss_confirmation(line, self.lang) {
+                            sink.warn(&near_miss_confirmation_hint(self.lang));
+                        }
+                        match menu::parse_menu_choice(line) {
+                            Some(n) => self.handle_menu_choice(n, &q, sink).await,
+                            None => self.reply(&q, sink).await,
+                        }
+                    }
+                    LineDisposition::NoPending => {
+                        // 没有待确认动作 → 无非确认词可言; 菜单序号只认"有菜单且在范围内"的
+                        // 纯数字行, 其余一律当普通提问 (FR-016)。
                         match menu::parse_menu_choice(line) {
                             Some(n) => self.handle_menu_choice(n, &q, sink).await,
                             None => self.reply(&q, sink).await,
@@ -321,7 +417,7 @@ impl ChatSession {
             return;
         };
         if request.is_empty() {
-            sink.line(&tf(
+            sink.warn(&tf(
                 self.lang,
                 format!("没有第 {n} 项; 请选 1..{len}(或直接说你想做什么)。"),
                 format!("There is no option {n}; choose 1..{len} (or just say what you want)."),
@@ -337,7 +433,7 @@ impl ChatSession {
     /// `/history`(别名 `/log`, FR-008): 渲染本会话全部往返; 不计轮次、不写 transcript。
     fn handle_history(&self, sink: &mut dyn SessionSink) {
         if self.transcript.is_empty() {
-            sink.line(t(
+            sink.notice(t(
                 self.lang,
                 "本会话还没有问答记录(斜杠命令和空行不算)。",
                 "No exchanges in this session yet (slash commands and blank lines do not count).",
@@ -367,7 +463,7 @@ impl ChatSession {
                 ));
             }
             LangCmd::Bad(arg) => {
-                sink.line(&tf(
+                sink.warn(&tf(
                     self.lang,
                     format!(
                         "/lang 参数只支持 zh / en; 收到: {arg}\n\
@@ -387,7 +483,7 @@ impl ChatSession {
                 self.lang = lang;
                 // 回执用**新**语言(FR-005); 提示词里的语言纪律也随之重建 (FR-006)。
                 self.rebuild_llm()?;
-                sink.line(&tf(
+                sink.notice(&tf(
                     lang,
                     format!(
                         "已切换界面语言: 中文 (zh)\n  {} 已更新, 立即生效。",
@@ -409,7 +505,7 @@ impl ChatSession {
         match guard.as_ref() {
             Some(m) => {
                 sink.line("");
-                sink.line(&menu::render(m));
+                sink.notice(&menu::render(m));
                 true
             }
             None => false,
@@ -452,7 +548,7 @@ impl ChatSession {
 
         let switch = match cmd {
             MarketCmd::Bad(arg) => {
-                sink.line(&format!(
+                sink.warn(&format!(
                     "/market 参数只支持 bstock / all; 收到: {arg}\n\
                      用法: /market(查看当前视野) · /market bstock(仅股票类, 默认) · /market all(全部交易对)"
                 ));
@@ -470,7 +566,7 @@ impl ChatSession {
             )?;
             // 切换后立刻按新配置重算规模(快照走缓存, 不额外联网), 只报规模不刷全表。
             let view = pairs::current_view(&self.root, false).await?;
-            sink.line(&format!(
+            sink.notice(&format!(
                 "已切换交易对视野: {}\n  ricow.toml [market] show_all_pairs = {show_all}\n  \
                  现货 {} 个 / 合约 {} 个 / 合计 {}\n列表: /market",
                 pairs::scope_text(view.filtered),
@@ -483,7 +579,7 @@ impl ChatSession {
 
         let view = pairs::current_view(&self.root, false).await?;
         sink.line(&pairs::render(&view, None));
-        sink.line("切换: /market bstock(仅股票类) · /market all(全部交易对)");
+        sink.notice("切换: /market bstock(仅股票类) · /market all(全部交易对)");
         Ok(())
     }
 
@@ -505,7 +601,7 @@ impl ChatSession {
             KeysCmd::Demo => KeysTarget::Demo,
             KeysCmd::Live => KeysTarget::Live,
             KeysCmd::Bad(arg) => {
-                sink.line(&format!(
+                sink.warn(&format!(
                     "/keys 参数只支持 ai / demo / live; 收到: {arg}\n\
                      用法: /keys(查看状态) · /keys ai(AI 助手密钥) · /keys demo(测试网凭据) · \
                      /keys live(主网/实盘凭据)"
@@ -516,7 +612,7 @@ impl ChatSession {
 
         // 密钥录入只在交互式会话里开放(与对话内确认同一 tty 门禁): 拿不到静默输入就不写文件。
         if !self.interactive {
-            sink.line(
+            sink.warn(
                 "当前不是交互式终端, 无法安全录入密钥; 请在终端直接运行 ricow 后再用 /keys。",
             );
             return Ok(());
@@ -528,7 +624,7 @@ impl ChatSession {
         match target {
             KeysTarget::Ai => {
                 if env_override {
-                    sink.line(&format!(
+                    sink.warn(&format!(
                         "注意: 环境变量 {} 已设置且**优先于**本文件; 写入后需取消该变量才生效。",
                         config::ENV_API_KEY
                     ));
@@ -539,7 +635,7 @@ impl ChatSession {
                 }
             }
             KeysTarget::Demo => {
-                sink.line(
+                sink.notice(
                     "币安测试网(demo)凭据: demo.binance.com → API 管理 → 创建 Key(只勾交易, 不要提现)。",
                 );
                 match read_pair(sink, "demo_key", "demo_secret") {
@@ -551,7 +647,7 @@ impl ChatSession {
                 }
             }
             KeysTarget::Live => {
-                sink.line("币安主网(实盘)凭据: 建议用只开交易、关闭提现的受限 Key 或子账户。");
+                sink.warn("币安主网(实盘)凭据: 建议用只开交易、关闭提现的受限 Key 或子账户。");
                 match read_pair(sink, "binance_key", "binance_secret") {
                     Some((k, s)) => {
                         updates.push(("exchange", "binance_key", SetValue::Str(k)));
@@ -563,7 +659,7 @@ impl ChatSession {
         }
 
         config_file::set_values(&self.root, &updates)?;
-        sink.line(&format!(
+        sink.notice(&format!(
             "已更新 {}: {}",
             config_file::path(&self.root).display(),
             updates.iter().map(|(s, k, _)| format!("[{s}].{k}")).collect::<Vec<_>>().join(", ")
@@ -572,10 +668,10 @@ impl ChatSession {
         // 环境变量覆盖时不重建(重建也只会用环境变量里的值, 报"已生效"就是撒谎)。
         if target == KeysTarget::Ai && !env_override {
             self.rebuild_llm()?;
-            sink.line("已用新密钥重建 LLM 客户端, 下一句话即生效。");
+            sink.notice("已用新密钥重建 LLM 客户端, 下一句话即生效。");
         }
         if let Some(w) = config_file::permission_warning(&self.root) {
-            sink.line(&format!("提示: {w}"));
+            sink.warn(&format!("提示: {w}"));
         }
         Ok(())
     }
@@ -609,7 +705,7 @@ impl ChatSession {
         match reply {
             Ok(ans) => {
                 if let Some(u) = &ans.usage {
-                    sink.line(&format!("[用量] {u}"));
+                    sink.notice(&format!("[用量] {u}"));
                 }
                 self.transcript.push((q.to_string(), ans.text.clone()));
                 self.history.push(Message::user(q.to_string()));
@@ -618,7 +714,7 @@ impl ChatSession {
             // 如实报错, 不吞: 网络/鉴权/模型不支持工具调用都会走到这里
             Err(e) => {
                 let shown = format!("错误: {e}");
-                sink.line(&shown);
+                sink.error(&shown);
                 self.transcript.push((q.to_string(), shown));
             }
         }
@@ -785,6 +881,46 @@ fn turn_divider(lang: Lang, n: u64) -> String {
     tf(lang, format!("── 第 {n} 轮 ──"), format!("── Turn {n} ──"))
 }
 
+/// [`turn_divider`] 的逆: 从一行文本里认回轮次号, **中英两种写法都认**(会话切过语言时
+/// 恢复仍要认得出旧分隔线)。不是分隔线就返回 `None`。
+///
+/// 恢复会话时用它扫页面流水取最大轮次号(见 [`ChatSession::resume_history`]) —— 与页面
+/// 回放读的是同一份数据, 接续的号因此只会更大, 不会倒退。
+pub(crate) fn parse_turn_divider(line: &str) -> Option<u64> {
+    let inner = line.trim().strip_prefix("──")?.strip_suffix("──")?.trim();
+    let digits = inner
+        .strip_prefix('第')
+        .and_then(|rest| rest.strip_suffix('轮'))
+        .or_else(|| inner.strip_prefix("Turn"))
+        .or_else(|| inner.strip_prefix("turn"))?
+        .trim();
+    digits.parse().ok()
+}
+
+/// 近似误输确认词时的兜底提示(判定见 [`confirm::looks_like_near_miss_confirmation`])。
+///
+/// 只讲两件事: **为什么没生效**(整行只写一个确认词才算), 以及**下一步怎么办**(这行已按普通
+/// 提问处理, 待确认动作还在)。词表取自 [`confirm::confirmation_words`], 不手抄。
+fn near_miss_confirmation_hint(lang: Lang) -> String {
+    let words = confirm::confirmation_words(lang)
+        .iter()
+        .map(|w| tf(lang, format!("「{w}」"), format!("\"{w}\"")))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    tf(
+        lang,
+        format!(
+            "提示: 这行不算确认词 —— 确认要整行只写一个确认词({words}), 不能带标点或别的字。\n\
+             这条已按普通提问处理, 待确认动作仍然有效; 想执行就单独回一行。"
+        ),
+        format!(
+            "Note: that line is not a confirmation word — to go ahead, send a line that contains only \
+             one of these, with no punctuation or extra words: {words}.\n\
+             This line was treated as a normal question; the pending action is still open."
+        ),
+    )
+}
+
 /// `/history` 单条往返的渲染(FR-008): 超上限时**截断并标注**, 不静默丢内容。
 fn clip_for_history(s: &str, lang: Lang) -> String {
     let total = s.chars().count();
@@ -804,11 +940,11 @@ fn read_secret(sink: &mut dyn SessionSink, prompt: &str) -> Option<String> {
     match sink.secret(prompt) {
         Some(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
         Some(_) => {
-            sink.line("输入为空, 未改动任何配置。");
+            sink.warn("输入为空, 未改动任何配置。");
             None
         }
         None => {
-            sink.line("未能读取密钥输入(需要交互式终端), 未改动任何配置。");
+            sink.warn("未能读取密钥输入(需要交互式终端), 未改动任何配置。");
             None
         }
     }
@@ -824,7 +960,7 @@ fn read_pair(
     let s = match read_secret(sink, &format!("{secret_name}(不回显; 回车放弃): ")) {
         Some(s) => s,
         None => {
-            sink.line("本次未改动(两者必须成对写入)。");
+            sink.warn("本次未改动(两者必须成对写入)。");
             return None;
         }
     };
@@ -1299,6 +1435,40 @@ mod tests {
         assert_eq!(classify("/stop shannon_grid"), LineInput::Unknown("stop".into()));
     }
 
+    /// 分隔线解析必须与渲染**同源**: 两种语言的渲染结果都认得出, 且只认完整分隔线
+    /// (普通文本不该被误判成轮次号, 否则恢复时会把 `turn` 顶到离谱的值)。
+    #[test]
+    fn test_parse_turn_divider_round_trips_and_rejects_plain_text() {
+        for n in [1u64, 7, 23, 1000] {
+            for lang in [Lang::Zh, Lang::En] {
+                assert_eq!(parse_turn_divider(&turn_divider(lang, n)), Some(n));
+            }
+        }
+        // 会话切过语言也要认: 与当前 `lang` 无关
+        assert_eq!(parse_turn_divider("── 第 12 轮 ──"), Some(12));
+        assert_eq!(parse_turn_divider("── Turn 12 ──"), Some(12));
+        assert_eq!(parse_turn_divider("  ── 第 3 轮 ──  "), Some(3), "前后空白不影响");
+        for line in
+            ["第 3 轮", "── 第 3 轮", "第 3 轮 ──", "── 你 ──", "── 第 轮 ──", "── Turn x ──", ""]
+        {
+            assert_eq!(parse_turn_divider(line), None, "不该把 {line:?} 当成分隔线");
+        }
+    }
+
+    /// 近似误输提示: 词表与该语言的确认词同源(不手抄), 且只说清"为什么没生效 / 下一步"。
+    #[test]
+    fn test_near_miss_hint_names_the_same_words_as_the_matcher() {
+        for lang in [Lang::Zh, Lang::En] {
+            let hint = near_miss_confirmation_hint(lang);
+            for w in confirm::confirmation_words(lang) {
+                assert!(hint.contains(w), "{lang:?} 提示里没提确认词 {w}: {hint}");
+            }
+            assert!(!hint.contains("ricow "), "提示不该教终端命令: {hint}");
+            // 要点: 说清"没生效"与"动作还在", 否则用户仍不知道该怎么办
+            assert!(hint.contains(t(lang, "不算确认词", "not a confirmation word")));
+        }
+    }
+
     #[test]
     fn test_classify_market_variants() {
         assert_eq!(classify("/market"), LineInput::Market(MarketCmd::Show));
@@ -1337,7 +1507,7 @@ mod tests {
         assert!(!short.contains("short"), "短密钥不得回显: {short}");
     }
 
-    /// 假 sink: 按脚本回答 `secret`, 收集所有输出行(用于测 `/keys` 的输入语义)。
+    /// 假 sink: 按脚本回答输入侧(`secret` / `input_line` 共用同一脚本队列), 收集所有输出行。
     struct FakeSink {
         answers: std::collections::VecDeque<Option<String>>,
         lines: Vec<String>,
@@ -1347,8 +1517,11 @@ mod tests {
         fn text(&mut self, chunk: &str) {
             self.lines.push(chunk.to_string());
         }
-        fn line(&mut self, text: &str) {
+        fn line_sev(&mut self, text: &str, _sev: Severity) {
             self.lines.push(text.to_string());
+        }
+        fn input_line(&mut self, _prompt: &str) -> Option<String> {
+            self.answers.pop_front().flatten()
         }
         fn secret(&mut self, _prompt: &str) -> Option<String> {
             self.answers.pop_front().flatten()
@@ -1397,6 +1570,28 @@ mod tests {
         assert!(h.contains("/keys"), "帮助要列出 /keys: {h}");
     }
 
+    /// SC-007: 单条往返超上限时截断并**标注原文长度**(不静默丢内容), 两种语言各自标注。
+    #[test]
+    fn test_clip_for_history_truncates_and_annotates() {
+        // 上限以内原样返回
+        let short = "问 1";
+        assert_eq!(clip_for_history(short, Lang::Zh), short);
+        let exact = "x".repeat(HISTORY_ENTRY_MAX_CHARS);
+        assert_eq!(clip_for_history(&exact, Lang::Zh), exact, "恰好到上限不截断");
+        // 超上限: 头部保留到上限 + 标注原文总字数
+        let total = HISTORY_ENTRY_MAX_CHARS + 7;
+        let long = "字".repeat(total);
+        let zh = clip_for_history(&long, Lang::Zh);
+        assert!(
+            zh.starts_with(&"字".repeat(HISTORY_ENTRY_MAX_CHARS)),
+            "应保留前 {HISTORY_ENTRY_MAX_CHARS} 字"
+        );
+        assert!(zh.contains(&format!("原文 {total} 字")), "应标注原文长度: {zh}");
+        // 英文界面走英文标注(FR-031)
+        let en = clip_for_history(&long, Lang::En);
+        assert!(en.contains("truncated") && en.contains(&total.to_string()), "英文标注缺失: {en}");
+    }
+
     fn temp_root(tag: &str) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1418,6 +1613,93 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("建策略目录");
         std::fs::write(dir.join("g1.toml"), "enabled = true").expect("写策略占位");
         assert!(empty_state_hint(&root, Lang::Zh).is_none(), "已有策略不该再提示两条路");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 造一个能 `open()` 的会话: 配置指向本机端点 —— 建会话不联网、不索要密钥。
+    /// 只用于验证确认结果的 history 注入, 全程不问模型。
+    async fn test_session(tag: &str) -> (ChatSession, std::path::PathBuf) {
+        let root = temp_root(tag);
+        std::fs::write(
+            root.join("ricow.toml"),
+            "[ai]\nprovider = \"oai\"\nmodel = \"test-model\"\n\
+             base_url = \"http://127.0.0.1:9/v1\"\n",
+        )
+        .expect("写测试配置");
+        let session =
+            ChatSession::open(root.clone(), Options::default()).await.expect("建测试会话");
+        (session, root)
+    }
+
+    /// 取一条 history 消息里的纯文本(非文本块按 Debug 兜底, 只为断言可读)。
+    fn message_text(m: &Message) -> String {
+        match m {
+            Message::Assistant { content, .. } => content
+                .iter()
+                .map(|c| match c {
+                    rig::message::AssistantContent::Text(t) => t.text().to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// SC-005 / FR-021~FR-023: 写动作确认执行后, 结果**同源**注入 `history` ——
+    /// 否则下一轮模型看不见自己刚确认的动作实际做了什么。
+    #[tokio::test]
+    async fn test_confirmed_result_is_injected_into_history() {
+        let (mut session, root) = test_session("confirm-history-ok").await;
+        // 造一份真实存在的策略文件, 让"删除策略"这个写动作成功(不碰网络/资金)
+        let dir = root.join("strategies");
+        std::fs::create_dir_all(&dir).expect("建策略目录");
+        std::fs::write(dir.join("g1.toml"), "name = \"g1\"\n").expect("写策略文件");
+        *session.pending.lock().await = Some(PendingAction::new_delete_strategy("g1"));
+
+        let mut sink = fake(&[]);
+        session.handle_line("确认", &mut sink).await.expect("确认行不该报错");
+
+        assert_eq!(session.history.len(), 1, "执行结果必须注入 history 恰好一条");
+        let injected = message_text(&session.history[0]);
+        assert!(injected.contains("已确认并完成删除"), "history 须含执行结果文案: {injected}");
+        // 同源(FR-022): 注入的就是 sink 显示的那份文本, 不是另写一遍
+        assert!(
+            sink.lines.iter().any(|l| l.contains(&injected)),
+            "注入内容必须与显示同源:\n显示={:?}\nhistory={injected}",
+            sink.lines
+        );
+        // 状态机语义不受注入影响: 确认已被消费; 注入文本即使被当输入行回放也不是确认词
+        assert!(session.pending.lock().await.is_none(), "确认后 pending 必须清空");
+        let slot = confirm::new_slot();
+        *slot.lock().await = Some(PendingAction::new_delete_strategy("g2"));
+        assert_eq!(
+            confirm::consume_line(&slot, &injected, Lang::Zh).await,
+            LineDisposition::Other,
+            "注入文本不得构成确认"
+        );
+        assert!(slot.lock().await.is_some(), "非确认输入不得消费 pending");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FR-024 / SC-005: 失败结果**同样**注入 —— 模型必须知道动作失败了, 而不是以为成功。
+    #[tokio::test]
+    async fn test_failed_confirmation_result_is_injected_into_history() {
+        let (mut session, root) = test_session("confirm-history-fail").await;
+        // 不存在的策略 → 删除动作必然失败(不碰网络/资金); 失败也不上抛, 只如实回报
+        *session.pending.lock().await = Some(PendingAction::new_delete_strategy("missing"));
+
+        let mut sink = fake(&[]);
+        session.handle_line("确认", &mut sink).await.expect("失败也要如实回报, 不上抛");
+
+        assert_eq!(session.history.len(), 1, "失败结果同样注入 history");
+        let injected = message_text(&session.history[0]);
+        assert!(injected.contains("执行失败"), "history 须含失败文案: {injected}");
+        assert!(
+            sink.lines.iter().any(|l| l.contains(&injected)),
+            "失败文案也必须同源:\n显示={:?}\nhistory={injected}",
+            sink.lines
+        );
+        assert!(session.pending.lock().await.is_none(), "失败后 pending 不得残留");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
