@@ -7,6 +7,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::error::{CoreError, CoreResult};
+use crate::interval::Interval;
+
 // ---- Market ----
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,4 +322,203 @@ pub struct OrderBookUpdate {
     pub bids: Vec<PriceLevel>,
     pub asks: Vec<PriceLevel>,
     pub timestamp: DateTime<Utc>,
+}
+
+// ---- 数据服务: 带复权列的 bar (028 T012) ----
+
+/// K 线 + 可选的复权收盘。
+///
+/// 为什么不是一个新 bar 类型: 既有 [`Kline`] 有 33 处字面量构造点(加字段会连锁炸全仓),
+/// 且两个并行的 bar 类型本身就是双轨。这里只做"给 K 线挂一列可选复权价"的包装:
+/// 数据源能提供复权收盘时(Yahoo)填 [`Bar::adj_close`], 不能提供时(Nasdaq/币安)为 `None`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Bar {
+    pub kline: Kline,
+    /// 复权收盘(源原生提供时才有); `None` = 该源不提供。
+    pub adj_close: Option<Decimal>,
+}
+
+impl Bar {
+    /// 无复权列的 bar。
+    pub fn new(kline: Kline) -> Self {
+        Self { kline, adj_close: None }
+    }
+
+    /// 带复权收盘的 bar。
+    pub fn with_adj_close(kline: Kline, adj_close: Option<Decimal>) -> Self {
+        Self { kline, adj_close }
+    }
+
+    /// 拆成 `(Kline, adj_close)`(缓存写入的列口径)。
+    pub fn into_parts(self) -> (Kline, Option<Decimal>) {
+        (self.kline, self.adj_close)
+    }
+}
+
+// ---- 数据服务: 序列键与口径 (028 T005) ----
+
+/// 价格口径: 序列暴露给策略的 OHLC 取原始价还是复权价。
+///
+/// `AdjClose` 仅在数据源提供复权收盘时有意义(Yahoo 提供 `adjclose`, 币安不提供);
+/// 源不支持该模式时**报错**, 不静默回落原始价(防口径混杂)。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PriceMode {
+    /// 原始收盘(默认)。
+    Close,
+    /// 复权收盘(Yahoo `adjclose`)。
+    AdjClose,
+}
+
+impl PriceMode {
+    /// 配置/日志口径标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            PriceMode::Close => "close",
+            PriceMode::AdjClose => "adjclose",
+        }
+    }
+
+    /// 标签 → 口径; 未知返回 `None`。
+    pub fn from_label(label: &str) -> Option<PriceMode> {
+        match label {
+            "close" => Some(PriceMode::Close),
+            "adjclose" => Some(PriceMode::AdjClose),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for PriceMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// 序列口径 (028 FR-005): 源原生粒度 vs 由更细粒度重采样而来。
+///
+/// 为什么显式暴露: 同一 `interval` 可能是源原生给的, 也可能是平台用 5m 合成 15m ——
+/// 策略需要知道这件事, 否则"换了个来源指标突然不一样"无法解释。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SeriesMode {
+    /// 源原生提供该周期。
+    Native,
+    /// 源不提供该周期, 由更细粒度重采样(仅完整桶, 见 `resample::resample_to_interval`)。
+    Resampled,
+}
+
+impl SeriesMode {
+    /// 配置/日志口径标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            SeriesMode::Native => "native",
+            SeriesMode::Resampled => "resampled",
+        }
+    }
+}
+
+impl fmt::Display for SeriesMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// 序列装载结果 (028 FR-005): 尾窗 K 线 + 口径 + 实际取数粒度。
+///
+/// 装配层拿它构造 `SeriesInfo`(策略可见的"这条序列是什么"); 重采样时 `feed_interval` 与
+/// `key.interval` 不同, 策略据此知道"我这条 15m 是平台用 5m 合成的"。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesWindow {
+    pub bars: Vec<Kline>,
+    pub mode: SeriesMode,
+    /// 实际取数粒度: `Native` 时 = 请求周期; `Resampled` 时 = 参与合成的细粒度。
+    pub feed_interval: Interval,
+}
+
+impl SeriesWindow {
+    /// 原生口径结果(直接来自源的该周期)。
+    pub fn native(bars: Vec<Kline>, interval: Interval) -> Self {
+        Self { bars, mode: SeriesMode::Native, feed_interval: interval }
+    }
+
+    /// 重采样口径结果。
+    pub fn resampled(bars: Vec<Kline>, feed_interval: Interval) -> Self {
+        Self { bars, mode: SeriesMode::Resampled, feed_interval }
+    }
+}
+
+/// 序列键(数据服务的唯一标识): `(source, symbol, interval)`。
+///
+/// - `source`: 数据源注册名(`binance_spot` / `binance_futures` / `nasdaq` / `yahoo`);
+/// - `symbol`: **源原生写法**(`ETHUSDT` / `QQQ`) —— 引擎不做跨源翻译、不猜;
+/// - `interval`: 周期标签见 [`Interval`]。
+///
+/// 校验: `source` / `symbol` 非空, 且不含缓存键分隔符 `|`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SeriesKey {
+    pub source: String,
+    pub symbol: String,
+    pub interval: Interval,
+}
+
+impl SeriesKey {
+    /// 构造并校验。
+    pub fn new(source: &str, symbol: &str, interval: Interval) -> CoreResult<Self> {
+        Self::validate_part("source", source)?;
+        Self::validate_part("symbol", symbol)?;
+        Ok(Self { source: source.to_string(), symbol: symbol.to_string(), interval })
+    }
+
+    fn validate_part(field: &str, value: &str) -> CoreResult<()> {
+        if value.trim().is_empty() {
+            return Err(CoreError::InvalidArgument(format!("{field} 不能为空")));
+        }
+        if value.contains('|') {
+            return Err(CoreError::InvalidArgument(format!("{field} 不能含分隔符 '|': {value}")));
+        }
+        Ok(())
+    }
+
+    /// 缓存键(`data_klines` 主键口径): `source|symbol|interval`。
+    pub fn cache_key(&self) -> String {
+        format!("{}|{}|{}", self.source, self.symbol, self.interval.label())
+    }
+
+    /// 缓存键反解; 格式不符或周期标签未知返回 `None`。
+    pub fn parse_cache_key(raw: &str) -> Option<SeriesKey> {
+        let mut parts = raw.split('|');
+        let source = parts.next()?;
+        let symbol = parts.next()?;
+        let interval_label = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let interval = Interval::from_label(interval_label)?;
+        SeriesKey::new(source, symbol, interval).ok()
+    }
+}
+
+impl fmt::Display for SeriesKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}@{}", self.source, self.symbol, self.interval)
+    }
+}
+
+/// 序列元信息(策略可见): 口径与新鲜度。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeriesMeta {
+    pub key: SeriesKey,
+    pub price_mode: PriceMode,
+    /// `true` = 由主序列重采样得到(源无该原生周期); `false` = 源原生周期。
+    pub resampled: bool,
+    /// `true` = 最近一次增量回补失败, 数据可能过期(策略自行判断, 引擎不静默用旧数据冒充新数据)。
+    pub stale: bool,
+    /// 请求的尾窗根数(下限 / 上限由序列句柄校验)。
+    pub requested_bars: usize,
+}
+
+impl SeriesMeta {
+    /// 新建(默认非重采样、非 stale)。
+    pub fn new(key: SeriesKey, price_mode: PriceMode, requested_bars: usize) -> Self {
+        Self { key, price_mode, resampled: false, stale: false, requested_bars }
+    }
 }

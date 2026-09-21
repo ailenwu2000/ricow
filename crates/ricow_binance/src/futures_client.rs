@@ -149,6 +149,26 @@ impl FuturesClient {
         .await
     }
 
+    /// 合约 K 线: 按 `[from_ms, to_ms)` 区间拉取 (028 T010)。
+    pub async fn get_klines_range(
+        &self,
+        symbol: &str,
+        interval: &str,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        crate::client::fetch_klines_range(
+            &self.http,
+            &self.base_url,
+            "/fapi/v1/klines",
+            symbol,
+            interval,
+            from_ms,
+            to_ms,
+        )
+        .await
+    }
+
     /// 合约盘口快照 (`GET /fapi/v1/depth`)。
     pub async fn get_depth(&self, symbol: &str, limit: u32) -> CoreResult<OrderBook> {
         let url = format!(

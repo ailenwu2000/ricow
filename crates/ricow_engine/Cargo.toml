@@ -25,10 +25,12 @@ uuid.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 toml = "0.8"
+# 028 T010: `data/source_binance.rs` 要实现 `ricow_core::KlineSource`(async trait),
+# 原先只在 dev-dependencies 里 → 生产代码编译不过, 移到正式依赖(版本仍是 workspace 的 0.1)。
+async-trait = "0.1"
 
 [dev-dependencies]
 rust_decimal_macros = "1"
-async-trait = "0.1"
 
 [lints]
 workspace = true

@@ -5,14 +5,32 @@
 //! 这里只做 LuaStrategy 实例化。
 //!
 //! 历史注记 (2026-09-11 下线): 首个 Lua 组合策略 bs_momentum 已删除 (真实成交轨期望 ≈0,
-//! 每 bar spot −0.0198% / futures +0.0367%, 不合格)。组合回测入口与 signal_klines 装载
+//! 每 bar spot −0.0198% / futures +0.0367%, 不合格)。组合回测入口
 //! 机制保留在 ricow / ricow_strategy (通用能力, 暂无内置消费者)。
 
 use ricow_core::{CoreError, CoreResult};
-use ricow_strategy::{LuaStrategy, Strategy, StrategyConfig};
+use ricow_strategy::{HostServices, LuaStrategy, Strategy, StrategyConfig};
 
 /// 根据配置实例化策略 (全部为 Lua; 内置名经 CLI 层 Lua 化后以 lua 类型到达)。
 pub fn load_strategy(config: &StrategyConfig) -> CoreResult<Box<dyn Strategy>> {
+    load_strategy_inner(config, None)
+}
+
+/// 同 [`load_strategy`], 但**在脚本顶层执行之前**注入宿主服务 (028 T016)。
+///
+/// 为什么必须在顶层之前: 策略可以在脚本顶层写 `data:series{...}` 声明数据面 —— 那一刻就要取数。
+/// `load_strategy`(不注入宿主) 只适合不使用 `data:*`/`http:*` 的脚本。
+pub fn load_strategy_with_host(
+    config: &StrategyConfig,
+    host: std::sync::Arc<dyn HostServices>,
+) -> CoreResult<Box<dyn Strategy>> {
+    load_strategy_inner(config, Some(host))
+}
+
+fn load_strategy_inner(
+    config: &StrategyConfig,
+    host: Option<std::sync::Arc<dyn HostServices>>,
+) -> CoreResult<Box<dyn Strategy>> {
     match config.strategy_type.as_str() {
         "lua" => {
             let code = config.get_str("script").ok_or_else(|| {
@@ -20,8 +38,11 @@ pub fn load_strategy(config: &StrategyConfig) -> CoreResult<Box<dyn Strategy>> {
             })?;
             ricow_strategy::lua::validate_script_source(code)
                 .map_err(CoreError::InvalidArgument)?;
-            let strategy = LuaStrategy::from_source(code, config.clone())
-                .map_err(CoreError::InvalidArgument)?;
+            let strategy = match host {
+                Some(h) => LuaStrategy::from_source_with_host(code, config.clone(), h),
+                None => LuaStrategy::from_source(code, config.clone()),
+            }
+            .map_err(CoreError::InvalidArgument)?;
             Ok(Box::new(strategy))
         }
         other => Err(CoreError::InvalidArgument(format!("unsupported strategy type: {other}"))),

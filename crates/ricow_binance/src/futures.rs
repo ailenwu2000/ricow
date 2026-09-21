@@ -223,6 +223,17 @@ impl Exchange for BnFuturesExchange {
         self.client.get_klines(pair, interval, limit).await
     }
 
+    /// 区间取数 (028 T010): 数据服务的 `KlineSource` 需要 `[from, to)` 语义。
+    async fn get_klines_range(
+        &self,
+        pair: &str,
+        interval: &str,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        self.client.get_klines_range(pair, interval, from_ms, to_ms).await
+    }
+
     async fn get_orderbook(&self, pair: &str, depth: u32) -> CoreResult<OrderBook> {
         self.client.get_depth(pair, depth).await
     }

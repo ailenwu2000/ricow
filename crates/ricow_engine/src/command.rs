@@ -21,9 +21,10 @@ use rust_decimal::Decimal;
 use crate::backtest_runner::run_backtest;
 use crate::confirm::create_preview;
 use crate::live::{plan_cleanup, residual_owned, CleanupOutcome, OnceGate};
-use crate::loader::load_strategy;
+use crate::loader::{load_strategy, load_strategy_with_host};
 use crate::market;
 use crate::notify::{Notifier, NotifyEvent};
+use ricow_strategy::HostServices;
 
 /// 引擎入口 — 无状态命令分发。
 pub struct Engine;
@@ -108,10 +109,12 @@ const FUNDING_POLL_SECS: u64 = 1800;
 /// 实盘双流事件 (行情 / 用户数据流 / 停机信号 / 资金费对账)。
 enum LiveEvent {
     Stop(Option<StopRequest>),
-    Quote(Option<ricow_core::OrderBookUpdate>),
+    Quote(Option<(String, ricow_core::OrderBookUpdate)>),
     User(Option<UserEvent>),
     /// 资金费增量拉取 (014 FR-003): 不驱动策略 tick, 只对账落库。
     Funding,
+    /// 声明驱动轮询 (028 T023): 推进已收盘序列与到点定时器(无行情也要推进)。
+    Drive,
 }
 
 /// 拉取资金费流水并落库 (014 FR-003): 水位 = db `MAX(funding_time)`(无记录则回溯 `FUNDING_LOOKBACK_MS`)。
@@ -590,6 +593,9 @@ impl Engine {
         exchange: Arc<dyn Exchange>,
         initial_balance: Balance,
         db: Option<&Database>,
+        // 028: 声明式数据面所需的本地数据服务(调用方持有 Database, 因此由调用方装配);
+        // `None` = 不支持声明(策略用 `data:*` 会拿到明确错误), 旧路径行为不变。
+        hub: Option<Arc<crate::data::DataHub>>,
         mut stop: Option<StopSignal>,
     ) -> CoreResult<RunOutcome> {
         // 出站通知 (003): 未配 `params.notify_webhook` → None (不打通道)
@@ -600,16 +606,84 @@ impl Engine {
         let mode = RunMode::DryRun;
 
         let mut ctx = DryRunContext::new(exchange.clone(), config.clone(), initial_balance);
-        let mut strategy = load_strategy(&config)?;
+        // 装配可能取数(冷启动补历史), 先打一行让"卡在取数"可见 —— 实测源不可达时这里会
+        // 静默等满 HTTP 超时(30s), 没有这行日志用户只会看到"启动后不动"。
+        if hub.is_some() {
+            tracing::info!(target: "engine", name = %config.name, "正在按策略声明装配数据面(可能需要取数)…");
+        }
+        let start_ms = Utc::now().timestamp_millis();
+        // 028: 宿主必须在**策略脚本顶层执行之前**就绪(声明期就要取数); Dry Run 允许回源(补缺口)。
+        let host: Option<Arc<crate::data::EngineHost>> = match &hub {
+            Some(h) => Some(Arc::new(crate::data::EngineHost::new(h.clone(), start_ms, true)?)),
+            None => None,
+        };
+        let mut strategy = match &host {
+            Some(h) => {
+                let dyn_host: Arc<dyn HostServices> = h.clone();
+                load_strategy_with_host(&config, dyn_host)?
+            }
+            None => load_strategy(&config)?,
+        };
         strategy.on_init(&mut ctx);
 
-        let mut stream = market::subscribe_orderbook(&exchange, &pair).await?;
+        // 028: 按声明装配数据面(序列/定时器); 无声明 → None(旧路径, 行为不变)
+        let mut driven = match &host {
+            Some(h) => Some(crate::data::DrivenRuntime::assemble(h.clone(), &*strategy, start_ms)?),
+            None => None,
+        };
+
+        // 028 FR-023: 盘口订阅集合 = 策略声明的 pair ∪ 配置 pair(去重, 配置 pair 恒在首位)。
+        // 单标的策略 = 一条订阅, 与旧行为逐位一致; 多标的时主循环按 (pair, update) 消费。
+        let mut quote_pairs: Vec<String> = strategy.quote_subscriptions();
+        if !quote_pairs.iter().any(|p| p == &pair) {
+            quote_pairs.insert(0, pair.clone());
+        }
+        let mut stream = market::subscribe_orderbooks(&exchange, &quote_pairs).await?;
         tracing::info!(target: "engine", name = %config.name, pair = %pair, "dry run started");
 
         let mut outcome = RunOutcome::default();
 
+        // 028: 声明驱动与订单处理共用的下单管线(与 on_tick 完全同一条出口, 不新增通道)。
+        macro_rules! submit_orders {
+            ($orders:expr) => {{
+                for req in $orders {
+                    outcome.orders_submitted += 1;
+                    match ctx.place_order(req) {
+                        Ok(ack) if ack.status == OrderStatus::Rejected => {
+                            // 风控/参数对齐拒单: 与"下单失败"区分计数 (策略循环不中断)
+                            // 026 时点① 只记**已提交**的单 —— 拒单未到交易所, 不产生订单行
+                            outcome.rejections += 1;
+                        }
+                        Ok(ack) => {
+                            if let Some(db) = db {
+                                persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode)
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            // 下单失败如实记录并计数 (不再静默吞掉)
+                            outcome.order_errors += 1;
+                            let msg = e.to_string();
+                            tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
+                            outcome.last_error = Some(format!("下单失败: {msg}"));
+                        }
+                    }
+                }
+            }};
+        }
+
+        // 驱动醒来方式: 停机信号 / 行情更新 / 驱动轮询(无行情也要推序列与定时器)
+        enum Woke {
+            Stop,
+            Update(Option<(String, ricow_core::OrderBookUpdate)>),
+            Poll,
+        }
+
+        let mut poll = tokio::time::interval(crate::data::DrivenRuntime::poll_interval());
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
-            let update = match stop.as_mut() {
+            let woke = match stop.as_mut() {
                 Some(rx) => {
                     tokio::select! {
                         biased;
@@ -620,43 +694,71 @@ impl Engine {
                                 // 发送端已关闭 = 管理器进程消失
                                 Err(_) => Some(StopReason::ManagerGone),
                             };
-                            break;
+                            Woke::Stop
                         }
-                        upd = stream.next() => upd,
+                        upd = stream.next() => Woke::Update(upd),
+                        _ = poll.tick(), if driven.is_some() => Woke::Poll,
                     }
                 }
-                None => stream.next().await,
+                None => {
+                    if driven.is_some() {
+                        tokio::select! {
+                            upd = stream.next() => Woke::Update(upd),
+                            _ = poll.tick() => Woke::Poll,
+                        }
+                    } else {
+                        Woke::Update(stream.next().await)
+                    }
+                }
             };
 
-            let Some(update) = update else { break };
+            if matches!(woke, Woke::Stop) {
+                break;
+            }
 
-            let ob = market::to_orderbook(update);
-            ctx.update_orderbook(&pair, ob);
-            outcome.ticks += 1;
-
-            let orders = strategy.on_tick(&mut ctx);
-            for req in orders {
-                outcome.orders_submitted += 1;
-                match ctx.place_order(req) {
-                    Ok(ack) if ack.status == OrderStatus::Rejected => {
-                        // 风控/参数对齐拒单: 与"下单失败"区分计数 (策略循环不中断)
-                        // 026 时点① 只记**已提交**的单 —— 拒单未到交易所, 不产生订单行
-                        outcome.rejections += 1;
-                    }
-                    Ok(ack) => {
-                        if let Some(db) = db {
-                            persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode).await;
+            // ① 声明驱动: 本刻新收盘的 bar / 到点的定时器 → 派发给策略(与 on_tick 同一条下单管线)
+            if let Some(d) = driven.as_mut() {
+                for ev in d.advance(Utc::now().timestamp_millis()) {
+                    match ev {
+                        crate::data::DriveEvent::Bar(info, bar) => {
+                            let orders = strategy.on_bar(&mut ctx, &info, &bar);
+                            submit_orders!(orders);
+                        }
+                        crate::data::DriveEvent::Timer(label) => {
+                            let orders = strategy.on_timer(&mut ctx, &label);
+                            submit_orders!(orders);
                         }
                     }
-                    Err(e) => {
-                        // 下单失败如实记录并计数 (不再静默吞掉)
-                        outcome.order_errors += 1;
-                        let msg = e.to_string();
-                        tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
-                        outcome.last_error = Some(format!("下单失败: {msg}"));
-                    }
+                    // 主动订单出口 (FR-002 ②③): 与回调返回值同批落地
+                    let intents = strategy.take_intents();
+                    submit_orders!(intents.orders);
+                }
+                // 增量取数失败/恢复 → 逐条置/清 `stale`(FR-016), 策略可 `s:stale()` 感知
+                for (id, ok) in d.take_stale_updates() {
+                    strategy.mark_series_stale(&id, !ok);
                 }
             }
+
+            // ② 行情更新
+            let update = match woke {
+                Woke::Poll => continue, // 已做过驱动, 继续等下一轮
+                Woke::Stop => unreachable!("已在上面跳出"),
+                Woke::Update(None) => break, // 行情流结束
+                Woke::Update(Some(u)) => u,
+            };
+
+            let (up_pair, update) = update;
+            let ob = market::to_orderbook(update);
+            ctx.update_orderbook(&up_pair, ob);
+            outcome.ticks += 1;
+
+            // 028 FR-001: 定义了 `on_quote` 就派发它(多标的时据此区分来源), 否则走既有 `on_tick`
+            let orders = if strategy.has_callback("on_quote") {
+                strategy.on_quote(&mut ctx, &up_pair)
+            } else {
+                strategy.on_tick(&mut ctx)
+            };
+            submit_orders!(orders);
 
             let fills = ctx.drain_fills();
             outcome.fills += fills.len() as u64;
@@ -757,11 +859,16 @@ impl Engine {
     /// - `close_all`: 停机清理时是否市价平掉策略持仓;
     /// - 用户数据流断线 = **异常停机** (plan P1; 断线后成交无法回灌, 静默继续会误判仓位);
     /// - 用户流事件只回写成交, **不驱动 tick** (plan P2, 与 Dry Run 的 tick 语义一致)。
+    // 参数即装配面(策略/交易所/库/数据服务/停机/清仓/模式) —— 由 CLI 一处组装, 不再包一层
+    // 只为少一个参数的结构体。
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_live(
         &self,
         config: StrategyConfig,
         exchange: Arc<dyn Exchange>,
         db: Option<&Database>,
+        // 028: 声明式数据面所需的本地数据服务(与 Dry Run 同义; `None` = 不支持声明)
+        hub: Option<Arc<crate::data::DataHub>>,
         stop: Option<StopSignal>,
         close_all: bool,
         // 运行模式: 日志标签(`label()`)必须如实标注, 不得把 demo 说成实盘; 落库口径走 `as_str()`
@@ -884,9 +991,37 @@ impl Engine {
         }
 
         // ③ 策略与双流 (行情 + 用户数据流)
-        let mut strategy = load_strategy(&config)?;
+        // 028: 宿主先于策略脚本顶层执行(声明期取数); 实盘允许回源补缺口。
+        // 装配可能取数(冷启动补历史), 先打一行让"卡在取数"可见 —— 实测源不可达时这里会
+        // 静默等满 HTTP 超时(30s), 没有这行日志用户只会看到"启动后不动"。
+        if hub.is_some() {
+            tracing::info!(target: "engine", name = %strategy_name, "正在按策略声明装配数据面(可能需要取数)…");
+        }
+        let start_ms = Utc::now().timestamp_millis();
+        let host: Option<Arc<crate::data::EngineHost>> = match &hub {
+            Some(h) => Some(Arc::new(crate::data::EngineHost::new(h.clone(), start_ms, true)?)),
+            None => None,
+        };
+        let mut strategy = match &host {
+            Some(h) => {
+                let dyn_host: Arc<dyn HostServices> = h.clone();
+                load_strategy_with_host(&config, dyn_host)?
+            }
+            None => load_strategy(&config)?,
+        };
         strategy.on_init(&mut ctx);
-        let mut quote_stream = market::subscribe_orderbook(&exchange, &pair).await?;
+        // 028: 按声明装配数据面; 无声明 → None(旧路径, 行为不变)
+        let mut driven = match &host {
+            Some(h) => Some(crate::data::DrivenRuntime::assemble(h.clone(), &*strategy, start_ms)?),
+            None => None,
+        };
+        let driven_active = driven.is_some();
+        // 028 FR-023: 盘口订阅集合 = 声明的 pair ∪ 配置 pair(单标的时与旧行为一致)
+        let mut quote_pairs: Vec<String> = strategy.quote_subscriptions();
+        if !quote_pairs.iter().any(|p| p == &pair) {
+            quote_pairs.insert(0, pair.clone());
+        }
+        let mut quote_stream = market::subscribe_orderbooks(&exchange, &quote_pairs).await?;
         let mut user_stream = exchange
             .subscribe_user_events()
             .await
@@ -902,11 +1037,65 @@ impl Engine {
         }
         let mut funding_tick = tokio::time::interval(Duration::from_secs(FUNDING_POLL_SECS));
         funding_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 028: 声明驱动的轮询节奏(与 Dry Run 一致)
+        let mut drive_tick = tokio::time::interval(crate::data::DrivenRuntime::poll_interval());
+        drive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tracing::info!(target: "engine", name = %strategy_name, pair = %pair, mode = %mode.label(), "live run started");
 
         let mut stop_rx = stop;
         // 停机时是否平仓: 启动参数与停机指令二者取或 (`start --live` 后 `stop --close-all` 也生效)
         let mut close_all_at_stop = close_all;
+
+        // 028: 行情/声明驱动两条路径共用的下单 + 成交后对齐管线(不新增下单通道)。
+        macro_rules! submit_live {
+            ($orders:expr) => {{
+                let mut any_filled = false;
+                for req in $orders {
+                    outcome.orders_submitted += 1;
+                    match ctx.place_order(req) {
+                        Ok(ack) if ack.status == OrderStatus::Rejected => {
+                            outcome.rejections += 1;
+                        }
+                        Ok(ack) => {
+                            // 026 时点①: 委托价/委托量在提交时落库
+                            if let Some(db) = db {
+                                persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode)
+                                    .await;
+                            }
+                            if ack.filled_size > Decimal::ZERO {
+                                any_filled = true;
+                            }
+                        }
+                        Err(e) => {
+                            outcome.order_errors += 1;
+                            let msg = e.to_string();
+                            tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
+                            outcome.last_error = Some(format!("下单失败: {msg}"));
+                        }
+                    }
+                }
+                // 下单即有成交 → 立刻对齐本地快照 (016 FR-B): 成交回写走用户流有延迟, 期间策略会按陈旧
+                // 持仓/现金重复下单 (demo 实测: 1.4s 内同价同量 3 次 → 2 成交 + 1 次资金不足报错)。
+                if any_filled {
+                    let refreshed = refresh_positions(
+                        &exchange,
+                        &market,
+                        &pair,
+                        &ctx,
+                        is_futures,
+                        &strategy_name,
+                        liq_warn_threshold,
+                        notifier.as_ref(),
+                    )
+                    .await;
+                    // 026 时点④: 只落**查到的事实**; None = 查询失败 → 不落库 (不拿陈旧快照冒充现状)
+                    if let (Some(db), Some(positions)) = (db, refreshed) {
+                        persist_position(db, &mut outcome, &strategy_name, &pair, &positions, mode)
+                            .await;
+                    }
+                }
+            }};
+        }
 
         loop {
             let ev = match stop_rx.as_mut() {
@@ -923,11 +1112,13 @@ impl Engine {
                     upd = quote_stream.next() => LiveEvent::Quote(upd),
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
+                    _ = drive_tick.tick(), if driven_active => LiveEvent::Drive,
                 },
                 None => tokio::select! {
                     upd = quote_stream.next() => LiveEvent::Quote(upd),
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
+                    _ = drive_tick.tick(), if driven_active => LiveEvent::Drive,
                 },
             };
 
@@ -957,61 +1148,39 @@ impl Engine {
                     outcome.last_error = Some("行情流中断 (WebSocket 断开)".into());
                     break;
                 }
-                LiveEvent::Quote(Some(update)) => {
+                LiveEvent::Quote(Some((quote_pair, update))) => {
                     let ob = market::to_orderbook(update);
-                    ctx.update_orderbook(&pair, ob);
+                    ctx.update_orderbook(&quote_pair, ob);
                     outcome.ticks += 1;
-                    let orders = strategy.on_tick(&mut ctx);
-                    let mut any_filled = false;
-                    for req in orders {
-                        outcome.orders_submitted += 1;
-                        match ctx.place_order(req) {
-                            Ok(ack) if ack.status == OrderStatus::Rejected => {
-                                outcome.rejections += 1;
-                            }
-                            Ok(ack) => {
-                                // 026 时点①: 委托价/委托量在提交时落库
-                                if let Some(db) = db {
-                                    persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode)
-                                        .await;
+                    // 028 FR-001: 定义了 `on_quote` 派发它(多标的区分来源), 否则走既有 `on_tick`
+                    let orders = if strategy.has_callback("on_quote") {
+                        strategy.on_quote(&mut ctx, &quote_pair)
+                    } else {
+                        strategy.on_tick(&mut ctx)
+                    };
+                    submit_live!(orders);
+                }
+                LiveEvent::Drive => {
+                    // 028 T023: 声明驱动 —— 本刻新收盘的 bar / 到点的定时器, 与行情路径同一条下单管线
+                    if let Some(d) = driven.as_mut() {
+                        for ev in d.advance(Utc::now().timestamp_millis()) {
+                            match ev {
+                                crate::data::DriveEvent::Bar(info, bar) => {
+                                    let orders = strategy.on_bar(&mut ctx, &info, &bar);
+                                    submit_live!(orders);
                                 }
-                                if ack.filled_size > Decimal::ZERO {
-                                    any_filled = true;
+                                crate::data::DriveEvent::Timer(label) => {
+                                    let orders = strategy.on_timer(&mut ctx, &label);
+                                    submit_live!(orders);
                                 }
                             }
-                            Err(e) => {
-                                outcome.order_errors += 1;
-                                let msg = e.to_string();
-                                tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
-                                outcome.last_error = Some(format!("下单失败: {msg}"));
-                            }
+                            // 主动订单出口 (FR-002 ②③): 与回调返回值同批落地
+                            let intents = strategy.take_intents();
+                            submit_live!(intents.orders);
                         }
-                    }
-                    // 下单即有成交 → 立刻对齐本地快照 (016 FR-B): 成交回写走用户流有延迟, 期间策略会按陈旧
-                    // 持仓/现金重复下单 (demo 实测: 1.4s 内同价同量 3 次 → 2 成交 + 1 次资金不足报错)。
-                    if any_filled {
-                        let refreshed = refresh_positions(
-                            &exchange,
-                            &market,
-                            &pair,
-                            &ctx,
-                            is_futures,
-                            &strategy_name,
-                            liq_warn_threshold,
-                            notifier.as_ref(),
-                        )
-                        .await;
-                        // 026 时点④: 只落**查到的事实**; None = 查询失败 → 不落库 (不拿陈旧快照冒充现状)
-                        if let (Some(db), Some(positions)) = (db, refreshed) {
-                            persist_position(
-                                db,
-                                &mut outcome,
-                                &strategy_name,
-                                &pair,
-                                &positions,
-                                mode,
-                            )
-                            .await;
+                        // 增量取数失败/恢复 → 逐条置/清 `stale`(FR-016)
+                        for (id, ok) in d.take_stale_updates() {
+                            strategy.mark_series_stale(&id, !ok);
                         }
                     }
                 }

@@ -132,8 +132,9 @@
   **仅保留**固定工程护栏 `order_guard`(100 单/秒, 固定常量、不读任何配置 —— 防 bug 风暴被交易所封禁, 不是投资判断);
   实盘门禁 `risk_gate` / `--accept-risk` / `risk_ack.json` 属"风险披露确认"(三判据之一), **不属于风控, 未删**。依据见 019 spec §七 R5。
 - **D16** ✅ **`ricow scan` 删除**(2026-09-15): 选币/研究入口与"运行策略的平台"定位正交(无 AI 工具面消费者、无集成测试);
-  用户拍板删除且**不留废弃代码**。仍按 2026-09-11 明示保留的通用能力: 美股数据层(`nasdaq`/`us_tickers`/`market_class`/`us_klines`)、
-  组合回测路径、`build_interval_ticks`、`ctx:now()`。
+  用户拍板删除且**不留废弃代码**。仍按 2026-09-11 明示保留的通用能力: 美股数据层(`nasdaq` 源 / `us_tickers` / `market_class` / 统一 `data_klines` 缓存)、
+  组合回测路径(多标的同一账本)、`build_interval_ticks`、`ctx:now()`。
+  (**028 D8 修订**: 原 `us_klines` 专桶与 `insert_us_klines`/`get_us_klines` 已退役, Nasdaq 变成一个普通数据源落 `data_klines`。)
 
 ### 已确认项
 
@@ -155,8 +156,8 @@
 |:---|:-----|
 | 密钥 | 单一明文配置文件 `$RICOW_ROOT/ricow.toml`(Unix 0600 / Windows 仅当前用户 ACL; 019 D31/R4; OS Keyring 方案已于 2026-09-14 移除, 理由见 README); 币安 API key(禁提现, 仅交易权限); 私钥不出本机 |
 | 下单 | CLI 单入口直连下单路径, 三条 `place_order` 必过固定工程护栏 `order_guard`(100 单/秒, 平台不做投资判断 — 赚赔政策属于策略); 写操作强制用户侧批准(预览 → 人工确认 → 一次性 token); Dry Run 默认 |
-| AI 生成代码 | Lua 沙箱(禁 require/loadstring, 指令预算, 无文件/网络/进程) + 编译门禁 + 沙箱回测门禁 + 用户 diff 确认 |
-| 网络 | 仅交易所 API + 用户自配 LLM API; 软件内无自动下载/自动更新 |
+| AI 生成代码 | Lua 沙箱(禁 require/loadstring, 指令预算, 无文件/进程/原生 socket 能力) + 编译门禁 + 沙箱回测门禁 + 用户 diff 确认 |
+| 网络 | 平台自身: 交易所 API + 内置数据源(Nasdaq/Yahoo) + 用户自配 LLM API; 用户策略可经 `http:get`(仅 GET, 超时 10s / 体积 5MB 上限)自取任意 URL, 平台不限制域名、不背书(用户自担); 软件内无自动下载/自动更新 |
 | 遥测 | 无遥测、无数据上报 |
 | 风险披露 | ✅ 两项均已落地: README 免责声明(`README.md`/`README_zh.md`) + **首次使用风险确认**(018: 实盘启动未确认即拒绝并打印披露要点, `--accept-risk` 确认一次记入 `$RICOW_ROOT/risk_ack.json`) |
 

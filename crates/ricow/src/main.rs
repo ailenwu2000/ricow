@@ -9,8 +9,8 @@ mod web;
 use clap::{Parser, Subcommand};
 
 use commands::{
-    agentkit, approve, backtest, chat, create, ctrl, daemon, db, deploy, instances, logs, market,
-    pairs, run,
+    agentkit, approve, backtest, chat, create, ctrl, daemon, data, db, deploy, instances, logs,
+    market, pairs, run,
 };
 
 #[derive(Parser)]
@@ -51,6 +51,8 @@ enum Command {
     Pairs(pairs::PairsArgs),
     /// K 线库管理
     Db(db::DbArgs),
+    /// 数据服务 (028): 从数据源拉 K 线入库 (回测只读本地库, 先 pull 再回测)
+    Data(data::DataArgs),
     /// 日志 (读 logs/<name>.log, --follow 尾随)
     Logs(logs::LogsArgs),
     /// 批准待确认操作 (两步确认)
@@ -105,6 +107,7 @@ async fn main() {
         Some(Command::Orderbook(args)) => market::orderbook(args).await,
         Some(Command::Pairs(args)) => pairs::pairs(args).await,
         Some(Command::Db(args)) => db::run(args).await,
+        Some(Command::Data(args)) => data::run(args).await,
         Some(Command::Logs(args)) => logs::run(args),
         Some(Command::Approve(args)) => approve::run(args).await,
         Some(Command::Create(args)) => create::run(args).await,

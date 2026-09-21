@@ -9,7 +9,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::NaiveDate;
 use ricow_core::{Balance, Kline};
-use ricow_strategy::{BacktestContext, BacktestReport, Context, Strategy, StrategyConfig};
+use ricow_strategy::{
+    BacktestContext, BacktestReport, CancelIntent, Context, Strategy, StrategyConfig,
+};
+
+use crate::data::SeriesDriver;
 
 /// 在历史 K 线上运行一次回测 (单标的)。
 ///
@@ -20,6 +24,10 @@ pub fn run_backtest(
     klines: &[Kline],
     strategy: &mut dyn Strategy,
 ) -> BacktestReport {
+    // 028 审核修复: 回测**不产生盘口事件**(没有 ws 流), 只写 `on_quote` 的策略在回测里
+    // 一次都不会触发 —— 与刚修的 data:timer 是同类"静默 0 成交"陷阱。
+    // 告警实现统一在一处(声明路径与旧路径共用), 免得两条件文案漂移。
+    crate::data::warn_if_quote_only(strategy);
     let mut ctx = BacktestContext::new(config, initial_balance);
     strategy.on_init(&mut ctx);
 
@@ -101,24 +109,148 @@ pub fn build_interval_ticks(
         .collect()
 }
 
+/// 把策略声明驱动的序列接进回测主循环 (028 T024, 新路径)。
+///
+/// **时序约定(无前视的关键, 逐条对齐既有回测模型)**:
+/// 1. `ctx.step_bar(k)` 先推进账本 —— 此时 bar `k` 是"正在形成的 bar", 成交按它的 `open` 撮合
+///    (与既有路径一致: 市价单在 `place_order` 时按本 tick 的 `bar.open` 成);
+/// 2. 然后才把**已收盘**的 bar 推给策略: 可见时刻用 `k.open_time`, 于是"刚刚收盘"的是 `k-1`
+///    (它的 `close_time = k.open_time - 1`) —— 策略拿到的是**上一根**的完整信息, 却只能在
+///    `k` 的开盘价上成交。反过来(先看 `k` 的收盘、再在 `k` 的开盘成交)就是作弊, 本实现不做。
+/// 3. 最后一根 bar 的 `on_bar` **不派发**: 它之后没有可成交的刻度, 派发只会产生永不成交的挂单。
+///
+/// 与 [`run_backtest`] 的其余部分完全相同: `on_tick` / 订单返回值 / `on_fill` 都照旧,
+/// 主动订单出口(`ctx:place_order` / `ctx:cancel_order`)与返回值**同批落地**, 无第二条通道。
+pub fn run_backtest_with_series(
+    config: StrategyConfig,
+    initial_balance: Balance,
+    klines: &[Kline],
+    driver: &mut SeriesDriver,
+    strategy: &mut dyn Strategy,
+) -> BacktestReport {
+    let mut ctx = BacktestContext::new(config, initial_balance);
+    strategy.on_init(&mut ctx);
+    drain_intents(&mut ctx, strategy);
+
+    // 028: 声明定时器走**同一份调度器**(虚拟钟刻度) —— 之前只接了 bar, `data:timer` 声明的
+    // 策略在回测里 on_timer 一次都不响(审核实测: 同一声明在实盘会响 10 次), 回测静默给出
+    // "策略没在跑"的假结论。这里与 Dry Run/实盘同一份 `TimerScheduler`, 只是时钟换成刻度。
+    let mut timers = timers_for(&mut *strategy, klines.first());
+    // 主时钟标的: 它的撮合参考 bar 由本 tick 的 k 直接给定(不依赖 forming_bars 的推理)。
+    let primary_symbol = driver.infos().first().map(|i| i.symbol.clone());
+
+    for k in klines {
+        let tick_ms = k.open_time.timestamp_millis();
+        // 1) **先**设本 tick 的撮合参考 bar, 再推进账本 —— `step_bar` 内部会立刻 `match_pending`
+        //    (挂单撮合), 若参考 bar 晚一刻设置, 声明路径的限价单会比旧路径晚一根成交(审核实测)。
+        let mut forming = driver.forming_bars(tick_ms);
+        if let Some(sym) = &primary_symbol {
+            // 主时钟兜底: 只有该标的**没有**从自己序列拿到参考 bar 时才用本 tick 的 k。
+            // (不能无条件覆盖 —— 同标的声明了更细周期时, 覆盖会把"取最细周期"的规则打掉,
+            //  于是成交价随主时钟粒度变化; 这是第三轮审核用例抓到的。)
+            if !forming.iter().any(|(s, _)| s == sym) {
+                forming.push((sym.clone(), k.clone()));
+            }
+        }
+        ctx.set_declared_bars(&forming);
+        // 2) 账本推进到 bar k(本 tick 的成交价 = bar k 的 open)
+        ctx.step_bar(k.clone());
+        // 3) 推"已收盘"的 bar: 可见时刻 = bar k 的开盘时刻 ⇒ 新收盘的是 k-1
+        for (info, bar) in driver.advance(tick_ms) {
+            let orders = strategy.on_bar(&mut ctx, &info, &bar);
+            place_all(&mut ctx, orders);
+            drain_intents(&mut ctx, strategy);
+            let fills = ctx.drain_fills();
+            for fill in fills {
+                strategy.on_fill(&mut ctx, fill);
+            }
+        }
+        // 4) 声明定时器: 与 bar 同一条下单管线(订单出口只有一个)
+        for label in timers.due(tick_ms) {
+            let orders = strategy.on_timer(&mut ctx, &label);
+            place_all(&mut ctx, orders);
+            drain_intents(&mut ctx, strategy);
+            let fills = ctx.drain_fills();
+            for fill in fills {
+                strategy.on_fill(&mut ctx, fill);
+            }
+        }
+        // 3) 旧回调路径: 与本 tick 的撮合同批
+        let orders = strategy.on_tick(&mut ctx);
+        place_all(&mut ctx, orders);
+        drain_intents(&mut ctx, strategy);
+        let fills = ctx.drain_fills();
+        for fill in fills {
+            strategy.on_fill(&mut ctx, fill);
+        }
+    }
+
+    ctx.finalize();
+    ctx.report()
+}
+
+/// 声明定时器 → 调度器(回测语义: **虚拟钟**, 起点 = 首根刻度; 与实盘的墙钟装配同一份
+/// [`TimerScheduler`], 只是时钟来源不同 —— 见 `data/driven.rs` 的对应构造)。
+///
+/// 审核发现的问题就在这: 028 首版只把 bar 接进回测, `data:timer` 声明的策略在回测里
+/// `on_timer` 一次都不响(同一声明在实盘会响 10 次), 回测会静默给出"策略没在跑"的假结论。
+fn timers_for(
+    strategy: &mut dyn Strategy,
+    first: Option<&Kline>,
+) -> ricow_strategy::TimerScheduler {
+    let decls = strategy.timer_declarations();
+    let start_ms = first.map(|k| k.open_time.timestamp_millis()).unwrap_or(0);
+    ricow_strategy::TimerScheduler::new(decls, start_ms)
+}
+
+/// 下单一律忽略单笔失败(与既有回测路径同语义: 拒单不中断回测)。
+fn place_all(ctx: &mut BacktestContext, orders: Vec<ricow_core::OrderRequest>) {
+    for req in orders {
+        let _ = ctx.place_order(req);
+    }
+}
+
+/// 落地主动订单意图: `ctx:place_order` 入队的订单 + `ctx:cancel_order` 的撤单意图 (FR-002 ②③)。
+fn drain_intents(ctx: &mut BacktestContext, strategy: &mut dyn Strategy) {
+    let intents = strategy.take_intents();
+    if intents.is_empty() {
+        return;
+    }
+    for req in intents.orders {
+        let _ = ctx.place_order(req);
+    }
+    for intent in intents.cancels {
+        let res = match intent {
+            CancelIntent::Owned => ctx.cancel_owned_orders(None),
+            CancelIntent::OwnedIn { pair } => ctx.cancel_owned_orders(Some(&pair)),
+            CancelIntent::ByOrderId { pair, order_id } => {
+                ctx.cancel_order(&pair, &order_id).map(|_| 1)
+            }
+            CancelIntent::ByClientId { pair, client_order_id } => {
+                ctx.cancel_order(&pair, &client_order_id).map(|_| 1)
+            }
+        };
+        if let Err(e) = res {
+            tracing::warn!(target: "backtest", "撤单意图未生效: {e}");
+        }
+    }
+}
+
 /// 组合回测 (M2): 多标的统一时间轴驱动。
 ///
 /// 流程与 `run_backtest` 对齐: on_init → 逐 tick [step_portfolio(推进 + 撮合前 tick
 /// 残留限价单) → on_tick 产单 → place_order(市价即时按本 tick 各 pair bar open 成交;
 /// 资金不足拒单计数) → drain_fills → on_fill] → report_portfolio。
 ///
-/// `signal_klines` (bs_momentum Lua 化, 2026-09-09): 美股信号日线 (键 = 原始 pair 名,
-/// 装配层按窗口截取), 构造 ctx 后装载 — 组合信号模式下 ctx:klines(pair) 返回按全局
-/// tick 时间截断的信号段 (无前视); 空 map = 信号通道关闭 (纯成交轨, 现行为)。
+/// 028 T038: 原 `signal_klines` 参数(信号线预装)已退役 —— 多标的只是"同一账本按统一时间轴
+/// 撮合"(保留), 历史数据由策略自己声明 `data:series{...}` / `market:subscribe`.
 pub fn run_portfolio_backtest(
     config: StrategyConfig,
     initial_balance: Balance,
     ticks: &[Vec<(String, Kline)>],
     strategy: &mut dyn Strategy,
-    signal_klines: HashMap<String, Vec<Kline>>,
 ) -> BacktestReport {
     let mut ctx = BacktestContext::new(config, initial_balance);
-    ctx.set_signal_klines(signal_klines);
     strategy.on_init(&mut ctx);
 
     for bars in ticks {
@@ -210,6 +342,9 @@ mod tests {
     const ROTATION_SCRIPT: &str = r#"
         plan = { {}, { "TSLABUSDT" }, { "TSLABUSDT", "NVDABUSDT" } }
         tick = 0
+        -- 028: 组合快照靠"声明"驱动(退役装配层 universe 配置注入) —— 要盯的标的自己声明。
+        market:subscribe({ pair = "TSLABUSDT" })
+        market:subscribe({ pair = "NVDABUSDT" })
         pool = { "TSLABUSDT", "NVDABUSDT" }
         function on_tick(ctx)
             tick = tick + 1
@@ -250,8 +385,6 @@ mod tests {
     fn lua_strategy() -> (LuaStrategy, StrategyConfig) {
         let mut cfg = strategy_config();
         cfg.params.insert("script".into(), ConfigValue::String(ROTATION_SCRIPT.into()));
-        // universe 键 → Lua 快照组合模式: 逐只填池内 price/position (T3.2 判据)。
-        cfg.params.insert("universe".into(), ConfigValue::String("TSLABUSDT,NVDABUSDT".into()));
         let s = LuaStrategy::from_source(ROTATION_SCRIPT, cfg.clone()).expect("脚本应编译通过");
         (s, cfg)
     }
@@ -314,11 +447,8 @@ mod tests {
         ];
 
         let report = run_portfolio_backtest(
-            cfg, // 与策略同一 config (含 universe) — ctx 装载后快照按池遍历
-            initial,
-            &ticks,
-            &mut s,
-            HashMap::new(), // 空信号 map = 纯成交轨 (现行为)
+            cfg, // 与策略同一声明配置 — ctx 装载后快照按声明(市场订阅)遍历
+            initial, &ticks, &mut s,
         );
 
         assert_eq!(report.total_bars, 3);

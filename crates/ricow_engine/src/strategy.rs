@@ -38,8 +38,13 @@ pub fn extract_code(response: &str) -> Option<String> {
     }
 
     // 无代码围栏, 检查整个响应是否就是代码。
+    //
+    // 判据 = 是否定义了任一**回调**(028 FR-001 的 7 个)。只认 `on_tick`/`on_init` 会让
+    // "只写 on_bar / on_timer 的策略"被判成"未提取到 Lua 代码"(028 实测坑)。
+    const CALLBACKS: [&str; 7] =
+        ["on_init", "on_tick", "on_bar", "on_quote", "on_timer", "on_fill", "on_stop"];
     let trimmed = response.trim();
-    if trimmed.contains("function on_tick") || trimmed.contains("function on_init") {
+    if CALLBACKS.iter().any(|cb| trimmed.contains(&format!("function {cb}"))) {
         return Some(trimmed.to_string());
     }
 
@@ -356,6 +361,19 @@ mod tests {
         let code = extract_code(response);
         assert!(code.is_some());
         assert!(code.unwrap().contains("function on_tick"));
+    }
+
+    #[test]
+    fn test_extract_code_accepts_any_of_seven_callbacks_without_fence() {
+        // 028 FR-001/T041: 只写 on_bar / on_timer 的策略也是合法策略, 不能被判"未提取到代码"
+        let only_bar = "function on_bar(ctx, series, bar)\n    return {}\nend";
+        assert_eq!(extract_code(only_bar).as_deref(), Some(only_bar));
+        let only_timer = "function on_timer(ctx, label)\n    return {}\nend";
+        assert_eq!(extract_code(only_timer).as_deref(), Some(only_timer));
+        let only_quote = "function on_quote(ctx, pair)\n    return {}\nend";
+        assert_eq!(extract_code(only_quote).as_deref(), Some(only_quote));
+        // 非回调文本仍然不提取(不误判)
+        assert!(extract_code("这是一段说明, 没有 Lua 回调").is_none());
     }
 
     #[test]

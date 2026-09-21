@@ -14,12 +14,18 @@
 
 策略由 4 个回调函数组成，ricow 引擎按生命周期调用：
 
-| 回调 | 时机 | 返回值 |
+| 回调 | 触发 | 返回值 |
 |:-----|:-----|:-----|
 | `function on_init(ctx)` | 策略启动时调用一次 | 无 |
-| `function on_tick(ctx)` | 每个行情更新时调用 | 订单数组（可为空 `{}`） |
+| `function on_tick(ctx)` | 每个行情更新(盘口) | 订单数组（可为空 `{}`） |
+| `function on_quote(ctx, pair)` | 盘口更新, 带来源 pair(多标的用; 与 on_tick 语义相同) | 订单数组 |
+| `function on_bar(ctx, series, bar)` | 某条**声明的序列**新收盘一根(028; 见 §十) | 订单数组 |
+| `function on_timer(ctx, label)` | 策略**自定节奏**到点(028 `data:timer`; 回测虚拟钟 / 实盘墙钟) | 订单数组 |
 | `function on_fill(ctx, fill)` | 订单成交时调用 | 无 |
 | `function on_stop(ctx)` | 策略停止时调用 (停机清理: 撤单/平仓) | 无 |
+
+写哪个就派发哪个(引擎按脚本里是否定义来选路径); 旧策略只写 `on_tick`/`on_fill`/`on_stop` 一样跑。
+想自己定数据来源/标的/周期/节奏 → 见 **§十 声明式数据面**。
 
 所有回调的 `ctx` 参数为只读行情/账户快照；策略只能通过 on_tick 返回订单数组影响行为。
 
@@ -136,7 +142,7 @@ end
 | 函数 | 返回 | 说明 |
 |:-----|:-----|:-----|
 | `ctx:log(msg)` | 无 | 写日志 |
-| `ctx:klines(pair)` | table? | 已收盘 K 线数组(无前视),每根 `{ts=, open=, close=, volume=}` (`ts` = bar open_time 的 epoch 秒, 2026-09-11 新增, 供盘中策略定位"当日会话起点")。单标的路径最多最近 100 根; 组合信号模式 (config 有 `universe` 键) 返回该 pair 美股信号线截至当前执行日的已收盘段, **尾窗封顶 400 根** (≥253 根可打分, 见 §四), 不套 100 cap |
+| `ctx:klines(pair)` | table? | 已收盘 K 线数组(无前视),每根 `{ts=, open=, high=, low=, close=, volume=}` (`ts` = bar open_time 的 epoch 秒), 行形状与句柄 `s:bars(n)` 同一个构造函数。**028 起全段返回**(原"单标的 100 根 cap"与"组合信号模式 400 根尾窗"随 `universe`/`signal_klines` 一并退役); 要控体量由策略自己 `data:series{...bars=N}` 声明窗口 |
 
 ### exec 执行组件（引擎内置，全局表，点号调用）
 
@@ -184,28 +190,13 @@ ticks_per_interval = exec.ticks_per(ctx:config_i64("interval_secs"), ctx:config_
 > **注 (2026-09-11)**: 该机制的唯一内置消费者 `bs_momentum.lua` 已删除 (真实成交轨期望 ≈0)。
 > 本节描述的**引擎能力保留** (通用), 但当前**无内置策略使用**; 新策略可照此接入。
 
-### 组合信号模式（ctx:klines 长窗; 原 bs_momentum 轮动用）
+### ~~组合信号模式（universe + signal_klines 预装）~~ —— 已于 028 退役
 
-- 触发：config.params 含 `universe` 键（逗号串 = 池内成交轨 symbol，装配层注入）。
-- 数据双轨：**信号轨** = 美股 Nasdaq 日线（key = 成交轨 pair 名），引擎在
-  `run_portfolio_backtest` 以 `signal_klines` 装载后，`ctx:klines(pair)` 返回该 pair
-  信号线**截至当前执行日**的已收盘段（截断条件 = bar.open_time < 组合全局 tick 时间，
-  即当 tick 各 pair bar open_time 最大值；数据缺口日该 pair 无 bar 时截断仍按全局时间，
-  不悬空）——脚本永不见未来 bar，无前视。信号线不足 253 根的标的由策略脚本自行跳过
-  （宁缺毋滥）。`ctx:price(pair)`/`ctx:pos_size(pair, side)` 按 pair 路由（成交轨当前
-  bar open / 实际持仓），组合内逐只可查。
-- 长度边界：组合信号模式返回该 pair 信号线截至当前执行日已收盘段，**尾窗封顶最近
-  `SIGNAL_TAIL`(400) 根**（007 v2，R1 十年回测性能前提；打分只需 ≥253 根，400 留足
-  ROC252/EMA200(t-20)/52w 高余量；超长段只裁旧根不裁未来，无前视不变）。单标的路径
-  （无 universe）维持最多最近 100 根不变（回归约束，行为边界）。
-- 成交轨 = 币安 bStock 1d（spot = bstock base+USDT；futures = fapi EQUITY us+USDT），
-  R1 研究回测可切 `--market us` = Nasdaq 日线近似（忽略 bStock 溢价/时差，报告注明）；
-  撮合/成交按成交轨 bar open；信号日 T（美股收盘）→ 成交于其后首根新 bar，引擎截断
-  语义天然实现（T 日信号线 open_time < T+1 tick 时间）。
-- v2 策略参数（bs_momentum.lua 007）：`market_gate`（池内 SPY symbol；空 = 门不激活，
-  006 兼容）、`rebalance_days`（周频闸，装配层注入 5）、`min_candidates`（持仓下限，
-  装配层注入 3）——市场门/周频/下限全部指标基于美股信号线（数据源铁律），详见
-  bs_momentum.lua 头注释。
+> **已删除(028 D7)**: `universe` 配置键、`signal_klines`/`SIGNAL_TAIL` 装载与 `set_signal_klines`
+> 全部移除。原因: "引擎替策略预装信号线"属于平台替策略做决定, 与"完整逻辑在策略里"冲突。
+> 迁移: 策略在脚本里**自己声明**要哪条序列(`data:series{...}`, 可用不同 source/symbol/interval,
+> 例如 `source="nasdaq"` 的信号日线 + 币安成交轨同时声明), 引擎只负责按声明取数与按 `close_time` 派发 —— 见 §十。
+> 快照覆盖的标的同样改为按声明推导(配置 pair ∪ 序列标的 ∪ `market:subscribe` 的 pair)。
 
 ### 撮合参数回写（费率/滑点/杠杆与撮合层同源）
 
@@ -258,7 +249,8 @@ end
 ## 七、安全边界
 
 - 沙箱只加载 base/table/string/math/utf8 库，**无 os/io/debug/package/coroutine**。
-- `require` / `loadstring` / `loadfile` / `dofile` 不可用；无文件、网络、进程访问。
+- `require` / `loadstring` / `loadfile` / `dofile` 不可用；沙箱内**无文件/进程能力**，
+  也没有原生 socket —— 网络只能走平台给的 `http:get(url)` 通道(仅 GET, 墙钟超时 10s, 响应体上限 5MB; 见 §十)。
 - `pcall` / `xpcall` 不可用（错误捕获被禁用, 保证指令预算错误必达引擎层, 无法被脚本吞掉后继续烧 CPU）。
 - 指令预算: 单 tick 最多 1,000,000 条指令（每个回调周期独立重置），死循环会被中断并记日志。
 - 内存上限: 单实例 64MB（防 string.rep 等单次调用绕过指令预算造成 OOM）。
@@ -317,3 +309,104 @@ TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝�
 `strategies/scripts/` 修改即自定义(`strategies/` 下除 `builtin/` 外均被 git 忽略,
 用户策略默认私有;想入库自行调整 `.gitignore`)。
 
+## 十、声明式数据面(028): 策略自己决定数据
+
+**一句话**: 引擎不再写死喂哪条 K 线 —— 策略在脚本里声明"我要什么数据、什么周期、什么时候被叫醒",
+平台只负责**取数(含预热)、按 `close_time` 无前视派发、以及交易/账户这一侧**。
+
+### 10.1 声明(脚本顶层或 `on_init` 里调用)
+
+```lua
+local eth = data:series{
+    id        = "eth1h",        -- 策略侧标识(回调 on_bar 里用它区分)
+    source    = "binance_spot", -- 内置源: binance_spot / binance_futures / nasdaq / yahoo
+    symbol    = "ETHUSDT",      -- 源原生写法(美股 = QQQ / SPY 等)
+    interval  = "1h",           -- 1m/3m/5m/15m/30m/1h/2h/4h/6h/8h/12h/1d/3d/1w
+      bars      = 300,            -- 策略可见尾窗根数(默认 300; **下限 = max(自报 min_bars, 2)**, 引擎不从指标
+                              --   周期反推; **bars 或 min_bars 超过 5000 都硬报错**)
+    min_bars  = 60,             -- 预热下限; 不足直接报"序列过短"(不会拿半截指标做决策)
+    drive     = true,           -- true = 该序列收盘时回调 on_bar(回测里它同时是主时钟)
+    price     = "close",        -- close(默认) / adjclose(仅 Yahoo 支持; 其它源用它会硬报错)
+}
+```
+
+- `data:subscribe{...}` = **声明 + 驱动**(等价 `drive = true`, 语义更直白: "我要被它叫醒"),
+  **不返回句柄**(FR-008: 收增量归 `subscribe`, 拿句柄归 `series`)。要"既有句柄又被驱动"请写
+  `data:series{..., drive = true}`; 同一 `id` 先 `series` 再 `subscribe` 会报错(免得声明与句柄分裂)。
+- `market:subscribe{ pair = "BTCUSDT" }` = 订阅盘口 → 该 pair 的行情更新回调 `on_quote(ctx, pair)`。
+- `data:timer{ label = "t20", secs = 20 }` / `{ label = "open", at = "09:30", tz_offset_minutes = -240 }`
+  = 自定节奏 → 回调 `on_timer(ctx, label)`(实盘/Dry Run 走**墙钟**; 回测按**虚拟钟刻度**, 同一份
+  `TimerScheduler`)。`secs` 与 `at` **只能给一个**(同给会报错)。刻度比节奏粗时(如 `secs=30` 配
+  1h 刻度)单刻度最多补 10 次, 之后按原相位重对齐(不连发)。
+- 声明时机: 脚本顶层**或** `on_init` 都可以(引擎在 `on_init` 之后装配数据面)。
+- **顶层会被执行两次**(回测/`create` 路径): 一次用于判定"该策略是否走声明路径"(`declared_series`),
+  一次是真正装配; `on_init` 与各回调只跑一次。因此**顶层只做声明与幂等操作**(`data:*`/`market:*`/
+  `data:timer`/读配置), 不要放有副作用的动作(下订单、写文件、`http:get` 取数) —— 那些放回调里。
+- **单时间轴 + 逐标的撮合价(回测)**: 声明驱动的回测只有**一条**时间轴 =
+  第一条**驱动**序列(`drive = true`); 每个刻度内各标的的成交参考价 = **该标的自己那条序列**
+  此刻"正在形成" bar 的 `open`(不是主时钟的价)。
+- **日线 `open_time` 是"日期对齐"值**(如 00:00Z / 00:00 本地), 而真实开盘在**交易时段开始**时;
+  因此把日线序列当作**交易标的**、且 tick 时刻早于当日真实开盘时, 该 tick 的参考价会是"当天的 open"。
+  回测请让**主时钟粒度 ≤ 交易标的粒度**(或直接用盘中序列), 否则成交价口径会偏乐观。
+  (美股份额: 日线 `open_time` = 00:00Z, 而盘前/盘中最早成交在 13:30Z 附近。)
+- **跨周期一次补发多根 bar**: 同一刻度内补发的多根 bar, 其下单都用"该标的此刻正在形成的 bar 的 open"
+  作参考价(**不做逐根参考价**) —— 这会低估换手/滑点, 但**不构成前视**(该价在刻度时刻已可见)。
+- **取数失败 = 直接报错, 不降级(2026-09-21 明确定口径)**: 声明期/运行期回源失败(网络不可达 / 403 区域
+  拦截 / 限流 / 超时)一律**如实抛出**(带原因 + `ricow data pull` 提示), **不会**"悄悄改用本地库数据继续跑" ——
+  降级会让错误很难发现, 是明确不允许的。回测(`allow_fetch=false`)只读本地库, 缺数据同样是硬报错。
+  > 唯一的例外是**运行期增量取数**: 失败只告警 + 把该序列置 `stale`(策略 `s:stale()` 可见, FR-016)且不退出主循环 ——
+  > 这是 spec 明写的口径(实盘不因一次取数失败退出), 仍属"显式可见", 不是静默降级。
+- **受限网络下取数**: 平台不提供代理配置项(网络环境不是产品能力); 走标准环境变量即可 ——
+  `HTTPS_PROXY=http://127.0.0.1:1080 ricow data pull …`(reqwest 默认读系统代理; 本机实测 socks5 端口
+  常同时支持 HTTP CONNECT, 故无需 `socks` 特性)。给策略的 `http:get` 不读系统代理(沙箱侧统一走宿主策略)。
+- **同策略序列数上限 32 条**: 第 33 条声明硬报错(同名重复声明 = 替换, 不算新增; 校验在取数**之前**)。
+- **撮合取价只认声明序列(硬规则)**: 声明驱动的回测里, **未声明序列的标的没有参考价** ——
+  它的市价单会被**拒单**(计数进报告), 不会悄悄用别的标的的价成交; 装配时会打一行提示告诉你
+  交易标的没在声明里。要交易一个标的, 就给它一条 `data:series{...}`(或 `data:subscribe{...}`);
+  `drive = false` 的序列只提供句柄读数、**不提供撮合参考价**(它不参与时间轴), 要拿它当交易标的
+  请用 `drive = true`(即使不写 `on_bar` 回调, 句柄也会随派发更新)。同一份 Lua 在 Dry Run/实盘
+  同样按声明驱动, 但时钟是墙钟、增量取数是行情长出来的。
+- 数据不够会**硬报错**并给出该敲的命令, 例如:
+  `错误: 序列 yahoo:SPY@1d 在本地库没有可用数据(区间 …); 先拉取: ricow data pull --source yahoo --symbol SPY --interval 1d`
+
+### 10.2 三个取数动词
+
+| 调用 | 作用 |
+|:-----|:-----|
+| `data:series{...}` | 声明一条序列(装载 + 可选驱动), 返回**句柄** |
+| `data:subscribe{...}` | 声明一条序列并**驱动**它(`drive = true`), 不返回句柄(读值用 `data:series`) |
+| `data:history{ source=, symbol=, interval=, limit= }` | 临时取一段历史(不声明句柄); 无数据报错带 `data pull` 提示 |
+| `http:get(url)` | 取任意 URL(仅 GET)。返回 `body, err` 两个值: 失败时 `body == nil` 且 `err` 是字符串(前缀可判别: `invalid_url` / `timeout` / `too_large` / `status` / `network`) |
+
+### 10.3 句柄(声明返回的表)
+
+| 成员 | 说明 |
+|:-----|:-----|
+| `s.id / s.source / s.symbol / s.interval / s.price / s.window / s.drive` | 声明回读(与 `on_bar` 的 `series` 参数同源) |
+| `s:len()` | 当前已装载根数 |
+| `s:stale()` | 增量取数是否失败过(失败置位, 恢复清除; 引擎不替策略决定要不要收敛) |
+| `s:last()` | 最后一根 `{ts, open, high, low, close, volume}` |
+| `s:close(back)` | 倒数第 `back` 根的收盘(`s:close()` = 最新一根) |
+| `s:ema/sma/wma/rsi/atr/adx/stoch/cci/roc/mom(n)` | 指标(与 `ctx:ema` 等同源实现, 同一输入长度下逐位一致) |
+| `s:macd()` → `{main,signal,hist}` / `s:boll(n)` → `{upper,mid,lower}` | 组合指标 |
+
+句柄由**引擎派发**推进(同一根 bar 至多推一次, 不会重复计数); 策略不需要也不应该自己往里塞 bar。
+
+### 10.4 三种驱动并存(策略自己选)
+
+| 驱动 | 何时用 | 回调 |
+|:-----|:-----|:-----|
+| 盘口 | 需要实时买卖盘/做市/高频 | `on_quote(ctx, pair)`(或旧的 `on_tick`) |
+| 序列收盘 | 按 1m/1h/1d 等**收盘**做决策(最常见) | `on_bar(ctx, series, bar)` |
+| 定时器 | 与行情无关的节奏(每天 09:30、每 30 秒对账) | `on_timer(ctx, label)` |
+
+三条路径的下单出口**完全相同**: 回调返回订单数组, 或调 `ctx:place_order{...}` —— 都在回调返回后
+与其它订单同批落地, 不区分驱动类型。
+
+### 10.5 回测/实盘的数据口径(重要)
+
+- **回测只读本地库**(可复现): 先 `ricow data pull --source <源> --symbol <标的> --interval <周期> [--days N | --start YYYY-MM-DD]`, 再 `ricow backtest …`。回测期间**不联网**。
+- **实盘/Dry Run** 允许回源补齐(缺口才拉), 增量取数失败会把该序列置 `stale`(策略可 `s:stale()` 感知)。
+- 无前视的口径只有一条: **`close_time <= 当前时刻` 的 bar 才可见**。回测里"当前时刻" = 主时钟推进到的 bar 开盘时刻, 所以"看到第 k 根收盘"之后, 成交只能发生在第 k+1 根开盘。
+- 主时钟 = 第一条 `drive = true` 的声明序列(回测据此推进账本)。
+- 不支持原生周期但有可整除的细粒度数据时会**重采样**并在 `series.mode`(`native`/`resampled`)与 `series.feed_interval` 里如实标明。

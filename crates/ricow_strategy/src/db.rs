@@ -4,7 +4,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use chrono::DateTime;
-use ricow_core::{Kline, OrderFill};
+use ricow_core::{Kline, OrderFill, SeriesKey};
 use rust_decimal::Decimal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -134,6 +134,28 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // 数据服务 K 线缓存 (028 T008): 键 = (source, symbol, interval, open_time)。
+        // 全部数据源(币安现货/合约、Nasdaq、Yahoo)统一落这张表 (D8: 原 us_klines 专桶
+        // 已退役, Nasdaq 变成一个普通 source); 历史的 klines 表保持原样不动。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS data_klines (
+                source TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                open_time INTEGER NOT NULL,
+                open TEXT NOT NULL,
+                high TEXT NOT NULL,
+                low TEXT NOT NULL,
+                close TEXT NOT NULL,
+                volume TEXT NOT NULL,
+                close_time INTEGER NOT NULL,
+                adj_close TEXT,
+                PRIMARY KEY (source, symbol, interval, open_time)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS fills (
                 trade_id TEXT,
@@ -146,25 +168,6 @@ impl Database {
                 fill_size TEXT NOT NULL,
                 fee TEXT NOT NULL,
                 timestamp INTEGER NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // 美股日线缓存 (Nasdaq 信号数据源, 与币安 klines 表隔离 — 005-market-filter)。
-        // pair = 美股代码 (TSLA/SPY), interval 恒 '1d'; 主键含 ticker 防跨市场污染。
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS us_klines (
-                ticker TEXT NOT NULL,
-                interval TEXT NOT NULL,
-                open_time INTEGER NOT NULL,
-                open TEXT NOT NULL,
-                high TEXT NOT NULL,
-                low TEXT NOT NULL,
-                close TEXT NOT NULL,
-                volume TEXT NOT NULL,
-                close_time INTEGER NOT NULL,
-                PRIMARY KEY (ticker, interval, open_time)
             )",
         )
         .execute(&self.pool)
@@ -375,42 +378,31 @@ impl Database {
         Ok(count)
     }
 
-    // ---- 美股日线 (us_klines, Nasdaq 信号数据源) ----
+    // ---- 数据服务 K 线缓存 (data_klines, 028 T008) ----
 
-    /// 插入或忽略一条美股日线 (主键 = ticker+interval+open_time, 增量去重)。
-    pub async fn insert_us_kline(&self, ticker: &str, k: &Kline) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT OR IGNORE INTO us_klines (ticker, interval, open_time, open, high, low, close, volume, close_time)
-             VALUES (?, '1d', ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(ticker)
-        .bind(k.open_time.timestamp_millis())
-        .bind(k.open.to_string())
-        .bind(k.high.to_string())
-        .bind(k.low.to_string())
-        .bind(k.close.to_string())
-        .bind(k.volume.to_string())
-        .bind(k.close_time.timestamp_millis())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// 批量插入美股日线 (单事务, 2026-09-09 bs_momentum 组合入口用)。
-    /// 首拉 70 只 × ~2500 根 ≈ 17.5 万行 — 逐条独立事务为分钟级, 单事务毫秒级
-    /// (SQLite WAL; INSERT OR IGNORE 增量去重, 已有缓存补拉安全)。
-    pub async fn insert_us_klines(
+    /// 批量写入 `data_klines`(单事务, 幂等): 已存在的 `(source,symbol,interval,open_time)`
+    /// **不覆盖** —— 这是"增量补齐"语义(FR-029)。返回**实际新增**行数。
+    ///
+    /// `rows` = `(Kline, adj_close)`; `adj_close = None` 表示该源不提供复权收盘。
+    pub async fn insert_data_klines(
         &self,
-        ticker: &str,
-        klines: &[Kline],
-    ) -> Result<(), sqlx::Error> {
+        key: &SeriesKey,
+        rows: &[(Kline, Option<Decimal>)],
+    ) -> Result<u64, sqlx::Error> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
         let mut tx = self.pool.begin().await?;
-        for k in klines {
-            sqlx::query(
-                "INSERT OR IGNORE INTO us_klines (ticker, interval, open_time, open, high, low, close, volume, close_time)
-                 VALUES (?, '1d', ?, ?, ?, ?, ?, ?, ?)",
+        let mut inserted = 0u64;
+        for (k, adj) in rows {
+            let res = sqlx::query(
+                "INSERT OR IGNORE INTO data_klines
+                 (source, symbol, interval, open_time, open, high, low, close, volume, close_time, adj_close)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .bind(ticker)
+            .bind(&key.source)
+            .bind(&key.symbol)
+            .bind(key.interval.label())
             .bind(k.open_time.timestamp_millis())
             .bind(k.open.to_string())
             .bind(k.high.to_string())
@@ -418,42 +410,129 @@ impl Database {
             .bind(k.close.to_string())
             .bind(k.volume.to_string())
             .bind(k.close_time.timestamp_millis())
+            .bind(adj.map(|d| d.to_string()))
             .execute(&mut *tx)
             .await?;
+            inserted += res.rows_affected();
         }
-        tx.commit().await
+        tx.commit().await?;
+        Ok(inserted)
     }
 
-    /// 查询美股日线 (升序, 最近 limit 条)。
-    pub async fn get_us_klines(&self, ticker: &str, limit: u32) -> Result<Vec<Kline>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT open_time, open, high, low, close, volume, close_time
-             FROM us_klines WHERE ticker = ? AND interval = '1d'
-             ORDER BY open_time DESC LIMIT ?",
+    /// 便捷重载: 无复权列的源(币安等)。
+    /// 简化插入(`adj_close` 一律 `None`): **测试与内部工具**用的便利包装。
+    ///
+    /// 生产路径一律走 [`Database::insert_data_klines`](带复权列); 这里保留 public 是因为
+    /// 跨 crate 测试(`ricow_engine` 的数据服务用例)也要造数据, `#[cfg(test)]` 跨不过去。
+    pub async fn insert_data_klines_plain(
+        &self,
+        key: &SeriesKey,
+        bars: &[Kline],
+    ) -> Result<u64, sqlx::Error> {
+        let rows: Vec<(Kline, Option<Decimal>)> = bars.iter().cloned().map(|k| (k, None)).collect();
+        self.insert_data_klines(key, &rows).await
+    }
+
+    /// 增量补齐水位 = 该序列已缓存的最大 `open_time`(毫秒); 无数据返回 `None`。
+    pub async fn data_kline_watermark(&self, key: &SeriesKey) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(open_time) FROM data_klines WHERE source = ? AND symbol = ? AND interval = ?",
         )
-        .bind(ticker)
-        .bind(limit as i64)
+        .bind(&key.source)
+        .bind(&key.symbol)
+        .bind(key.interval.label())
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// 按区间读回 `[from_ms, to_ms)`, 升序。
+    pub async fn get_data_klines(
+        &self,
+        key: &SeriesKey,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<(Kline, Option<Decimal>)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT open_time, open, high, low, close, volume, close_time, adj_close
+             FROM data_klines
+             WHERE source = ? AND symbol = ? AND interval = ? AND open_time >= ? AND open_time < ?
+             ORDER BY open_time ASC",
+        )
+        .bind(&key.source)
+        .bind(&key.symbol)
+        .bind(key.interval.label())
+        .bind(from_ms)
+        .bind(to_ms)
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows.iter().filter_map(row_to_data_kline).collect())
+    }
 
-        let mut klines: Vec<Kline> = rows
-            .iter()
-            .filter_map(|r| {
-                let open_time = r.get::<i64, _>("open_time");
-                let close_time = r.get::<i64, _>("close_time");
-                Some(Kline {
-                    open_time: DateTime::from_timestamp_millis(open_time)?,
-                    open: Decimal::from_str(r.get::<String, _>("open").as_str()).ok()?,
-                    high: Decimal::from_str(r.get::<String, _>("high").as_str()).ok()?,
-                    low: Decimal::from_str(r.get::<String, _>("low").as_str()).ok()?,
-                    close: Decimal::from_str(r.get::<String, _>("close").as_str()).ok()?,
-                    volume: Decimal::from_str(r.get::<String, _>("volume").as_str()).ok()?,
-                    close_time: DateTime::from_timestamp_millis(close_time)?,
-                })
-            })
-            .collect();
-        klines.reverse();
-        Ok(klines)
+    /// 尾窗读回(最近 `n` 根, 升序)—— 序列句柄的读取口径。
+    ///
+    /// **无前视**版本见 [`Self::data_klines_tail_before`]: 回测必须用它。
+    pub async fn data_klines_tail(
+        &self,
+        key: &SeriesKey,
+        n: u32,
+    ) -> Result<Vec<(Kline, Option<Decimal>)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT open_time, open, high, low, close, volume, close_time, adj_close
+             FROM data_klines
+             WHERE source = ? AND symbol = ? AND interval = ?
+             ORDER BY open_time DESC LIMIT ?",
+        )
+        .bind(&key.source)
+        .bind(&key.symbol)
+        .bind(key.interval.label())
+        .bind(n)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: Vec<(Kline, Option<Decimal>)> =
+            rows.iter().filter_map(row_to_data_kline).collect();
+        out.reverse();
+        Ok(out)
+    }
+
+    /// 尾窗读回, 但只取**截至 `before_ms` 已收盘**的 bar(`close_time <= before_ms`)。
+    ///
+    /// 这是回测无前视的单点(FR-013): 同一张本地表里既有历史也有"未来", 割断点只能在这里。
+    /// 判定用 `close_time` 而不是 `open_time`: 一根 bar 只有收盘后才可被策略看见。
+    pub async fn data_klines_tail_before(
+        &self,
+        key: &SeriesKey,
+        n: u32,
+        before_ms: i64,
+    ) -> Result<Vec<(Kline, Option<Decimal>)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT open_time, open, high, low, close, volume, close_time, adj_close
+             FROM data_klines
+             WHERE source = ? AND symbol = ? AND interval = ? AND close_time <= ?
+             ORDER BY open_time DESC LIMIT ?",
+        )
+        .bind(&key.source)
+        .bind(&key.symbol)
+        .bind(key.interval.label())
+        .bind(before_ms)
+        .bind(n)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: Vec<(Kline, Option<Decimal>)> =
+            rows.iter().filter_map(row_to_data_kline).collect();
+        out.reverse();
+        Ok(out)
+    }
+
+    /// 行数(诊断 / 测试)。
+    pub async fn data_kline_count(&self, key: &SeriesKey) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM data_klines WHERE source = ? AND symbol = ? AND interval = ?",
+        )
+        .bind(&key.source)
+        .bind(&key.symbol)
+        .bind(key.interval.label())
+        .fetch_one(&self.pool)
+        .await
     }
 
     // ---- 成交 ----
@@ -1144,8 +1223,28 @@ fn order_record_from_row(r: &sqlx::sqlite::SqliteRow) -> OrderRecord {
     }
 }
 
+/// `data_klines` 行 → `(Kline, adj_close)`(028 T008): 复权收盘为 NULL 时返回 `None`。
+fn row_to_data_kline(r: &sqlx::sqlite::SqliteRow) -> Option<(Kline, Option<Decimal>)> {
+    let open_time: i64 = r.get("open_time");
+    let close_time: i64 = r.get("close_time");
+    let adj: Option<String> = r.get("adj_close");
+    Some((
+        Kline {
+            open_time: DateTime::from_timestamp_millis(open_time)?,
+            open: Decimal::from_str(r.get::<String, _>("open").as_str()).ok()?,
+            high: Decimal::from_str(r.get::<String, _>("high").as_str()).ok()?,
+            low: Decimal::from_str(r.get::<String, _>("low").as_str()).ok()?,
+            close: Decimal::from_str(r.get::<String, _>("close").as_str()).ok()?,
+            volume: Decimal::from_str(r.get::<String, _>("volume").as_str()).ok()?,
+            close_time: DateTime::from_timestamp_millis(close_time)?,
+        },
+        adj.and_then(|s| Decimal::from_str(&s).ok()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
+    use ricow_core::Interval;
 
     #[tokio::test]
     async fn test_prune_previews_removes_expired_and_terminal_only() {
@@ -1353,25 +1452,110 @@ mod tests {
         assert_eq!(n3, 1);
         assert_eq!(fees3, dec!(0.000004));
     }
+    // ---- 数据服务 K 线缓存 (data_klines, 028 T008) ----
+
+    fn data_key(source: &str, symbol: &str) -> SeriesKey {
+        SeriesKey::new(source, symbol, Interval::H1).unwrap()
+    }
 
     #[tokio::test]
-    async fn test_insert_and_get_us_klines() {
+    async fn test_data_klines_write_is_idempotent() {
         let db = Database::open_in_memory().await.unwrap();
-        // 美股日线独立表: 与币安 klines 隔离 (同名时间戳互不污染)。
-        db.insert_us_kline("TSLA", &sample_kline(1000)).await.unwrap();
-        db.insert_us_kline("TSLA", &sample_kline(1_060_000)).await.unwrap();
-        db.insert_us_kline("TSLA", &sample_kline(1000)).await.unwrap(); // 去重
-        db.insert_kline("TSLA", "1d", &sample_kline(1000)).await.unwrap(); // 币安侧同 key 独立
+        let key = data_key("yahoo", "QQQ");
+        let bars = vec![sample_kline(1000), sample_kline(3_600_000)];
 
-        let us = db.get_us_klines("TSLA", 10).await.unwrap();
-        assert_eq!(us.len(), 2, "us_klines 只含美股插入");
-        assert_eq!(us[0].open_time.timestamp_millis(), 1000);
-        assert_eq!(us[1].open_time.timestamp_millis(), 1_060_000);
-        // 币安 klines 表不受 us_klines 影响。
-        let bn = db.get_klines("TSLA", "1d", 10).await.unwrap();
-        assert_eq!(bn.len(), 1);
-        // 空查询安全。
-        let empty = db.get_us_klines("AAPL", 10).await.unwrap();
-        assert!(empty.is_empty());
+        let first = db.insert_data_klines_plain(&key, &bars).await.unwrap();
+        assert_eq!(first, 2, "首次写入两根");
+        let second = db.insert_data_klines_plain(&key, &bars).await.unwrap();
+        assert_eq!(second, 0, "重复写入必须零新增(幂等)");
+        assert_eq!(db.data_kline_count(&key).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_data_klines_incremental_append_does_not_overwrite_existing() {
+        let db = Database::open_in_memory().await.unwrap();
+        let key = data_key("yahoo", "QQQ");
+        let mut bar_a = sample_kline(1000);
+        bar_a.close = dec!(100);
+        db.insert_data_klines_plain(&key, &[bar_a.clone()]).await.unwrap();
+
+        // 同一 open_time 的"新数据"(收盘价不同) 不得覆盖既有行。
+        let mut bar_a_changed = sample_kline(1000);
+        bar_a_changed.close = dec!(999);
+        let inserted = db.insert_data_klines_plain(&key, &[bar_a_changed]).await.unwrap();
+        assert_eq!(inserted, 0);
+        let back = db.get_data_klines(&key, 0, 2_000).await.unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0.close, dec!(100), "既有行不被增量覆盖");
+
+        // 真正的新 bar 才追加。
+        let inserted = db.insert_data_klines_plain(&key, &[sample_kline(3_600_000)]).await.unwrap();
+        assert_eq!(inserted, 1);
+        assert_eq!(db.data_kline_count(&key).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_data_klines_range_read_is_bounded_and_ascending() {
+        let db = Database::open_in_memory().await.unwrap();
+        let key = data_key("binance_spot", "ETHUSDT");
+        let bars = vec![sample_kline(3_600_000), sample_kline(0), sample_kline(7_200_000)];
+        db.insert_data_klines_plain(&key, &bars).await.unwrap();
+
+        let all = db.get_data_klines(&key, 0, 10_800_000).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.windows(2).all(|w| w[0].0.open_time < w[1].0.open_time), "读回必须升序");
+        let window = db.get_data_klines(&key, 3_600_000, 7_200_000).await.unwrap();
+        assert_eq!(window.len(), 1, "区间为 [from, to): 只含 1h 那根");
+        assert_eq!(window[0].0.open_time.timestamp_millis(), 3_600_000);
+    }
+
+    #[tokio::test]
+    async fn test_data_klines_tail_returns_last_n_ascending() {
+        let db = Database::open_in_memory().await.unwrap();
+        let key = data_key("yahoo", "SPY");
+        let bars: Vec<Kline> = (0..5).map(|i| sample_kline(i * 3_600_000)).collect();
+        db.insert_data_klines_plain(&key, &bars).await.unwrap();
+
+        let tail = db.data_klines_tail(&key, 2).await.unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].0.open_time.timestamp_millis(), 3 * 3_600_000, "取最近两根");
+        assert_eq!(tail[1].0.open_time.timestamp_millis(), 4 * 3_600_000);
+    }
+
+    #[tokio::test]
+    async fn test_data_klines_watermark_tracks_max_open_time() {
+        let db = Database::open_in_memory().await.unwrap();
+        let key = data_key("yahoo", "QQQ");
+        assert_eq!(db.data_kline_watermark(&key).await.unwrap(), None, "空序列无水位");
+        db.insert_data_klines_plain(&key, &[sample_kline(0), sample_kline(7_200_000)])
+            .await
+            .unwrap();
+        assert_eq!(db.data_kline_watermark(&key).await.unwrap(), Some(7_200_000));
+    }
+
+    #[tokio::test]
+    async fn test_data_klines_adj_close_roundtrip_and_null() {
+        let db = Database::open_in_memory().await.unwrap();
+        let key = data_key("yahoo", "QQQ");
+        let rows = vec![(sample_kline(0), Some(dec!(123.456))), (sample_kline(3_600_000), None)];
+        db.insert_data_klines(&key, &rows).await.unwrap();
+
+        let back = db.data_klines_tail(&key, 10).await.unwrap();
+        assert_eq!(back[0].1, Some(dec!(123.456)), "复权收盘原样往返");
+        assert_eq!(back[1].1, None, "无复权列为 NULL → None");
+    }
+
+    #[tokio::test]
+    async fn test_data_klines_source_isolation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let yahoo = data_key("yahoo", "QQQ");
+        let nasdaq = data_key("nasdaq", "QQQ");
+        db.insert_data_klines_plain(&yahoo, &[sample_kline(0)]).await.unwrap();
+        db.insert_data_klines_plain(&nasdaq, &[sample_kline(0), sample_kline(3_600_000)])
+            .await
+            .unwrap();
+
+        assert_eq!(db.data_kline_count(&yahoo).await.unwrap(), 1, "同 symbol 不同 source 互不污染");
+        assert_eq!(db.data_kline_count(&nasdaq).await.unwrap(), 2);
     }
 }

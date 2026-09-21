@@ -1,5 +1,6 @@
 //! Binance 现货 REST 客户端: 公开端点 + HMAC-SHA256 签名端点。
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -122,6 +123,26 @@ impl BinanceClient {
     ) -> CoreResult<Vec<Kline>> {
         fetch_klines_paged(&self.http, &self.base_url, "/api/v3/klines", symbol, interval, limit)
             .await
+    }
+
+    /// 现货 K 线: 按 `[from_ms, to_ms)` 区间拉取 (028 T010)。
+    pub async fn get_klines_range(
+        &self,
+        symbol: &str,
+        interval: &str,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        fetch_klines_range(
+            &self.http,
+            &self.base_url,
+            "/api/v3/klines",
+            symbol,
+            interval,
+            from_ms,
+            to_ms,
+        )
+        .await
     }
 
     pub async fn get_depth(&self, symbol: &str, limit: u32) -> CoreResult<OrderBook> {
@@ -320,24 +341,11 @@ pub(crate) fn parse_kline_row(row: &[Value]) -> Option<Kline> {
 }
 
 /// interval 字符串 → 毫秒 (现货/合约同小写口径; 纯函数, 便于单测)。
+///
+/// 周期表已收敛到 `ricow_core::Interval`(028 T004) —— 本函数只做一层薄转发,
+/// 未知标签仍返回 `None`, 由调用方按原有文案报错。
 pub(crate) fn interval_ms(interval: &str) -> Option<i64> {
-    Some(match interval {
-        "1m" => 60_000,
-        "3m" => 180_000,
-        "5m" => 300_000,
-        "15m" => 900_000,
-        "30m" => 1_800_000,
-        "1h" => 3_600_000,
-        "2h" => 7_200_000,
-        "4h" => 14_400_000,
-        "6h" => 21_600_000,
-        "8h" => 28_800_000,
-        "12h" => 43_200_000,
-        "1d" => 86_400_000,
-        "3d" => 259_200_000,
-        "1w" => 604_800_000,
-        _ => return None,
-    })
+    ricow_core::Interval::ms_of_label(interval)
 }
 
 /// 分页拉取 K 线 (现货 `/api/v3/klines` 与合约 `/fapi/v1/klines` 同构; 单页上限 1000 根)。
@@ -388,6 +396,91 @@ pub(crate) async fn fetch_klines_paged(
         start_time = Some(last_open + step);
     }
     Ok(all)
+}
+
+/// 按 `open_time` 升序 + 去重 (同 `open_time` 后到者覆盖) —— 分页结果的统一点 (028 T010)。
+pub(crate) fn normalize_klines(bars: Vec<Kline>) -> Vec<Kline> {
+    let mut map: BTreeMap<i64, Kline> = BTreeMap::new();
+    for k in bars {
+        map.insert(k.open_time.timestamp_millis(), k);
+    }
+    map.into_values().collect()
+}
+
+/// 按 `[from_ms, to_ms)` 区间分页拉取 K 线 (现货 `/api/v3/klines` 与合约 `/fapi/v1/klines` 同构)。
+///
+/// 与 [`fetch_klines_paged`](最近 N 根)的区别: 这里用 `startTime` 游标**从过去向前**翻页,
+/// 并用 `endTime` 界住单页上界; 页间按 `open_time` 去重后升序返回。028 T010
+/// (`KlineSource::fetch_klines(from, to)` 的区间语义落地)。
+///
+/// 防御: 单页固定 1000 根(交易所上限); `from_ms >= to_ms` 直接返回空(不算错误);
+/// 游标不前进或达到 `MAX_RANGE_BARS` 时停止(避免把 `from` 传错时无限翻页)。
+pub(crate) async fn fetch_klines_range(
+    http: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    symbol: &str,
+    interval: &str,
+    from_ms: i64,
+    to_ms: i64,
+) -> CoreResult<Vec<Kline>> {
+    const MAX_PAGE: u32 = 1000;
+    /// 单次区间请求的根数上限 (≈2.8 年 1m; 兜底防跑飞)。
+    const MAX_RANGE_BARS: usize = 1_500_000;
+
+    if from_ms >= to_ms {
+        return Ok(Vec::new());
+    }
+    let step = interval_ms(interval)
+        .ok_or_else(|| CoreError::InvalidArgument(format!("unsupported interval: {interval}")))?;
+
+    let mut all: Vec<Kline> = Vec::new();
+    let mut cursor = from_ms;
+    loop {
+        let url = format!(
+            "{base_url}{path}?symbol={symbol}&interval={interval}&startTime={cursor}&endTime={to_ms}&limit={MAX_PAGE}"
+        );
+        let resp = http.get(&url).send().await.map_err(|e| CoreError::Network(e.to_string()))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| CoreError::Network(e.to_string()))?;
+        if !status.is_success() {
+            return Err(CoreError::Exchange(format!("BN {status}: {text}")));
+        }
+        let raw: Vec<Vec<Value>> =
+            serde_json::from_str(&text).map_err(|e| CoreError::Parse(format!("{e}: {text}")))?;
+        if raw.is_empty() {
+            break; // 无更多历史
+        }
+        let page_klines: Vec<Kline> = raw.iter().filter_map(|r| parse_kline_row(r)).collect();
+        if page_klines.is_empty() {
+            break;
+        }
+        let count = page_klines.len();
+        let last_open = page_klines.last().expect("非空").open_time.timestamp_millis();
+        all.extend(page_klines);
+        if count < MAX_PAGE as usize {
+            break; // 不足一整页 = 已到 to_ms 或源无更多
+        }
+        if last_open + step >= to_ms {
+            break;
+        }
+        let next = last_open + step;
+        if next <= cursor {
+            break; // 防御: 游标不前进
+        }
+        cursor = next;
+        if all.len() >= MAX_RANGE_BARS {
+            break;
+        }
+    }
+
+    // 交易所 `endTime` 为闭区间且可能带出恰好落在上界外的 bar → 按半开区间精确裁剪。
+    let mut out = normalize_klines(all);
+    out.retain(|k| {
+        let t = k.open_time.timestamp_millis();
+        t >= from_ms && t < to_ms
+    });
+    Ok(out)
 }
 
 /// 订单状态映射 (BN 字符串 → 内部枚举; 现货与合约同构, 纯函数便于单测)。
@@ -683,5 +776,47 @@ mod tests {
         assert_eq!(m.min_notional, None, "0 视为无约束");
         assert_eq!(m.min_size, Decimal::ONE, "无 LOT_SIZE 时回退 1");
         assert_eq!(m.step_size, None);
+    }
+
+    // ---- 区间分页的去重/排序 (028 T010, 纯函数) ----
+
+    fn k(open_ms: i64, close: &str) -> Kline {
+        Kline {
+            open_time: DateTime::from_timestamp_millis(open_ms).unwrap(),
+            open: Decimal::from(1),
+            high: Decimal::from(1),
+            low: Decimal::from(1),
+            close: Decimal::from_str(close).unwrap(),
+            volume: Decimal::from(1),
+            close_time: DateTime::from_timestamp_millis(open_ms + 59_999).unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_normalize_klines_sorts_and_dedupes() {
+        // 页间重叠: 第 2 根出现两次(值相同), 输入乱序 → 输出升序且唯一。
+        let out = normalize_klines(vec![
+            k(120_000, "3"),
+            k(0, "1"),
+            k(60_000, "2"),
+            k(60_000, "2"),
+            k(0, "1"),
+        ]);
+        assert_eq!(out.len(), 3, "去重后 3 根");
+        let times: Vec<i64> = out.iter().map(|b| b.open_time.timestamp_millis()).collect();
+        assert_eq!(times, vec![0, 60_000, 120_000], "升序");
+    }
+
+    #[test]
+    fn test_normalize_klines_keeps_last_value_on_conflict() {
+        // 同 open_time 后到者覆盖(记录口径: 越后的页越新)。
+        let out = normalize_klines(vec![k(0, "1"), k(0, "9")]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].close, Decimal::from(9));
+    }
+
+    #[test]
+    fn test_normalize_klines_empty() {
+        assert!(normalize_klines(Vec::new()).is_empty());
     }
 }

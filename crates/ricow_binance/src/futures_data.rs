@@ -57,17 +57,11 @@ impl FuturesDataClient {
         limit: u32,
     ) -> CoreResult<Vec<Kline>> {
         const MAX_PAGE: u32 = 1000;
-        let interval_ms = match interval {
-            "1m" => 60_000_i64,
-            "5m" => 300_000,
-            "15m" => 900_000,
-            "1h" => 3_600_000,
-            "4h" => 14_400_000,
-            "1d" => 86_400_000,
-            other => {
-                return Err(CoreError::InvalidArgument(format!("unsupported interval: {other}")))
-            }
-        };
+        // 周期表收敛到 ricow_core::Interval (028 T004): 与现货共用同一张表,
+        // 不再各写一份 match(两处支持集此前并不一致)。
+        let interval_ms = ricow_core::Interval::ms_of_label(interval).ok_or_else(|| {
+            CoreError::InvalidArgument(format!("unsupported interval: {interval}"))
+        })?;
 
         let mut all: Vec<Kline> = Vec::new();
         // 起点 = now − limit×interval (不传 startTime 只回最新 1000 根)。

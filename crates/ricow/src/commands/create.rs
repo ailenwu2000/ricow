@@ -104,6 +104,27 @@ pub async fn create_preview(
         .map_err(CoreError::InvalidArgument)?;
     config.market = market.to_string();
 
+    // ③½ 028: **声明数据面**的策略走数据服务(声明什么取什么), 不再由引擎预取 1h K 线喂它。
+    //
+    // 审核发现的缺口: create 的沙箱门禁原来只走"未装宿主的旧回测路径", 于是
+    // `ricow create --script <声明式策略>` 直接报"data:series 不可用 —— 数据服务未装配",
+    // 028 的样板过不了项目唯一的创建出口。这里补上分支: 有声明 → 声明驱动回测(窗口 = --days)。
+    //
+    // 门禁允许**联网补数**(创建时不该要求用户先手工 `ricow data pull`; D3 的"只读本地库"
+    // 只约束 `ricow backtest` 路径)。⚠️ 门禁回测一律**虚拟资金**(`--days`/`initial_cash` 口径),
+    // 不碰测试网/主网。
+    let declared = {
+        let hub = crate::commands::data_hub().await?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let from_ms = now_ms - (days as i64) * 86_400_000;
+        let decls = ricow_engine::data::declared_series(&config, hub.clone(), from_ms, true)?;
+        if decls.is_empty() {
+            None
+        } else {
+            Some((hub, from_ms, now_ms, decls))
+        }
+    };
+
     // ④ 真实 K 线 (与 `ricow backtest` 同口径的数据源分支; 现货/合约公共端点, 免 key)
     let hours_per_bar = match interval {
         "1m" => 1.0 / 60.0,
@@ -120,7 +141,10 @@ pub async fn create_preview(
     };
     let limit = ((days as f64) * 24.0 / hours_per_bar) as u32;
     let is_futures = config.market == "futures";
-    let klines = if is_futures {
+    let klines = if declared.is_some() {
+        // 声明驱动: 数据面由策略声明决定(每个 (source, symbol, interval) 各自取), 不预取单标的 K 线。
+        Vec::new()
+    } else if is_futures {
         let fapi = ricow_binance::FuturesDataClient::new()?;
         // MMR: 按 symbol 内置首档表 (exchangeInfo 公共值不可靠, specs/backtest.md §十一 T7)
         config
@@ -130,7 +154,7 @@ pub async fn create_preview(
     } else {
         crate::commands::bn_exchange()?.get_klines(pair, interval, limit).await?
     };
-    if klines.is_empty() {
+    if declared.is_none() && klines.is_empty() {
         return Err(CoreError::Exchange(format!("{pair} 无 K 线数据 (检查交易对是否存在/拼写)")));
     }
 
@@ -153,8 +177,30 @@ pub async fn create_preview(
         ricow_strategy::BacktestParams::resolve(&config, &cash_override).initial_cash,
     )
     .ok_or_else(|| CoreError::InvalidArgument("回测本金 initial_cash 非法".into()))?;
-    let (report, preview_id) =
-        Engine::new().backtest_and_preview(&db, config, initial_cash, &klines).await?;
+    let (report, preview_id) = if let Some((hub, from_ms, to_ms, decls)) = declared {
+        eprintln!(
+            "声明数据面: {} 条序列驱动回测窗口(主时钟 {}; {} 天)",
+            decls.len(),
+            decls[0].key,
+            days
+        );
+        // 本金 = 与报告表头同口径的 `initial_cash`(三层合并后的值)。
+        let balance =
+            ricow_core::Balance { asset: "USDT".into(), free: initial_cash, locked: Decimal::ZERO };
+        let report = ricow_engine::data::run_declared_backtest(
+            config.clone(),
+            balance,
+            hub,
+            from_ms,
+            to_ms,
+            true, // 门禁允许联网补数(创建流程)
+        )?;
+        let toml_str = config.to_toml().map_err(|e| CoreError::Parse(e.to_string()))?;
+        let preview_id = ricow_engine::create_preview(&db, "strategy", &toml_str).await?;
+        (report, preview_id)
+    } else {
+        Engine::new().backtest_and_preview(&db, config, initial_cash, &klines).await?
+    };
 
     let report_text = format_backtest_report(
         &report,

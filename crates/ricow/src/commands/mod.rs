@@ -16,6 +16,7 @@ pub mod config_file;
 pub mod create;
 pub mod ctrl;
 pub mod daemon;
+pub mod data;
 pub mod db;
 pub mod deploy;
 pub mod instances;
@@ -38,6 +39,20 @@ use rust_decimal::Decimal;
 pub(crate) fn bn_exchange() -> ricow_core::CoreResult<std::sync::Arc<dyn ricow_core::Exchange>> {
     let client = ricow_binance::BinanceClient::new()?;
     Ok(std::sync::Arc::new(ricow_binance::BnSpotExchange::new(client)))
+}
+
+/// 声明式数据面用的本地数据服务 (028): 与 `ricow data pull` 同一套来源与本地库。
+///
+/// Dry Run / 实盘在**策略脚本顶层执行之前**需要它(策略可在顶层声明 `data:series{...}`),
+/// 因此单独开一条库连接交给 `DataHub`(落库路径仍用调用方自己那条, 互不影响)。
+pub(crate) async fn data_hub() -> CoreResult<std::sync::Arc<ricow_engine::DataHub>> {
+    let db = ricow_strategy::Database::open(&default_db_path())
+        .await
+        .map_err(|e| CoreError::Exchange(e.to_string()))?;
+    Ok(std::sync::Arc::new(
+        ricow_engine::DataHub::new(data::build_registry()?, db)
+            .with_min_interval(std::time::Duration::from_millis(500)),
+    ))
 }
 
 /// 创建带凭据的 Binance 现货交易所 (签名端点: 实盘下单 / 账户查询)。

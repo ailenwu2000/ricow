@@ -64,7 +64,13 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 ## 四、策略层(Lua)
 
-- 策略统一 Lua 5.4(mlua 嵌入式沙箱): 4 回调 `on_init/on_tick/on_fill/on_stop`, `on_tick` 返回订单数组; ctx 为只读快照
+- 策略统一 Lua 5.4(mlua 嵌入式沙箱): **7 回调** `on_init/on_tick/on_quote/on_bar/on_timer/on_fill/on_stop`,
+  订单类回调返回订单数组(**写哪个派发哪个**: 引擎按脚本是否定义选路径); ctx 为只读快照
+- **声明式数据面(028)**: 策略在脚本里 `data:series{source,symbol,interval,bars,min_bars,drive}` /
+  `data:subscribe` / `market:subscribe` / `data:timer` 声明"要什么数据、什么周期、什么时候被叫醒",
+  引擎按声明取数(含预热)、按 `close_time <= 当前时刻` 无前视派发, 数据不够硬报错并给出该敲的 `ricow data pull` 命令。
+  数据服务: `DataHub`(源注册表 + 本地 `data_klines` 缓存 + 重采样 + 限速) + 内置源 `binance_spot`/`binance_futures`/`nasdaq`/`yahoo` ——
+  **新增一个数据源 = 1 个适配文件 + 1 处注册**; 策略侧另可 `http:get(url)` 自取任意 URL(平台不限制域名, 用户自担)。
 - **ctx.\*** API(冒号调用): 行情 / 持仓余额 / 配置参数(config_f64 等)/ 指标(基于已收盘 K 线, 无前视)/ 时间 `now()`(2026-09-11 新增, 供"每日固定时刻动作"的盘中策略)
 - **exec.\*** 执行组件(引擎内置 Rust 实现, 加载时注册全局表, 脚本内可覆盖): `levels` / `pullback_triggered` / `detect_quote` / `ticks_per` / `slice_due` / `side_order`
 - 内置资产(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/commands/mod.rs:BUILTIN_SCRIPTS`):
@@ -73,9 +79,10 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   - ~~`strategies/builtin/bs_momentum.lua`~~ — **已于 2026-09-11 删除** (真实 bStock 成交轨期望 ≈0:
     spot 91 天 每 bar −0.0198% / futures 220 天 +0.0367%; 七年 R1 数字含幸存者偏误不作证据);
     同批删除的还有 `bs_intraday_top5.lua`(日内 Top5, 成本算术否决)。证据见 specs/research/。
-    **其引擎机制保留为通用能力**: 组合回测路径 `run_portfolio_backtest` + 组合信号模式
-    (`universe` 键 / `signal_klines` / `SIGNAL_TAIL` 尾窗) + 任意 interval tick 对齐 `build_interval_ticks`,
-    暂无内置消费者; 组合回测 CLI 入口随策略一并删除。
+    **其引擎机制保留为通用能力**: 组合回测路径 `run_portfolio_backtest`(多标的同一账本按统一时间轴撮合) +
+    任意 interval tick 对齐 `build_interval_ticks`, 暂无内置消费者; 组合回测 CLI 入口随策略一并删除。
+    ~~组合信号模式(`universe` 键 / `signal_klines` / `SIGNAL_TAIL` 尾窗)~~ —— **已于 028 退役**(D7:
+    平台不替策略预装信号线; 策略自己用 `data:series` 声明要哪条序列)。
 - 用户策略: `<项目根>/strategies/<name>.toml` + `strategies/scripts/<name>.lua`(git 忽略默认私有; builtin 例外)
 - **单一配置文件**(019 D31, R4 修订): `$RICOW_ROOT/ricow.toml`(权限: **Unix 0600 / Windows 无 POSIX 权限位**, 写入时尽力收紧为仅当前用户 ACL —— 对外展示口径统一取 `commands/config_file.rs::permission_summary`, 不得无条件写"0600"; 进 `.gitignore`)—— `[ai]`(provider / model / base_url / max_turns / api_key)、
   `[exchange]`(demo_key / demo_secret / binance_key / binance_secret)与 `[market]`(show_all_pairs)同文件; 该文件**即界面**(无 `ricow keyring` / `ricow setup` / 写凭据命令), 未知键硬失败。
@@ -128,7 +135,8 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - `RICOW_ROOT`(数据目录, 决策 D4): 显式覆盖 > 当前目录已有 `ricow.db`/`strategies/` 时沿用现状 > 平台标准目录
   (Windows `%APPDATA%\ricow` / macOS `~/Library/Application Support/ricow` / Linux `$XDG_DATA_HOME|~/.local/share`+`/ricow`)
-- `RICOW_DB`(默认 `RICOW_ROOT/ricow.db`): SQLite, **共 10 张表** — `klines`(交易所 K 线缓存)/ `fills`(成交, 含 `strategy_id`)/ `pnl_snapshots`(盈亏快照)/ `previews`(写操作预览)/ `us_klines`(美股 Nasdaq 日线, 信号轨与交易日历; **缓存不回源, 需手工增量补最后若干天**)/ `funding_fees`(资金费流水, `tran_id` 幂等)/ `web_sessions` + `web_messages`(025: 会话与对话流水, 外键级联删除)/ `orders` + `positions`(026: 订单与当前持仓, 各带 `mode`)
+- `RICOW_DB`(默认 `RICOW_ROOT/ricow.db`): SQLite, **共 10 张表** — `klines`(交易所 K 线缓存)/ `fills`(成交, 含 `strategy_id`)/ `pnl_snapshots`(盈亏快照)/ `previews`(写操作预览)/ `data_klines`(**028 D8: 数据服务统一缓存**, 键 `(source, symbol, interval, open_time)` 幂等 + 水位; 取代原 `us_klines` 专桶, Nasdaq 归一成普通 source; **运行时只读这张表**)
+  > ⚠️ 另一张 `klines` 表是 `ricow db sync` 的**遗留缓存**, 运行时(回测/实盘)不读它 —— `ricow data pull` 落的是 `data_klines`。/ `funding_fees`(资金费流水, `tran_id` 幂等)/ `web_sessions` + `web_messages`(025: 会话与对话流水, 外键级联删除)/ `orders` + `positions`(026: 订单与当前持仓, 各带 `mode`)
 - `RICOW_ROOT/run/`: `daemon.json`(daemon pid/端口/token, Unix 0600 / Windows 仅当前用户 ACL)/ `<name>.json`(实例台账: pid/启动时间/模式/上次退出码与原因)
   > ⚠️ 多进程共享同一 `ricow.db` 的并发写依赖 WAL + `busy_timeout`(sqlx 默认 5s): 实测 3 进程 × 200 事务在 busy_timeout=5s 下全部成功, =0 时失败 83%(`.hermes`→已归档 `specs/research/process-model-probe-2026-09.md` §四)。**不得把 `busy_timeout` 设为 0, 也不得把数据目录放在网络盘/云同步盘**(SQLite WAL 明确不支持网络文件系统)
 - `RICOW_ROOT/logs/`: `<name>.log`(策略进程 stdout/stderr 追加日志; 启动时 >10MB 轮转 `.log.1`)与 `daemon.log`
@@ -174,13 +182,16 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   旧方案(env `RICOW_BN_*` / OS Keyring / `ricow keyring` / `credentials.toml`)已于 2026-09-14 全部移除 —— 不保留回退(keyring 在本机不可用)。
 - 实盘下单参数由引擎按交易所过滤器**自动对齐**(数量按 `step_size` 向下取整 / 限价取"不劣于意图"的一侧 / 不足 `min_qty`·`min_notional` 拒单并如实报错); 订单号统一带 `<策略名>-` 前缀, 停机撤单**只撤本实例归属**的单, 非归属单只上报不撤
 - Lua 沙箱: 无 os/io/require/loadstring/pcall, 指令预算 1M/tick, 内存 64MB
-- 网络: 仅交易所 API + 美股行情(Nasdaq 官方); 无遥测、无自动更新
+- 网络: 平台出站 = 交易所 API + 内置数据源(Nasdaq 官方 / Yahoo) + 用户自配 LLM;
+  用户策略可经 `http:get` 自取任意 URL(平台不限制域名, 用户自担); 无遥测、无自动更新
 
 ## 八、~~选币 scan~~(已于 2026-09-15 删除)
 
 - **删除范围**(020-platform-scope-trim): `ricow scan` 命令 + `ricow_engine::scan` 实现 + 仅它使用的 `ricow_engine::indicators`(`ema` / `adx` 及其测试)。
-- **保留**(用户明示的通用能力, 见 roadmap"已终止的探索"): 美股数据层 `nasdaq` / `us_tickers` / `market_class` / `us_klines` 缓存、
-  组合回测路径 `run_portfolio_backtest` + 组合信号模式、`build_interval_ticks`、`ctx:now()`。
+- **保留**(用户明示的通用能力, 见 roadmap"已终止的探索"): 美股数据层 `nasdaq` / `us_tickers` / `market_class` / 统一 `data_klines` 缓存、
+  组合回测路径 `run_portfolio_backtest`(多标的同一账本撮合)、`build_interval_ticks`、`ctx:now()`。
+  (028 D7/D8 修订: 组合**信号模式**(`universe` 键 / `signal_klines` / `SIGNAL_TAIL`)与 `us_klines` 专桶**已退役**;
+  `nasdaq` 归一成数据服务的普通 source 落 `data_klines`; D7 保留的是"多标的同一账本撮合"这一能力。)
 - 历史设计口径(7d×0.4 + 30d×0.6 打分 / EMA20+ADX14 趋势 / 前 10 后 10 方向一致性排除)见 `specs/changes/005-market-filter/`。
 
 ## 九、测试策略

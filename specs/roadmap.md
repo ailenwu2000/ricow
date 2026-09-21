@@ -35,7 +35,10 @@
 
 ## 测试基线
 
-- **当前基线 (2026-09-19, Windows, 026 落地后实跑)**: `cargo test --workspace` = **504 passed / 0 failed / 21 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
+- **当前基线 (2026-09-21, Linux/WSL, 028 落地后实跑)**: `cargo test --workspace` = **625 passed / 0 failed / 27 ignored**; `cargo fmt --all --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` exit 0。
+  较上次记录的 504/21: **+120 通过 / +6 ignored**; 增量来自 028 数据服务(`DataHub` 源注册表 + `data_klines` 统一缓存 + 重采样 + 限速; `data:series`/`data:subscribe`/`data:history`、`market:subscribe`、`http:get`、7 回调、句柄指标 `s:ema/atr/...`、`s:bars(n)`、顶层 `config` 访问面; `SeriesDriver`/`DrivenRuntime`/`run_declared_backtest`; `ricow data pull` CLI 与 4 个内置源 binance_spot/binance_futures/nasdaq/yahoo; 退役信号预装与 `us_klines` 专桶、`ctx:klines` 去掉 100 根 cap), 另有 http 错误分类、内置脚本零网络、护栏跨 pair 共享等新用例; 逐条见 `specs/changes/028-data-service/checklists/execution.md`。
+  真机验证(2026-09-21): `ricow data pull --source binance_spot --symbol ETHUSDT --interval 1h --days 150` → 新增 3528 根; 声明式回测 1440 根/45 笔成交/拒单 0; 声明式 Dry Run(1m 序列 + 20s 定时器 + 双盘口)跑 10 分 56 秒, `on_bar` 每分钟恰好一根、启动不派发历史 bar; 多标的 Dry Run 13009 ticks / errors 0 / 停机零残留。
+- **前基线 (2026-09-19, Windows, 026 落地后实跑)**: `cargo test --workspace` = **504 passed / 0 failed / 21 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
   较上次记录的 472/21: **+32 通过 / ignored 不变(仍 21)**; 增量全部来自 026(两张新表与幂等迁移、`recent_fills_with_mode` 的 mode 关联、`web/tail.rs` 尾读与轮转、交易/日志端点与只读红线、AI 工具三态与 Confirm 结果注入), 逐条见 `specs/changes/026-trade-visibility/tasks.md`。
 - **前基线 (2026-09-19, Windows, 023 + 025 落地后实跑)**: `cargo test --workspace` = **472 passed / 0 failed / 21 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
   较 2026-09-17 的 403/21: **+69 通过 / ignored 不变(仍 21)**; 增量来自 2026-09-18 起的对话体验重构(023)与 Web UI(025: axum 鉴权与回环绑定、会话缝第二个 sink、会话历史持久化与回放、术语表、启动脚本站位), 另含 025 实机收口补的 2 例(Web 输入「一次入站只投一行」回归、daemon 前置校验回归), 逐条见 `specs/changes/023-ai-chat-ux/` 与 `specs/changes/025-web-ui/tasks.md`。
@@ -48,7 +51,7 @@
   ignored 全部为需真实外部环境的用例 (BN demo 现货 / 合约 / 用户流、Nasdaq 冒烟、019 AI 真机与 demo 联调), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
   220 → 204 的差额 = 009 移除 `locus_hl`(16 个内联测试); 204 → 216 = 008 新增 supervisor / CLI 命令面用例; 216 → 233 = 004 风控用例(频率窗口/两级熔断/装配与参数校验/接线); 233 → 270 = 011 用例(下单参数对齐 / 时钟预检判定 / 归属与停机清理编排 / 门禁 / proto 往返 / 现货事件解析 / 交易所过滤器解析 / 归属前缀长度约束)。
 - 验证方式: `cargo test --workspace`(纯逻辑) + 带 env key 的 `#[ignore]` 真实联调 (见 `specs/testnet.md`)。
-- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → **504(026 交易可见性, 当前)**。
+- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → **509(028 开工实测)** → **625(028 数据服务, 当前)**。
 
 ## 变更档案状态 (specs/changes/)
 
@@ -79,6 +82,19 @@
 
 > **026-trade-visibility(2026-09-19, 已实施)**: 让交易与日志**可见**(起因: 用户实测"跑测试网看不到交易信息与日志")。① **落库**: 引擎侧新增 `orders` / `positions` 两表(`CREATE TABLE IF NOT EXISTS` 幂等追加, 既有 8 张表**零改动**)并在下单提交 / 订单状态变化 / 成交回报 / 持仓刷新时写入; `pnl_snapshots` 由死表改为**每笔成交后写一条**且永久保留。② **Web 面板**: 新增只读交易面板(持仓 / 挂单 / 最近成交)+ 日志面板(策略切换 + 尾读 SSE 实时追加), 共 4 条交易端点(`/api/trades/{fills,orders,positions,pnl}`)与 3 条日志端点(`/api/logs`、`/tail`、`/stream`), 全部挂在**同一道 token 中间件之内**, 页面**无任何直连交易所的写按钮**(撤单 / 平仓 / 停机仍走对话确认)。③ **口径**: 数据源**唯一来源 = 本地库**(不直连交易所, 停机后仍能看最后状态并标注"截至 <时间>"); 每条回复带 `source` 三态(`ok` / `daemon_down` / `unreadable`), **不把"连不上 daemon"说成"没有交易"**; 成交的 `mode` 由 `exchange_order_id` ⟕ `orders` 带出, 关联不到即如实显示"未知"不猜。④ **修两处假阴性**: AI `instance_status` 把"连不上 daemon"说成"策略已经停着/没有可停止的对象"; demo 测试网停机误印「实盘停机」文案(现按**真实运行模式**措辞)。⑤ **AI 回流**: 新增三个只读工具(`positions` / `open_orders` / `pnl`), 写操作执行结果注入对话 history。测试 472 → **504 passed / 0 failed / 21 ignored**, 三门禁全绿; 端到端以**真实 demo 测试网**验证(禁 mock); 见 `specs/changes/026-trade-visibility/`。
 
+> **027-stop-unknown-instance(2026-09-21, 已实施)**: 停机回执按"名字是否存在 / 是否在跑"四组合分别措辞 —— 名字存在但本来就没在跑时只陈述「该策略未在运行 (无需停止)」, 不再套"已停止"头衔(两份互相打架的回执会摧毁用户对停机通道的信任); 见 `specs/changes/027-stop-unknown-instance/`。
+
+> **028-data-service(2026-09-21, 实施中 → 待 converge 复核)**: 把引擎从"引擎写死喂数据、策略填空"改成"**平台提供数据服务 + 策略自己声明完整逻辑**"(用户原话: 完整逻辑结构都在策略里, 保证策略灵活)。① **数据服务**: `DataHub`(源注册表 + 本地 `data_klines` 统一缓存 + 重采样 + 限速 + 订阅路由), 内置 4 源(`binance_spot`/`binance_futures`/`nasdaq`/`yahoo`), 新增一个源 = 1 个适配文件 + 1 处注册; `ricow data pull` 落库, **回测只读本地库**(可复现; 缺数据报错直接给出该敲的命令)。② **策略侧**: `data:series{source,symbol,interval,bars,min_bars,drive,price}` / `data:subscribe` / `data:history` / `market:subscribe` / `data:timer` / `http:get`, 回调从 4 个扩到 7 个(`on_bar` 声明序列收盘 / `on_quote` 盘口 / `on_timer` 自定节奏, 写哪个派发哪个), 句柄指标与 `ctx:ema/atr` 同源实现(同一输入长度逐位一致), 顶层 `config` 访问面让脚本声明期就能按配置取参数。③ **无前视单点**: 可见性 = `close_time <= 当前时刻`; 回测主时钟 = 第一条驱动序列, 观 K 根收盘 → 只能 K+1 根开盘成交(有可证伪用例); 预热只进句柄不派发。④ **退役**(D7/D8): 信号预装(`universe`/`signal_klines`/`SIGNAL_TAIL`/`full_klines`)与 `us_klines` 专桶、`ctx:klines` 的 100 根 cap 全删, 保留多标的同一账本撮合。⑤ **宪法修订**: 原则一网络口径扩为"用户策略可经 `http:get` 自取任意 URL(平台不限制域名、不背书, 用户自担)"(1.2.0)。测试 **509(028 开工基线)** → **625/0/27**, 三门禁全绿。**T027 已解封(2026-09-21)**: 本机对 Yahoo 恒 403 属**区域拦截**(响应体是 `lang="zh"` 页) —— 过本机代理
+(`HTTPS_PROXY=http://127.0.0.1:1080`, 该端口同时支持 socks5 与 HTTP CONNECT)后真机取数通过:
+`yahoo_live_smoke` 2 passed; `ricow data pull --source yahoo --symbol QQQ --interval 1d --days 3650` 取到 **2510 根(10 年)**;
+**不带代理**回测该数据 → `主时钟 yahoo:QQQ@1d` / 250 根 / 5 笔成交(证明回测只读本地库)。顺带修掉一个真 bug:
+声明期取数失败原来会**中断启动**(本地库够用也失败), 现改为**降级为本地库 + 置 stale**(与 FR-016 统一)。
+
+**未完成(T044)**: 6 个内置 Lua 脚本未迁到新 API —— 它们在 `on_init` 里用 `ctx:config_*` 取参数, 而
+`data:series` 声明要早于引擎装配, 迁移需先把"按配置声明"的写法固定下来(顶层 `config` 访问面已备好);
+本次以"内置脚本零 `http.` 断言 + 行为不受退役影响(两个读 K 线的脚本只取尾部 bar)"为界。
+(`ricow create` 的沙箱门禁**已接上声明驱动路径**, 声明式策略可正常过创建出口 —— 这是审核发现的缺口, 已修。)见 `specs/changes/028-data-service/`。
+
 > SDD 产物规范: 计划与任务分解应存于 `specs/changes/<feature>/{spec,plan,tasks}.md`。
 > 005/006/007 的计划当时落在 `.hermes/plans/`(临时区, 已 git 忽略), 未回填档案 —— 后续变更须归档到位。
 
@@ -88,7 +104,8 @@
    - 判定: 真实 bStock 成交轨期望 ≈0 (spot 91 天每 bar −0.0198%、期末 −5.38%; futures 220 天每 bar +0.0367%、期末 −1.08%),
      十年 Nasdaq 近似轨的 +15,088% 含幸存者偏误, 不作证据 → 用户判定"期望值为负, 不合格"。
    - 已删: `strategies/builtin/bs_momentum.lua` + 组合回测 CLI 入口。
-   - 保留(通用能力, 暂无内置消费者): 组合回测路径 `run_portfolio_backtest` + 组合信号模式(`universe` / `signal_klines` / `SIGNAL_TAIL`)。
+   - 保留(通用能力, 暂无内置消费者): 组合回测路径 `run_portfolio_backtest`(多标的同一账本撮合)。
+     ~~组合信号模式(`universe` / `signal_klines` / `SIGNAL_TAIL`)~~ **2026-09-21 第 028 号变更退役**(D7)。
    - 证据: `specs/research/bs-momentum-attribution-2026-09.md` §七。
 2. **bStock 日内 Top5 相对强度 (2026-09-11 放弃)**
    - 判定: 算术否决 —— 日频 100% 换手下成本 0.2%/日 > 最优毛期望 +0.122%/日; 合约样本(148 会话)超额 ≈0。
@@ -100,8 +117,10 @@
      本变更**未实施, 无新实测数字**(不编造); 判定依据 = 前两条实测(bs_momentum 真实成交轨 ≈0 / 日内族被换手成本算术否决)
      + 短线横截面族落在反转区且样本仅 63/150 个交易日无法证明长期有效。
    - 产物: `specs/changes/010-bs-rs-rotation/`(spec.md + checklists, 未实施即终止留档); 上游计划 `.hermes/plans/2026-09-11_222951-…` 已标注作废。
-   - **保留(用户明示"相关功能保留, 以后可能会用")**: 美股数据层(`nasdaq` / `us_tickers` / `market_class` / `us_klines` 缓存)、
-     ~~`ricow scan --pool bstock-spot` 横截面选币~~(**2026-09-15 用户改判删除** —— 020-platform-scope-trim; 其余保留项不变)、组合回测路径 `run_portfolio_backtest` + 组合信号模式(`universe` / `signal_klines` / `SIGNAL_TAIL`)、
+   - **保留(用户明示"相关功能保留, 以后可能会用")**: 美股数据层(`nasdaq` / `us_tickers` / `market_class` / 统一 `data_klines` 缓存
+     —— ⚠️ 2026-09-21 第 028 号变更 D8: 原 `us_klines` 专桶已退役, Nasdaq 归一成数据服务普通 source)、
+     ~~`ricow scan --pool bstock-spot` 横截面选币~~(**2026-09-15 用户改判删除** —— 020-platform-scope-trim; 其余保留项不变)、组合回测路径 `run_portfolio_backtest`
+     (~~组合信号模式 `universe` / `signal_klines` / `SIGNAL_TAIL`~~ **028 退役**)、
      `build_interval_ticks`、`ctx:now()`。这些能力**当前无内置策略消费者, 但不算死代码, 不删**(宪法原则五"死代码必删"不适用于用户明示保留的通用能力)。
 
 ## 当前阶段: P4 (dogfood 实盘 → 公开发布)

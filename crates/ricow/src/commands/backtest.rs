@@ -288,6 +288,57 @@ pub(crate) async fn run_backtest(
     }
     // 三层回测参数 (内置默认 < 策略 TOML [backtest] < CLI): 解析出全量有效值 + 写回 params。
     let params = apply_backtest_cli(&args, &mut config)?;
+
+    // 028 US1: 策略**声明了驱动序列** → 走声明驱动路径。
+    //   时间轴 = 第一条驱动序列, 数据只读本地库(不联网、可复现), 历史窗口 = 最近 `--days` 天;
+    //   策略用 `data:series{...}` / `market:subscribe{...}` 自己决定标的与周期, 引擎不替它挑。
+    {
+        let hub = crate::commands::data_hub().await?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        // 回测路径: 声明期取数**不联网**(D3 只读本地库, 缺数据直接报错并给出 data pull 命令)。
+        let decls = ricow_engine::data::declared_series(&config, hub.clone(), now_ms, false)?;
+        if !decls.is_empty() {
+            let from_ms = now_ms - (days as i64) * 86_400_000;
+            let initial_cash = Decimal::from_f64_retain(params.initial_cash)
+                .ok_or_else(|| CoreError::InvalidArgument("initial_cash 非法".into()))?;
+            let initial_balance =
+                Balance { asset: "USDT".into(), free: initial_cash, locked: Decimal::ZERO };
+            // 主时钟序列(第一条驱动声明) —— 报告抬头用它代替 config.pair。
+            let primary = decls[0].key.to_string();
+            let is_futures = config.market == "futures";
+            let effective_mmr_pct = config.get_f64("mmr_pct").unwrap_or(1.0);
+            let report = ricow_engine::data::run_declared_backtest(
+                config,
+                initial_balance,
+                hub,
+                from_ms,
+                now_ms,
+                false, // D3: 回测只读本地库, 不联网
+            )?;
+            let text = format_backtest_report(
+                &report,
+                &format!(
+                    "回测报告(声明驱动): {} 主时钟 {primary} ({days} 天, 声明 {} 条序列, {})",
+                    args.strategy,
+                    decls.len(),
+                    if is_futures {
+                        format!(
+                            "合约 USDT-M · {} 持仓 · {:.0}x · MMR {:.2}%",
+                            report.position_mode.as_deref().unwrap_or("one-way"),
+                            report.leverage.unwrap_or(1.0),
+                            effective_mmr_pct
+                        )
+                    } else {
+                        "现货".to_string()
+                    }
+                ),
+                initial_cash,
+                is_futures,
+            );
+            return Ok((text, report));
+        }
+    }
+
     // TOML 策略缺 pair 时用 --pair 兜底; 两者皆无报错。
     if config.get_str("pair").is_none() {
         let pair = args.pair.clone().ok_or_else(|| {

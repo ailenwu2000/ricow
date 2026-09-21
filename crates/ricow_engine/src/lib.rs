@@ -3,6 +3,7 @@
 mod backtest_runner;
 mod command;
 mod confirm;
+pub mod data;
 mod live;
 mod loader;
 mod market;
@@ -13,10 +14,12 @@ mod strategy;
 mod us_tickers;
 
 pub use backtest_runner::{
-    build_daily_ticks, build_interval_ticks, run_backtest, run_portfolio_backtest,
+    build_daily_ticks, build_interval_ticks, run_backtest, run_backtest_with_series,
+    run_portfolio_backtest,
 };
 pub use command::{Engine, RunMode, RunOutcome, StopReason, StopRequest, StopSignal};
 pub use confirm::{approve, consume, create_preview, get_preview, reject, PREVIEW_TTL_SECS};
+pub use data::{CachedBar, DataHub};
 pub use live::{
     check_clock_skew, clock_align_guidance, dry_run_gate, dry_run_initial_cash,
     liquidation_distance, live_gate, plan_cleanup, residual_owned, risk_gate, skew_ms,

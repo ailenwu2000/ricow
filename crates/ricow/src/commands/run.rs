@@ -126,6 +126,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                 config,
                 demo_exchange,
                 Some(&db),
+                Some(crate::commands::data_hub().await?),
                 Some(stop_rx),
                 args.close_all,
                 RunMode::Demo,
@@ -176,6 +177,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                     config,
                     live_exchange,
                     Some(&db),
+                    Some(crate::commands::data_hub().await?),
                     Some(stop_rx),
                     args.close_all,
                     RunMode::Live,
@@ -209,7 +211,14 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                 config.name
             );
             let outcome = Engine::new()
-                .run_dry_run(config, exchange, initial_balance, Some(&db), Some(stop_rx))
+                .run_dry_run(
+                    config,
+                    exchange,
+                    initial_balance,
+                    Some(&db),
+                    Some(crate::commands::data_hub().await?),
+                    Some(stop_rx),
+                )
                 .await?;
             print_run_outcome(&outcome);
             // 行情流中断属异常: 非零退出, 供管理器/用户识别 (不静默 Ok)

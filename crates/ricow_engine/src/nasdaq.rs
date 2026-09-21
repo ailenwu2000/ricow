@@ -20,7 +20,7 @@
 //! - 跨年/跨月无特例: 12/31 的 bar open_time = 12-31T00:00:00Z, close_time =
 //!   次年 01-01T00:00:00Z; 对齐/截断一律按 DateTime<Utc> 全序比较, 勿按字符串日期。
 //!
-//! 缓存: 调用方负责落库 (ricow_strategy::Database us_klines 表), 本模块只做网络拉取 + 解析。
+//! 缓存: 调用方负责落库 (统一走 `data_klines`, source = "nasdaq"), 本模块只做网络拉取 + 解析。
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -35,10 +35,10 @@ use crate::us_tickers::AssetClass;
 /// Nasdaq API 主站。
 const NASDAQ_API: &str = "https://api.nasdaq.com";
 
-/// 请求窗口: 服务端上限 ~10 年 (2514 根)。R1 需要 10 年, 固定 fromdate 2016-01-01。
-const FROM_DATE: &str = "2016-01-01";
-
-/// Nasdaq 日线客户端 (信号轨数据源)。
+/// Nasdaq 日线客户端。
+///
+/// 起始日期不再是写死的常量 (028 T011): 调用方按需要的区间传 `fromdate`/`todate`
+/// (均为 `MM/DD/YYYY`, 闭区间); 服务端窗口上限约 2514 根, 超出即拿不满。
 pub struct NasdaqClient {
     http: reqwest::Client,
 }
@@ -59,17 +59,20 @@ impl NasdaqClient {
         Self { http }
     }
 
-    /// 拉取单只美股/ETF 日线 (截至 todate, 含当日)。失败 = Err (调用方按失败语义处理)。
-    pub async fn get_daily_klines(
+    /// 拉取单只美股/ETF 日线, 区间 `[fromdate, todate]` (均 `MM/DD/YYYY`, **闭区间**)。
+    ///
+    /// 失败 = Err (调用方按失败语义处理)。028 T011: 起始日由调用方给, 不再写死 2016-01-01。
+    pub async fn get_daily_klines_between(
         &self,
         ticker: &str,
         assetclass: AssetClass,
+        fromdate: &str,
         todate: &str,
     ) -> CoreResult<Vec<Kline>> {
         let mut last_err: Option<CoreError> = None;
         // 失败语义: 重试 3 次, 指数退避 1s/2s/4s。
         for attempt in 0..3 {
-            match self.fetch_once(ticker, assetclass, todate).await {
+            match self.fetch_once(ticker, assetclass, fromdate, todate).await {
                 Ok(klines) => return Ok(klines),
                 Err(e) => {
                     last_err = Some(e);
@@ -86,10 +89,11 @@ impl NasdaqClient {
         &self,
         ticker: &str,
         assetclass: AssetClass,
+        fromdate: &str,
         todate: &str,
     ) -> CoreResult<Vec<Kline>> {
         let url = format!(
-            "{NASDAQ_API}/api/quote/{ticker}/historical?assetclass={}&fromdate={FROM_DATE}&todate={todate}&limit=9999",
+            "{NASDAQ_API}/api/quote/{ticker}/historical?assetclass={}&fromdate={fromdate}&todate={todate}&limit=9999",
             assetclass.as_str()
         );
         let resp = self

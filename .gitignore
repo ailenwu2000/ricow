@@ -12,6 +12,8 @@ target-cold/
 backup/
 strategies/*
 !strategies/builtin/
+# 028: 声明式数据面样板(用户读的示范脚本, 随仓库分发; 用户自己的策略仍在 strategies/* 里被忽略)
+!strategies/examples/
 ricow.db
 ricow.db-shm
 ricow.db-wal

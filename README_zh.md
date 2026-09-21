@@ -126,6 +126,9 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_P
 - `RICOW_BN_BASE_URL` / `RICOW_FAPI_BASE_URL` 可整体替换 REST 域名(现货 / 合约): **公开数据与签名下单都跟着变**;
   币安官方公开数据域名 `https://data-api.binance.vision` **只提供公开数据**, 适合纯回测/看行情, **下单会失败** —— 别把它当常规解法。
 - demo(`--demo`)无需手配域名: CLI 自动走 `demo-api.binance.com` / `demo-fapi.binance.com`。
+- **内置数据源**(`ricow data pull --source <名>`): `binance_spot` / `binance_futures`(区间 K 线, 自动翻页)与 `nasdaq` / `yahoo`(美股日线, 免 key)。全部落进同一张本地表 `data_klines`, 键 = `(source, symbol, interval, open_time)`。
+- **回测只读本地库**(可复现): 先 `ricow data pull --source binance_spot --symbol ETHUSDT --interval 1h --days 150`, 再 `ricow backtest …`; 缺数据时错误里直接印出该敲的 `data pull` 命令, 回测中途不会偷偷联网。
+- **你的策略可以自己取数**: Lua 策略用 `http:get(url)`(仅 GET, 墙钟超时 10s, 响应体上限 5MB)。域名不限 —— 风险由你自担(平台不为这些请求背书); 项目自带策略一律不用它。
 
 ### 8. 安全须知
 
@@ -156,7 +159,7 @@ xattr -d com.apple.quarantine ./ricow
 
 **怎么换 AI 供应商, 或用本地模型?** 改 `ricow.toml` 里的 `[ai]`: `provider`(预设: `deepseek`(默认)/ `moonshot` / `zhipu` / `qwen` / `openrouter` / `openai` / `ollama`)、`model`, 不在列表里的再补 `base_url`。该供应商的 `api_key` 写在同一个段里。在助手会话里用 `/keys` 可以把 provider + 密钥 + 模型写回文件, 且保留你的注释。
 
-**能完全离线跑吗?** AI 那半边可以: `provider = "ollama"` + `base_url = "http://127.0.0.1:11434/v1"` + 你本地已拉取的模型(`ollama list`), 全程不联网。交易内核不行: 回测要下载真实 K 线, demo/实盘要真实下单, 所以币安必须可达(国内网络请设 `HTTPS_PROXY`)。只有 AI 端点这一项是可选的。
+**能完全离线跑吗?** AI 那半边可以: `provider = "ollama"` + `base_url = "http://127.0.0.1:11434/v1"` + 你本地已拉取的模型(`ollama list`), 全程不联网。**回测也能离线**: 数据先 `ricow data pull` 落到本地库, 之后回测只读本地库、不联网(这正是可复现的前提)。demo/实盘要真实下单, 所以币安必须可达(国内网络请设 `HTTPS_PROXY`)。只有 AI 端点这一项是可选的。
 
 **策略、数据库、配置放在哪?** 都在 `$RICOW_ROOT` —— 解析顺序: 环境变量 `RICOW_ROOT` → 当前目录(已经含 `ricow.db`/`strategies/` 时) → 平台默认数据目录。`ricow.toml`(Unix `0600` / Windows 仅当前用户 ACL)与 `ricow.db` 都在那里。
 
@@ -166,7 +169,8 @@ xattr -d com.apple.quarantine ./ricow
 
 - `specs/` — 唯一文档体系: constitution(项目宪法)/ product(产品方案)/ architecture(架构)/ lua-api(Lua API 规范)/ roadmap(里程碑进度)/ research(调研资料)/ changes(变更档案, SDD 流程产物)
 - `crates/` — 5 crate workspace: core / binance / strategy / engine / cli
-- `strategies/builtin/` — 内置参考实现(编译期嵌入二进制): shannon_grid.lua(**唯一策略样板**, 照它写你的策略)+ executors/{dca,twap,vwap,pullback,ladder}(执行模式示例, 非策略); exec 执行组件为引擎内置(Rust 实现, Lua 策略直接调用 exec.*)
+- `strategies/builtin/` — 内置参考实现(编译期嵌入二进制): shannon_grid.lua(策略样板, 照它写你的策略)+ executors/{dca,twap,vwap,pullback,ladder}(执行模式示例, 非策略); exec 执行组件为引擎内置(Rust 实现, Lua 策略直接调用 exec.*)
+- `strategies/examples/ema_cross_declared.lua` — **声明式数据面样板(028)**: `data:series{source,symbol,interval,bars,min_bars,drive}` + `on_bar` + 句柄指标(`s:ema`), 策略自己决定来源/标的/周期
 - 自建策略走 `create` 闭环:`ricow create --name <名字> --pair <交易对> --script <你的.lua>` → `ricow approve` → `ricow deploy <preview_id> --token <token>`(带编译门禁 + 真实 K 线沙箱回测, **确认前不落盘**;样板 = 内置 `strategies/builtin/shannon_grid.lua`,见 [specs/lua-api.md](specs/lua-api.md) 第九节)
 - `website/` — 官网落地页(<https://ricow.xyz>,纯静态 HTML/CSS,由 `.github/workflows/pages.yml` 部署到 GitHub Pages)
 - `crates/ricow/src/supervisor/` — 策略进程管理器(常驻 daemon + 本机控制通道 + 实例台账, 见 [specs/architecture.md §三](specs/architecture.md))
@@ -189,3 +193,13 @@ xattr -d com.apple.quarantine ./ricow
 ---
 
 [English README](README.md) · [项目宪法](specs/constitution.md) · [贡献指南](CONTRIBUTING.md)
+
+### 网络受限环境
+
+取数走标准环境变量代理(平台不提供代理配置项):
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:1080 ricow data pull --source yahoo --symbol QQQ --interval 1d --days 3650
+```
+
+回测只读本地库, 不需要网络。**取数失败一律如实报错**(不降级、不静默改用旧数据); 受限网络下请给取数命令配上代理环境变量(如上)。

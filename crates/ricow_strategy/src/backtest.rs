@@ -1,7 +1,7 @@
 //! 回测引擎: 历史 K 线逐根驱动, OHLC 合成撮合。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ricow_core::{
     parse_pair, Balance, CoreResult, Kline, OrderAck, OrderBook, OrderFill, OrderRequest,
@@ -101,13 +101,6 @@ pub struct BacktestReport {
     pub holdings_snapshots: Vec<Vec<(String, Decimal)>>,
 }
 
-/// 组合信号模式 ctx:klines 返回段的最大长度 (007 v2, R1 十年回测性能前提)。
-///
-/// 打分所需最近根数: IBD RS ROC252 / EMA200(t-20) / 52w 高窗口 ≈ 253 根下界;
-/// 400 根留足递推与趋势确认余量。十年 (≈2514 根) 信号线每 tick 全量克隆会卡死,
-/// 超长段只保留最近 SIGNAL_TAIL 根 (升序) — 无前视不变 (截断仍按全局 tick 时间)。
-pub const SIGNAL_TAIL: usize = 400;
-
 /// 该 bar 覆盖时段 `[open, close)` 内的 8h 资金费结算点个数 (UTC 00/08/16)。
 ///
 /// 013 FR-004 修正 L1: 旧实现按 `bar.open_time.hour() ∈ {0,8,16}` 判定 —— 1m/5m 的 00:00–00:59 段 bar
@@ -174,6 +167,17 @@ pub struct BacktestContext {
     /// 组合模式 (多标的轮动回测, M2): 当前 tick 各 pair 的 bar (键 = resolve_key(pair))。
     /// 单标的路径恒空; 撮合/估值按 pair 路由时回落 current_bar。
     portfolio_bars: HashMap<String, Kline>,
+    /// 028 声明驱动回测: 各**声明序列**在本 tick 的撮合参考 bar(键 = resolve_key(symbol) 与裸 symbol)。
+    ///
+    /// 为什么不复用 `portfolio_bars`: 那一份非空会把估值/`now()`/报告切到组合模式口径;
+    /// 这里只要"按 pair 路由价格"这一件事。
+    declared_bars: HashMap<String, Kline>,
+    /// 028: 本次回测里"有自己序列"的标的集合 —— 命中者只认自己的 bar, 绝不回落到主时钟价格。
+    declared_symbols: HashSet<String>,
+    /// 028: 声明驱动回测的**严格取价**模式(由 `set_declared_bars` 打开)。
+    /// 打开后撮合参考价**只认声明过的序列**: 未声明的标的没有参考价 → 市价单按既有语义拒单,
+    /// 绝不回落到主时钟序列的价。旧路径(`Engine::backtest`)不开这个开关, 行为逐位不变。
+    declared_strict: bool,
     /// 组合模式: 各 pair 已收盘序列 (键 = resolve_key(pair)), ctx:klines(pair) 按 pair 路由。
     portfolio_klines: HashMap<String, Vec<Kline>>,
     /// 组合模式: 最近收盘价 (键 = resolve_key(pair), 期末估值/组合权益用)。
@@ -182,10 +186,6 @@ pub struct BacktestContext {
     /// 与 equity_curve 每 tick 收盘点同点记录 (曲线初始点与末根补估点无快照); 单标的路径恒空。
     holdings_snapshots: Vec<Vec<(String, Decimal)>>,
     /// 组合信号模式 (2026-09-09 bs_momentum Lua 化): 美股信号日线 (键 = resolve_key(pair),
-    /// 全量预装, 不随 tick 推进)。组合模式下 ctx:klines(pair) 返回该容器按全局 tick 时间
-    /// 截断的已收盘段 (脚本永不见未来, 无前视); 容器空 = 信号通道关闭, 回落成交轨
-    /// portfolio_klines/closed_klines (单标的与纯成交轨组合行为零改动)。
-    signal_klines: HashMap<String, Vec<Kline>>,
     default_exchange: String,
     slippage_bps: u32,
     initial_equity: Decimal,
@@ -281,10 +281,12 @@ impl BacktestContext {
             closed_klines: Vec::new(),
             finalized: false,
             portfolio_bars: HashMap::new(),
+            declared_bars: HashMap::new(),
+            declared_symbols: HashSet::new(),
+            declared_strict: false,
             portfolio_klines: HashMap::new(),
             portfolio_prices: HashMap::new(),
             holdings_snapshots: Vec::new(),
-            signal_klines: HashMap::new(),
             default_exchange: "bn".to_string(),
             slippage_bps,
             initial_equity: initial_cash,
@@ -330,55 +332,89 @@ impl BacktestContext {
         }
     }
 
-    /// 撮合参考 bar: 组合模式按 pair 路由 portfolio_bars, 单标的回落 current_bar。
+    /// 在声明序列里查这一 pair 的参考 bar —— 兼容几种**等价写法**(第四轮复核发现: 原来
+    /// 只有裸 symbol 与 `bn:` 前缀能命中, 写成交易所全名 `binance:ETHUSDT` / `BINANCE:ETHUSDT`
+    /// 会被当成"未声明标的"而**静默拒单**):
+    /// ① 精确键 `source:symbol`; ② 原样 `pair`; ③ 忽略前缀与大小写, 只比 `:` 之后的 base
+    /// (`bn` / `binance` / `binance_spot` 都被视为同一交易所的别名)。
+    ///
+    /// 多个声明序列共用同一 base 且前缀区分不出(如同时声明 `yahoo:QQQ` 与 `nasdaq:QQQ`,
+    /// 而下单写 `QQQ`)→ 返回 `None`:**宁拒单也不猜价**(声明驱动回测的第一硬规则)。
+    fn declared_lookup(&self, pair: &str) -> Option<&Kline> {
+        let key = self.resolve_key(pair);
+        if let Some(b) = self.declared_bars.get(&key) {
+            return Some(b);
+        }
+        if let Some(b) = self.declared_bars.get(pair) {
+            return Some(b);
+        }
+        let (prefix, base) = parse_pair(pair);
+        // 前缀能对上某个声明来源名 → 优先它(消歧)。
+        if !prefix.is_empty() {
+            let p = prefix.to_ascii_lowercase();
+            if let Some(b) = self.declared_bars.iter().find(|(k, _)| {
+                let (src, base_k) = parse_pair(k);
+                src.eq_ignore_ascii_case(&p) && base_k.eq_ignore_ascii_case(base)
+            }) {
+                return Some(b.1);
+            }
+        }
+        // 只比 base(忽略大小写)。
+        //
+        // ⚠️ 同一序列在声明表里有**两个键**(解析键 `bn:TEST` + 原样 symbol `TEST`), 所以"命中多条"
+        // 不等于歧义 —— 只有它们的 bar **内容不同**(真·两条不同声明序列同名, 如 yahoo/nasdaq 同名)
+        // 才算歧义: 那时宁拒单也不猜价。
+        let mut hit: Option<(&String, &Kline)> = None;
+        for (k, v) in self.declared_bars.iter() {
+            let (_, base_k) = parse_pair(k);
+            if base_k.eq_ignore_ascii_case(base) {
+                match hit {
+                    None => hit = Some((k, v)),
+                    Some((_, prev)) => {
+                        if prev.open_time != v.open_time || prev.close != v.close {
+                            tracing::warn!(
+                                target: "backtest", pair = %pair,
+                                "声明里有多个**不同**序列的标的同名为 '{}'(如 yahoo/nasdaq 同名), \
+                                 无法判断用哪条 → 不猜价(请在下单时写清交易所前缀)",
+                                base
+                            );
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        hit.map(|(_, v)| v)
+    }
+
+    /// 撮合参考 bar: **声明序列优先**(每 pair 各按自己的序列), 其次组合模式 portfolio_bars,
+    /// 最后单标的回落 current_bar。
+    ///
+    /// 声明序列命中时**不回落到主时钟**: 拿别的标的的价成交是量级级错误(审核实测:
+    /// 交易 BBBUSDT 却按 AAAUSDT 的 1010 成交, 真实价 ≈10)。没有自己的 bar → 返回 None,
+    /// 市价单按既有"无参考 bar 拒单"语义处理(限价单照旧挂 pending)。
     fn bar_for(&self, pair: &str) -> Option<&Kline> {
+        let key = self.resolve_key(pair);
+        // 声明驱动回测: **只认声明序列** —— 未声明的标的直接 None(拒单), 不回落主时钟。
+        // (回落到别的标的的价格是量级级错误: 审核实测过交易 BBBUSDT 却按 AAAUSDT 的 1010 成交。)
+        if self.declared_strict {
+            return self.declared_lookup(pair);
+        }
+        if self.declared_symbols.contains(&key) || self.declared_symbols.contains(pair) {
+            return self.declared_lookup(pair);
+        }
         if self.portfolio_bars.is_empty() {
             self.current_bar.as_ref()
         } else {
-            self.portfolio_bars.get(&self.resolve_key(pair)).or(self.current_bar.as_ref())
+            self.portfolio_bars.get(&key).or(self.current_bar.as_ref())
         }
     }
 
-    /// 装载美股信号线 (组合信号模式, bs_momentum Lua 化)。键 = 原始 pair 名
-    /// (如 "TSLABUSDT"), resolve_key 归一存储; 空 map = 信号通道关闭 (现行为)。
-    /// 由 runner (run_portfolio_backtest) 在 on_init 前调用; 信号线全量预装
-    /// (装配层按窗口截取, 严禁全量 Nasdaq 装载), 截断发生在 klines_for。
-    pub fn set_signal_klines(&mut self, map: HashMap<String, Vec<Kline>>) {
-        self.signal_klines =
-            map.into_iter().map(|(pair, bars)| (self.resolve_key(&pair), bars)).collect();
-    }
-
-    /// ctx 可见历史 K 线: 组合信号模式 (signal_klines 非空) 返回该 pair 信号线
-    /// **截至当前执行日的已收盘段** (bar.open_time < 全局 tick 时间), 无前视;
-    /// 信号容器空 → 回落成交轨 portfolio_klines/closed_klines (单标的零改动)。
+    /// ctx 可见历史 K 线 (无前视): 组合路径返回该 pair 已收盘段, 单标的回落 closed_klines。
+    ///
+    /// 028 T038: 原"组合信号预装"通道 (`signal_klines` + `SIGNAL_TAIL` 尾窗封顶) 已退役 ——
+    /// 策略要历史就自己声明 `data:series{...}`(句柄自带窗口/尾窗), 引擎不再替它预装信号线。
     fn klines_for(&self, pair: &str) -> Option<Vec<Kline>> {
-        if !self.signal_klines.is_empty() {
-            // 全局 tick 时间 = 当前 portfolio_bars 各 bar open_time 最大值 (与
-            // step_portfolio 收旧 bar 的 last_bar 同口径; 组合统一时间轴)。数据缺口日
-            // 该 pair 无当日 bar 时, tick 时间仍由其它 pair bar 决定, 截断不悬空 (Y1)。
-            let cutoff = self.portfolio_bars.values().map(|k| k.open_time).max();
-            let Some(cutoff) = cutoff else {
-                return Some(Vec::new()); // on_init 期尚无 tick → 空信号段 (策略零单幂等)
-            };
-            // 该 pair 无信号线 (池外/数据缺失) → 空段; 信号线不足的标的由脚本按
-            // 长度门槛跳过 ("宁缺毋滥"), 不给成交轨序列 (91 天 bStock 会误导打分)。
-            return Some(
-                self.signal_klines
-                    .get(&self.resolve_key(pair))
-                    .map(|bars| {
-                        // 007 v2 尾窗 (R1 十年回测性能前提): 十年 ≈2514 根/标的, 若每 tick
-                        // 克隆全部已收盘段 (2514 tick × 70 只 × ~1250 根均值 ≈ 2 亿根克隆)
-                        // 会卡死; 打分只需最近 ≥253 根 (ROC252/EMA200/52w 高), 尾窗 400 根足够。
-                        // 信号线升序契约 (nasdaq.rs parse reverse / db.rs 升序) →
-                        // partition_point 定位已收盘边界 O(log n), 只克隆最近 SIGNAL_TAIL 根
-                        // (无前视不变: 截断仍按全局 tick 时间, 封顶只裁旧根不裁未来)。
-                        let end = bars.partition_point(|k| k.open_time < cutoff);
-                        let start = end.saturating_sub(SIGNAL_TAIL);
-                        bars[start..end].to_vec()
-                    })
-                    .unwrap_or_default(),
-            );
-        }
         if self.portfolio_klines.is_empty() {
             Some(self.closed_klines.clone())
         } else {
@@ -510,6 +546,26 @@ impl BacktestContext {
         self.current_bar = Some(kline.clone());
         self.total_bars += 1;
         self.match_pending();
+    }
+
+    /// 028: 设置本 tick 各**声明序列**的撮合参考 bar(`(标的, bar)`), 整体替换。
+    ///
+    /// 每 tick 整体替换而不是增量更新: 某标的"此刻没有正在形成的 bar"(休市/数据到尽头)
+    /// 时它必须从表里消失, 否则会拿上一次的陈旧价继续成交。
+    pub fn set_declared_bars(&mut self, bars: &[(String, Kline)]) {
+        self.declared_bars.clear();
+        self.declared_symbols.clear();
+        self.declared_strict = true;
+        for (symbol, bar) in bars {
+            let key = self.resolve_key(symbol);
+            self.declared_bars.insert(key.clone(), bar.clone());
+            self.declared_bars.insert(symbol.clone(), bar.clone());
+            self.declared_symbols.insert(key.clone());
+            self.declared_symbols.insert(symbol.clone());
+            // 同时喂给逐标的估值表(键与上面同源): 报告/权益曲线按各 pair 自己的最近价算。
+            self.portfolio_prices.insert(key, bar.close);
+            self.portfolio_prices.insert(symbol.clone(), bar.close);
+        }
     }
 
     /// 组合模式 (多标的轮动回测, M2): 推进一个"统一 tick" —— 输入为各 pair 的
@@ -859,6 +915,16 @@ impl BacktestContext {
     /// 按给定价格估值总权益 (K8): 现货 = 现金 + Σ(持仓 × price);
     /// 合约 = 现金 + Σ逐仓钱包 + Σ未实现 (各仓按方向计价)。
     fn mark_to_market(&self, price: &Decimal) -> Decimal {
+        // 028 审核修复: **逐标的估值** —— 组合/声明路径按各 pair 自己的最近价, 缺价才回落入参
+        // (主时钟价)。旧单标的路径 `portfolio_prices` 为空 → `px()` 恒等于入参, 行为逐位不变。
+        // (此前多标的持仓的全部市值都乘主时钟 bar 的 close, 报告数字系统性错误。)
+        let px = |pair: &str| -> Decimal {
+            self.portfolio_prices
+                .get(&self.resolve_key(pair))
+                .or_else(|| self.portfolio_prices.get(pair))
+                .copied()
+                .unwrap_or(*price)
+        };
         let cash = self.cash();
         if self.is_futures() {
             let mut equity = cash;
@@ -869,9 +935,10 @@ impl BacktestContext {
                 if p.size <= Decimal::ZERO {
                     continue;
                 }
+                let mark = px(&p.pair);
                 let u = match p.side {
-                    OrderSide::Buy => (price - p.entry_price) * p.size,
-                    OrderSide::Sell => (p.entry_price - price) * p.size,
+                    OrderSide::Buy => (mark - p.entry_price) * p.size,
+                    OrderSide::Sell => (p.entry_price - mark) * p.size,
                 };
                 equity += u;
             }
@@ -879,7 +946,7 @@ impl BacktestContext {
         } else {
             let mut pos_value = Decimal::ZERO;
             for p in self.virtual_positions.values() {
-                pos_value += p.size * *price;
+                pos_value += p.size * px(&p.pair);
             }
             cash + pos_value
         }
@@ -1057,7 +1124,19 @@ impl BacktestContext {
         let final_equity = if self.is_futures() {
             self.mark_to_market(&final_price)
         } else {
-            final_cash + final_pos_size * final_price
+            // 028 审核修复: 现货期末权益 = 现金 + **各标的按自己的价**求市值之和。
+            // 旧路径只有单标的(portfolio_prices 空) → 与 `final_pos_size * final_price` 等价。
+            let mut v = self.cash();
+            for p in self.virtual_positions.values() {
+                let mark = self
+                    .portfolio_prices
+                    .get(&self.resolve_key(&p.pair))
+                    .or_else(|| self.portfolio_prices.get(&p.pair))
+                    .copied()
+                    .unwrap_or(final_price);
+                v += p.size * mark;
+            }
+            v
         };
         let initial = self.initial_equity;
         let pct = |v: Decimal| -> f64 {
@@ -1566,7 +1645,16 @@ impl BacktestContext {
             fill_price,
             fill_size: req.size,
             fee,
-            timestamp: chrono::Utc::now(),
+            // 028 审核修复: 回测成交时间戳用**虚拟钟**(本 tick 主时钟 bar 的开盘时刻)。
+            //
+            // ⚠️ 与强平成交的时间戳**不严格同值**: 强平用 `bar.close_time`(第四轮复核指出) ——
+            // 这是有意的语义差别: 普通成交发生在"本 tick 决策之后"(开盘时刻口径), 而强平是
+            // 结算一根已收盘 bar 的结果(收盘时刻口径)。两者都在虚拟钟内, 故可复现性不受影响。
+            timestamp: self
+                .current_bar
+                .as_ref()
+                .map(|k| k.open_time)
+                .unwrap_or_else(chrono::Utc::now),
         };
         self.pnl.record_fill(&fill);
         self.fill_queue.push(fill);
@@ -1654,6 +1742,24 @@ impl Context for BacktestContext {
                 // 限价挂 pending。
                 if req.order_type == OrderType::Market {
                     self.rejected_count += 1;
+                }
+                if !self.declared_bars.is_empty() {
+                    let declared: Vec<String> = {
+                        let mut v: Vec<String> = self
+                            .declared_bars
+                            .keys()
+                            .map(|k| parse_pair(k).1.to_ascii_uppercase())
+                            .collect();
+                        v.sort();
+                        v.dedup();
+                        v
+                    };
+                    tracing::warn!(
+                        target: "backtest", pair = %req.pair,
+                        declared = %declared.join(", "),
+                        "该标的没有声明序列 → 无参考价, 市价单拒单(声明驱动回测只认声明过的序列); \
+                         要交易它请为它加一条 data:series{{...}}"
+                    );
                 }
                 let ack = OrderAck {
                     exchange_order_id: exchange_order_id.clone(),
@@ -1765,6 +1871,16 @@ impl Context for BacktestContext {
         } else {
             Err(ricow_core::CoreError::OrderNotFound(order_id.to_string()))
         }
+    }
+
+    /// 撤本实例挂单 (028 T015) —— 回测虚拟挂单全归本实例。
+    fn cancel_owned_orders(&mut self, pair: Option<&str>) -> CoreResult<usize> {
+        let before = self.pending_orders.len();
+        match pair {
+            Some(p) => self.pending_orders.retain(|(_, req)| req.pair != p),
+            None => self.pending_orders.clear(),
+        }
+        Ok(before - self.pending_orders.len())
     }
 
     fn update_orderbook(&mut self, _pair: &str, _ob: OrderBook) {}
@@ -2338,6 +2454,28 @@ mod tests {
         );
         assert_eq!(ctx.report().rejected_count, 1, "护栏拒单应如实计数");
         assert_eq!(ctx.balance("ETH"), Some(dec!(100)), "被拒订单不得成交");
+    }
+
+    /// 028 T032: 护栏计数**跨 pair 共享** —— 防的是策略级风暴, 不是单标的风暴。
+    ///
+    /// 两个标的各下 60 单(共 120) → 第 101 单起被拒, 与标的无关。
+    #[test]
+    fn test_order_guard_counts_shared_across_pairs() {
+        let mut ctx = test_ctx("spot", "one-way", 1_000_000);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut rejected = 0;
+        for i in 1..=60 {
+            for pair in ["ETH", "BTC"] {
+                let ack = ctx
+                    .place_order(OrderRequest::new_market(pair, OrderSide::Buy, dec!(1)))
+                    .unwrap();
+                if ack.status == OrderStatus::Rejected {
+                    rejected += 1;
+                    assert!(i > 50, "第 {i} 轮 {pair} 就被拒 → 说明计数不是共享的全局窗口");
+                }
+            }
+        }
+        assert_eq!(rejected, 20, "120 单里应有 20 单被固定护栏拒(100/秒)");
     }
 
     /// 019-R5: 固定护栏不误伤常规节奏 (单 tick 少量下单恒放行)。
@@ -2999,186 +3137,5 @@ mod tests {
         let solo_report = solo.report();
         assert!(solo_report.holdings_snapshots.is_empty(), "单标的快照恒空");
         assert!(!solo_report.equity_curve.is_empty(), "单标的亦有净值曲线");
-    }
-
-    // ---- 组合信号模式 (T2 bs_momentum Lua 化: signal_klines 容器 + 全局 tick 截断) ----
-
-    const DAY: i64 = 86_400;
-
-    /// 合成美股信号线: day 0 起每天一根 (UTC 00:00 锚, 与 nasdaq.rs 时间契约一致), n 根。
-    fn signal_line(n: usize) -> Vec<Kline> {
-        (0..n)
-            .map(|i| {
-                let t = i as i64 * DAY;
-                let p = rust_decimal::Decimal::from(100 + i as i64);
-                Kline {
-                    open_time: chrono::DateTime::from_timestamp(t, 0).unwrap(),
-                    open: p,
-                    high: p + dec!(1),
-                    low: p - dec!(1),
-                    close: p,
-                    volume: Decimal::ONE,
-                    close_time: chrono::DateTime::from_timestamp(t + DAY, 0).unwrap(),
-                }
-            })
-            .collect()
-    }
-
-    /// 成交轨日线 bar (UTC 日对齐: open_time = 当日 00:00)。
-    fn exec_bar(day: i64, px: i64) -> Kline {
-        let t = day * DAY;
-        let p = rust_decimal::Decimal::from(px);
-        Kline {
-            open_time: chrono::DateTime::from_timestamp(t, 0).unwrap(),
-            open: p,
-            high: p + dec!(1),
-            low: p - dec!(1),
-            close: p,
-            volume: Decimal::ONE,
-            close_time: chrono::DateTime::from_timestamp(t + DAY, 0).unwrap(),
-        }
-    }
-
-    /// T2: signal 截断按全局 tick 时间 — tick 推进到 day k → 返回信号线 < day k 全段;
-    /// on_init 期 (无 tick) 空段 (策略零单幂等); 信号线尽头后不再增长。
-    #[test]
-    fn test_signal_klines_truncated_to_global_tick() {
-        let mut ctx = BacktestContext::new(
-            portfolio_config(),
-            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
-        );
-        let mut sig: HashMap<String, Vec<Kline>> = HashMap::new();
-        sig.insert("TSLABUSDT".into(), signal_line(300));
-        ctx.set_signal_klines(sig);
-        assert!(ctx.klines_for("TSLABUSDT").unwrap().is_empty(), "on_init 期空段 (幂等零单)");
-        ctx.step_portfolio(&[("TSLABUSDT".into(), exec_bar(10, 200))]);
-        let ks = ctx.klines_for("TSLABUSDT").unwrap();
-        assert_eq!(ks.len(), 10, "day10 tick 可见 day0..9 共 10 根, got {}", ks.len());
-        assert_eq!(
-            ks.last().unwrap().open_time,
-            chrono::DateTime::from_timestamp(9 * DAY, 0).unwrap(),
-            "末根 = tick 日前最后一根信号线"
-        );
-        ctx.step_portfolio(&[("TSLABUSDT".into(), exec_bar(15, 210))]);
-        let ks = ctx.klines_for("TSLABUSDT").unwrap();
-        assert_eq!(ks.len(), 15, "day15 tick → day0..14");
-        // 信号线 300 根尽头: day400 tick 后不再增长。
-        ctx.step_portfolio(&[("TSLABUSDT".into(), exec_bar(400, 300))]);
-        assert_eq!(ctx.klines_for("TSLABUSDT").unwrap().len(), 300);
-    }
-
-    /// T2: 无前视 — 改未来 (> 当前 tick) 价格不改变已返回段; tick 越过该日后新值才可见。
-    #[test]
-    fn test_signal_klines_no_lookahead() {
-        let mut ctx = BacktestContext::new(
-            portfolio_config(),
-            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
-        );
-        let mut sig: HashMap<String, Vec<Kline>> = HashMap::new();
-        let mut line = signal_line(300);
-        line[15].close = dec!(9999); // tick10 时的"未来 bar"
-        sig.insert("TSLABUSDT".into(), line);
-        ctx.set_signal_klines(sig);
-        ctx.step_portfolio(&[("TSLABUSDT".into(), exec_bar(10, 200))]);
-        let ks = ctx.klines_for("TSLABUSDT").unwrap();
-        assert_eq!(ks.len(), 10);
-        assert!(ks.iter().all(|k| k.close != dec!(9999)), "未来价格不得渗入已返回段 (无前视)");
-        // 越过 day15 → day15 bar 出现且带 9999 (此时已是历史)。
-        ctx.step_portfolio(&[("TSLABUSDT".into(), exec_bar(16, 210))]);
-        let ks = ctx.klines_for("TSLABUSDT").unwrap();
-        assert_eq!(ks.len(), 16);
-        assert!(ks.iter().any(|k| k.close == dec!(9999)), "越过日后该 bar 应可见");
-    }
-
-    /// 007 v2: 信号段尾窗封顶 (R1 十年回测性能前提) — 超长信号线只返回最近 SIGNAL_TAIL 根,
-    /// 且无前视保留 (截断仍按全局 tick 时间, 封顶只裁旧根不裁未来)。
-    #[test]
-    fn test_signal_klines_tail_capped_at_signal_tail() {
-        let mut ctx = BacktestContext::new(
-            portfolio_config(),
-            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
-        );
-        let mut sig: HashMap<String, Vec<Kline>> = HashMap::new();
-        let mut line = signal_line(2600); // ≈ 十年 (2514) 量级
-        line[2599].close = dec!(99999); // 未来 marker (当前 tick 远未到)
-        sig.insert("TSLABUSDT".into(), line);
-        ctx.set_signal_klines(sig);
-        // tick 推进到 day 2500 → 信号线 < day2500 共 2500 根 → 应裁到 SIGNAL_TAIL 根。
-        ctx.step_portfolio(&[("TSLABUSDT".into(), exec_bar(2500, 200))]);
-        let ks = ctx.klines_for("TSLABUSDT").unwrap();
-        assert_eq!(ks.len(), SIGNAL_TAIL, "2500 根信号段应封顶为 SIGNAL_TAIL, got {}", ks.len());
-        assert_eq!(
-            ks.last().unwrap().open_time,
-            chrono::DateTime::from_timestamp(2499 * DAY, 0).unwrap(),
-            "末根 = tick 日前最后一根 (day2499)"
-        );
-        assert_eq!(
-            ks.first().unwrap().open_time,
-            chrono::DateTime::from_timestamp((2500 - SIGNAL_TAIL) as i64 * DAY, 0).unwrap(),
-            "首根 = 末根前 SIGNAL_TAIL-1 根 (升序保留尾部)"
-        );
-        assert!(
-            ks.iter().all(|k| k.close != dec!(99999)),
-            "未来 marker (day2599) 不得渗入 (无前视)"
-        );
-        // 短段 (< SIGNAL_TAIL) 不裁: 回到既有行为。
-        let mut ctx2 = BacktestContext::new(
-            portfolio_config(),
-            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
-        );
-        let mut sig2: HashMap<String, Vec<Kline>> = HashMap::new();
-        sig2.insert("TSLABUSDT".into(), signal_line(300));
-        ctx2.set_signal_klines(sig2);
-        ctx2.step_portfolio(&[("TSLABUSDT".into(), exec_bar(250, 200))]);
-        assert_eq!(
-            ctx2.klines_for("TSLABUSDT").unwrap().len(),
-            250,
-            "短段 (250 < SIGNAL_TAIL) 维持现行为不裁"
-        );
-    }
-
-    /// T2: 数据缺口日 (该 pair 当日无 bar) — 全局 tick 时间由其它 pair bar 决定, 截断不悬空 (Y1)。
-    #[test]
-    fn test_signal_klines_gap_day_uses_global_tick() {
-        let mut ctx = BacktestContext::new(
-            portfolio_config(),
-            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
-        );
-        let mut sig: HashMap<String, Vec<Kline>> = HashMap::new();
-        sig.insert("TSLABUSDT".into(), signal_line(300));
-        sig.insert("NVDABUSDT".into(), signal_line(300));
-        ctx.set_signal_klines(sig);
-        ctx.step_portfolio(&[
-            ("TSLABUSDT".into(), exec_bar(5, 100)),
-            ("NVDABUSDT".into(), exec_bar(5, 200)),
-        ]);
-        // day6: A 缺口 (无 bar), 只有 B — A 截断仍按全局 tick (B 的 day6)。
-        ctx.step_portfolio(&[("NVDABUSDT".into(), exec_bar(6, 210))]);
-        let ks_a = ctx.klines_for("TSLABUSDT").unwrap();
-        assert_eq!(ks_a.len(), 6, "A 缺口日截断仍按全局 tick day6 (day0..5), got {}", ks_a.len());
-        let ks_b = ctx.klines_for("NVDABUSDT").unwrap();
-        assert_eq!(ks_b.len(), 6);
-    }
-
-    /// T2 回归: 容器空 (set 空 map) → 回落现组合已收盘序列逻辑, 信号路径不介入。
-    #[test]
-    fn test_signal_klines_empty_map_falls_back_to_portfolio() {
-        let mut ctx = BacktestContext::new(
-            portfolio_config(),
-            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
-        );
-        ctx.set_signal_klines(HashMap::new());
-        ctx.step_portfolio(&[(
-            "TSLABUSDT".into(),
-            kline(dec!(100), dec!(110), dec!(95), dec!(105)),
-        )]);
-        ctx.step_portfolio(&[(
-            "TSLABUSDT".into(),
-            kline(dec!(106), dec!(112), dec!(100), dec!(110)),
-        )]);
-        // 无 signal → ctx:klines 走 portfolio_klines (已收盘序列: 第一 tick 的 bar)。
-        let ks = ctx.klines_for("TSLABUSDT").unwrap();
-        assert_eq!(ks.len(), 1, "回落组合已收盘序列");
-        assert_eq!(ks[0].close, dec!(105), "tick1 bar 收盘 105");
     }
 }

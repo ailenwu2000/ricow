@@ -8,10 +8,14 @@
 
 mod error;
 mod exchange;
+mod interval;
+mod resample;
 mod types;
 #[cfg(test)]
 mod types_tests;
 
 pub use error::{CoreError, CoreResult};
-pub use exchange::Exchange;
+pub use exchange::{Exchange, KlineSource, SourceRegistry};
+pub use interval::{Interval, MINUTE_MS};
+pub use resample::{resample_complete, resample_to_interval};
 pub use types::*;

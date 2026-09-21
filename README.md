@@ -121,6 +121,9 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # your proxy (or HTTP_PROXY / ALL_PRO
 - On `network error`, first check the proxy: `curl https://api.binance.com/api/v3/time` should return JSON.
 - `RICOW_BN_BASE_URL` / `RICOW_FAPI_BASE_URL` replace the whole REST domain (spot / futures): **public data and signed orders both move with it**; Binance's public-data-only domain `https://data-api.binance.vision` has **no trading endpoints** — fine for pure backtests, but orders will fail there.
 - demo (`--demo`) needs no domain config: the CLI uses `demo-api.binance.com` / `demo-fapi.binance.com`.
+- **Built-in data sources** (`ricow data pull --source <name>`): `binance_spot` / `binance_futures` (K-line ranges with pagination) and `nasdaq` / `yahoo` (daily US stocks, no API key). Everything lands in one local table (`data_klines`), keyed by `(source, symbol, interval, open_time)`.
+- **Backtests read the local database only** (reproducibility): pull first (`ricow data pull --source binance_spot --symbol ETHUSDT --interval 1h --days 150`), then `ricow backtest …`. If data is missing, the error prints the exact `data pull` command to run — no hidden network fetch mid-backtest.
+- **Your strategy may fetch its own data**: Lua strategies call `http:get(url)` (GET only, 10s wall-clock timeout, 5MB response cap). Any URL/domain is allowed — you own the risk; built-in strategies never use it.
 
 ### 8. Security notes
 
@@ -151,7 +154,7 @@ or use *System Settings → Privacy & Security → Open Anyway*. **Why we don't 
 
 **How do I switch AI provider, or use a local model?** Edit `[ai]` in `ricow.toml`: `provider` (presets: `deepseek` (default) / `moonshot` / `zhipu` / `qwen` / `openrouter` / `openai` / `ollama`), `model`, and for anything not on that list also `base_url`. The provider's `api_key` lives in the same section. From inside the assistant, `/keys` writes provider + key + model back into the file while keeping your comments.
 
-**Can I run it offline?** The AI part can be: `provider = "ollama"` with `base_url = "http://127.0.0.1:11434/v1"` and a model you already pulled (`ollama list`) needs no internet at all. The trading core cannot: backtests download real K-lines and demo/live place real orders, so Binance must be reachable (from mainland China, set `HTTPS_PROXY`). Only the AI endpoint is optional.
+**Can I run it offline?** The AI part can be: `provider = "ollama"` with `base_url = "http://127.0.0.1:11434/v1"` and a model you already pulled (`ollama list`) needs no internet at all. **Backtests can too**: pull the data first (`ricow data pull`), then backtests read only the local database — that is what makes them reproducible. demo/live place real orders, so Binance must be reachable (from mainland China, set `HTTPS_PROXY`). Only the AI endpoint is optional.
 
 **Where do my strategies, database and config live?** In `$RICOW_ROOT` — resolution order: the `RICOW_ROOT` env var → the current directory if it already contains `ricow.db`/`strategies/` → the platform default data directory. `ricow.toml` (`0600` on Unix / current-user ACL on Windows) and `ricow.db` both live there.
 
@@ -184,3 +187,13 @@ This software is for learning and research only and is not investment advice. Cr
 ---
 
 [中文文档](README_zh.md) · [项目宪法 / constitution](specs/constitution.md) · [贡献指南 / Contributing](CONTRIBUTING.md)
+
+### Restricted network
+
+取数走标准环境变量代理(平台不提供代理配置项):
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:1080 ricow data pull --source yahoo --symbol QQQ --interval 1d --days 3650
+```
+
+Backtests read the local store only and need no network. **Fetch failures fail loudly** (no silent fallback to stale local data); behind a restricted network, pass a proxy env var to the fetch command as shown above.

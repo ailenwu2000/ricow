@@ -168,4 +168,64 @@ mod tests {
         assert_eq!(parse_pair("binance:"), ("binance", ""));
         assert_eq!(parse_pair("binance:BTC:USD"), ("binance", "BTC:USD"));
     }
+
+    // ---- 数据服务: 序列键与口径 (028 T005) ----
+
+    fn key(source: &str, symbol: &str, interval: Interval) -> SeriesKey {
+        SeriesKey::new(source, symbol, interval).expect("构造成功")
+    }
+
+    #[test]
+    fn test_series_key_cache_key_roundtrip() {
+        let k = key("yahoo", "QQQ", Interval::D1);
+        assert_eq!(k.cache_key(), "yahoo|QQQ|1d");
+        assert_eq!(SeriesKey::parse_cache_key(&k.cache_key()), Some(k));
+    }
+
+    #[test]
+    fn test_series_key_display_carries_all_three_parts() {
+        let k = key("binance_spot", "ETHUSDT", Interval::H1);
+        assert_eq!(k.to_string(), "binance_spot:ETHUSDT@1h");
+    }
+
+    #[test]
+    fn test_series_key_rejects_empty_and_separator() {
+        assert!(SeriesKey::new("", "QQQ", Interval::D1).is_err());
+        assert!(SeriesKey::new("yahoo", "   ", Interval::D1).is_err());
+        assert!(SeriesKey::new("yahoo", "QQ|Q", Interval::D1).is_err());
+        assert!(SeriesKey::new("ya|hoo", "QQQ", Interval::D1).is_err());
+    }
+
+    #[test]
+    fn test_series_key_parse_rejects_malformed() {
+        assert_eq!(SeriesKey::parse_cache_key("yahoo|QQQ"), None, "缺周期段");
+        assert_eq!(SeriesKey::parse_cache_key("yahoo|QQQ|7m"), None, "未知周期");
+        assert_eq!(SeriesKey::parse_cache_key("yahoo|QQQ|1d|extra"), None, "多段");
+        assert_eq!(SeriesKey::parse_cache_key("||"), None, "空 part");
+    }
+
+    #[test]
+    fn test_price_mode_roundtrip_and_unknown() {
+        for mode in [PriceMode::Close, PriceMode::AdjClose] {
+            assert_eq!(PriceMode::from_label(mode.label()), Some(mode));
+        }
+        assert_eq!(PriceMode::from_label("adjusted"), None);
+        assert_eq!(PriceMode::AdjClose.to_string(), "adjclose");
+    }
+
+    #[test]
+    fn test_series_meta_defaults_are_not_resampled_and_fresh() {
+        let meta = SeriesMeta::new(key("yahoo", "QQQ", Interval::D1), PriceMode::Close, 300);
+        assert!(!meta.resampled);
+        assert!(!meta.stale);
+        assert_eq!(meta.requested_bars, 300);
+    }
+
+    #[test]
+    fn test_series_key_serde_roundtrip() {
+        let k = key("nasdaq", "AAPL", Interval::D1);
+        let json = serde_json::to_string(&k).unwrap();
+        let back: SeriesKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, k);
+    }
 }

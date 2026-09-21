@@ -32,6 +32,16 @@ pub trait Context: Send {
     fn balance(&self, asset: &str) -> Option<Decimal>;
     fn place_order(&mut self, req: OrderRequest) -> CoreResult<OrderAck>;
     fn cancel_order(&mut self, pair: &str, order_id: &str) -> CoreResult<()>;
+
+    /// 撤销**本实例归属**的挂单 (028 T015): `pair = None` 撤全部, `Some(p)` 只撤该交易对。
+    ///
+    /// 返回撤销数量。默认实现 = 不支持(报错) —— 各上下文按自己的账本语义覆盖:
+    /// 回测/Dry Run 撤虚拟挂单; 实盘按订单归属前缀撤真实挂单。
+    fn cancel_owned_orders(&mut self, _pair: Option<&str>) -> CoreResult<usize> {
+        Err(CoreError::InvalidArgument(
+            "当前上下文不支持撤销本实例挂单 (cancel_owned_orders)".to_string(),
+        ))
+    }
     fn update_orderbook(&mut self, pair: &str, ob: OrderBook);
     fn record_fill(&mut self, _fill: &OrderFill) {}
     /// 取走上下文内部产生的成交事件 (DryRun 虚拟撮合)。
@@ -418,6 +428,48 @@ impl Context for LiveContext {
         let base = base.to_string();
         let order_id = order_id.to_string();
         self.run_async(async move { exchange.cancel_order(&base, &order_id).await })
+    }
+
+    /// 撤本实例挂单 (028 T015): 实盘按**订单归属前缀**过滤后逐个撤单。
+    ///
+    /// 覆盖面 = 给定 `pair`, 或(未给时)本实例见过的行情对(盘口缓存键) ∪ 配置 `pair`。
+    /// 只撤 `client_order_id` 以本实例前缀开头的单 —— 用户数据流是全账户的, 别人的单不动。
+    fn cancel_owned_orders(&mut self, pair: Option<&str>) -> CoreResult<usize> {
+        let pairs: Vec<String> = match pair {
+            Some(p) => vec![p.to_string()],
+            None => {
+                let mut v: Vec<String> =
+                    self.orderbook_cache.read().expect("orderbook_cache").keys().cloned().collect();
+                if let Some(p) = self.config.get_str("pair") {
+                    if !v.iter().any(|x| x == p) {
+                        v.push(p.to_string());
+                    }
+                }
+                v
+            }
+        };
+        let mut cancelled = 0usize;
+        for p in pairs {
+            let (prefix, base) = parse_pair(&p);
+            let exchange = self.resolve_exchange(prefix)?;
+            let base = base.to_string();
+            let open = {
+                let ex = exchange.clone();
+                let b = base.clone();
+                self.run_async(async move { ex.get_open_orders(&b).await })
+            }?;
+            for info in open {
+                if !crate::align::is_owned(&info.client_order_id, &self.order_prefix) {
+                    continue;
+                }
+                let ex = exchange.clone();
+                let b = base.clone();
+                let oid = info.exchange_order_id.clone();
+                self.run_async(async move { ex.cancel_order(&b, &oid).await })?;
+                cancelled += 1;
+            }
+        }
+        Ok(cancelled)
     }
 
     fn log(&self, msg: &str) {
@@ -836,6 +888,16 @@ impl Context for DryRunContext {
         } else {
             Err(CoreError::OrderNotFound(order_id.to_string()))
         }
+    }
+
+    /// 撤本实例挂单 (028 T015): Dry Run 的虚拟挂单全归本实例 —— 直接按 `pair` 过滤。
+    fn cancel_owned_orders(&mut self, pair: Option<&str>) -> CoreResult<usize> {
+        let before = self.pending_orders.len();
+        match pair {
+            Some(p) => self.pending_orders.retain(|(_, req)| req.pair != p),
+            None => self.pending_orders.clear(),
+        }
+        Ok(before - self.pending_orders.len())
     }
 
     fn log(&self, msg: &str) {
