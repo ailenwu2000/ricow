@@ -142,6 +142,11 @@ pub const REPORT_TERMS: &[Term] = &[
         zh: "现货账户总资产 = 持币市值 + 现金, 含未实现盈亏。",
         en: "Spot account value = holdings at market + cash, including unrealized P&L.",
     },
+    Term {
+        key: "基准对照",
+        zh: "把策略与「同本金满仓买入持有」「同 target_ratio 半仓买入持有」并列对照; 只有「策略 − 敞口对齐基准」才是策略行为本身的净贡献。",
+        en: "Places the strategy next to buy-and-hold at the same capital and to a same-target_ratio hold; only (strategy − exposure-matched baseline) is the net contribution of the strategy's own behaviour.",
+    },
 ];
 
 /// 报告里没有打印、但对话与配置里常出现的术语 (FR-024 点名的那几个)。

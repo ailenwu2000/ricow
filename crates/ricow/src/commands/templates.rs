@@ -1,7 +1,7 @@
 //! 内置策略模板目录 (019 G8): 由 `commands/mod.rs` 私有常量迁出并补上元数据。
 //!
 //! 编译期嵌入, 无运行时依赖, 一份来源供三个出口:
-//! ① CLI 回测 `ricow backtest --strategy shannon_grid`(经 [code_of] 把内置名 Lua 化);
+//! ① CLI 回测 `ricow backtest --strategy shannon_rebalance`(经 [code_of] 把内置名 Lua 化);
 //! ② AI 只读工具 `list_templates` / `read_template`;
 //! ③ 空状态欢迎文案(告知"可以从模板起步")。
 //!
@@ -48,7 +48,7 @@ pub struct Template {
 /// 全部内置模板(顺序即展示顺序)。
 pub const ALL: &[Template] = &[
     Template {
-        name: "shannon_grid",
+        name: "shannon_rebalance",
         kind: TemplateKind::Strategy,
         summary: "香农 50:50 中轴再平衡: 首 tick 按 target_ratio 建仓, 持仓占比偏离 target_ratio±band 即回平衡; 可选 ATR 自适应带宽与策略自管回撤止损",
         params: &[
@@ -62,7 +62,7 @@ pub const ALL: &[Template] = &[
             "pause_bars",
             "dd_stop_pct",
         ],
-        code: include_str!("../../../../strategies/builtin/shannon_grid.lua"),
+        code: include_str!("../../../../strategies/builtin/shannon_rebalance.lua"),
     },
     Template {
         name: "dca",
@@ -202,16 +202,16 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(before, names.len(), "模板名重复");
-        assert!(find("shannon_grid").is_some());
-        assert!(code_of("shannon_grid").is_some_and(|c| c.contains("on_tick")));
+        assert!(find("shannon_rebalance").is_some());
+        assert!(code_of("shannon_rebalance").is_some_and(|c| c.contains("on_tick")));
         assert!(find("no-such-template").is_none());
         assert!(code_of("no-such-template").is_none());
     }
 
     #[test]
     fn test_executor_components_are_not_direct_strategies() {
-        // 类别纪律: 只有 shannon_grid 是完整策略; 执行组件必须被标成组件(免得被直接部署)
-        assert!(find("shannon_grid").is_some_and(|t| t.kind.is_direct_strategy()));
+        // 类别纪律: 只有 shannon_rebalance 是完整策略; 执行组件必须被标成组件(免得被直接部署)
+        assert!(find("shannon_rebalance").is_some_and(|t| t.kind.is_direct_strategy()));
         for name in ["dca", "twap", "vwap", "pullback", "ladder"] {
             let t = find(name).unwrap_or_else(|| panic!("缺模板 {name}"));
             assert_eq!(t.kind, TemplateKind::ExecutorComponent, "{name} 应是执行组件");
@@ -222,16 +222,16 @@ mod tests {
     #[test]
     fn test_list_text_states_both_routes() {
         let text = list_text();
-        for must in ["shannon_grid", "完整策略", "执行组件", "read_template", "preview_strategy"]
+        for must in ["shannon_rebalance", "完整策略", "执行组件", "read_template", "preview_strategy"]
         {
             assert!(text.contains(must), "清单缺少: {must}");
         }
-        assert!(text.contains("shannon_grid"), "{text}");
+        assert!(text.contains("shannon_rebalance"), "{text}");
     }
 
     #[test]
     fn test_render_read_includes_code_and_kind_warning() {
-        let grid = render_read(find("shannon_grid").unwrap());
+        let grid = render_read(find("shannon_rebalance").unwrap());
         assert!(grid.contains("完整策略"), "{grid}");
         assert!(grid.contains("pair"), "{grid}");
         assert!(grid.contains("on_tick"), "详情须带原文代码");

@@ -14,7 +14,7 @@ pub struct RunArgs {
     /// 首次实盘使用需读风险披露后确认一次 (018; product.md §十)
     #[arg(long = "accept-risk")]
     pub accept_risk: bool,
-    /// 策略名 (已部署 TOML, 如 <项目根>/strategies/<name>.toml) 或策略类型直跑 (shannon_grid/dca/twap/vwap, 其余为执行模式示例)
+    /// 策略名 (已部署 TOML, 如 <项目根>/strategies/<name>.toml) 或策略类型直跑 (shannon_rebalance/dca/twap/vwap, 其余为执行模式示例)
     pub strategy: String,
     /// 交易对 (直跑模式必填; TOML 加载模式忽略)
     #[arg(long)]
@@ -371,12 +371,51 @@ async fn inline_config(
 
     // 各策略的默认参数 (示例, 可后续接 preset)
     match args.strategy.as_str() {
-        "shannon_grid" => {
+        "shannon_rebalance" => {
             params.entry("order_size".into()).or_insert(ConfigValue::Float(0.01));
             params.entry("rebalance_band".into()).or_insert(ConfigValue::Float(0.005));
             params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
             params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
             params.entry("atr_mult".into()).or_insert(ConfigValue::Float(1.0));
+        }
+        "shannon_etf_accum" => {
+            params.entry("atr_interval".into()).or_insert(ConfigValue::String("1h".into()));
+            params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
+            params.entry("atr_mult".into()).or_insert(ConfigValue::Float(2.0));
+            params.entry("ema_fast".into()).or_insert(ConfigValue::Integer(10));
+            params.entry("ema_slow".into()).or_insert(ConfigValue::Integer(20));
+            params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
+            params.entry("min_notional".into()).or_insert(ConfigValue::Float(5.0));
+            params.entry("rehang_secs".into()).or_insert(ConfigValue::Integer(3600));
+            params.entry("fee_bps".into()).or_insert(ConfigValue::Float(10.0));
+            // 023 v3: 虚拟账本口径(真实 1 万 × 10 = 虚拟 10 万)+ 保本线 + 建仓后通道开关。
+            params.entry("real_cash".into()).or_insert(ConfigValue::Float(10000.0));
+            params.entry("leverage_mult".into()).or_insert(ConfigValue::Float(10.0));
+            params.entry("min_spacing_pct".into()).or_insert(ConfigValue::Float(0.004));
+            // 建仓后不再使用金叉/死叉(用户 2026-09-18 定稿): 默认只跑 平衡价 ± 2ATR 网格挂单;
+            // true = 仅作历史对照(交叉通道市价进出, 不挂网格)。
+            params.entry("enable_cross".into()).or_insert(ConfigValue::Boolean(false));
+            // 日线趋势判据(用户 2026-09-18 定稿): BULL 可以买不卖 / BEAR 可以卖不买 /
+            // RANGE 正常; 判据序列 = 日线(`ctx:close_tf` + `ctx:ema_tf`)。
+            params.entry("regime_filter".into()).or_insert(ConfigValue::String("ema200".into()));
+            params.entry("regime_interval".into()).or_insert(ConfigValue::String("1d".into()));
+            params.entry("regime_ema_period".into()).or_insert(ConfigValue::Integer(200));
+            params.entry("regime_band_pct".into()).or_insert(ConfigValue::Float(0.03));
+            // 入口对齐开关: 第一根 K 线即建仓(不等金叉), 供不同粒度/参数对照回测
+            params.entry("enter_at_start".into()).or_insert(ConfigValue::Boolean(false));
+            // 旧 ER 判据的参数(§二十二 实测无效, 保留; 仅当显式设 `regime_filter=er` 时才生效)。
+            params.entry("er_period".into()).or_insert(ConfigValue::Integer(20));
+            params.entry("er_threshold".into()).or_insert(ConfigValue::Float(0.25));
+            params.entry("regime_sma".into()).or_insert(ConfigValue::Integer(50));
+            params.entry("leverage_basis".into()).or_insert(ConfigValue::String("cash".into()));
+            // 信号通道与过滤器(2026-09-18 实测: RSI 优于金叉死叉; "价 < SMA(n) 不买"提升最大)
+            params.entry("signal".into()).or_insert(ConfigValue::String("cross".into()));
+            params.entry("rsi_n".into()).or_insert(ConfigValue::Float(14.0));
+            params.entry("rsi_buy".into()).or_insert(ConfigValue::Float(30.0));
+            params.entry("rsi_sell".into()).or_insert(ConfigValue::Float(70.0));
+            params.entry("boll_n".into()).or_insert(ConfigValue::Float(20.0));
+            params.entry("boll_dev".into()).or_insert(ConfigValue::Float(2.0));
+            params.entry("trend_filter_sma".into()).or_insert(ConfigValue::Float(0.0));
         }
         "dca" => {
             params.insert("order_size".into(), ConfigValue::Float(0.01));
@@ -456,7 +495,7 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "shannon_grid"
+type = "shannon_rebalance"
 enabled = {enabled}
 exchange = "binance"
 

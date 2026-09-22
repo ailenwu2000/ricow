@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_valid_names_accepted() {
-        for n in ["eth-grid-300", "grid_demo", "shannon_grid", "a", "ABC123", "x-1_2"] {
+        for n in ["eth-grid-300", "grid_demo", "shannon_rebalance", "a", "ABC123", "x-1_2"] {
             assert!(validate_strategy_name(n).is_ok(), "{n} 应合法");
         }
     }

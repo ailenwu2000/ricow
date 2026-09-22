@@ -391,7 +391,7 @@ fn tool_run_backtest(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "run_backtest",
         "对某个策略在真实历史 K 线上跑一次回测并返回报告(与 `ricow backtest` 同一条代码路径、同一份格式化)。\
-只读: 不动资金、不落盘、不改配置。策略名可以是已部署策略名, 或内置名 shannon_grid/dca/twap/vwap/pullback/ladder。",
+只读: 不动资金、不落盘、不改配置。策略名可以是已部署策略名, 或内置名 shannon_rebalance/dca/twap/vwap/pullback/ladder。",
         json!({
             "type": "object",
             "properties": {
@@ -786,7 +786,7 @@ fn tool_list_pairs(ctx: ToolCtx) -> DynamicTool {
 fn tool_list_templates(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "list_templates",
-        "列出**内置策略模板**(编译期内置, 不用网络): 完整策略 1 个(shannon_grid) + 执行组件 5 个(dca/twap/vwap/pullback/ladder)。\
+        "列出**内置策略模板**(编译期内置, 不用网络): 完整策略 1 个(shannon_rebalance) + 执行组件 5 个(dca/twap/vwap/pullback/ladder)。\
          用户说\"从模板建\"或不知道从哪开始时先调用本工具, 再让用户挑一个; 取原文用 read_template。",
         json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         move |_c, _args| {
@@ -802,12 +802,12 @@ fn tool_read_template(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "read_template",
         "读取某个内置模板的**元数据 + Lua 原文**。\
-         完整策略(shannon_grid)的原文可直接作为 preview_strategy 的 script 提交(参数按用户回答填); \
+         完整策略(shannon_rebalance)的原文可直接作为 preview_strategy 的 script 提交(参数按用户回答填); \
          执行组件(dca/twap/vwap/pullback/ladder)只是执行片段, 不是完整策略 —— 要落盘须先嵌入 on_tick 框架并补齐信号。",
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "模板名, 取值见 list_templates(如 shannon_grid / dca)" }
+                "name": { "type": "string", "description": "模板名, 取值见 list_templates(如 shannon_rebalance / dca)" }
             },
             "required": ["name"],
             "additionalProperties": false

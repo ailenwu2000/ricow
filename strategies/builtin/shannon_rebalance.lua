@@ -16,7 +16,7 @@
 --       pause_pct / pause_bars (默认 6) /
 --       dd_stop_pct (默认 0 = 关闭): **策略自管回撤**阈值 —— 权益从峰值回撤达该比例即停止买入
 --         (2026-09-15 起平台不再代做亏损熔断, 这类判断属于策略; 平台提供 ctx:equity()/ctx:net_pnl())。
--- 用法: ricow backtest --strategy shannon_grid --pair ETH
+-- 用法: ricow backtest --strategy shannon_rebalance --pair ETH
 -- 复制到 strategies/scripts/ 即自定义。
 
 pair = nil
@@ -105,7 +105,7 @@ function on_init(ctx)
     peak_equity = 0
     dd_halted = false
     dd_logged = false
-    ctx:log("shannon_grid: 初始化 " .. pair .. " order_size=" .. order_size
+    ctx:log("shannon_rebalance: 初始化 " .. pair .. " order_size=" .. order_size
         .. " target_ratio=" .. target_ratio .. " band=" .. rebalance_band
         .. " atr_period=" .. atr_period .. " atr_mult=" .. atr_mult)
 end
@@ -131,10 +131,10 @@ function build_position(ctx, price)
     local size = ctx:balance(quote_asset) * target_ratio / price
     built = true
     if size <= 0 then
-        ctx:log("shannon_grid: 建仓跳过 (无可用资金或价格无效)")
+        ctx:log("shannon_rebalance: 建仓跳过 (无可用资金或价格无效)")
         return {}
     end
-    ctx:log("shannon_grid: 建仓买入 " .. math.floor(target_ratio * 100 + 0.5)
+    ctx:log("shannon_rebalance: 建仓买入 " .. math.floor(target_ratio * 100 + 0.5)
         .. "% 权益 @ ~" .. price .. " (size=" .. size .. ")")
     return { { pair = pair, side = "buy", size = size, order_type = "market" } }
 end
@@ -162,7 +162,7 @@ function tick_rebalance(ctx, price)
     if size <= 0 then
         return {}
     end
-    ctx:log("shannon_grid: 再平衡 " .. side .. " " .. size .. " (回 "
+    ctx:log("shannon_rebalance: 再平衡 " .. side .. " " .. size .. " (回 "
         .. math.floor(target_ratio * 100 + 0.5) .. "%, band=" .. band .. ")")
     return { { pair = pair, side = side, size = size, order_type = "market" } }
 end
@@ -182,7 +182,7 @@ function on_tick(ctx)
         initialized = true
         built = ctx:position_size(pair) > 0
         if built then
-            ctx:log("shannon_grid: 检测到持仓, 跳过建仓直接再平衡")
+            ctx:log("shannon_rebalance: 检测到持仓, 跳过建仓直接再平衡")
         end
     end
 
@@ -195,7 +195,7 @@ function on_tick(ctx)
                 local range = math.abs(k.close - k.open) / k.open
                 if range >= pause_pct then
                     paused_until = tick_count + pause_bars
-                    ctx:log("shannon_grid: 极端行情暂停 " .. pause_bars .. " bar (涨跌 "
+                    ctx:log("shannon_rebalance: 极端行情暂停 " .. pause_bars .. " bar (涨跌 "
                         .. math.floor(range * 10000 + 0.5) / 100 .. "%)")
                 end
             end
@@ -208,7 +208,7 @@ function on_tick(ctx)
     dd_halted = drawdown_halted(ctx)
     if dd_halted and not dd_logged then
         dd_logged = true
-        ctx:log("shannon_grid: 自管回撤触发, 停止买入 (权益=" .. ctx:equity()
+        ctx:log("shannon_rebalance: 自管回撤触发, 停止买入 (权益=" .. ctx:equity()
             .. ", 峰值=" .. peak_equity .. ", 阈值=" .. dd_stop_pct .. ")")
     end
 

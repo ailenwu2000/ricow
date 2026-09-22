@@ -347,7 +347,7 @@ mod tests {
     fn test_parse_strategy_toml() {
         let toml_str = r#"
 [strategy]
-type = "shannon_grid"
+type = "shannon_rebalance"
 name = "ETH 中性网格"
 enabled = true
 exchange = "binance"
@@ -362,7 +362,7 @@ max_position_notional = 10000.0
 "#;
         let config = StrategyConfig::from_toml(toml_str).unwrap();
         assert_eq!(config.name, "ETH 中性网格");
-        assert_eq!(config.strategy_type, "shannon_grid");
+        assert_eq!(config.strategy_type, "shannon_rebalance");
         assert_eq!(config.get_str("pair"), Some("ETH"));
         assert_eq!(config.get_f64("order_size"), Some(0.01));
     }
@@ -385,7 +385,7 @@ exchange = "binance"
     fn test_toml_roundtrip() {
         let toml_str = r#"
 [strategy]
-type = "shannon_grid"
+type = "shannon_rebalance"
 name = "test"
 exchange = "binance"
 dry_run_started_at = "2026-07-18T00:00:00Z"

@@ -84,7 +84,7 @@ end
 
 > **盈亏政策属于策略** (2026-09-15, 020-platform-scope-trim): 平台**不再**提供亏损熔断/峰值回撤这类默认判断
 > (原"两级亏损熔断"已删除)。策略用 `ctx:net_pnl()` / `ctx:equity()` 自己实现回撤与止损 ——
-> 内置 `shannon_grid` 的 `dd_stop_pct` 参数即一条参考写法 (默认 0 = 关闭)。
+> 内置 `shannon_rebalance` 的 `dd_stop_pct` 参数即一条参考写法 (默认 0 = 关闭)。
 >
 > 持仓语义 (specs/backtest.md §五.6/§八 D9): 默认 `one-way` 模式同一交易对只有一个净仓, `position_*` 即全部信息;
 > `hedge` 模式下多空可并存, 净仓查询 (`position_*`) 合并多空后取净 (net = 0 时 side 为 `"none"`),
@@ -102,6 +102,9 @@ end
 > 设为与实盘相同的资金口径, Dry Run 的权益口径才与实盘可比, 见 `specs/changes/016-dryrun-initial-cash/`; 注意平台自 2026-09-16 起不再有 `[risk]` 配置面, 风控由策略自管 —— 见 `specs/changes/019-ai-assistant/spec.md` §七 R5);
 > `min_dry_run_hours` —— 实盘前的 Dry Run 时长门禁(缺省 24, 设 0 关闭);
 > `liq_warn_pct` —— 合约距强平告警阈值(缺省 15);
+> `warmup_bars` —— 回测预热段长度(根数, 缺省 0): 声明 `atr_interval` / `regime_interval` 时 CLI 自动填
+> (取 ATR 预热与趋势判据预热**的大者**; 后者 = 3×(regime_ema_period+1) 根高周期 bar),
+> 该段只喂高周期指标(ATR / 趋势判据 EMA), **不进 tick 循环与报告**(2026-09-17 新增, 023);
 > `notify_webhook` / `notify_chat_id` / `notify_events` / `notify_min_interval_secs` —— 出站通知(缺省关闭)。
 | `ctx:config_i64(key)` | integer | 整数参数 |
 | `ctx:config_str(key)` | string | 字符串参数 |
@@ -113,6 +116,10 @@ end
 ### 指标 API（基于已收盘 K 线，无前视）
 
 指标输入为**已收盘**历史序列（当前未收盘 bar 不可见），数据不足返回 `nil`（用 `if v then` 判断）。
+
+> **指标输入长度契约（2026-09-17 固定）**: 单标的路径下 `ctx:klines` 与全部指标的输入 = 同一条
+> **尾窗序列，上限 100 根**（引擎按此裁剪，避免每 tick 克隆全量历史 —— 1m×79 天曾是 10^9 级拷贝）。
+> 需要更长窗口的指标（如 EMA200）不属于单标的路径能力，请用组合信号模式或高周期序列。
 
 | 函数 | 返回 | 说明 |
 |:-----|:-----|:-----|
@@ -128,8 +135,18 @@ end
 | `ctx:cci(pair, n)` | number? | 顺势指标 |
 | `ctx:roc(pair, n)` | number? | 变动率 |
 | `ctx:mom(pair, n)` | number? | 动量 |
+| `ctx:atr_tf(pair)` | number? | **高周期（第二序列）ATR**（2026-09-17 新增，023 香农 ETF 指数增加策略）：周期由策略配置决定，不是调用参数 —— 取 `atr_interval`（如 `"1h"`）+ `atr_period`（缺省 14）。引擎按高周期桶缓存，**每根高周期 bar 只算一次**；可见性判据 = 桶起点 + 周期 ≤ 本 tick 时间（与 `ctx:klines` 同源，无前视）。通道未预装或高周期 bar 不足 `n+1` 根 → `nil`。 |
+| `ctx:close_tf(pair)` | number? | **上一根已收盘高周期 bar 的收盘价**（2026-09-18 新增，023 日线趋势判据）：序列由策略配置 `regime_interval`（缺省 `"1d"`）决定，与 `atr_tf`/`ema_tf` 共用同一缓存与同一无前视口径（未收盘的那根不可见）。未预装 → `nil`。 |
+| `ctx:ema_tf(pair)` | number? | **高周期 EMA**（2026-09-18 新增，023 日线趋势判据）：EMA 周期取 `regime_ema_period`（缺省 200），序列同 `close_tf`（`regime_interval`）。按高周期桶缓存、无前视；可见 bar 不足 `period` 根 → `nil`。注：`ta` 的 EMA 用**首值种**，序列起点越早越准 → 预热长度见下方"装配责任"。 |
+| `ctx:atr(pair, n)` | number? | 平均真实波幅（**主序列**口径；高周期见上一行的 `ctx:atr_tf`） |
 
 数据不足阈值: EMA/SMA/WMA/BOLL/Stoch/CCI 需 ≥n 根; RSI/ATR/ROC 需 ≥n+1 根; MACD 需 ≥35 根; ADX 需 ≥2n 根。
+
+> **高周期通道的装配责任（023；2026-09-18 扩为多套）**: 引擎不替策略猜周期，装配层负责把序列重采样后预装（缓存键 = `pair|tf`，同一 pair 可同时装多套，例如 4h ATR + 日线趋势判据）。
+> - 回测：策略声明 `atr_interval`（网格间距）与/或 `regime_interval`（趋势判据）时，CLI 用**全段**（含预热段）主序列重采样装入；预热根数 = `max(ATR 预热, 趋势判据预热)`，趋势判据按 **3×(regime_ema_period+1) 根高周期 bar** 取（`ta` 的 EMA 用首值种，种子残差 `(1−2/(n+1))^k`：n=200 时 201 根 13.5% / 402 根 1.8% / 603 根 0.25%，±3% 带下必须取 3×），预热段只喂高周期指标、**不进 tick 循环与报告**；
+> - 模拟盘/实盘：**当前未接线**（`set_tf_klines` 只在回测装配层被调用）→ 实盘/模拟盘下 `ctx:atr_tf` `ctx:ema_tf` `ctx:close_tf` 恒为 `nil`，依赖它们的策略在实盘不会下单。若要让这些通道在实盘可用，需在 K 线刷新路径补"拉主序列 → 重采样 → 装入 (pair, tf)"；
+> - 重采样口径：只保留**完整桶**（首尾半桶与缺口桶丢弃，防"半小时当一小时"算错 ATR）；
+> - 与 `ctx:atr` 的区别：`ctx:atr` 算的是**主序列**（1m 主序列下就是 1m ATR），`ctx:atr_tf` 才是高周期 ATR；两者口径不同，不可混用。
 
 ### 其他
 
@@ -292,17 +309,17 @@ end
 4. 回测:`ricow backtest --strategy <name>`(TOML 已含 pair 时可省 `--pair`);
 5. 启动:`ricow run <name>`(Dry Run;TOML 里 `enabled = false` 会被拒绝启动)。
 
-**没有独立的"策略模板文件"**: 样板就是下节的 `strategies/builtin/shannon_grid.lua`, 直接读它照写。
+**没有独立的"策略模板文件"**: 样板就是下节的 `strategies/builtin/shannon_rebalance.lua`, 直接读它照写。
 手工建策略(不走 create 闭环)同样支持: 自己写 `strategies/<name>.toml` + `strategies/scripts/<name>.lua`,
 TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝对路径);旧部署(TOML 内嵌 `script` 代码字符串)依然兼容。
 
 目录定位:默认取**当前工作目录**(在项目根运行 `ricow`);从其他目录运行可设
 `RICOW_ROOT=<项目根>`;数据库路径可单独用 `RICOW_DB=<path>` 覆盖。
 
-内置脚本(shannon_grid 策略样板 + executors/ 执行模式示例)均为 Lua 脚本,参考实现见
+内置脚本(shannon_rebalance 策略样板 + executors/ 执行模式示例)均为 Lua 脚本,参考实现见
 `strategies/builtin/`(git 跟踪,与用户策略同目录,复制即自定义):
 
-- `strategies/builtin/shannon_grid.lua` — 香农 50:50 中轴再平衡(**唯一策略样板**)
+- `strategies/builtin/shannon_rebalance.lua` — 香农 50:50 中轴再平衡(**唯一策略样板**)
 - `strategies/builtin/executors/dca.lua` / `twap.lua` / `vwap.lua` — 定时定投 / 时间加权分批 / 成交量加权分批(间隔按 tick 计数,需 `bar_seconds` 参数,CLI 按 interval 自动注入; vwap 参考价 = 已收盘 K 线成交量加权均价, 无成交量回退市价)
 - `strategies/builtin/executors/pullback.lua` — 新高后回撤买入
 - `strategies/builtin/executors/ladder.lua` — 区间分档挂限价单
@@ -311,9 +328,9 @@ TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝�
 > 复制后改信号部分即成为你自己的策略。**builtin 脚本为编译期嵌入(include_str!), 直接改文件不重编译不生效**;
 > 自定义请复制到 `strategies/scripts/` 再改。
 
-直接 `ricow backtest --strategy shannon_grid --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
+直接 `ricow backtest --strategy shannon_rebalance --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
 **交易对必须带报价币**, 现货用 `ETHUSDT` 而非 `ETH`, 否则交易所返回 `Invalid symbol`);
-复制 `strategies/builtin/shannon_grid.lua` 或 `strategies/builtin/executors/*.lua` 到
+复制 `strategies/builtin/shannon_rebalance.lua` 或 `strategies/builtin/executors/*.lua` 到
 `strategies/scripts/` 修改即自定义(`strategies/` 下除 `builtin/` 外均被 git 忽略,
 用户策略默认私有;想入库自行调整 `.gitignore`)。
 

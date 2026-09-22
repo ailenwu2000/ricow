@@ -65,7 +65,7 @@
 
 ### 内置参考实现(1 策略样板 + 1 执行组件库, 随版本发布)
 
-- **策略样板**: `strategies/builtin/shannon_grid.lua` — 香农动态网格(实时计算 + 主动成交 + 自适应波动), 唯一完整策略参考
+- **策略样板**: `strategies/builtin/shannon_rebalance.lua` — 香农动态网格(实时计算 + 主动成交 + 自适应波动), 唯一完整策略参考
 - **执行组件库**: exec — 用户 Lua 策略可直接调用的执行函数(引擎内置 Rust 实现, 加载时注册为全局 `exec` 表, 无需 require, 脚本内可覆盖): `exec.levels`(阶梯档位) / `exec.pullback_triggered`(回调触发) / `exec.ticks_per` + `exec.slice_due`(分批节奏) / `exec.detect_quote`(报价资产) / `exec.side_order`(对手价订单)
 - **执行模式示例**: `strategies/builtin/executors/{dca,twap,vwap,pullback,ladder}.lua` — 上述组件的独立可运行薄壳(CLI 直跑/旧 TOML 兼容), 复制即自定义
 
@@ -172,7 +172,7 @@
 **硬性纪律**: 交易流程必须用 testnet 真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单测试;
 纯逻辑用单元测试, 不属 mock; 数据缺失(未配 testnet key)时跳过该测试(`#[ignore]`)而非 fallback mock。
 
-## 十二、香农动态网格(shannon_grid)策略规格与风险提示(来源: 原 requirements 4.3.1, v4 扩写 2026-09-05)
+## 十二、香农动态网格(shannon_rebalance)策略规格与风险提示(来源: 原 requirements 4.3.1, v4 扩写 2026-09-05)
 
 **机制**: 建仓 = 一次市价买入 `target_ratio`(默认 0.5)权益;之后每 tick 按最新价计算总价值,
 目标 = `权益 × target_ratio`(一半币一半现金之外可调), 精确恢复"目标比例"——价格涨 → 卖出回平衡(锁利),

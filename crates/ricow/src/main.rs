@@ -22,6 +22,7 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // CLI 子命令参数结构体天生偏大, 变体大小差异无实际代价
 enum Command {
     /// 启动策略 (经 daemon 后台运行; 前台调试用 run)
     Start(ctrl::StartArgs),

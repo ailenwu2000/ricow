@@ -862,13 +862,13 @@ pub fn empty_state_hint(root: &Path, lang: Lang) -> Option<String> {
     Some(tf(
         lang,
         "现在还没有任何策略 —— 两条路都行:\n\
-         ① 从模板起步: 说\"看看模板\", 我列出内置模板(如 shannon_grid 中轴再平衡), 你挑一个, 我再问交易对与参数;\n\
+         ① 从模板起步: 说\"看看模板\", 我列出内置模板(如 shannon_rebalance 中轴再平衡), 你挑一个, 我再问交易对与参数;\n\
          ② 全新编写: 直接说需求(例: \"给 AAPL 做 50:50 再平衡, 每次 0.01\"), 我按 Lua API 写代码并先跑沙箱回测;\n\
          两条路都要你本人回一句确认词才落盘; 落盘后我可以带你跑 Dry Run(虚拟撮合) / 测试网 demo。\n\
          不知道有哪些可交易对: 输入 /market 看当前视野。"
             .to_string(),
         "There are no strategies yet — two ways to start:\n\
-         1) Start from a template: say \"show me the templates\", I'll list the built-in ones (e.g. shannon_grid, centre rebalancing), you pick one, then I'll ask for the pair and parameters.\n\
+         1) Start from a template: say \"show me the templates\", I'll list the built-in ones (e.g. shannon_rebalance, centre rebalancing), you pick one, then I'll ask for the pair and parameters.\n\
          2) Write one from scratch: just describe what you want (e.g. \"50:50 rebalance on AAPL, 0.01 each time\"), I'll write it against the Lua API and run a sandbox backtest first.\n\
          Either way nothing is written until you reply with a confirmation word; after that I can walk you through a dry run (simulated fills) or the testnet demo.\n\
          Not sure which pairs you can trade? Type /market to see the current scope."
@@ -1432,7 +1432,7 @@ mod tests {
         assert_eq!(classify("/status"), LineInput::Unknown("status".into()));
         assert_eq!(classify("回测 ETH 30 天"), LineInput::Ask("回测 ETH 30 天".into()));
         // 斜杠命令带参数时只取命令名
-        assert_eq!(classify("/stop shannon_grid"), LineInput::Unknown("stop".into()));
+        assert_eq!(classify("/stop shannon_rebalance"), LineInput::Unknown("stop".into()));
     }
 
     /// 分隔线解析必须与渲染**同源**: 两种语言的渲染结果都认得出, 且只认完整分隔线

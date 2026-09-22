@@ -145,11 +145,32 @@ impl FuturesClient {
             symbol,
             interval,
             limit,
+            None,
         )
         .await
     }
 
     /// 合约盘口快照 (`GET /fapi/v1/depth`)。
+    /// 截止到 `end_ms` 的 K 线 (回测按自然年月分段用)。
+    pub async fn get_klines_ending_at(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+        end_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        crate::client::fetch_klines_paged(
+            &self.http,
+            &self.base_url,
+            "/fapi/v1/klines",
+            symbol,
+            interval,
+            limit,
+            Some(end_ms),
+        )
+        .await
+    }
+
     pub async fn get_depth(&self, symbol: &str, limit: u32) -> CoreResult<OrderBook> {
         let url = format!(
             "{}/fapi/v1/depth?symbol={}&limit={limit}",

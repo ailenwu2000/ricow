@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use chrono::Utc;
 use clap::Args;
 use ricow_core::{Balance, CoreError, CoreResult};
 use ricow_engine::Engine;
@@ -10,9 +11,16 @@ use rust_decimal::Decimal;
 use crate::commands::format_backtest_report;
 use ricow_strategy::{BacktestParams, BacktestToml, ConfigValue, StrategyConfig};
 
+/// `YYYY-MM-DD` -> 当日 00:00 UTC 毫秒 (回测窗口边界用)。
+fn parse_ymd_ms(s: &str) -> CoreResult<i64> {
+    let d = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .map_err(|e| CoreError::InvalidArgument(format!("--start/--end 需 YYYY-MM-DD: {e}")))?;
+    Ok(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
+}
+
 #[derive(Args, Default)]
 pub struct BacktestArgs {
-    /// 策略类型 (shannon_grid/dca/twap/vwap/pullback/ladder/lua 或已部署策略名; 其余为执行模式示例, exec API 见 specs/lua-api.md)
+    /// 策略类型 (shannon_rebalance/dca/twap/vwap/pullback/ladder/lua 或已部署策略名; 其余为执行模式示例, exec API 见 specs/lua-api.md)
     #[arg(long)]
     pub strategy: String,
     /// 交易对 (TOML 策略已含 pair 时可省略; 直跑模式必填)
@@ -21,6 +29,14 @@ pub struct BacktestArgs {
     /// 回测天数 (默认 90)
     #[arg(long)]
     pub days: Option<u32>,
+
+    /// 回测窗口起点 (YYYY-MM-DD, UTC); 与 --end 配套, 覆盖 --days (按自然年月分段用)。
+    #[arg(long)]
+    pub start: Option<String>,
+
+    /// 回测窗口终点 (YYYY-MM-DD, UTC, 不含); 缺省 = 现在。
+    #[arg(long)]
+    pub end: Option<String>,
     /// K 线间隔 (1m/5m/15m/1h/4h/1d, 默认 1h)
     #[arg(long)]
     pub interval: Option<String>,
@@ -74,9 +90,15 @@ pub(crate) fn parse_param(s: &str) -> Option<(String, ConfigValue)> {
         return None;
     }
     let value = value.trim();
-    let cv = match value.parse::<f64>() {
-        Ok(f) => ConfigValue::Float(f),
-        Err(_) => ConfigValue::String(value.to_string()),
+    // true/false(不区分大小写)→ Boolean: Lua 侧 ctx:config_bool 只认 ConfigValue::Boolean,
+    // 若落到 String 就会恒读成 false(2026-09-18 踩坑: `--param enter_at_start=true` 不生效)。
+    let cv = match value.to_ascii_lowercase().as_str() {
+        "true" => ConfigValue::Boolean(true),
+        "false" => ConfigValue::Boolean(false),
+        _ => match value.parse::<f64>() {
+            Ok(f) => ConfigValue::Float(f),
+            Err(_) => ConfigValue::String(value.to_string()),
+        },
     };
     Some((key, cv))
 }
@@ -125,12 +147,52 @@ async fn inline_config(
     let mut params: HashMap<String, ConfigValue> = HashMap::new();
     params.insert("pair".into(), ConfigValue::String(pair.clone()));
     match args.strategy.as_str() {
-        "shannon_grid" => {
+        "shannon_rebalance" => {
             params.entry("order_size".into()).or_insert(ConfigValue::Float(0.01));
             params.entry("rebalance_band".into()).or_insert(ConfigValue::Float(0.005));
             params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
             params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
             params.entry("atr_mult".into()).or_insert(ConfigValue::Float(1.0));
+        }
+        "shannon_etf_accum" => {
+            params.entry("atr_interval".into()).or_insert(ConfigValue::String("1h".into()));
+            params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
+            params.entry("atr_mult".into()).or_insert(ConfigValue::Float(2.0));
+            params.entry("ema_fast".into()).or_insert(ConfigValue::Integer(10));
+            params.entry("ema_slow".into()).or_insert(ConfigValue::Integer(20));
+            params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
+            params.entry("min_notional".into()).or_insert(ConfigValue::Float(5.0));
+            params.entry("rehang_secs".into()).or_insert(ConfigValue::Integer(3600));
+            params.entry("fee_bps".into()).or_insert(ConfigValue::Float(10.0));
+            // 023 v3: 虚拟账本口径(真实 1 万 × 10 = 虚拟 10 万)+ 保本线 + 建仓后通道开关。
+            params.entry("real_cash".into()).or_insert(ConfigValue::Float(10000.0));
+            params.entry("leverage_mult".into()).or_insert(ConfigValue::Float(10.0));
+            params.entry("min_spacing_pct".into()).or_insert(ConfigValue::Float(0.004));
+            // 建仓后不再使用金叉/死叉(用户 2026-09-18 定稿): 默认只跑 平衡价 ± 2ATR 网格挂单;
+            // true = 仅作历史对照(交叉通道市价进出, 不挂网格)。
+            params.entry("enable_cross".into()).or_insert(ConfigValue::Boolean(false));
+            // 日线趋势判据(用户 2026-09-18 定稿): BULL(`close > EMA200×1.03`) 可以买不卖 /
+            // BEAR(`close < EMA200×0.97`) 可以卖不买 / RANGE(带内) 正常。判据序列 = 日线
+            // (`ctx:close_tf` + `ctx:ema_tf`), 预热见下方 warmup。
+            params.entry("regime_filter".into()).or_insert(ConfigValue::String("ema200".into()));
+            params.entry("regime_interval".into()).or_insert(ConfigValue::String("1d".into()));
+            params.entry("regime_ema_period".into()).or_insert(ConfigValue::Integer(200));
+            params.entry("regime_band_pct".into()).or_insert(ConfigValue::Float(0.03));
+            // 入口对齐开关: 第一根 K 线即建仓(不等金叉), 供不同粒度/参数对照回测
+            params.entry("enter_at_start".into()).or_insert(ConfigValue::Boolean(false));
+            // 旧 ER 判据的参数(§二十二 实测无效, 保留; 仅当显式设 `regime_filter=er` 时才生效)。
+            params.entry("er_period".into()).or_insert(ConfigValue::Integer(20));
+            params.entry("er_threshold".into()).or_insert(ConfigValue::Float(0.25));
+            params.entry("regime_sma".into()).or_insert(ConfigValue::Integer(50));
+            params.entry("leverage_basis".into()).or_insert(ConfigValue::String("cash".into()));
+            // 信号通道与过滤器(2026-09-18 实测: RSI 优于金叉死叉; "价 < SMA(n) 不买"提升最大)
+            params.entry("signal".into()).or_insert(ConfigValue::String("cross".into()));
+            params.entry("rsi_n".into()).or_insert(ConfigValue::Float(14.0));
+            params.entry("rsi_buy".into()).or_insert(ConfigValue::Float(30.0));
+            params.entry("rsi_sell".into()).or_insert(ConfigValue::Float(70.0));
+            params.entry("boll_n".into()).or_insert(ConfigValue::Float(20.0));
+            params.entry("boll_dev".into()).or_insert(ConfigValue::Float(2.0));
+            params.entry("trend_filter_sma".into()).or_insert(ConfigValue::Float(0.0));
         }
         "dca" => {
             params.insert("order_size".into(), ConfigValue::Float(0.01));
@@ -265,6 +327,20 @@ pub(crate) async fn run_backtest(
             )))
         }
     };
+    // --start/--end: 显式窗口 (自然年月分段); --end 缺省 = 现在。
+    let end_ms: Option<i64> = match args.end.as_deref() {
+        Some(d) => Some(parse_ymd_ms(d)?),
+        None => None,
+    };
+    let (days, end_ms) = match args.start.as_deref() {
+        Some(s) => {
+            let s_ms = parse_ymd_ms(s)?;
+            let e_ms = end_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
+            let d = (((e_ms - s_ms) as f64) / 86_400_000.0).round().max(1.0) as u32;
+            (d, Some(e_ms))
+        }
+        None => (days, end_ms),
+    };
     let limit = ((days as f64) * 24.0 / hours_per_bar) as u32;
 
     let exchange = crate::commands::bn_exchange()?;
@@ -288,6 +364,43 @@ pub(crate) async fn run_backtest(
     }
     // 三层回测参数 (内置默认 < 策略 TOML [backtest] < CLI): 解析出全量有效值 + 写回 params。
     let params = apply_backtest_cli(&args, &mut config)?;
+    // 023 高周期预热: 策略声明 `atr_interval`(网格间距) 与/或 `regime_interval`(日线趋势判据) 时,
+    // 多取主序列做预热, 使高周期指标从窗口首根起就就绪(预热段由引擎跳过, 不进 tick 循环与报告)。
+    //   · ATR: 24h 或 (period+1) 根高周期 bar;
+    //   · 趋势判据 EMA: 3×(period+1) 根高周期 bar —— `ta` 的 EMA 用**首值种**, 种子残差 =
+    //     (1−2/(n+1))^k ⇒ n=200 时: 201 根 13.5% / 402 根 1.8% / 603 根 0.25%;
+    //     ±3% 带下 13.5% 的漂移会判错边界, 故取 3×(period+1)=603 天。交易所历史不足时
+    //     分页自然取到多少算多少(预热段只喂指标, 不影响报告窗口)。
+    let atr_warmup = if let Some(atr_iv) = config.get_str("atr_interval") {
+        // 24h 覆盖 1h ATR(24 根 ≥ 14 根); 4h/1d 主序列上 24h 只有 1~6 根 → 按
+        // "ATR 就绪所需 (period+1) 根" 取上限, 避免开窗前 15 根空转(2026-09-18)。
+        let period = config.get_f64("atr_period").unwrap_or(14.0);
+        let atr_ms = ricow_strategy::tf_ms_of(atr_iv).unwrap_or(3_600_000) as f64;
+        let bar_ms = hours_per_bar * 3_600_000.0;
+        let need = (((period + 1.0) * atr_ms / bar_ms).ceil() as u32).max(1);
+        need.max(((24.0 / hours_per_bar) as u32).max(1))
+    } else {
+        0
+    };
+    // 趋势判据只在 `regime_filter = ema200` 时需要日线序列 —— off/er 不额外取数。
+    let regime_warmup = if matches!(config.get_str("regime_filter"), Some("ema200")) {
+        match config.get_str("regime_interval") {
+            Some(tf) => {
+                let period = config.get_f64("regime_ema_period").unwrap_or(200.0);
+                let tf_ms = ricow_strategy::tf_ms_of(tf).unwrap_or(86_400_000) as f64;
+                let bar_ms = hours_per_bar * 3_600_000.0;
+                (((3.0 * (period + 1.0)) * tf_ms / bar_ms).ceil() as u32).max(1)
+            }
+            None => 0,
+        }
+    } else {
+        0
+    };
+    let warmup_bars = atr_warmup.max(regime_warmup);
+    if warmup_bars > 0 {
+        config.params.insert("warmup_bars".into(), ConfigValue::Integer(warmup_bars as i64));
+    }
+    let fetch_limit = limit + warmup_bars;
     // TOML 策略缺 pair 时用 --pair 兜底; 两者皆无报错。
     if config.get_str("pair").is_none() {
         let pair = args.pair.clone().ok_or_else(|| {
@@ -307,12 +420,50 @@ pub(crate) async fn run_backtest(
                 .params
                 .insert("mmr_pct".into(), ConfigValue::Float(ricow_binance::tier1_mmr_pct(&pair)));
         }
-        fapi.get_klines(&pair, &interval, limit).await?
+        match end_ms {
+            Some(e) => fapi.get_klines_ending_at(&pair, &interval, fetch_limit, e).await?,
+            None => fapi.get_klines(&pair, &interval, fetch_limit).await?,
+        }
     } else {
-        exchange.get_klines(&pair, &interval, limit).await?
+        match end_ms {
+            Some(e) => exchange.get_klines_until(&pair, &interval, fetch_limit, e).await?,
+            None => exchange.get_klines(&pair, &interval, fetch_limit).await?,
+        }
     };
     if klines.is_empty() {
         return Err(CoreError::Exchange(format!("no klines for {pair}")));
+    }
+    // `--end` 的文档语义是"不含", 但交易所 `endTime` 是**闭区间** —— 会把恰好落在窗口终点的
+    // 那根 bar 也取回, 于是"预热带满"与"历史不足(预热被裁剪)"两种路径会差 1 根
+    // (2026-09-18 实测: on-4h 8,767 根 vs off-4h 8,766 根) → 按文档语义裁掉终点那一根。
+    let klines = match end_ms {
+        Some(e) => {
+            klines.into_iter().filter(|k| k.open_time.timestamp_millis() < e).collect::<Vec<_>>()
+        }
+        None => klines,
+    };
+    if klines.is_empty() {
+        return Err(CoreError::Exchange(format!("no klines in window for {pair}")));
+    }
+    // 预热段"取到多少算多少": 交易所历史短于请求的 `warmup_bars` 时(例: 2022-01-01 起算 + 603 天
+    // 日线趋势判据预热, 而 SOL 现货自 2020-08 才上线), 若不裁剪, 引擎的 `skip` 会把**请求窗口的
+    // 开头**当成预热吃掉 —— 静默缩短报告窗口, 令开/关两组不可比(2026-09-18 实测: on-4h 少 95 天)。
+    // 裁剪口径 = 实际取到的、早于窗口起点的 bar 数。
+    if warmup_bars > 0 {
+        let step_ms = (hours_per_bar * 3_600_000.0) as i64;
+        let e_ms = end_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
+        let start_ms = e_ms - (limit as i64) * step_ms;
+        let available = klines.partition_point(|k| k.open_time.timestamp_millis() < start_ms) as u32;
+        let actual = warmup_bars.min(available);
+        if actual != warmup_bars {
+            tracing::warn!(
+                target: "multiframe",
+                requested = warmup_bars,
+                actual = actual,
+                "交易所历史不足以填满预热段 → 按实际可取根数裁剪(不缩短报告窗口)"
+            );
+            config.params.insert("warmup_bars".into(), ConfigValue::Integer(actual as i64));
+        }
     }
 
     let initial_cash = Decimal::from_f64_retain(params.initial_cash)
@@ -361,6 +512,23 @@ mod tests {
     use super::*;
     use crate::commands::test_util::ENV_LOCK;
 
+    #[test]
+    fn test_parse_param_bool_and_number() {
+        // 回归(2026-09-18): true/false 必须解析成 Boolean —— 落到 String 时 Lua 的
+        // ctx:config_bool 会恒读成 false, 导致 `--param xxx=true` 静默失效。
+        assert!(matches!(
+            parse_param("enter_at_start=true"),
+            Some((_, ConfigValue::Boolean(true)))
+        ));
+        assert!(matches!(
+            parse_param("enable_cross=FALSE"),
+            Some((_, ConfigValue::Boolean(false)))
+        ));
+        assert!(matches!(parse_param("atr_mult=2.5"), Some((_, ConfigValue::Float(_)))));
+        assert!(matches!(parse_param("pair=SOLUSDT"), Some((_, ConfigValue::String(_)))));
+        assert!(parse_param("novalue").is_none());
+    }
+
     #[tokio::test]
     // 测试专用: ENV_LOCK 串行化 RICOW_ROOT 的读写; 这里**有意**跨 await 持有整个测试体,
     // 否则并行测试会读到彼此的环境变量(见 mod.rs 的 ENV_LOCK 说明)。
@@ -375,7 +543,7 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "shannon_grid"
+type = "shannon_rebalance"
 enabled = true
 exchange = "binance"
 
@@ -387,6 +555,8 @@ order_size = 0.02
         .unwrap();
         let exchange = crate::commands::bn_exchange().unwrap();
         let args = BacktestArgs {
+            start: None,
+            end: None,
             strategy: "demo".into(),
             pair: None,
             days: None,
@@ -428,7 +598,7 @@ order_size = 0.02
             r#"
 [strategy]
 name = "nopair"
-type = "shannon_grid"
+type = "shannon_rebalance"
 enabled = true
 exchange = "binance"
 "#,
@@ -436,6 +606,8 @@ exchange = "binance"
         .unwrap();
         let exchange = crate::commands::bn_exchange().unwrap();
         let args = BacktestArgs {
+            start: None,
+            end: None,
             strategy: "nopair".into(),
             pair: Some("BNBUSDT".into()),
             days: None,

@@ -3,7 +3,7 @@
 //! 平台不做投资风控(019-R5, 2026-09-16): 盈亏/仓位政策由策略自管;
 //! 仅保留固定 100 单/秒的 [`OrderGuard`] 工程护栏防程序失控。
 //!
-//! 策略层统一 Lua: 内置脚本(shannon_grid 策略样板 + executors/ 执行模式示例)与用户策略
+//! 策略层统一 Lua: 内置脚本(shannon_rebalance 策略样板 + executors/ 执行模式示例)与用户策略
 //! 均为 Lua 脚本, 参考实现见 `strategies/builtin/`, API 规范见 `specs/lua-api.md`。
 
 mod align;
@@ -17,6 +17,7 @@ mod indicators_api;
 pub mod lua;
 mod lua_sandbox;
 mod metrics;
+mod multiframe;
 mod name;
 mod order_guard;
 mod pnl;
@@ -36,6 +37,7 @@ pub use db::{
 };
 pub use fee::FeeModel;
 pub use lua::{validate_lua, validate_script_source, LuaStrategy};
+pub use multiframe::{resample_complete, tf_key, tf_ms_of, TfCache};
 pub use name::{
     prefix_conflict, suggest_strategy_name, validate_strategy_name, MAX_STRATEGY_NAME_LEN,
 };

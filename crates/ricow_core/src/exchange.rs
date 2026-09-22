@@ -27,6 +27,19 @@ pub trait Exchange: Send + Sync {
     /// 获取历史 K 线
     async fn get_klines(&self, pair: &str, interval: &str, limit: u32) -> CoreResult<Vec<Kline>>;
 
+    /// 截止到 `end_ms` 的 K 线 (回测按自然年月分段用)。缺省实现忽略 `end_ms`(降级为"到最新"),
+    /// 支持的数据源 (现货/合约数据源) 覆盖之。
+    async fn get_klines_until(
+        &self,
+        pair: &str,
+        interval: &str,
+        limit: u32,
+        end_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        let _ = end_ms;
+        self.get_klines(pair, interval, limit).await
+    }
+
     /// 获取当前盘口快照
     async fn get_orderbook(&self, pair: &str, depth: u32) -> CoreResult<OrderBook>;
 

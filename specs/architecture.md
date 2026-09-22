@@ -68,7 +68,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **ctx.\*** API(冒号调用): 行情 / 持仓余额 / 配置参数(config_f64 等)/ 指标(基于已收盘 K 线, 无前视)/ 时间 `now()`(2026-09-11 新增, 供"每日固定时刻动作"的盘中策略)
 - **exec.\*** 执行组件(引擎内置 Rust 实现, 加载时注册全局表, 脚本内可覆盖): `levels` / `pullback_triggered` / `detect_quote` / `ticks_per` / `slice_due` / `side_order`
 - 内置资产(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/commands/mod.rs:BUILTIN_SCRIPTS`):
-  - `strategies/builtin/shannon_grid.lua` — 策略样板(香农 50:50 中轴再平衡, 单标的, `target_ratio` 中轴可调 + ATR 自适应 band)
+  - `strategies/builtin/shannon_rebalance.lua` — 策略样板(香农 50:50 中轴再平衡, 单标的, `target_ratio` 中轴可调 + ATR 自适应 band)
   - `strategies/builtin/executors/{dca,twap,vwap,pullback,ladder}.lua` — 执行模式示例(最简信号 + exec.* 执行, **非策略**; 复制改信号即自定义)
   - ~~`strategies/builtin/bs_momentum.lua`~~ — **已于 2026-09-11 删除** (真实 bStock 成交轨期望 ≈0:
     spot 91 天 每 bar −0.0198% / futures 220 天 +0.0367%; 七年 R1 数字含幸存者偏误不作证据);
@@ -119,7 +119,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - 前台调试: `ricow run <name>`(Dry Run; 进程内监听 stdin `stop` / 管道 EOF / Ctrl-C 优雅停机, 不被 daemon 管理)
 - 回测: `ricow backtest --strategy <名|类型> [--pair] [--days] [--interval] [--script] [--param k=v] [--market spot|futures] [--position-mode one-way|hedge] [--fee/--fee-maker/--fee-taker/--slippage-bps/--cash/--leverage/--max-leverage/--mmr-pct/--funding-rate]`(杠杆默认上限 10x,超限须 --max-leverage 显式放宽;MMR 默认按 symbol 内置首档表, 表外 1.0%)
   - 数据源按市场分支: 现货走交易所 REST; 合约 (futures) 走 fapi 公共数据源 (K 线; MMR 按 symbol 内置首档表,表外回落 1.0%)
-  - 直跑模式: `--strategy {shannon_grid|dca|twap|vwap|pullback|ladder|lua}` — 内置脚本经 BUILTIN_SCRIPTS 常量表注入(后五项为执行模式示例, 需 --pair)
+  - 直跑模式: `--strategy {shannon_rebalance|dca|twap|vwap|pullback|ladder|lua}` — 内置脚本经 BUILTIN_SCRIPTS 常量表注入(后五项为执行模式示例, 需 --pair)
   - 部署模式: `--strategy <name>` 命中 `strategies/<name>.toml` 加载(`script_path` 引用文件或内嵌 `script`)
 - 启动: `ricow start <name>`(经 daemon 后台运行) / `ricow run <name>`(前台调试; 默认 Dry Run, TOML `enabled=false` 拒绝启动)
 - ~~选币: `ricow scan …`~~ —— **已于 2026-09-15 删除**(020-platform-scope-trim: 选币/研究入口与"运行策略的平台"定位正交; 用户拍板删除, 不留废弃代码)
