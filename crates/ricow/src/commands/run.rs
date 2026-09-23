@@ -14,7 +14,7 @@ pub struct RunArgs {
     /// 首次实盘使用需读风险披露后确认一次 (018; product.md §十)
     #[arg(long = "accept-risk")]
     pub accept_risk: bool,
-    /// 策略名 (已部署 TOML, 如 <项目根>/strategies/<name>.toml) 或策略类型直跑 (shannon_rebalance/dca/twap/vwap, 其余为执行模式示例)
+    /// 策略名 (已部署 TOML, 如 <项目根>/strategies/<name>.toml) 或策略类型直跑 (shannon_rebalance/shannon_spot_grid/dca/twap/vwap, 其余为执行模式示例)
     pub strategy: String,
     /// 交易对 (直跑模式必填; TOML 加载模式忽略)
     #[arg(long)]
@@ -378,27 +378,23 @@ async fn inline_config(
             params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
             params.entry("atr_mult".into()).or_insert(ConfigValue::Float(1.0));
         }
-        "shannon_etf_accum" => {
+        "shannon_spot_grid" => {
             params.entry("atr_interval".into()).or_insert(ConfigValue::String("1h".into()));
             params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
             params.entry("atr_mult".into()).or_insert(ConfigValue::Float(2.0));
-            params.entry("ema_fast".into()).or_insert(ConfigValue::Integer(10));
-            params.entry("ema_slow".into()).or_insert(ConfigValue::Integer(20));
+            // 趋势门控(方案 B, 用户 2026-09-23): 默认 off(=纯网格); on = BULL 暂停卖出 / BEAR 暂停买入。
+            params.entry("trend_gate".into()).or_insert(ConfigValue::String("off".into()));
             params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
             params.entry("min_notional".into()).or_insert(ConfigValue::Float(5.0));
-            params.entry("rehang_secs".into()).or_insert(ConfigValue::Integer(3600));
-            params.entry("fee_bps".into()).or_insert(ConfigValue::Float(10.0));
-            // 023 v3: 虚拟账本口径(真实 1 万 × 10 = 虚拟 10 万)+ 保本线 + 建仓后通道开关。
-            params.entry("real_cash".into()).or_insert(ConfigValue::Float(10000.0));
-            params.entry("leverage_mult".into()).or_insert(ConfigValue::Float(10.0));
-            params.entry("min_spacing_pct".into()).or_insert(ConfigValue::Float(0.004));
-            // 建仓后不再使用金叉/死叉(用户 2026-09-18 定稿): 默认只跑 平衡价 ± 2ATR 网格挂单;
-            // true = 仅作历史对照(交叉通道市价进出, 不挂网格)。
-            params.entry("enable_cross".into()).or_insert(ConfigValue::Boolean(false));
+            // 虚拟账本口径(真实本金 × 杠杆)。
+            // 030: 虚拟杠杆默认 2、范围 1~5; 账本基准 cash; fee_side 供成本门槛硬校验。
+            params.entry("leverage_mult".into()).or_insert(ConfigValue::Float(2.0));
+            params.entry("leverage_basis".into()).or_insert(ConfigValue::String("cash".into()));
+            params.entry("fee_side".into()).or_insert(ConfigValue::Float(0.001));
             // 日线趋势判据(用户 2026-09-18 定稿): BULL 可以买不卖 / BEAR 可以卖不买 /
             // RANGE 正常; 判据序列 = 日线(`ctx:close_tf` + `ctx:ema_tf`)。
             params.entry("regime_filter".into()).or_insert(ConfigValue::String("ema200".into()));
-            params.entry("regime_interval".into()).or_insert(ConfigValue::String("1d".into()));
+            params.entry("regime_interval".into()).or_insert(ConfigValue::String("1h".into()));
             params.entry("regime_ema_period".into()).or_insert(ConfigValue::Integer(200));
             params.entry("regime_band_pct".into()).or_insert(ConfigValue::Float(0.03));
             // 入口对齐开关: 第一根 K 线即建仓(不等金叉), 供不同粒度/参数对照回测

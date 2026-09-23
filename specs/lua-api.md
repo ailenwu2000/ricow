@@ -139,6 +139,9 @@ end
 | `ctx:close_tf(pair)` | number? | **上一根已收盘高周期 bar 的收盘价**（2026-09-18 新增，023 日线趋势判据）：序列由策略配置 `regime_interval`（缺省 `"1d"`）决定，与 `atr_tf`/`ema_tf` 共用同一缓存与同一无前视口径（未收盘的那根不可见）。未预装 → `nil`。 |
 | `ctx:ema_tf(pair)` | number? | **高周期 EMA**（2026-09-18 新增，023 日线趋势判据）：EMA 周期取 `regime_ema_period`（缺省 200），序列同 `close_tf`（`regime_interval`）。按高周期桶缓存、无前视；可见 bar 不足 `period` 根 → `nil`。注：`ta` 的 EMA 用**首值种**，序列起点越早越准 → 预热长度见下方"装配责任"。 |
 | `ctx:atr(pair, n)` | number? | 平均真实波幅（**主序列**口径；高周期见上一行的 `ctx:atr_tf`） |
+| `ctx:ema_cross(pair)` | table? | **信号序列 EMA 快慢线**（2026-09-22 新增，030 香农现货网格）：返回 `{fast=…, slow=…}`；序列与周期由策略配置决定 —— `ema_interval`（缺省 `"1h"`）+ `ema_fast`/`ema_slow`（缺省 3/5）。与 `atr_tf` 共用同一缓存与同一**无前视**口径（只看到已收盘的桶）；未预装或可见 bar 不足 → `nil`。 |
+| `ctx:state_get(key)` | string? | **读策略持久化状态**（2026-09-22 新增，030 断点续接）：引擎启动时把上次会话保存的键值注回；键与值都是字符串，无记录 → `nil`。 |
+| `ctx:state_set(key, value)` | — | **写策略持久化状态**（2026-09-22 新增，030 断点续接）：引擎在**每笔成交后与停机时**取快照落库（表 `strategy_state`），下次启动自动注回 —— 支撑“关机/中止不清仓、重启继续跑”。 |
 
 数据不足阈值: EMA/SMA/WMA/BOLL/Stoch/CCI 需 ≥n 根; RSI/ATR/ROC 需 ≥n+1 根; MACD 需 ≥35 根; ADX 需 ≥2n 根。
 
@@ -147,6 +150,7 @@ end
 > - 模拟盘/实盘：**当前未接线**（`set_tf_klines` 只在回测装配层被调用）→ 实盘/模拟盘下 `ctx:atr_tf` `ctx:ema_tf` `ctx:close_tf` 恒为 `nil`，依赖它们的策略在实盘不会下单。若要让这些通道在实盘可用，需在 K 线刷新路径补"拉主序列 → 重采样 → 装入 (pair, tf)"；
 > - 重采样口径：只保留**完整桶**（首尾半桶与缺口桶丢弃，防"半小时当一小时"算错 ATR）；
 > - 与 `ctx:atr` 的区别：`ctx:atr` 算的是**主序列**（1m 主序列下就是 1m ATR），`ctx:atr_tf` 才是高周期 ATR；两者口径不同，不可混用。
+> - 信号序列（030）：策略声明 `ema_interval`（缺省 `1h`）时装配层预装该序列，供 `ctx:ema_cross` 取快慢线；跨平台桶缓存口径与 `atr_tf` 完全一致，预热取 **3×(ema_slow+1) 根高周期 bar**。
 
 ### 其他
 

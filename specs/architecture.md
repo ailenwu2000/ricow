@@ -69,6 +69,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **exec.\*** 执行组件(引擎内置 Rust 实现, 加载时注册全局表, 脚本内可覆盖): `levels` / `pullback_triggered` / `detect_quote` / `ticks_per` / `slice_due` / `side_order`
 - 内置资产(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/commands/mod.rs:BUILTIN_SCRIPTS`):
   - `strategies/builtin/shannon_rebalance.lua` — 策略样板(香农 50:50 中轴再平衡, 单标的, `target_ratio` 中轴可调 + ATR 自适应 band)
+  - `strategies/builtin/shannon_spot_grid.lua` — 香农现货网格(030): 虚拟账本(本金 × 杠杆 1~5, `v_cap` 动态 = 币×现价+现金)决定目标持币量; `start_price` 触发激活(可选 `initial_buy_amount` 建初始仓); 平衡价 ± `atr_mult×ATR` 双边限价网格, 成交即以该价为新平衡价并重挂两侧; 挂单量 = 使账本在该价回到 `target_ratio` 权重; 卖量受真实持仓兜底; 趋势门控可选(`trend_gate`, 默认关); 成本门槛硬校验(R7) + `strategy_state` 断点续接; 仓位清空即结束
   - `strategies/builtin/executors/{dca,twap,vwap,pullback,ladder}.lua` — 执行模式示例(最简信号 + exec.* 执行, **非策略**; 复制改信号即自定义)
   - ~~`strategies/builtin/bs_momentum.lua`~~ — **已于 2026-09-11 删除** (真实 bStock 成交轨期望 ≈0:
     spot 91 天 每 bar −0.0198% / futures 220 天 +0.0367%; 七年 R1 数字含幸存者偏误不作证据);

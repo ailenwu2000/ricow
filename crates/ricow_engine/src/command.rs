@@ -601,6 +601,19 @@ impl Engine {
 
         let mut ctx = DryRunContext::new(exchange.clone(), config.clone(), initial_balance);
         let mut strategy = load_strategy(&config)?;
+        // 030 断点续接: 把上次会话保存的策略状态注回 (无记录 = 首次运行)。
+        if let Some(db) = db {
+            match db.strategy_state_all(&strategy_name).await {
+                Ok(items) if !items.is_empty() => {
+                    tracing::info!(target: "engine", name = %strategy_name, keys = items.len(), "注入已保存的策略状态");
+                    strategy.state_restore(items);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(target: "engine", name = %strategy_name, "读策略状态失败: {e}");
+                }
+            }
+        }
         strategy.on_init(&mut ctx);
 
         let mut stream = market::subscribe_orderbook(&exchange, &pair).await?;
@@ -682,6 +695,15 @@ impl Engine {
                     });
                 }
                 strategy.on_fill(&mut ctx, fill);
+                // 030 断点续接: 成交后立即持久化策略状态(关机/中止后重启可继续)。
+                if let Some(db) = db {
+                    for (k, v) in strategy.state_snapshot() {
+                        if let Err(e) = db.strategy_state_set(&strategy_name, &k, &v).await {
+                            outcome.persist_errors += 1;
+                            tracing::error!(target: "engine", key = %k, "策略状态落库失败: {e}");
+                        }
+                    }
+                }
                 // 026 时点④: dry run 的持仓事实 = 虚拟持仓 (None = 已平 → 落 size 0)
                 if let Some(db) = db {
                     persist_position(
@@ -700,6 +722,15 @@ impl Engine {
         // 停机清理: 策略实现了 on_stop 才会调 (是否实现由脚本决定, 引擎不虚构清理行为)
         outcome.on_stop_implemented = strategy.has_on_stop();
         strategy.on_stop(&mut ctx);
+        // 030 断点续接: 停机时持久化最终状态(不清仓, 状态留给下次启动)。
+        if let Some(db) = db {
+            for (k, v) in strategy.state_snapshot() {
+                if let Err(e) = db.strategy_state_set(&strategy_name, &k, &v).await {
+                    outcome.persist_errors += 1;
+                    tracing::error!(target: "engine", key = %k, "策略状态落库失败: {e}");
+                }
+            }
+        }
 
         // 清理回调产生的成交同样落库 + 回调 (与主循环一致)
         for fill in ctx.drain_fills() {
@@ -885,6 +916,19 @@ impl Engine {
 
         // ③ 策略与双流 (行情 + 用户数据流)
         let mut strategy = load_strategy(&config)?;
+        // 030 断点续接: 把上次会话保存的策略状态注回 (无记录 = 首次运行)。
+        if let Some(db) = db {
+            match db.strategy_state_all(&strategy_name).await {
+                Ok(items) if !items.is_empty() => {
+                    tracing::info!(target: "engine", name = %strategy_name, keys = items.len(), "注入已保存的策略状态");
+                    strategy.state_restore(items);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(target: "engine", name = %strategy_name, "读策略状态失败: {e}");
+                }
+            }
+        }
         strategy.on_init(&mut ctx);
         let mut quote_stream = market::subscribe_orderbook(&exchange, &pair).await?;
         let mut user_stream = exchange
@@ -1061,6 +1105,15 @@ impl Engine {
                             });
                         }
                         strategy.on_fill(&mut ctx, fill);
+                // 030 断点续接: 成交后立即持久化策略状态(关机/中止后重启可继续)。
+                if let Some(db) = db {
+                    for (k, v) in strategy.state_snapshot() {
+                        if let Err(e) = db.strategy_state_set(&strategy_name, &k, &v).await {
+                            outcome.persist_errors += 1;
+                            tracing::error!(target: "engine", key = %k, "策略状态落库失败: {e}");
+                        }
+                    }
+                }
                         // 成交后刷新持仓 (P3: 不做高频轮询, 只在成交后刷; 覆盖式避免陈旧仓位)
                         let refreshed = refresh_positions(
                             &exchange,
@@ -1112,6 +1165,15 @@ impl Engine {
         // ④ 停机清理 (D5 顺序): 停消费 → on_stop → 撤单兜底 → 可选平仓 → 残留复查 → 如实输出; 幂等
         outcome.on_stop_implemented = strategy.has_on_stop();
         strategy.on_stop(&mut ctx);
+        // 030 断点续接: 停机时持久化最终状态(不清仓, 状态留给下次启动)。
+        if let Some(db) = db {
+            for (k, v) in strategy.state_snapshot() {
+                if let Err(e) = db.strategy_state_set(&strategy_name, &k, &v).await {
+                    outcome.persist_errors += 1;
+                    tracing::error!(target: "engine", key = %k, "策略状态落库失败: {e}");
+                }
+            }
+        }
         for fill in ctx.drain_fills() {
             outcome.fills += 1;
             if let Some(db) = db {

@@ -1970,6 +1970,13 @@ impl Context for BacktestContext {
         self.tf_caches.get(&tf_key(&self.resolve_key(pair), &tf))?.atr(period, now_ms)
     }
 
+    /// 高周期 EMA(指定序列, 030): 信号序列(如 "1h")上的 EMA 快慢线交叉判据用。
+    /// 与 `atr_tf` 同一缓存与同一**回测时钟**口径(无前视: 只看到已收盘的桶)。
+    fn ema_tf_on(&self, pair: &str, tf: &str, period: usize) -> Option<f64> {
+        let now_ms = self.now_utc()?.timestamp_millis();
+        self.tf_caches.get(&tf_key(&self.resolve_key(pair), tf))?.ema(period, now_ms)
+    }
+
     /// 高周期 EMA (2026-09-18 日线趋势判据): 序列 = 配置 `regime_interval`(缺省 "1d"),
     /// 与 `atr_tf` 同一缓存与同一无前视口径; 可见桶不足 period → None。
     fn ema_tf(&self, pair: &str, period: usize) -> Option<f64> {
@@ -2162,7 +2169,7 @@ mod tests {
         params.insert("atr_interval".to_string(), crate::config::ConfigValue::String("1h".into()));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_etf_accum".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params,
@@ -2223,7 +2230,7 @@ mod tests {
         params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_etf_accum".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params,
@@ -2271,7 +2278,7 @@ mod tests {
         params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_etf_accum".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params,

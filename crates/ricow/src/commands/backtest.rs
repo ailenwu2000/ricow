@@ -20,7 +20,7 @@ fn parse_ymd_ms(s: &str) -> CoreResult<i64> {
 
 #[derive(Args, Default)]
 pub struct BacktestArgs {
-    /// 策略类型 (shannon_rebalance/dca/twap/vwap/pullback/ladder/lua 或已部署策略名; 其余为执行模式示例, exec API 见 specs/lua-api.md)
+    /// 策略类型 (shannon_rebalance/shannon_spot_grid/dca/twap/vwap/pullback/ladder/lua 或已部署策略名; 其余为执行模式示例, exec API 见 specs/lua-api.md)
     #[arg(long)]
     pub strategy: String,
     /// 交易对 (TOML 策略已含 pair 时可省略; 直跑模式必填)
@@ -154,28 +154,25 @@ async fn inline_config(
             params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
             params.entry("atr_mult".into()).or_insert(ConfigValue::Float(1.0));
         }
-        "shannon_etf_accum" => {
+        "shannon_spot_grid" => {
             params.entry("atr_interval".into()).or_insert(ConfigValue::String("1h".into()));
             params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
             params.entry("atr_mult".into()).or_insert(ConfigValue::Float(2.0));
-            params.entry("ema_fast".into()).or_insert(ConfigValue::Integer(10));
-            params.entry("ema_slow".into()).or_insert(ConfigValue::Integer(20));
+            // 趋势门控(方案 B, 用户 2026-09-23): BULL 暂停卖出 / BEAR 暂停买入; 默认 off。
+            params.entry("trend_gate".into()).or_insert(ConfigValue::String("off".into()));
             params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
             params.entry("min_notional".into()).or_insert(ConfigValue::Float(5.0));
-            params.entry("rehang_secs".into()).or_insert(ConfigValue::Integer(3600));
-            params.entry("fee_bps".into()).or_insert(ConfigValue::Float(10.0));
-            // 023 v3: 虚拟账本口径(真实 1 万 × 10 = 虚拟 10 万)+ 保本线 + 建仓后通道开关。
-            params.entry("real_cash".into()).or_insert(ConfigValue::Float(10000.0));
-            params.entry("leverage_mult".into()).or_insert(ConfigValue::Float(10.0));
-            params.entry("min_spacing_pct".into()).or_insert(ConfigValue::Float(0.004));
-            // 建仓后不再使用金叉/死叉(用户 2026-09-18 定稿): 默认只跑 平衡价 ± 2ATR 网格挂单;
-            // true = 仅作历史对照(交叉通道市价进出, 不挂网格)。
-            params.entry("enable_cross".into()).or_insert(ConfigValue::Boolean(false));
-            // 日线趋势判据(用户 2026-09-18 定稿): BULL(`close > EMA200×1.03`) 可以买不卖 /
-            // BEAR(`close < EMA200×0.97`) 可以卖不买 / RANGE(带内) 正常。判据序列 = 日线
+            // 虚拟账本口径(真实本金 × 杠杆)。
+            // 虚拟杠杆默认 2、范围 1~5; 账本基准 cash;
+            // fee_side = 现货单边费率, 供成本门槛硬校验(atr_mult×ATR > 4×fee_side×价格)。
+            params.entry("leverage_mult".into()).or_insert(ConfigValue::Float(2.0));
+            params.entry("leverage_basis".into()).or_insert(ConfigValue::String("cash".into()));
+            params.entry("fee_side".into()).or_insert(ConfigValue::Float(0.001));
+            // 趋势判据(1h EMA200): BULL(`close > EMA200×(1+band)`) 暂停卖出 /
+            // BEAR(`close < EMA200×(1−band)`) 暂停买入 / RANGE(带内) 两侧正常。判据序列 = 1h
             // (`ctx:close_tf` + `ctx:ema_tf`), 预热见下方 warmup。
             params.entry("regime_filter".into()).or_insert(ConfigValue::String("ema200".into()));
-            params.entry("regime_interval".into()).or_insert(ConfigValue::String("1d".into()));
+            params.entry("regime_interval".into()).or_insert(ConfigValue::String("1h".into()));
             params.entry("regime_ema_period".into()).or_insert(ConfigValue::Integer(200));
             params.entry("regime_band_pct".into()).or_insert(ConfigValue::Float(0.03));
             // 入口对齐开关: 第一根 K 线即建仓(不等金叉), 供不同粒度/参数对照回测
@@ -411,8 +408,12 @@ pub(crate) async fn run_backtest(
     let pair = config.get_str("pair").unwrap().to_string();
     // 数据源分支 (三层配置的 market 决定, specs/backtest.md §五): 合约用 fapi 公共数据源,
     // 现货沿用交易所客户端。K 线 JSON 同构, 直接喂同一回测引擎。
-    let klines = if config.market == "futures" {
-        let fapi = ricow_binance::FuturesDataClient::new()?;
+    // 分页取数 (2026-09-22, 030): 币安 K 线**单次请求上限 1000 根** —— 超过必须向前翻页拼接,
+    // 否则长窗口 (1m 数天 / 1h 数月) 会拿到错误响应: 表现为 "network error: error decoding
+    // response body" (120 天 1m) 或长时间无输出 (3 天/1 天 1m 实测)。此处按 1000 根/批往前翻页。
+    const KLINE_PAGE_MAX: u32 = 1000;
+    let fapi = if config.market == "futures" {
+        let f = ricow_binance::FuturesDataClient::new()?;
         // MMR 元数据: 用户未显式 --mmr-pct 时, 按 symbol 查内置首档表 (exchangeInfo 公共值不可靠,
         // 见 specs/backtest.md §十一 T7); 表外回落 1.0%。
         if args.mmr_pct.is_none() {
@@ -420,16 +421,29 @@ pub(crate) async fn run_backtest(
                 .params
                 .insert("mmr_pct".into(), ConfigValue::Float(ricow_binance::tier1_mmr_pct(&pair)));
         }
-        match end_ms {
-            Some(e) => fapi.get_klines_ending_at(&pair, &interval, fetch_limit, e).await?,
-            None => fapi.get_klines(&pair, &interval, fetch_limit).await?,
-        }
+        Some(f)
     } else {
-        match end_ms {
-            Some(e) => exchange.get_klines_until(&pair, &interval, fetch_limit, e).await?,
-            None => exchange.get_klines(&pair, &interval, fetch_limit).await?,
-        }
+        None
     };
+    let mut acc: Vec<ricow_core::Kline> = Vec::new();
+    let mut cursor = end_ms; // None = 到"现在"为止
+    while acc.len() < fetch_limit as usize {
+        let want = (fetch_limit as usize - acc.len()).min(KLINE_PAGE_MAX as usize) as u32;
+        let batch = match (&fapi, cursor) {
+            (Some(f), Some(e)) => f.get_klines_ending_at(&pair, &interval, want, e).await?,
+            (Some(f), None) => f.get_klines(&pair, &interval, want).await?,
+            (None, Some(e)) => exchange.get_klines_until(&pair, &interval, want, e).await?,
+            (None, None) => exchange.get_klines(&pair, &interval, want).await?,
+        };
+        if batch.is_empty() {
+            break;
+        }
+        cursor = Some(batch[0].open_time.timestamp_millis() - 1);
+        let mut merged = batch;
+        merged.extend(acc);
+        acc = merged;
+    }
+    let klines = acc;
     if klines.is_empty() {
         return Err(CoreError::Exchange(format!("no klines for {pair}")));
     }
@@ -456,13 +470,15 @@ pub(crate) async fn run_backtest(
         let available = klines.partition_point(|k| k.open_time.timestamp_millis() < start_ms) as u32;
         let actual = warmup_bars.min(available);
         if actual != warmup_bars {
-            tracing::warn!(
-                target: "multiframe",
-                requested = warmup_bars,
-                actual = actual,
-                "交易所历史不足以填满预热段 → 按实际可取根数裁剪(不缩短报告窗口)"
-            );
-            config.params.insert("warmup_bars".into(), ConfigValue::Integer(actual as i64));
+            // 030(2026-09-23): 预热段不足 = 指标初值不可信, 甚至会让判据**永久未就绪**而静默不下单。
+            // 按项目纪律"错误必须暴露, 不许静默降级", 这里**硬报错**, 不再 WARN + 裁剪继续跑。
+            // (旧行为导致 QQQBUSDT 回测: 日线只有 84 根 < EMA200 需求, 判据永久未就绪 → 0 成交,
+            //  却产出一份看起来正常的报告。)
+            return Err(CoreError::InvalidArgument(format!(
+                "预热段不足, 拒绝回测: 请求 {warmup_bars} 根高周期历史, 交易所只有 {actual} 根 —— \
+                 指标初值会失真(用到日线判据时很可能永久未就绪而静默不下单)。\
+                 请扩大窗口、缩短高周期预热需求(如 regime_ema_period), 或关闭该判据(regime_filter=off)。"
+            )));
         }
     }
 
@@ -521,7 +537,7 @@ mod tests {
             Some((_, ConfigValue::Boolean(true)))
         ));
         assert!(matches!(
-            parse_param("enable_cross=FALSE"),
+            parse_param("enter_at_start=false"),
             Some((_, ConfigValue::Boolean(false)))
         ));
         assert!(matches!(parse_param("atr_mult=2.5"), Some((_, ConfigValue::Float(_)))));

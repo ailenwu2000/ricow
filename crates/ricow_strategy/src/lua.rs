@@ -85,6 +85,10 @@ pub(crate) struct LuaCtxData {
     tf_ema: HashMap<String, f64>,
     /// **上一根已收盘**高周期 bar 的 close 快照(序列同 `tf_ema`): 趋势判据的逐字输入。
     tf_close: HashMap<String, f64>,
+    /// 信号序列 EMA 快慢线快照 (2026-09-22, 030): 键 = pair, 值 = (fast, slow)。
+    /// 序列来自配置 `ema_interval`(如 "1h"), 周期来自 `ema_fast` / `ema_slow`(默认 3/5);
+    /// 供金叉/死叉判据。与 `tf_atr` 同一缓存与同一无前视口径。
+    tf_ema_cross: HashMap<String, (f64, f64)>,
     /// 组合信号模式标志 (bs_momentum Lua 化, T3): true → ctx:klines 返回全段
     /// (引擎已截断至执行日, ≥253 根供 IBD RS/EMA200 打分), 不套单标的 100 根 cap;
     /// false (默认) → 单标的路径维持 cap 100 (行为边界, 回归约束)。
@@ -113,6 +117,7 @@ impl LuaCtxData {
             tf_atr: HashMap::new(),
             tf_ema: HashMap::new(),
             tf_close: HashMap::new(),
+            tf_ema_cross: HashMap::new(),
             full_klines: false,
         }
     }
@@ -267,6 +272,40 @@ impl UserData for LuaCtxData {
         // (缺省 200)。与 `atr_tf` 同一缓存与同一无前视口径, 每根高周期 bar 只算一次。
         // 未预装/数据不足 → nil, 策略必须 `if v then` guard。
         methods.add_method("ema_tf", |_, data, pair: String| Ok(data.tf_ema.get(&pair).copied()));
+        // 信号序列 EMA 快慢线 (2026-09-22, 030): `ctx:ema_cross(pair)` → {fast=…, slow=…} 或 nil。
+        // 序列来自配置 `ema_interval`(缺省 "1h"), 周期来自 `ema_fast`/`ema_slow`(缺省 3/5)。
+        methods.add_method("ema_cross", |lua, data, pair: String| match data.tf_ema_cross.get(&pair) {
+            Some((f, sl)) => {
+                let t = lua.create_table()?;
+                t.set("fast", *f)?;
+                t.set("slow", *sl)?;
+                Ok(Value::Table(t))
+            }
+            None => Ok(Value::Nil),
+        });
+        // 策略状态持久化 (2026-09-22, 030): `ctx:state_get(key)` / `ctx:state_set(key, value)`。
+        // 存储在 Lua 全局表 `_RICOW_STATE` 内(策略实例生命周期内常驻), 引擎在成交后/停机时
+        // 取快照落库、重启时注回 —— 支撑"关机不清仓、重启继续跑"。键与值都是字符串。
+        methods.add_method("state_get", |lua, _, key: String| {
+            let g = lua.globals();
+            match g.get::<Option<Table>>("_RICOW_STATE")? {
+                Some(t) => Ok(t.get::<Option<String>>(key)?),
+                None => Ok(None),
+            }
+        });
+        methods.add_method("state_set", |lua, _, (key, value): (String, String)| {
+            let g = lua.globals();
+            let t = match g.get::<Option<Table>>("_RICOW_STATE")? {
+                Some(t) => t,
+                None => {
+                    let t = lua.create_table()?;
+                    g.set("_RICOW_STATE", &t)?;
+                    t
+                }
+            };
+            t.set(key, value)?;
+            Ok(())
+        });
         methods
             .add_method("close_tf", |_, data, pair: String| Ok(data.tf_close.get(&pair).copied()));
         methods.add_method("adx", |_, data, (pair, period): (String, usize)| {
@@ -429,6 +468,22 @@ impl LuaStrategy {
                 }
                 if let Some(c) = ctx.close_tf(&pair) {
                     data.tf_close.insert(pair.clone(), c);
+                }
+            }
+            // 信号序列 EMA 快慢线 (2026-09-22, 030): 仅在策略声明 `ema_interval` 时取,
+            // 周期取 `ema_fast` / `ema_slow`(缺省 3/5)。未就绪 → 不插入(策略读到 nil)。
+            {
+                let sig_tf = ctx
+                    .config()
+                    .get_str("ema_interval")
+                    .unwrap_or("1h")
+                    .to_string();
+                let f = ctx.config().get_i64("ema_fast").unwrap_or(3).max(1) as usize;
+                let sl = ctx.config().get_i64("ema_slow").unwrap_or(5).max(1) as usize;
+                if let (Some(fv), Some(sv)) =
+                    (ctx.ema_tf_on(&pair, &sig_tf, f), ctx.ema_tf_on(&pair, &sig_tf, sl))
+                {
+                    data.tf_ema_cross.insert(pair.clone(), (fv, sv));
                 }
             }
         }
@@ -655,6 +710,30 @@ impl Strategy for LuaStrategy {
         let mut data = LuaCtxData::new();
         self.fill_snapshot(ctx, &mut data);
         self.call("on_stop", data, vec![]);
+    }
+
+    /// 取走 `_RICOW_STATE` 的当前内容 (030): 引擎落库用。
+    fn state_snapshot(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let g = self.lua.globals();
+        if let Ok(Some(t)) = g.get::<Option<Table>>("_RICOW_STATE") {
+            for pair in t.pairs::<String, String>() {
+                if let Ok((k, v)) = pair {
+                    out.push((k, v));
+                }
+            }
+        }
+        out
+    }
+
+    /// 注入上次会话的状态 (030): 在 `on_init` 之前由引擎调用。
+    fn state_restore(&mut self, items: Vec<(String, String)>) {
+        let g = self.lua.globals();
+        let Ok(t) = self.lua.create_table() else { return };
+        for (k, v) in items {
+            let _ = t.set(k, v);
+        }
+        let _ = g.set("_RICOW_STATE", &t);
     }
 
     /// 脚本里定义了 `on_stop` 才算实现了清理 (未定义 → 引擎提示手工处理)。
@@ -903,7 +982,7 @@ mod tests {
         params.insert("atr_period".to_string(), crate::config::ConfigValue::Integer(14));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_etf_accum".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params,
@@ -964,7 +1043,7 @@ mod tests {
         params.insert("regime_ema_period".to_string(), crate::config::ConfigValue::Integer(2));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_etf_accum".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params,
@@ -1045,7 +1124,7 @@ mod tests {
         params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_etf_accum".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params,
@@ -1076,7 +1155,7 @@ mod tests {
         "#;
         let cfg2 = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_etf_accum".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params: std::collections::HashMap::new(),

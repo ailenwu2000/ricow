@@ -20,7 +20,7 @@ use crate::strategy::Strategy;
 use rust_decimal::prelude::ToPrimitive;
 
 const SHANNON_GRID: &str = include_str!("../../../strategies/builtin/shannon_rebalance.lua");
-const SHANNON_ETF_ACCUM: &str = include_str!("../../../strategies/builtin/shannon_etf_accum.lua");
+const SHANNON_ETF_ACCUM: &str = include_str!("../../../strategies/builtin/shannon_spot_grid.lua");
 const DCA: &str = include_str!("../../../strategies/builtin/executors/dca.lua");
 const TWAP: &str = include_str!("../../../strategies/builtin/executors/twap.lua");
 const VWAP: &str = include_str!("../../../strategies/builtin/executors/vwap.lua");
@@ -408,7 +408,7 @@ fn test_shannon_rebalance_target_ratio_clamped() {
 }
 
 // ============================================================================
-// 023 香农 ETF 指数增加策略 (shannon_etf_accum) 集成测试
+// 023 香农 ETF 指数增加策略 (shannon_spot_grid) 集成测试
 // ============================================================================
 
 /// 023 测试用: 第 `hour` 小时的 bar(1h 间隔; 引擎不校验周期, 策略只看时间戳)。
@@ -447,6 +447,9 @@ fn accum_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
         ("atr_period", ConfigValue::Integer(14)),
         ("atr_mult", ConfigValue::Float(2.0)),
         ("min_notional", ConfigValue::Float(5.0)),
+        // 030: 日线判据默认开 —— 测试桩默认关(未装日线序列时判据未就绪会整体不下单);
+        // 判据相关的用例在 extra 里显式打开。
+        ("regime_filter", ConfigValue::String("off".into())),
         ("cash", ConfigValue::Float(10000.0)),
         // 虚拟账本口径(023 v3): 默认 1× 使 v_cap == 测试本金(单一变量); 测"卖不出去"时改成 10×。
         ("leverage_mult", ConfigValue::Float(1.0)),
@@ -509,294 +512,294 @@ fn run_accum_multi(
 }
 
 #[test]
-fn test_shannon_etf_accum_requires_tf_atr_channel() {
+fn test_shannon_spot_grid_requires_tf_atr_channel() {
     // 高周期通道未预装 → 一笔都不下(不猜 ATR 值, 不建仓)。
     let (orders, _ctx) = run_accum(accum_cfg(&[]), &uptrend_bars(), None);
     assert!(orders.iter().all(|o| o.is_empty()), "ATR 通道未就绪时必须完全不动");
 }
 
-/// 023 测试用: 按给定价格序列生成 1h 间隔的 bar(引擎不校验周期; OHLC 同价, 便于精确断言)。
-fn bars_from(prices: &[i64]) -> Vec<Kline> {
-    prices.iter().enumerate().map(|(h, p)| bar_at_hour(h as i64, *p, *p, *p, *p)).collect()
+/// 030 测试用: 主序列 —— 横盘 `n` 根 @ `px`(与高周期序列同粒度, 引擎不校验周期)。
+fn flat_main(n: i64, px: i64) -> Vec<Kline> {
+    (0..n).map(|h| bar_at_hour(h, px, px, px, px)).collect()
 }
 
-/// 网格双向用: 横盘 → 上冲(建仓) → 锯齿(每次 ±40 远大于 spacing, 保证买卖两侧都成交)。
-fn r2_bars() -> Vec<Kline> {
-    let mut p: Vec<i64> = vec![100; 30];
-    p.extend((1..=5).map(|i| 100 + i * 5)); // 105..125 → 建仓
-    for i in 0..12 {
-        p.push(if i % 2 == 0 { 145 } else { 105 });
+/// 030 测试用: 主序列 —— 前 `at` 根 @ `base`, 之后 @ `then`。
+fn step_main(n: i64, base: i64, at: i64, then: i64) -> Vec<Kline> {
+    (0..n)
+        .map(|h| {
+            let p = if h < at { base } else { then };
+            bar_at_hour(h, p, p, p, p)
+        })
+        .collect()
+}
+
+/// 030 测试用: 高周期(1h)序列 —— 前 `flat` 根横盘, 之后每根 +`step` → EMA3 上穿 EMA5。
+/// high−low = 2 且前收落在区间内 → ATR 恒为 2; 平盘段让 EMA3/EMA5 收敛到相等。
+fn tf_bars_up(flat: i64, n: i64, step: i64) -> Vec<Kline> {
+    (0..n)
+        .map(|h| {
+            let px = if h < flat { 100 } else { 100 + (h - flat + 1) * step };
+            bar_at_hour(h, px, px + 1, px - 1, px)
+        })
+        .collect()
+}
+
+/// 030 测试用: 高周期序列 —— 横盘 → 上行(金叉) → 回落(死叉)。
+fn tf_bars_up_down(flat: i64, up: i64, down: i64, step: i64) -> Vec<Kline> {
+    let mut v = Vec::new();
+    let mut px = 100;
+    for h in 0..(flat + up + down) {
+        if h >= flat && h < flat + up {
+            px += step;
+        } else if h >= flat + up {
+            px -= step;
+        }
+        v.push(bar_at_hour(h, px, px + 1, px - 1, px));
     }
-    bars_from(&p)
+    v
 }
 
-/// R3 用: 上冲(建仓 + 网格卖) → **长横盘让 EMA10/20 收敛** → 单根深跌(下一根检出死叉)
-/// → **跳空高开**(开盘 215 > 旧锚 195 + spacing 4, 且此刻才是"新死叉") → R3 条件成立。
-/// 死叉事件只能在其后一根被检出, 所以"高价 + 新死叉"必须落在同一根 —— 这正是 R3 在连续
-/// 行情里极难触发的原因(见结果文档)。
-fn r3_bars() -> Vec<Kline> {
-    let mut p: Vec<i64> = vec![100; 30];
-    p.extend((1..=20).map(|i| 100 + i * 5)); // 105..200 → 建仓 + 网格卖(锚跟到 ~199)
-    p.extend(std::iter::repeat_n(200, 40)); // 长横盘: EMA10/20 收敛到 200
-    p.push(180); // 单根深跌 → 网格买成交(锚 ≈ 195), 且造成 EMA 死叉
-    p.push(215); // 跳空高开: 215 > 195 + 4, 且本根检出"新死叉" → R3
-    p.extend(std::iter::repeat_n(215, 3));
-    bars_from(&p)
-}
-
-#[test]
-fn test_shannon_etf_accum_r1_anchor_above_market_and_small_entry() {
-    // R1(2026-09-18 修订): 初次金叉 → 锚 = ask + spacing; 虚拟账本在锚价建 target 权重;
-    // 再用**当前市价**算回平衡量 → 市价买入。入场是"小额"(≈ v_cap×target×(spacing/锚)),
-    // 不再是 v1 的"半仓一次性建仓"。
-    let bars = uptrend_bars();
-    let (orders, _ctx, st) = run_accum_full(accum_cfg(&[]), &bars, Some(tf_bars(30)));
-    let idx = orders
-        .iter()
-        .position(|o| o.iter().any(|r| r.order_type == OrderType::Market))
-        .expect("应有一笔市价建仓");
-    let market: Vec<&OrderRequest> =
-        orders[idx].iter().filter(|o| o.order_type == OrderType::Market).collect();
-    assert_eq!(market.len(), 1, "初次金叉只应一笔市价建仓");
-    assert_eq!(market[0].side, OrderSide::Buy);
-    // R1 语义(用户口径): 锚 = 价 + spacing; 虚拟账本在锚价建 50:50(10 万账本的 target 权重);
-    //   下单量 = **虚拟账本自己的回平衡量**(与真实持仓无关) = 0.25 × v_cap × (锚 − 价)/锚
-    //   → v_cap=10000 时约 87 USDT(账户的 0.9%), 不是 v1 的"半仓一次性建仓"。
-    let px = bars[idx].open;
-    let spacing = dec!(4);
-    let anchor = px + spacing;
-    let expect_notional = dec!(2500) * spacing / anchor;
-    let got_notional = market[0].size * px;
-    let rel = ((got_notional - expect_notional) / expect_notional).abs();
-    assert!(rel < dec!(0.01), "R1 买量名义应 ≈ {expect_notional}: 实得 {got_notional}");
-    assert!(
-        got_notional > dec!(50) && got_notional < dec!(150),
-        "R1 应是账本回平衡量的小额入场(≈87, 而非半仓 5000): {got_notional}"
-    );
-    // 虚拟账本已在 R1 建好, 且计数正确
-    assert!(st.global_f64("v_coin").unwrap_or(0.0) > 0.0, "虚拟账本应在 R1 建成");
-    assert_eq!(st.global_f64("cross_buy"), Some(1.0), "应记 1 次交叉买入");
-    // 同批必须先撤后挂: 建仓批不含撤单(还没有挂单), 但不得出现卖单
-    assert!(orders[idx].iter().all(|o| o.side != OrderSide::Sell), "建仓时不得卖出");
-    let _ = st;
-}
-
-#[test]
-fn test_shannon_etf_accum_no_chasing_buy_and_both_grid_sides_alive() {
-    // 跌下来买 / 涨上去卖: 由网格两侧限价单实现。交叉通道(R2/R3)要求"新交叉"与
-    // "价格离开锚点 > spacing"在同根成立, 而锚点跟随成交、网格买单正落在 锚−spacing,
-    // 因此连续行情里几乎不可达 —— 这里锁住两个可测事实:
-    //   ① 单边上涨不得追高加仓(市价买只有建仓那一次);
-    //   ② 网格两侧都在真实成交(不是只买不卖)。
-    let (orders, _ctx, st) = run_accum_full(accum_cfg(&[]), &r2_bars(), Some(tf_bars(60)));
-    let market: Vec<&OrderRequest> =
-        orders.iter().flatten().filter(|o| o.order_type == OrderType::Market).collect();
-    // 网格在"锚已被价格甩开"时会用市价补单(2026-09-18 修复: 限价单被价格穿过不会立即成交,
-    // 曾经导致纯网格枯死) → 这里锁住真正的不变量: 首笔市价单是建仓, 之后不得出现
-    // 交叉通道的追高加仓(cross_buy 恒为 1), 且市价补单买卖两侧都会出现。
-    assert_eq!(market[0].side, OrderSide::Buy, "首笔市价单应为建仓");
-    assert!(market.iter().any(|o| o.side == OrderSide::Sell), "网格应有市价补单(卖侧)");
-    assert_eq!(st.global_f64("cross_buy"), Some(1.0), "不得出现交叉通道追高加仓");
-    assert!(
-        st.global_f64("fill_count").unwrap_or(0.0) > 5.0,
-        "网格应有多次成交: {:?}",
-        st.global_f64("fill_count")
-    );
-
-    let (orders2, _c2, st2) = run_accum_full(accum_cfg(&[]), &uptrend_bars(), Some(tf_bars(60)));
-    let m2_buys: Vec<&OrderRequest> = orders2
+fn market_orders(orders: &[Vec<OrderRequest>]) -> Vec<OrderRequest> {
+    orders
         .iter()
         .flatten()
-        .filter(|o| o.order_type == OrderType::Market && o.side == OrderSide::Buy)
-        .collect();
-    // 单边上涨不得"追高加仓": 市价买只允许建仓那一次(网格补单若出现, 只可能是卖侧 —— 涨停式
-    // 跳空把卖价甩到市价下方)。
-    assert_eq!(m2_buys.len(), 1, "单边上涨只应建仓一次市价买, 实得 {}", m2_buys.len());
-    assert_eq!(st2.global_f64("cross_buy"), Some(1.0));
+        .filter(|o| o.order_type == OrderType::Market)
+        .cloned()
+        .collect()
 }
 
 #[test]
-fn test_shannon_etf_accum_r3_no_spurious_market_sell_and_grid_handles_sellside() {
-    // R3(死叉 + 价 > 锚 + spacing)在当前锚点跟随机制下几乎不可触发 —— 卖侧由网格实现。
-    // 这条用例锁住: 交叉通道不得触发真实卖出(网格自身的补单不算交叉通道)。
-    let (_orders, _ctx, st) = run_accum_full(accum_cfg(&[]), &r3_bars(), Some(tf_bars(80)));
-    // 网格补单可以是市价卖(见上条用例), 但**交叉通道 R3 不得触发真实卖出**。
-    assert_eq!(st.global_f64("cross_sell_real"), Some(0.0));
-    assert!(st.global_f64("fill_count").unwrap_or(0.0) > 0.0, "上涨段网格卖单应成交");
-}
-
-#[test]
-fn test_shannon_etf_accum_virtual_book_invariant_no_expansion() {
-    // 不变量 I1(用户 2026-09-18 补充): 虚拟账本不是成交历史的累加器, 而是"10 万本金在参考价
-    // (初始锚 = ask + spacing)处的 target 权重快照" → `v_coin × 锚 == target × v_cap`。
-    // 这是"虚拟仓位不会因卖不出去而扩张"的可断言形式(v_coin 有闭式上界)。
-    let bars = uptrend_bars();
-    let (orders, _ctx, st) = run_accum_full(accum_cfg(&[]), &bars, Some(tf_bars(30)));
-    let idx = orders
-        .iter()
-        .position(|o| o.iter().any(|r| r.order_type == OrderType::Market))
-        .expect("应有市价建仓");
-    let _ = idx;
-    // 锚 = 最近一次成交价(用户口径: 每次成交后 锚 := 成交价); 账本按成交继续演化 →
-    // 每笔成交后账本在锚价处必然是 **50:50**: v_coin × 锚 == v_cash。
-    let anchor = st.global_f64("balance_price").expect("锚应已设置");
-    let v_coin = st.global_f64("v_coin").expect("v_coin 应可读");
-    let v_cash = st.global_f64("v_cash").expect("v_cash 应可读");
-    let coin_value = v_coin * anchor;
-    let rel = (coin_value - v_cash).abs() / v_cash;
-    assert!(rel < 1e-6, "账本在锚价处应 50:50: coin_value={coin_value} vs v_cash={v_cash}");
-    assert!(v_coin > 0.0 && v_coin.is_finite(), "v_coin 异常: {v_coin}");
-}
-
-#[test]
-fn test_shannon_etf_accum_no_market_sell_without_cover() {
-    // 用户第 3 条: 需要卖但真实账户不够 → 零真实成交(不得出现市价卖)。
-    let (orders, _ctx, st) = run_accum_full(accum_cfg(&[]), &r3_bars(), Some(tf_bars(80)));
-    let (mut bought, mut sold) = (dec!(0), dec!(0));
-    for o in orders.iter().flatten() {
-        if o.side == OrderSide::Sell {
-            sold += o.size;
-        } else {
-            bought += o.size;
-        }
-    }
-    // 无仓不得卖: 任何时刻的卖出请求总量都不得超过买入总量(否则就是"卖空", 引擎会拒单)。
-    assert!(sold <= bought, "卖出总量 {sold} 超过买入总量 {bought} → 出现无仓卖出");
-    assert_eq!(st.global_f64("cross_sell_real"), Some(0.0));
-}
-
-#[test]
-fn test_shannon_etf_accum_skips_thin_spacing() {
-    // 保本守卫: spacing ≤ 0.2%×价格 → 不挂单(只可能建仓, 之后静默)。
-    let bars = uptrend_bars();
-    let (orders, _ctx) =
-        run_accum(accum_cfg(&[("atr_mult", ConfigValue::Float(0.0001))]), &bars, Some(tf_bars(30)));
-    let limits: Vec<&OrderRequest> =
-        orders.iter().flatten().filter(|o| o.order_type == OrderType::Limit).collect();
-    assert!(limits.is_empty(), "低于保本线不得挂单, 实得 {} 张", limits.len());
-}
-
-#[test]
-fn test_shannon_etf_accum_skips_small_notional() {
-    // min_notional 守卫: 名义不足 → 不挂单。
-    let bars = uptrend_bars();
+fn test_shannon_spot_grid_requires_signal_ema_channel() {
+    // 信号 EMA 序列未预装(ema_interval 指向未装的 "4h")→ 一笔都不下(不猜 EMA 值)。
+    let bars = flat_main(60, 100);
     let (orders, _ctx) = run_accum(
-        accum_cfg(&[("min_notional", ConfigValue::Float(1_000_000.0))]),
+        accum_cfg(&[("ema_interval", ConfigValue::String("4h".into()))]),
         &bars,
-        Some(tf_bars(30)),
+        Some(tf_bars_up(20, 40, 5)),
     );
-    let limits: Vec<&OrderRequest> =
-        orders.iter().flatten().filter(|o| o.order_type == OrderType::Limit).collect();
-    assert!(limits.is_empty(), "名义不足不得挂单, 实得 {} 张", limits.len());
-}
-
-// ============================================================================
-// 023 v4 日线趋势判据 (2026-09-18 用户定稿): BULL 只买不卖 / BEAR 只卖不买 / RANGE 正常
-// 判据 = 上一根已收盘高周期 bar 的 close 与 EMA(period) 的 ±band 带(含等号归 RANGE)。
-// 单测里用"4h 序列 + 小 period"跑同一段 Lua 逻辑(周期只是参数, 判定口径与日线一致)。
-// ============================================================================
-
-/// 023 趋势判据测试用: 4h 间隔的 bar(每 4 小时一根), OHLC 同价 → 只用于 close/EMA 判据。
-fn bars_4h(prices: &[i64]) -> Vec<Kline> {
-    prices.iter().enumerate().map(|(i, p)| bar_at_hour(i as i64 * 4, *p, *p, *p, *p)).collect()
-}
-
-fn regime_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
-    let mut params = vec![
-        ("regime_filter", ConfigValue::String("ema200".into())),
-        ("regime_interval", ConfigValue::String("4h".into())),
-        ("regime_ema_period", ConfigValue::Integer(3)),
-    ];
-    params.extend_from_slice(extra);
-    accum_cfg(&params)
-}
-
-#[test]
-fn test_shannon_etf_accum_regime_not_ready_blocks_all_orders() {
-    // D3-A: 判据未就绪(判据序列未预装 / 可见 bar 不足 period 根)→ 一笔都不下(不猜值)。
-    // 这里装 ATR 序列("1h")但**不装**判据序列("1d") → ATR 就绪、判据未就绪。
-    let cfg = accum_cfg(&[
-        ("regime_filter", ConfigValue::String("ema200".into())),
-        ("regime_interval", ConfigValue::String("1d".into())),
-    ]);
-    let (orders, _ctx, st) = run_accum_multi(cfg, &uptrend_bars(), &[("1h", Some(tf_bars(40)))]);
-    assert!(orders.iter().all(|o| o.is_empty()), "判据未就绪必须完全不动");
-    assert_eq!(st.global_f64("cross_buy"), Some(0.0), "判据未就绪不得建仓");
-    assert!(st.global_f64("regime_ready_skip").unwrap_or(0.0) > 0.0, "应记未就绪跳过");
-}
-
-#[test]
-fn test_shannon_etf_accum_regime_bear_blocks_entry() {
-    // D2-A: BEAR(`close < EMA×(1−band)`)连**首次金叉建仓**一起拦。
-    // 判据序列 = 4h 快速衰减(EMA(3) 稳定远在上方) → 全程 BEAR。
-    let cfg = regime_cfg(&[]);
-    let (orders, _ctx, st) = run_accum_multi(
-        cfg,
-        &uptrend_bars(),
-        &[
-            ("1h", Some(tf_bars(40))),
-            ("4h", Some(bars_4h(&[1000, 500, 250, 125, 62, 31, 15, 7, 3, 1, 1, 1]))),
-        ],
-    );
-    assert!(orders.iter().all(|o| o.is_empty()), "熊市不得建仓, 也不该挂任何单");
-    assert_eq!(st.global_f64("cross_buy"), Some(0.0), "熊市禁建仓(D2-A)");
-    assert!(st.global_f64("regime_block_buy").unwrap_or(0.0) > 0.0, "应记拦买次数");
-    assert_eq!(st.global_f64("regime_block_sell"), Some(0.0), "熊市不拦卖");
-    assert_eq!(st.global_f64("ticks_bear").unwrap_or(0.0) > 0.0, true);
-}
-
-#[test]
-fn test_shannon_etf_accum_regime_bull_blocks_sell_side_only() {
-    // BULL(`close > EMA×(1+band)`)→ 只买不卖: 建仓照常(只有 BEAR 拦建仓), 之后**不得出现任何卖单**。
-    // 判据序列 = 4h 倍增(band≈0): close 恒 ≈ 1.5×EMA → BULL 稳定。
-    let cfg = regime_cfg(&[("regime_band_pct", ConfigValue::Float(1e-9))]);
-    let bull =
-        bars_4h(&[100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600, 51200, 102400, 204800]);
-    let (orders, _ctx, st) =
-        run_accum_multi(cfg, &r2_bars(), &[("1h", Some(tf_bars(60))), ("4h", Some(bull))]);
-    let flat: Vec<&OrderRequest> = orders.iter().flatten().collect();
-    assert_eq!(st.global_f64("cross_buy"), Some(1.0), "建仓不受 BULL 拦");
-    assert!(flat.iter().all(|o| o.side != OrderSide::Sell), "牛市不得出现任何卖单");
     assert!(
-        flat.iter().any(|o| o.side == OrderSide::Buy && o.order_type == OrderType::Limit),
-        "牛市买侧仍应挂单"
+        orders.iter().all(|o| o.is_empty()),
+        "信号 EMA 通道未就绪时必须完全不动"
     );
-    assert!(st.global_f64("regime_block_sell").unwrap_or(0.0) > 0.0, "应记拦卖次数");
-    assert!(st.global_f64("ticks_bull").unwrap_or(0.0) > 0.0, "应记 BULL tick 数");
 }
 
 #[test]
-fn test_shannon_etf_accum_regime_range_when_close_equals_ema() {
-    // 逐字边界: `close` **等于** `EMA×(1±band)` 归 RANGE(band≈0 时 close == EMA 精确成立)
-    // → 必须走"两侧正常"(买/卖两张都挂), 既不算 BULL 也不算 BEAR。
-    let cfg = regime_cfg(&[("regime_band_pct", ConfigValue::Float(1e-9))]);
-    let flat4h = bars_4h(&[100; 12]);
-    let (orders, _ctx, st) =
-        run_accum_multi(cfg, &r2_bars(), &[("1h", Some(tf_bars(60))), ("4h", Some(flat4h))]);
-    let flat: Vec<&OrderRequest> = orders.iter().flatten().collect();
-    assert!(flat.iter().any(|o| o.side == OrderSide::Buy), "RANGE 买侧应放开");
-    assert!(flat.iter().any(|o| o.side == OrderSide::Sell), "RANGE 卖侧应放开");
-    assert_eq!(st.global_f64("regime_block_sell"), Some(0.0), "带内不得拦卖");
-    assert_eq!(st.global_f64("regime_block_buy"), Some(0.0), "带内不得拦买");
-    assert!(st.global_f64("ticks_range").unwrap_or(0.0) > 0.0, "应记 RANGE tick 数");
+fn test_shannon_spot_grid_thin_spacing_halts() {
+    // R7 成本门槛(硬校验): atr_mult×ATR ≤ 4×fee_side×价格 → 停机(FATAL), 不再下单。
+    let bars = flat_main(60, 100);
+    let (orders, _ctx, st) = run_accum_full(
+        accum_cfg(&[("atr_mult", ConfigValue::Float(0.0001))]),
+        &bars,
+        Some(tf_bars_up(20, 60, 1)),
+    );
+    assert!(
+        orders.iter().all(|o| o.is_empty()),
+        "成本门槛不满足时必须停机且不下任何单"
+    );
+    assert_eq!(st.global_f64("buy_count"), None.or(Some(0.0)), "不得建仓");
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "不得有成交");
 }
 
 #[test]
-fn test_shannon_etf_accum_regime_blocked_side_still_cancels() {
-    // P3(架构审核): 被拦侧 + 另一侧本轮也挂不出时, **仍必须发 cancel_pending** ——
-    // 否则牛市里那张旧卖单留在盘上并成交, 等于"牛市不卖"被静默破坏。
-    // 构造: BULL 拦卖 + `trend_filter_sma` 在下跌 bar 上把买侧关掉 → 两侧都无单可挂。
-    let cfg = regime_cfg(&[
-        ("regime_band_pct", ConfigValue::Float(1e-9)),
-        ("trend_filter_sma", ConfigValue::Integer(2)),
+fn test_shannon_spot_grid_leverage_clamped_to_5() {
+    // R6: 杠杆钳制到 1~5 —— 配 10 倍时虚拟资金按 5 倍算(投入资金 10000 → 50000)。
+    let bars = flat_main(40, 100);
+    let (_orders, _ctx, st) = run_accum_full(
+        accum_cfg(&[("leverage_mult", ConfigValue::Float(10.0))]),
+        &bars,
+        Some(tf_bars_up(20, 60, 1)),
+    );
+    assert_eq!(st.global_f64("v_cap"), Some(50000.0), "杠杆应钳制到 5");
+}
+
+
+// ─────────────────── 030-A 网格挂单语义(2026-09-23 用户口径) ───────────────────
+
+/// 030-A 测试用: 主序列价格从 base 走到 then(之后保持), 用于触发/验证 `start_price` 激活门槛。
+fn drop_main(n: i64, base: i64, then: i64, at: i64) -> Vec<Kline> {
+    (0..n)
+        .map(|h| {
+            let p = if h < at { base } else { then };
+            bar_at_hour(h, p, p, p, p)
+        })
+        .collect()
+}
+
+#[test]
+fn test_shannon_spot_grid_requires_start_price() {
+    let bars = drop_main(40, 200, 100, 10);
+    let (orders, _ctx, st) = run_accum_full(accum_cfg(&[]), &bars, Some(tf_bars(60)));
+    assert!(
+        orders.iter().all(|o| o.is_empty()),
+        "缺必填 start_price 时不得下任何单"
+    );
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "缺参数 -> 无成交");
+}
+
+#[test]
+fn test_shannon_spot_grid_activate_with_initial_buy_then_ladder() {
+    let cfg = accum_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("initial_buy_amount", ConfigValue::Float(1000.0)),
     ]);
-    let bull =
-        bars_4h(&[100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600, 51200, 102400, 204800]);
-    let (orders, _ctx, st) =
-        run_accum_multi(cfg, &r2_bars(), &[("1h", Some(tf_bars(60))), ("4h", Some(bull))]);
-    let only_cancel =
-        orders.iter().filter(|o| o.len() == 1 && o[0].action == OrderAction::CancelPending).count();
-    assert!(only_cancel > 0, "被拦侧必须撤旧单(实得 {only_cancel} 次)");
-    assert!(st.global_f64("regime_blocked_cancel").unwrap_or(0.0) > 0.0, "应记被拦撤单次数");
-    assert!(orders.iter().flatten().all(|o| o.side != OrderSide::Sell), "牛市全程不得出现卖单");
+    let bars = drop_main(60, 200, 100, 10);
+    let (orders, _ctx, st) = run_accum_full(cfg, &bars, Some(tf_bars(60)));
+    let market: Vec<_> = orders
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Market)
+        .collect();
+    assert_eq!(market.len(), 1, "激活时应恰有一笔市价初始建仓");
+    assert_eq!(market[0].side, OrderSide::Buy);
+    assert_eq!(
+        st.global_f64("balance_price"),
+        Some(100.0),
+        "初始建仓成交价应成为第一次平衡价"
+    );
+    // 挂单: 平衡价 ± atr_mult×ATR = 100 ± 2×2 = 96 / 104; 无仓可卖(真实持仓很少) -> 只有买单
+    let limits: Vec<_> = orders
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    assert!(!limits.is_empty(), "激活后应挂出网格单");
+    let buys: Vec<_> = limits.iter().filter(|o| o.side == OrderSide::Buy).collect();
+    let sells: Vec<_> = limits.iter().filter(|o| o.side == OrderSide::Sell).collect();
+    assert!(
+        !buys.is_empty() && !sells.is_empty(),
+        "两侧都应有挂单(挂单量由账本 50:50 决定): buys={} sells={}",
+        buys.len(),
+        sells.len()
+    );
+    let buy_px = limits[0].price.expect("限价单必须带价格");
+    assert_eq!(buy_px, dec!(96), "买单价位应为 平衡价 − 2×ATR = 96");
+}
+
+#[test]
+fn test_shannon_spot_grid_activate_without_initial_buy() {
+    let cfg = accum_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let bars = drop_main(60, 200, 100, 10);
+    let (orders, _ctx, st) = run_accum_full(cfg, &bars, Some(tf_bars(60)));
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "未设初始仓位 -> 无成交");
+    assert_eq!(
+        st.global_f64("balance_price"),
+        Some(100.0),
+        "未设初始仓位 -> 平衡价 := 激活时现价"
+    );
+    let limits: Vec<_> = orders
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    assert!(!limits.is_empty(), "未设初始仓位也应挂出买单");
+    assert_eq!(
+        limits[0].price.expect("限价单必须带价格"),
+        dec!(96),
+        "买单价位 = 平衡价 − 2×ATR"
+    );
+}
+
+#[test]
+fn test_shannon_spot_grid_state_snapshot_has_anchor_and_cap() {
+    let cfg = accum_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("initial_buy_amount", ConfigValue::Float(1000.0)),
+    ]);
+    let bars = drop_main(60, 200, 100, 10);
+    let (_orders, _ctx, st) = run_accum_full(cfg, &bars, Some(tf_bars(60)));
+    let snap = st.state_snapshot();
+    assert!(
+        snap.iter().any(|(k, _)| k == "balance_price"),
+        "状态快照应含平衡价(断点续接的最小必需项)"
+    );
+    assert!(
+        snap.iter().any(|(k, _)| k == "v_cap"),
+        "状态快照应含账本规模"
+    );
+}
+
+/// 030 门控: trend_gate=off(默认, 纯网格)在 BULL 状态下仍挂卖单。
+#[test]
+fn test_shannon_spot_grid_gate_off_still_sells_in_bull() {
+    let cfg = accum_cfg(&[
+        ("start_price", ConfigValue::Float(1000.0)),
+        // 主时钟 = 1h 且主序列与判据序列同一条: 判据需要 200+ 根 1h 可见 bar 才就绪
+        ("interval", ConfigValue::String("1h".into())),
+        ("regime_filter", ConfigValue::String("ema200".into())),
+        ("regime_interval", ConfigValue::String("1h".into())),
+        ("regime_ema_period", ConfigValue::Integer(200)),
+        ("trend_gate", ConfigValue::String("off".into())),
+        ("leverage_mult", ConfigValue::Float(2.0)),
+        // 必须有初始仓, 否则卖量被"持仓不足"限制为 0, 无法区分门控是否生效
+        ("initial_buy_amount", ConfigValue::Float(5000.0)),
+    ]);
+    // 1h: 横盘 10 根 -> 强势上行; 长度 910 > 判据 EMA200 预热(603 根), 末段 close 远高于 EMA200 = BULL
+    let bull = tf_bars_up(10, 900, 1);
+    let (orders, _ctx, st) = run_accum_full(cfg, &bull.clone(), Some(bull));
+    let buys = orders.iter().flatten().filter(|o| o.side == OrderSide::Buy).count();
+    let sells = orders
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.side == OrderSide::Sell)
+        .count();
+    assert!(buys > 0, "桩应产生订单(否则门控效果无法验证): buys={buys} ticks={}", orders.len());
+    assert!(sells > 0, "trend_gate=off 应为纯网格: BULL 下仍应挂卖单 (实际 {sells})");
+}
+
+/// 030 门控: trend_gate=on 在 BULL 状态暂停卖出(不得挂出卖单)。
+#[test]
+fn test_shannon_spot_grid_gate_on_blocks_sell_in_bull() {
+    let cfg = accum_cfg(&[
+        ("start_price", ConfigValue::Float(1000.0)),
+        ("interval", ConfigValue::String("1h".into())),
+        ("regime_filter", ConfigValue::String("ema200".into())),
+        ("regime_interval", ConfigValue::String("1h".into())),
+        ("regime_ema_period", ConfigValue::Integer(200)),
+        ("trend_gate", ConfigValue::String("on".into())),
+        ("leverage_mult", ConfigValue::Float(2.0)),
+        // 必须有初始仓, 否则卖量被"持仓不足"限制为 0, 无法区分门控是否生效
+        ("initial_buy_amount", ConfigValue::Float(5000.0)),
+    ]);
+    let bull = tf_bars_up(10, 900, 1);
+    let (orders, _ctx, _st) = run_accum_full(cfg, &bull.clone(), Some(bull));
+    let sells = orders
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.side == OrderSide::Sell)
+        .count();
+    assert_eq!(sells, 0, "trend_gate=on 时 BULL 下不应挂卖单 (实际 {sells})");
+}
+
+/// 030: `real_cash` 缺省时必须按**账户权益**(= --cash 本金)建账本, 而不是硬编码 1 万 ——
+/// 否则用户设 `--cash 20000` 却得到按 1 万算的虚拟账本(实战踩过的陷阱)。
+#[test]
+fn test_shannon_spot_grid_real_cash_defaults_to_equity() {
+    let cfg = accum_cfg(&[
+        ("start_price", ConfigValue::Float(1000.0)),
+        ("leverage_mult", ConfigValue::Float(2.0)),
+    ]);
+    // 测试本金 = 10000(见 run_accum_multi 的 Balance) -> 未设 real_cash 时 v_cap 应为 10000 × 2
+    let (_orders, _ctx, st) = run_accum_full(cfg, &uptrend_bars(), None);
+    assert_eq!(
+        st.global_f64("v_cap"),
+        Some(20000.0),
+        "未设 real_cash 时虚拟资金应为 账户权益 10000 × 杠杆 2 = 20000"
+    );
+}
+
+/// 030 收益分解: 建仓成交价/建仓量/投入本金必须被记录(否则停机分解会静默缺失)。
+#[test]
+fn test_shannon_spot_grid_records_entry_for_pnl_split() {
+    let cfg = accum_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("initial_buy_amount", ConfigValue::Float(1000.0)),
+    ]);
+    let (_orders, _ctx, st) = run_accum_full(cfg, &drop_main(60, 200, 100, 10), Some(tf_bars(60)));
+    assert_eq!(
+        st.global_f64("entry_price"),
+        Some(100.0),
+        "初始建仓成交价应被记录(收益分解的持仓成本基准)"
+    );
+    assert!(st.global_f64("entry_size").unwrap_or(0.0) > 0.0, "初始建仓量应被记录");
+    assert!(st.global_f64("invested0").unwrap_or(0.0) > 0.0, "投入本金应被记录");
 }

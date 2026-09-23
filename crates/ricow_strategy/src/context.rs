@@ -73,6 +73,12 @@ pub trait Context: Send {
     fn close_tf(&self, _pair: &str) -> Option<f64> {
         None
     }
+    /// 高周期 EMA, **序列周期由调用参数指定**(2026-09-22, 030): 与 `ema_tf` 同一缓存,
+    /// 但 tf 不再绑定 `regime_interval` —— 供策略在**信号序列**(如 `1h`)上取任意周期 EMA
+    /// (如 EMA3/EMA5 交叉判据)。按桶缓存 + 无前视; 未预装 / 可见桶不足 → None。默认无通道。
+    fn ema_tf_on(&self, _pair: &str, _tf: &str, _period: usize) -> Option<f64> {
+        None
+    }
     /// 预装高周期 K 线 (第二序列)。`tf` = 周期标签(如 `"1h"`); 装配层须先用
     /// [`crate::resample_complete`] 剔除不完整/缺口桶再装入。同一 `pair` 可装多套
     /// (如 4h ATR + 日线趋势判据), 键 = `pair|tf`。默认 no-op。
@@ -533,6 +539,12 @@ impl Context for LiveContext {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
         self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.close(now_ms)
+    }
+
+    /// 高周期 EMA(指定序列, 030): 信号序列(如 1h)上的 EMA 快慢线交叉判据用。
+    fn ema_tf_on(&self, pair: &str, tf: &str, period: usize) -> Option<f64> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.tf_cache.read().ok()?.get(&tf_key(pair, tf))?.ema(period, now_ms)
     }
 
     fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
@@ -1012,6 +1024,12 @@ impl Context for DryRunContext {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
         self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.close(now_ms)
+    }
+
+    /// 高周期 EMA(指定序列, 030): 信号序列(如 1h)上的 EMA 快慢线交叉判据用。
+    fn ema_tf_on(&self, pair: &str, tf: &str, period: usize) -> Option<f64> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.tf_cache.read().ok()?.get(&tf_key(pair, tf))?.ema(period, now_ms)
     }
 
     fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {

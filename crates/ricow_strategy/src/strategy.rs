@@ -23,6 +23,15 @@ pub trait Strategy: Send + Sync {
     /// 是否实现了停机清理 (`on_stop`)。
     ///
     /// 引擎据此决定是"已执行清理"还是"提示用户手工处理"; 默认 false (无清理)。
+    /// 策略状态快照 (030 断点续接): 引擎在成交后 / 停机时取走并落库, 重启时经
+    /// [`Strategy::state_restore`] 原样注回。默认空 —— 无状态策略无需实现。
+    fn state_snapshot(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// 注入上次会话保存的状态 (030): 引擎在 `on_init` **之前**调用。默认 no-op。
+    fn state_restore(&mut self, _items: Vec<(String, String)>) {}
+
     fn has_on_stop(&self) -> bool {
         false
     }

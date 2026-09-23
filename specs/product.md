@@ -66,6 +66,7 @@
 ### 内置参考实现(1 策略样板 + 1 执行组件库, 随版本发布)
 
 - **策略样板**: `strategies/builtin/shannon_rebalance.lua` — 香农动态网格(实时计算 + 主动成交 + 自适应波动), 唯一完整策略参考
+- **现货网格策略**: `strategies/builtin/shannon_spot_grid.lua` — 香农现货网格(虚拟账本 = 本金 × 杠杆 1~5 决定目标持币量; 价格低于 `start_price` 才激活, 可在激活时市价买入初始仓; 平衡价上下 `atr_mult×ATR` 各挂一张限价单, 任一成交即以该成交价为新平衡价并立即重挂两侧; 卖量受真实持仓兜底(有多少挂多少); 趋势门控可选 `trend_gate`(默认关: 开时上涨趋势暂停卖出); 成本门槛硬校验(R7) + `strategy_state` 断点续接; **仓位清空即结束**; 适合震荡市, **不适合单边急涨(会跑输同敞口持有)与单边下跌**)
 - **执行组件库**: exec — 用户 Lua 策略可直接调用的执行函数(引擎内置 Rust 实现, 加载时注册为全局 `exec` 表, 无需 require, 脚本内可覆盖): `exec.levels`(阶梯档位) / `exec.pullback_triggered`(回调触发) / `exec.ticks_per` + `exec.slice_due`(分批节奏) / `exec.detect_quote`(报价资产) / `exec.side_order`(对手价订单)
 - **执行模式示例**: `strategies/builtin/executors/{dca,twap,vwap,pullback,ladder}.lua` — 上述组件的独立可运行薄壳(CLI 直跑/旧 TOML 兼容), 复制即自定义
 

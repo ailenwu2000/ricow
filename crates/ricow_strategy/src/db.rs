@@ -151,6 +151,20 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // 策略状态持久化 (030): Lua 策略经 `ctx:state_set/state_get` 读写的键值对 ——
+        // 支撑"关机/中止不清仓、重启后继续跑"。引擎只负责存取, 不解释语义。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS strategy_state (
+                strategy_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (strategy_id, key)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // 美股日线缓存 (Nasdaq 信号数据源, 与币安 klines 表隔离 — 005-market-filter)。
         // pair = 美股代码 (TSLA/SPY), interval 恒 '1d'; 主键含 ticker 防跨市场污染。
         sqlx::query(
@@ -459,6 +473,41 @@ impl Database {
     // ---- 成交 ----
 
     /// 记录一笔成交。
+    /// 读某策略的全部持久化状态 (030 断点续接): 空 = 首次运行。
+    pub async fn strategy_state_all(
+        &self,
+        strategy_id: &str,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM strategy_state WHERE strategy_id = ?")
+                .bind(strategy_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
+    /// 写一条策略状态 (UPSERT; 同一 (策略, 键) 覆盖)。
+    pub async fn strategy_state_set(
+        &self,
+        strategy_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO strategy_state (strategy_id, key, value, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(strategy_id, key) DO UPDATE SET value = excluded.value,
+                                                         updated_at = excluded.updated_at",
+        )
+        .bind(strategy_id)
+        .bind(key)
+        .bind(value)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn insert_fill(
         &self,
         strategy_id: &str,

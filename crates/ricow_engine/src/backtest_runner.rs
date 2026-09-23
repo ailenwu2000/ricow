@@ -26,7 +26,7 @@ pub fn run_backtest(
     // 不进 tick 循环与报告。
     let tf_pair = config.get_str("pair").map(str::to_string);
     let mut tf_labels: Vec<String> = Vec::new();
-    for key in ["atr_interval", "regime_interval"] {
+    for key in ["atr_interval", "regime_interval", "ema_interval"] {
         if let Some(tf) = config.get_str(key) {
             if !tf_labels.iter().any(|t| t == tf) {
                 tf_labels.push(tf.to_string());
