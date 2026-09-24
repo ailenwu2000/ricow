@@ -215,12 +215,12 @@ impl UserData for LuaCtxData {
             tracing::info!(target: "lua_strategy", "{msg}");
             Ok(())
         });
-        // 已收盘 K 线历史 (无前视): 返回 {open=, close=} 表数组。单标的路径最多最近
-        // 100 根 (行为边界, 回归约束); 组合信号模式 (full_klines) 返回全段 — 引擎已按
-        // 执行日截断, ≥253 根供长窗打分 (bs_momentum Lua 化 T3)。
+        // 已收盘 K 线历史 (无前视): 返回 {open=, close=} 表数组, 长度 = 缓存长度。
+        // 注: 单标的路径此前被硬裁到"最近 100 根", 该限制无设计依据(2026-09-24 用户确认
+        // 从未提出过), 已撤销 —— 策略需要多长历史应由策略决定, 引擎不应暗中截断。
         methods.add_method("klines", |lua, data, pair: String| {
             let k = data.klines(&pair).unwrap_or_default();
-            let start = if data.full_klines { 0 } else { k.len().saturating_sub(100) };
+            let start = 0usize;
             let t = lua.create_table()?;
             for (i, kline) in k.iter().skip(start).enumerate() {
                 let row = lua.create_table()?;
@@ -1410,7 +1410,7 @@ mod tests {
 
     /// T3 回归: 无 universe (单标的路径) → 脚本 ctx:klines 仍 ≤100 根 (行为边界)。
     #[test]
-    fn test_single_klines_still_capped_at_100() {
+    fn test_single_klines_returns_all_closed_bars() {
         let script = r#"
             n = -1
             function on_tick(ctx)
@@ -1441,7 +1441,10 @@ mod tests {
         }
         let _ = strategy.on_tick(&mut ctx);
         let n: i64 = strategy.lua.globals().get("n").expect("n 已置位");
-        assert_eq!(n, 100, "单标的 klines 仍 cap 100, got {n}");
+        // 2026-09-24: "单标的 klines cap 100" 无设计依据(用户确认从未提出过, 属实现侧
+        // 自行添加并自测锁定的约束), 已撤销 -> ctx:klines 返回全部已收盘序列。
+        // 返回全部**已收盘** bar(喂入 250 根, 最后一根尚未收盘 -> 249)。
+        assert_eq!(n, 249, "单标的 klines 应返回全部已收盘序列, got {n}");
     }
 
     /// FR-005 (024): 净仓归零后, 策略侧 `ctx:position_side` 必须报 `none` (size<=0 契约)。

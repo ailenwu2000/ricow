@@ -600,6 +600,48 @@ impl Engine {
         let mode = RunMode::DryRun;
 
         let mut ctx = DryRunContext::new(exchange.clone(), config.clone(), initial_balance);
+        // 030: 为实盘/demo **预装 K 线历史** —— 此前实盘路径的 klines_cache 无人填充,
+        // 于是 ctx:klines 恒空、策略在第一个守卫就 return(2026-09-24 demo 实测定位)。
+        // 主时钟用策略 `interval`; 策略声明的高周期(atr/regime)单独预取并重采样为"完整桶"。
+        {
+            let main_tf = config.get_str("interval").unwrap_or("1h");
+            match exchange.get_klines(&pair, &main_tf, 1000).await {
+                Ok(bars) if !bars.is_empty() => {
+                    tracing::info!(target: "engine", tf = %main_tf, n = bars.len(), "预装主时钟 K 线历史");
+                    // 主时钟序列**同时**装入高周期缓存: 策略的 atr_interval/regime_interval 常与
+                    // 主时钟同周期, 不装则 atr_tf/close_tf/ema_tf 仍返回 nil(demo 复测发现)。
+                    let tf_ms = ricow_strategy::tf_ms_of(&main_tf).unwrap_or(3_600_000) as i64;
+                    let complete = ricow_strategy::resample_complete(&bars, tf_ms);
+                    ctx.set_tf_klines(&pair, &main_tf, complete);
+                    ctx.update_klines(&pair, bars);
+                }
+                Ok(_) => tracing::warn!(target: "engine", tf = %main_tf, "主时钟 K 线历史为空"),
+                Err(e) => tracing::warn!(target: "engine", tf = %main_tf, "取主时钟 K 线失败: {e}"),
+            }
+            for key in ["atr_interval", "regime_interval"] {
+                let Some(tf) = config.get_str(key) else { continue };
+                if tf == main_tf {
+                    continue;
+                }
+                let need: u32 = if key == "regime_interval" {
+                    let period = config.get_f64("regime_ema_period").unwrap_or(200.0);
+                    ((3.0 * (period + 1.0)) as u32).clamp(600, 1000)
+                } else {
+                    300
+                };
+                match exchange.get_klines(&pair, &tf, need).await {
+                    Ok(bars) if !bars.is_empty() => {
+                        let tf_ms = ricow_strategy::tf_ms_of(&tf).unwrap_or(3_600_000) as i64;
+                        let complete = ricow_strategy::resample_complete(&bars, tf_ms);
+                        tracing::info!(target: "engine", tf = %tf, n = complete.len(), "预装高周期 K 线历史");
+                        ctx.set_tf_klines(&pair, &tf, complete);
+                    }
+                    Ok(_) => tracing::warn!(target: "engine", tf = %tf, "高周期 K 线历史为空"),
+                    Err(e) => tracing::warn!(target: "engine", tf = %tf, "取高周期 K 线失败: {e}"),
+                }
+            }
+        }
+
         let mut strategy = load_strategy(&config)?;
         // 030 断点续接: 把上次会话保存的策略状态注回 (无记录 = 首次运行)。
         if let Some(db) = db {
@@ -646,6 +688,11 @@ impl Engine {
             let ob = market::to_orderbook(update);
             ctx.update_orderbook(&pair, ob);
             outcome.ticks += 1;
+
+            // 030: 用最新价刷新"当前未收盘"K 线 —— 这是实盘侧 ctx:klines 从空到有的来源。
+            if let Some(px) = ctx.price(&pair) {
+                ctx.tick_kline(&pair, px, chrono::Utc::now().timestamp_millis());
+            }
 
             let orders = strategy.on_tick(&mut ctx);
             for req in orders {
@@ -816,6 +863,48 @@ impl Engine {
 
         let rt = tokio::runtime::Handle::current();
         let mut ctx = LiveContext::new(exchange.clone(), config.clone(), rt);
+        // 030: 为实盘/demo **预装 K 线历史** —— 此前实盘路径的 klines_cache 无人填充,
+        // 于是 ctx:klines 恒空、策略在第一个守卫就 return(2026-09-24 demo 实测定位)。
+        // 主时钟用策略 `interval`; 策略声明的高周期(atr/regime)单独预取并重采样为"完整桶"。
+        {
+            let main_tf = config.get_str("interval").unwrap_or("1h");
+            match exchange.get_klines(&pair, &main_tf, 1000).await {
+                Ok(bars) if !bars.is_empty() => {
+                    tracing::info!(target: "engine", tf = %main_tf, n = bars.len(), "预装主时钟 K 线历史");
+                    // 主时钟序列**同时**装入高周期缓存: 策略的 atr_interval/regime_interval 常与
+                    // 主时钟同周期, 不装则 atr_tf/close_tf/ema_tf 仍返回 nil(demo 复测发现)。
+                    let tf_ms = ricow_strategy::tf_ms_of(&main_tf).unwrap_or(3_600_000) as i64;
+                    let complete = ricow_strategy::resample_complete(&bars, tf_ms);
+                    ctx.set_tf_klines(&pair, &main_tf, complete);
+                    ctx.update_klines(&pair, bars);
+                }
+                Ok(_) => tracing::warn!(target: "engine", tf = %main_tf, "主时钟 K 线历史为空"),
+                Err(e) => tracing::warn!(target: "engine", tf = %main_tf, "取主时钟 K 线失败: {e}"),
+            }
+            for key in ["atr_interval", "regime_interval"] {
+                let Some(tf) = config.get_str(key) else { continue };
+                if tf == main_tf {
+                    continue;
+                }
+                let need: u32 = if key == "regime_interval" {
+                    let period = config.get_f64("regime_ema_period").unwrap_or(200.0);
+                    ((3.0 * (period + 1.0)) as u32).clamp(600, 1000)
+                } else {
+                    300
+                };
+                match exchange.get_klines(&pair, &tf, need).await {
+                    Ok(bars) if !bars.is_empty() => {
+                        let tf_ms = ricow_strategy::tf_ms_of(&tf).unwrap_or(3_600_000) as i64;
+                        let complete = ricow_strategy::resample_complete(&bars, tf_ms);
+                        tracing::info!(target: "engine", tf = %tf, n = complete.len(), "预装高周期 K 线历史");
+                        ctx.set_tf_klines(&pair, &tf, complete);
+                    }
+                    Ok(_) => tracing::warn!(target: "engine", tf = %tf, "高周期 K 线历史为空"),
+                    Err(e) => tracing::warn!(target: "engine", tf = %tf, "取高周期 K 线失败: {e}"),
+                }
+            }
+        }
+
         ctx.set_markets(&markets);
         let prefix = ctx.order_prefix().to_string();
 
@@ -1005,6 +1094,11 @@ impl Engine {
                     let ob = market::to_orderbook(update);
                     ctx.update_orderbook(&pair, ob);
                     outcome.ticks += 1;
+                    // 030: 用最新价刷新"当前未收盘"K 线 —— 这是实盘侧 ctx:klines 从空到有的来源。
+                    if let Some(px) = ctx.price(&pair) {
+                        ctx.tick_kline(&pair, px, chrono::Utc::now().timestamp_millis());
+                    }
+
                     let orders = strategy.on_tick(&mut ctx);
                     let mut any_filled = false;
                     for req in orders {
@@ -1104,6 +1198,20 @@ impl Engine {
                                 fee: fill.fee,
                             });
                         }
+                        // 审计 #4: 策略在成交回调里判断"是否已清仓", 而持仓刷新原本在本行之后,
+                        // 回调读到的是**成交前**的旧仓位(清仓那笔判不出 -> finished 永不置位)。
+                        // 回调前先刷一次, 使"策略看到的持仓"与本次成交口径一致; 失败不阻塞回调。
+                        let _ = refresh_positions(
+                            &exchange,
+                            &market,
+                            &pair,
+                            &ctx,
+                            is_futures,
+                            &strategy_name,
+                            liq_warn_threshold,
+                            notifier.as_ref(),
+                        )
+                        .await;
                         strategy.on_fill(&mut ctx, fill);
                 // 030 断点续接: 成交后立即持久化策略状态(关机/中止后重启可继续)。
                 if let Some(db) = db {

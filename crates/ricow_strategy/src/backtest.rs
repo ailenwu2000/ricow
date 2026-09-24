@@ -131,6 +131,9 @@ pub const SIGNAL_TAIL: usize = 400;
 /// 次 tick = 10^9 级拷贝, 1m 回测根本跑不动。冻结为 100 根同时把"指标输入上限 =
 /// 100 根"固定成契约 (写入 specs/lua-api.md); 需要更长窗口的指标不走主序列。
 /// 组合信号模式 (full_klines) 不受影响, 仍用 SIGNAL_TAIL = 400。
+// 注: ctx:klines 不再截断 —— 023 引入的 100 根尾窗无设计依据(2026-09-24 用户确认从未
+// 提出), 已撤销, 回测与实盘路径行为一致。常量仅保留以标记该历史行为。
+#[allow(dead_code)]
 const KLINES_TAIL: usize = 100;
 
 /// 该 bar 覆盖时段 `[open, close)` 内的 8h 资金费结算点个数 (UTC 00/08/16)。
@@ -423,8 +426,9 @@ impl BacktestContext {
             );
         }
         if self.portfolio_klines.is_empty() {
-            // 尾窗 (023): 只克隆最近 KLINES_TAIL 根 —— 策略与指标的输入上限即此值。
-            let start = self.closed_klines.len().saturating_sub(KLINES_TAIL);
+            // ctx:klines 返回全部已收盘序列(此前按 023 的 KLINES_TAIL 尾窗截断, 无设计依据,
+            // 2026-09-24 撤销): 策略需要多长历史由策略决定, 引擎不暗中截断。
+            let start = 0usize;
             Some(self.closed_klines[start..].to_vec())
         } else {
             self.portfolio_klines

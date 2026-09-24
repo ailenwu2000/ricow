@@ -83,6 +83,13 @@ pub trait Context: Send {
     /// [`crate::resample_complete`] 剔除不完整/缺口桶再装入。同一 `pair` 可装多套
     /// (如 4h ATR + 日线趋势判据), 键 = `pair|tf`。默认 no-op。
     fn set_tf_klines(&mut self, _pair: &str, _tf: &str, _bars: Vec<Kline>) {}
+
+    /// 用一笔最新价更新**当前未收盘**主时钟 K 线(实盘/demo 专用)。
+    ///
+    /// 实盘没有回测那样"逐根推进"的 bar 流, 因此由引擎在每次 tick 时用最新价刷新最后一根:
+    /// high/low/close 随价格更新; 跨桶(新的主时钟 K 线开盘)时自动追加新 bar 并裁剪窗口长度。
+    /// 默认 no-op —— 回测上下文由 `step_bar` 推进, 不需要它。
+    fn tick_kline(&self, _pair: &str, _price: Decimal, _now_ms: i64) {}
 }
 
 // ---- LiveContext ----
@@ -546,6 +553,72 @@ impl Context for LiveContext {
         let now_ms = chrono::Utc::now().timestamp_millis();
         self.tf_cache.read().ok()?.get(&tf_key(pair, tf))?.ema(period, now_ms)
     }
+
+    /// 实盘/demo: 用最新价维护"当前未收盘"主时钟 K 线(周期 = 策略 `interval`)。
+    /// 这是实盘侧 `ctx:klines` 能从空到有的关键 —— 此前实盘上下文的 klines_cache 无人填充,
+    /// 导致策略在第一个守卫(K 线)就 return, 永不动作(2026-09-24 demo 实测定位)。
+    fn tick_kline(&self, pair: &str, price: Decimal, now_ms: i64) {
+        // interval 缺省 1h: 否则省略该参数的实盘 TOML 会让 tick_kline 变成 no-op,
+        // 主时钟 K 线永不推进 -> 每个进程只决策一次(2026-09-24 审计 #7)。
+        let tf = self.config.get_str("interval").unwrap_or("1h").to_string();
+        let Some(step) = crate::tf_ms_of(&tf) else {
+            return;
+        };
+        let bucket_ms = now_ms / step * step;
+        let mut opened_new_bar = false;
+        {
+        let Ok(mut cache) = self.klines_cache.write() else {
+            return;
+        };
+        let v = cache.entry(pair.to_string()).or_default();
+        let cur = v.last().map(|k| k.open_time.timestamp_millis());
+        match cur {
+            // 同一根未收盘 bar: 更新 high/low/close
+            Some(b) if b == bucket_ms => {
+                if let Some(last) = v.last_mut() {
+                    if price > last.high {
+                        last.high = price;
+                    }
+                    if price < last.low {
+                        last.low = price;
+                    }
+                    last.close = price;
+                }
+            }
+            // 乱序/过期的 tick: 忽略
+            Some(b) if b > bucket_ms => {}
+            // 跨桶: 开新 bar(open = 该 tick 的价格), 并裁剪窗口
+            _ => {
+                let open_time = chrono::DateTime::from_timestamp_millis(bucket_ms)
+                    .unwrap_or_else(chrono::Utc::now);
+                let close_time = chrono::DateTime::from_timestamp_millis(bucket_ms + step - 1)
+                    .unwrap_or_else(chrono::Utc::now);
+                v.push(Kline {
+                    open_time,
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: Decimal::ZERO,
+                    close_time,
+                });
+                let max_keep = 1500usize;
+                if v.len() > max_keep {
+                    let drop_n = v.len() - max_keep;
+                    v.drain(0..drop_n);
+                }
+                opened_new_bar = true;
+            }
+        }
+        }
+        // 跨桶 = 上一根主时钟 K 线已收盘 -> 重采样刷新高周期缓存。
+        // 不刷新的话 atr_tf / close_tf / ema_tf 会一直用启动时那份序列(长跑后失真)。
+        // 必须在**释放 klines_cache 写锁之后**调用, 否则与本函数的读锁互等(死锁)。
+        if opened_new_bar {
+            self.refresh_tf_cache(pair, &tf);
+        }
+    }
+
 
     fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
         let Some(tf_ms) = crate::multiframe::tf_ms_of(tf) else {
@@ -1032,6 +1105,72 @@ impl Context for DryRunContext {
         self.tf_cache.read().ok()?.get(&tf_key(pair, tf))?.ema(period, now_ms)
     }
 
+    /// 实盘/demo: 用最新价维护"当前未收盘"主时钟 K 线(周期 = 策略 `interval`)。
+    /// 这是实盘侧 `ctx:klines` 能从空到有的关键 —— 此前实盘上下文的 klines_cache 无人填充,
+    /// 导致策略在第一个守卫(K 线)就 return, 永不动作(2026-09-24 demo 实测定位)。
+    fn tick_kline(&self, pair: &str, price: Decimal, now_ms: i64) {
+        // interval 缺省 1h: 否则省略该参数的实盘 TOML 会让 tick_kline 变成 no-op,
+        // 主时钟 K 线永不推进 -> 每个进程只决策一次(2026-09-24 审计 #7)。
+        let tf = self.config.get_str("interval").unwrap_or("1h").to_string();
+        let Some(step) = crate::tf_ms_of(&tf) else {
+            return;
+        };
+        let bucket_ms = now_ms / step * step;
+        let mut opened_new_bar = false;
+        {
+        let Ok(mut cache) = self.klines_cache.write() else {
+            return;
+        };
+        let v = cache.entry(pair.to_string()).or_default();
+        let cur = v.last().map(|k| k.open_time.timestamp_millis());
+        match cur {
+            // 同一根未收盘 bar: 更新 high/low/close
+            Some(b) if b == bucket_ms => {
+                if let Some(last) = v.last_mut() {
+                    if price > last.high {
+                        last.high = price;
+                    }
+                    if price < last.low {
+                        last.low = price;
+                    }
+                    last.close = price;
+                }
+            }
+            // 乱序/过期的 tick: 忽略
+            Some(b) if b > bucket_ms => {}
+            // 跨桶: 开新 bar(open = 该 tick 的价格), 并裁剪窗口
+            _ => {
+                let open_time = chrono::DateTime::from_timestamp_millis(bucket_ms)
+                    .unwrap_or_else(chrono::Utc::now);
+                let close_time = chrono::DateTime::from_timestamp_millis(bucket_ms + step - 1)
+                    .unwrap_or_else(chrono::Utc::now);
+                v.push(Kline {
+                    open_time,
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: Decimal::ZERO,
+                    close_time,
+                });
+                let max_keep = 1500usize;
+                if v.len() > max_keep {
+                    let drop_n = v.len() - max_keep;
+                    v.drain(0..drop_n);
+                }
+                opened_new_bar = true;
+            }
+        }
+        }
+        // 跨桶 = 上一根主时钟 K 线已收盘 -> 重采样刷新高周期缓存。
+        // 不刷新的话 atr_tf / close_tf / ema_tf 会一直用启动时那份序列(长跑后失真)。
+        // 必须在**释放 klines_cache 写锁之后**调用, 否则与本函数的读锁互等(死锁)。
+        if opened_new_bar {
+            self.refresh_tf_cache(pair, &tf);
+        }
+    }
+
+
     fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
         let Some(tf_ms) = crate::multiframe::tf_ms_of(tf) else {
             tracing::warn!(target: "multiframe", tf, "未知高周期标签, 忽略预装");
@@ -1212,6 +1351,78 @@ mod tests {
             apply_fill_to_net_position(&mut p, OrderSide::Buy, dec!(0.27), dec!(2500));
             assert_eq!(p.side, OrderSide::Buy);
             assert_eq!(p.size, dec!(0.27));
+        }
+    }
+}
+
+impl LiveContext {
+    /// 用主时钟 K 线刷新高周期缓存(策略声明的 atr_interval / regime_interval, 含主时钟自身)。
+    fn refresh_tf_cache(&self, pair: &str, main_tf: &str) {
+        let bars = {
+            let Ok(kc) = self.klines_cache.read() else {
+                return;
+            };
+            match kc.get(pair) {
+                Some(b) => b.clone(),
+                None => return,
+            }
+        };
+        if bars.is_empty() {
+            return;
+        }
+        let mut targets: Vec<String> = vec![main_tf.to_string()];
+        // 覆盖全部高周期: atr_interval(ATR) / regime_interval(判据) / ema_interval(EMA 通道)。
+        // 漏掉任一个, 该序列长跑后就会停在启动那一刻(2026-09-24 审计 #8)。
+        for key in ["atr_interval", "regime_interval", "ema_interval"] {
+            if let Some(tf) = self.config.get_str(key) {
+                if !targets.iter().any(|t| t.as_str() == tf) {
+                    targets.push(tf.to_string());
+                }
+            }
+        }
+        if let Ok(mut tfc) = self.tf_cache.write() {
+            for tf in targets {
+                let Some(tf_ms) = crate::multiframe::tf_ms_of(&tf) else {
+                    continue;
+                };
+                tfc.insert(tf_key(pair, &tf), TfCache::new(tf_ms, bars.clone()));
+            }
+        }
+    }
+}
+
+impl DryRunContext {
+    /// 用主时钟 K 线刷新高周期缓存(策略声明的 atr_interval / regime_interval, 含主时钟自身)。
+    fn refresh_tf_cache(&self, pair: &str, main_tf: &str) {
+        let bars = {
+            let Ok(kc) = self.klines_cache.read() else {
+                return;
+            };
+            match kc.get(pair) {
+                Some(b) => b.clone(),
+                None => return,
+            }
+        };
+        if bars.is_empty() {
+            return;
+        }
+        let mut targets: Vec<String> = vec![main_tf.to_string()];
+        // 覆盖全部高周期: atr_interval(ATR) / regime_interval(判据) / ema_interval(EMA 通道)。
+        // 漏掉任一个, 该序列长跑后就会停在启动那一刻(2026-09-24 审计 #8)。
+        for key in ["atr_interval", "regime_interval", "ema_interval"] {
+            if let Some(tf) = self.config.get_str(key) {
+                if !targets.iter().any(|t| t.as_str() == tf) {
+                    targets.push(tf.to_string());
+                }
+            }
+        }
+        if let Ok(mut tfc) = self.tf_cache.write() {
+            for tf in targets {
+                let Some(tf_ms) = crate::multiframe::tf_ms_of(&tf) else {
+                    continue;
+                };
+                tfc.insert(tf_key(pair, &tf), TfCache::new(tf_ms, bars.clone()));
+            }
         }
     }
 }

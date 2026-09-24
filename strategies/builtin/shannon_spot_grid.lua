@@ -91,9 +91,8 @@ built = false
 balance_price = nil
 last_side = nil
 last_bar_ts = nil
-prev_fast = nil
-prev_slow = nil
 finished = false        -- 实际仓位清空 -> 策略结束(用户 2026-09-23)
+tick_diag = 0            -- 诊断: on_tick 调用计数(定位"实时下卡在哪一步")
 halted = false          -- R7 成本门槛不满足 -> 停机(不再下单)
 cost_checked = false    -- R7 只做一次启动校验(030: 不再每 tick 复查)
 -- 网格挂单(030-A)
@@ -218,6 +217,16 @@ local function virtual_cap(ctx)
     return r * mult
 end
 
+-- 本金基准(虚拟账本的分母): real_cash 显式给定时用它, 否则 = 激活时刻的账户权益。
+-- 单独抽出来是为了让 init 日志显示**实际生效值**, 而不是参数缺省值。
+local function cash_basis(ctx)
+    local r = num(ctx, "real_cash", 0)
+    if r > 0 then
+        return r
+    end
+    return ctx:equity() or 0
+end
+
 -- 恒定杠杆: 每 tick 把账本按"名义规模变化"等比缩放(保持币/现金权重, 等价于账本继续持有,
 -- 绝对值(沙箱不含 math 库, 手写)
 local function fabs(x)
@@ -303,6 +312,12 @@ function save_state(ctx)
     ctx:state_set("entry_price", string.format("%.10f", entry_price))
     ctx:state_set("entry_size", string.format("%.10f", entry_size))
     ctx:state_set("invested0", string.format("%.2f", invested0))
+    -- 终态必须持久化: 否则重启后 R7 停机的策略会复活(成本门槛被绕过),
+    -- 清仓结束的策略也会被重新激活(2026-09-24 审计, 与 need_rehang 同类缺陷)。
+    ctx:state_set("halted", halted and "1" or "0")
+    ctx:state_set("finished", finished and "1" or "0")
+    -- 建仓市价单**在途**标记: 不持久化的话, 在市价单成交前重启会再买一次(双倍初始仓, 审计 #6)。
+    ctx:state_set("pending_entry", pending_entry and "1" or "0")
 end
 
 function on_init(ctx)
@@ -310,8 +325,6 @@ function on_init(ctx)
     quote_asset = exec.detect_quote(pair)
     balance_price = nil
     last_bar_ts = nil
-    prev_fast = nil
-    prev_slow = nil
     regime_state = "?"
     halted = false
     v_cap = virtual_cap(ctx)
@@ -323,9 +336,22 @@ function on_init(ctx)
         v_coin = tonumber(ctx:state_get("v_coin")) or 0
         v_cash = tonumber(ctx:state_get("v_cash")) or 0
         v_cap = tonumber(ctx:state_get("v_cap")) or v_cap
+        -- 重启后必须**重新挂单**: 停机时引擎做了撤单兜底, 交易所侧已无本策略挂单,
+        -- 而 need_rehang 不持久化(默认 false)会导致续接后永不挂单(2026-09-24 demo 实测)。
+        need_rehang = true
         entry_price = tonumber(ctx:state_get("entry_price")) or 0
         entry_size = tonumber(ctx:state_get("entry_size")) or 0
         invested0 = tonumber(ctx:state_get("invested0")) or 0
+        -- 终态恢复(必须在 halted=false 复位之后执行, 否则会被覆盖):
+        -- 上次已 R7 停机 / 已清仓结束 -> 本次续接不再交易。
+        -- 建仓单在途: 恢复该标记, 避免重启后再买一次(审计 #6)。
+        pending_entry = (ctx:state_get("pending_entry") == "1")
+        halted = (ctx:state_get("halted") == "1")
+        finished = (ctx:state_get("finished") == "1")
+        if halted or finished then
+            ctx:log("[shannon_spot_grid] 续接: 上次已停机(halted=" .. tostring(halted) ..
+                    ", finished=" .. tostring(finished) .. ") -> 本次不再交易")
+        end
             ctx:log(string.format(
             "[shannon_spot_grid] R8 续接上次状态: 平衡价 %.4f, 账本(币 %.6f 现金 %.2f 规模 %.0f)",
             balance_price, v_coin, v_cash, v_cap))
@@ -339,11 +365,11 @@ function on_init(ctx)
     end
     ctx:log(string.format(
         "[shannon_spot_grid] init pair=%s quote=%s 杠杆=%.1f(钳制 1~5) 基准=%s 虚拟资金=%.0f " ..
-        "(real_cash=%.0f) target=%.2f atr=%s×%d mult=%.2f fee_side=%.4f",
-        pair, quote_asset, lev, leverage_basis(ctx), v_cap, num(ctx, "real_cash", 10000),
+        "(本金基准=%.0f) target=%.2f atr=%s×%d mult=%.2f min_notional=%.2f fee_side=%.4f trend_gate=%s",
+        pair, quote_asset, lev, leverage_basis(ctx), v_cap, cash_basis(ctx),
         target_ratio_of(ctx), cfg_str(ctx, "atr_interval", "1h"), num(ctx, "atr_period", 14),
         num(ctx, "atr_mult", 2), num(ctx, "min_notional", 5), num(ctx, "fee_side", 0.001),
-        cfg_str(ctx, "trend_gate", "on")))
+        cfg_str(ctx, "trend_gate", "off")))
 
     local init_amt = num(ctx, "initial_buy_amount", 0)
     if init_amt > 0 then
@@ -358,7 +384,7 @@ function on_init(ctx)
     if cfg_str(ctx, "regime_filter", "ema200") == "ema200" then
         ctx:log(string.format(
             "[shannon_spot_grid] 趋势判据(1h EMA200): ema200 interval=%s ema=%d band=%.3f " ..
-            "(BULL 只买不卖 / BEAR 只卖不买 / RANGE 两侧正常; 判据未就绪不下单)",
+            "(BULL 拦卖 / BEAR 拦买 / RANGE 两侧正常; 受 trend_gate 开关控制, 默认 off; 判据未就绪不下单)",
             cfg_str(ctx, "regime_interval", "1h"), num(ctx, "regime_ema_period", 200),
             num(ctx, "regime_band_pct", 0.03)))
     else
@@ -370,6 +396,20 @@ function on_tick(ctx)
     if finished then
         return {}
     end
+    -- 诊断打点(每 20 次调用一行): 实时下定位"卡在哪一步"。
+    -- 必须放在最前面 —— 后面的守卫会提前 return 且不计数, 静默失联时看不到任何线索。
+    do
+        local p0 = ctx:config_str("pair")
+        local kk0 = ctx:klines(p0)
+        local n0 = (kk0 and #kk0) or 0
+        tick_diag = tick_diag + 1
+        if tick_diag == 1 or tick_diag % 20 == 0 then
+            ctx:log(string.format(
+                "[shannon_spot_grid] diag #%d klines=%d ts=%s price=%s atr=%s built=%s 持仓=%.6f",
+                tick_diag, n0, tostring(n0 > 0 and kk0[n0].ts or nil), tostring(ctx:price(p0)),
+                tostring(ctx:atr_tf(p0)), tostring(built), ctx:position_size(p0) or 0))
+        end
+    end
     local pair = ctx:config_str("pair")
     local atr_mult = num(ctx, "atr_mult", 2)
     local min_notional = num(ctx, "min_notional", 5)
@@ -378,6 +418,8 @@ function on_tick(ctx)
     local fee_bps = fee_side * 10000
     -- 趋势判据(1h EMA200): ema200(默认开) / off(关闭)
     local regime_filter = cfg_str(ctx, "regime_filter", "ema200")
+    -- 门控开关(trend_gate=on|off, 默认 off): 决定"判据未就绪"是否要拦交易。
+    local trend_gate_on = (cfg_str(ctx, "trend_gate", "off") == "on")
 
     -- ── 1. 决策节流: 只在主时钟收线时决策一次(主时钟 = 网格周期)。
     local k = ctx:klines(pair)
@@ -385,16 +427,14 @@ function on_tick(ctx)
     if k and #k > 0 then
         ts = k[#k].ts
     end
-    local new_bar = false
-    if ts ~= nil then
-        new_bar = (ts ~= last_bar_ts)
-        if not new_bar then
-            return {}
-        end
-        last_bar_ts = ts
-    else
+    if ts == nil then
         return {}
     end
+    if ts == last_bar_ts then
+        return {}
+    end
+    -- 注意: 节流标记(last_bar_ts = ts)必须在**所有守卫之后**才设 —— 否则某个 tick 恰好取不到价格时,
+    -- 会把这根 K 线的决策机会白白消耗掉(2026-09-24 DryRun 实测: 整根 15m 空转)。
 
     local price = ctx:price(pair)
     -- 停机日志需要: 末次价格 + 账户当前权益(用于算"有效杠杆")
@@ -402,8 +442,22 @@ function on_tick(ctx)
     if not price or price <= 0 then
         return {}
     end
+    -- 决策条件齐备 -> 现在才落下节流标记(见上方注释)
+    last_bar_ts = ts
 
     -- ── 2. 高周期 ATR(引擎按桶缓存, 每根高周期 bar 只算一次); 通道未就绪不下单
+    -- 运行状态行(每根主时钟 K 线一行): 实时观察与留档用 —— 能一眼看出
+    -- "ATR 是否就绪 / 是否已激活 / 平衡价与挂单基准 / 真实持仓与虚拟账本"。
+    do
+        local a = ctx:atr_tf(pair)
+        local a_s = (a and a > 0) and string.format("%.4f", a) or "未就绪"
+        ctx:log(string.format(
+            "[shannon_spot_grid] tick price=%.4f atr=%s 平衡价=%s built=%s 持仓=%.6f v_coin=%.6f v_cash=%.2f v_cap=%.2f 判据=%s",
+            ctx:price(pair) or 0, a_s,
+            balance_price and string.format("%.4f", balance_price) or "nil",
+            tostring(built), ctx:position_size(pair) or 0, v_coin, v_cash, v_cap, tostring(regime_state)))
+    end
+
     local atr = ctx:atr_tf(pair)
     if not atr or atr <= 0 then
         skip_no_atr = skip_no_atr + 1
@@ -458,9 +512,15 @@ function on_tick(ctx)
                     regime_ready_skip, cfg_str(ctx, "regime_interval", "1h"),
                     num(ctx, "regime_ema_period", 200)))
             end
-            return {}
-        end
-        if state == "bull" then
+
+            -- 判据未就绪的处理(2026-09-24 独立审计 #2):
+            --   门控**开启**(trend_gate=on): 判据就是下单依据, 未就绪不能盲目交易 -> 拦。
+            --   门控**关闭**(默认 off): 门控本就不生效, 未就绪与"能否交易"无关 -> 不拦,
+            --   否则未就绪即"永不激活"(实测 5759 tick 全跳过、0 成交)。
+            if trend_gate_on then
+                return {}
+            end
+        elseif state == "bull" then
             ticks_bull = ticks_bull + 1
             block_sell = true
         elseif state == "bear" then
@@ -607,6 +667,11 @@ function on_fill(ctx, fill)
             v_cash = v_cash - size * px
         else
             v_coin = v_coin - size
+            -- 账本币不可为负(2026-09-24 审计 #5): 一旦为负, 下一轮"回平衡"会变成净买入去补空头,
+            -- 与"纯现货、有多少卖多少"的设计相反, 且收益分解失真。
+            if v_coin < 0 then
+                v_coin = 0
+            end
             v_cash = v_cash + size * px
         end
     end
