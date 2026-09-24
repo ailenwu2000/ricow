@@ -12,13 +12,14 @@
 
 ## 一、策略结构
 
-策略由 4 个回调函数组成，ricow 引擎按生命周期调用：
+策略由 5 个回调函数组成，ricow 引擎按生命周期调用：
 
 | 回调 | 时机 | 返回值 |
 |:-----|:-----|:-----|
 | `function on_init(ctx)` | 策略启动时调用一次 | 无 |
 | `function on_tick(ctx)` | 每个行情更新时调用 | 订单数组（可为空 `{}`） |
 | `function on_fill(ctx, fill)` | 订单成交时调用 | 无 |
+| `function on_order_update(ctx, upd)` | 订单终态时调用 (拒单/撤单/过期回传, 2026-09-24 接线) | 无 |
 | `function on_stop(ctx)` | 策略停止时调用 (停机清理: 撤单/平仓) | 无 |
 
 所有回调的 `ctx` 参数为只读行情/账户快照；策略只能通过 on_tick 返回订单数组影响行为。
@@ -44,6 +45,27 @@ end
 ```
 
 > **常见错误**：`fill.size` / `fill.price` **不存在**，读到的是 `nil` —— 直接进 `string.format("%.6f", nil)` 会抛错；写成 `fill.size or 0` 则**静默打成 0**（实测 2026-09-14 有生成策略因此把成交量/价打印成 `0.000000` / `0.00`，而订单行里的真实价是对的）。
+
+### on_order_update 的 upd 字段（订单终态回调参数, 2026-09-24 接线）
+
+`on_order_update(ctx, upd)` 的第二个参数是**订单终态事件表**（拒单/撤单/过期回传，与引擎 `update_to_table` 同源）。引擎在 `place_order` 返回 `Rejected` / `Cancelled` / `Expired` 时回调，让策略感知"订单没成"，避免挂单被拒后停摆：
+
+| 字段 | 类型 | 含义 |
+|:-----|:-----|:-----|
+| `pair` | string | 交易对 |
+| `status` | string | `"rejected"` / `"cancelled"` / `"expired"` |
+| `filled_size` | number | 已成交数量（拒单恒 0） |
+| `remaining_size` | number | 未成交数量 |
+| `client_order_id` | string | 客户端订单号（引擎生成） |
+| `exchange_order_id` | string | 交易所订单号（拒单时为空串） |
+
+```lua
+function on_order_update(ctx, upd)
+  if upd.status == "rejected" or upd.status == "cancelled" then
+    need_rehang = true  -- 挂单没成 → 下一 tick 重挂, 防停摆
+  end
+end
+```
 
 ### on_stop 的停机清理语义 (008)
 
@@ -135,22 +157,24 @@ end
 | `ctx:cci(pair, n)` | number? | 顺势指标 |
 | `ctx:roc(pair, n)` | number? | 变动率 |
 | `ctx:mom(pair, n)` | number? | 动量 |
-| `ctx:atr_tf(pair)` | number? | **高周期（第二序列）ATR**（2026-09-17 新增，023 香农 ETF 指数增加策略）：周期由策略配置决定，不是调用参数 —— 取 `atr_interval`（如 `"1h"`）+ `atr_period`（缺省 14）。引擎按高周期桶缓存，**每根高周期 bar 只算一次**；可见性判据 = 桶起点 + 周期 ≤ 本 tick 时间（与 `ctx:klines` 同源，无前视）。通道未预装或高周期 bar 不足 `n+1` 根 → `nil`。 |
-| `ctx:close_tf(pair)` | number? | **上一根已收盘高周期 bar 的收盘价**（2026-09-18 新增，023 日线趋势判据）：序列由策略配置 `regime_interval`（缺省 `"1d"`）决定，与 `atr_tf`/`ema_tf` 共用同一缓存与同一无前视口径（未收盘的那根不可见）。未预装 → `nil`。 |
-| `ctx:ema_tf(pair)` | number? | **高周期 EMA**（2026-09-18 新增，023 日线趋势判据）：EMA 周期取 `regime_ema_period`（缺省 200），序列同 `close_tf`（`regime_interval`）。按高周期桶缓存、无前视；可见 bar 不足 `period` 根 → `nil`。注：`ta` 的 EMA 用**首值种**，序列起点越早越准 → 预热长度见下方"装配责任"。 |
-| `ctx:atr(pair, n)` | number? | 平均真实波幅（**主序列**口径；高周期见上一行的 `ctx:atr_tf`） |
-| `ctx:ema_cross(pair)` | table? | **信号序列 EMA 快慢线**（2026-09-22 新增，030 香农现货网格）：返回 `{fast=…, slow=…}`；序列与周期由策略配置决定 —— `ema_interval`（缺省 `"1h"`）+ `ema_fast`/`ema_slow`（缺省 3/5）。与 `atr_tf` 共用同一缓存与同一**无前视**口径（只看到已收盘的桶）；未预装或可见 bar 不足 → `nil`。 |
+| `ctx:need_klines(role, tf, min_bars)` | — | **声明数据需求**（2026-09-24 新增，030 策略/引擎分层收敛）：在 `on_init` 里声明策略要哪些周期、多少根。`role` = `"primary"`（主时钟，至多一个，驱动逐 bar 推进）或 `"aux"`（辅助周期，供指标）。引擎按声明拉取/重采样供给，不读策略参数名、不猜根数。声明阶段只依赖 config（幂等，可重复调用）。 |
+| `ctx:atr_tf(pair, tf, period)` | number? | **高周期 ATR**：显式传周期 `tf` 与 `period`（旧签名 `atr_tf(pair)` 已删）。序列须先在 `on_init` 用 `need_klines("aux", tf, ...)` 声明预装；引擎按桶缓存、无前视，可见 bar 不足 `period+1` 根 → `nil`。 |
+| `ctx:close_tf(pair, tf)` | number? | **上一根已收盘高周期 bar 的收盘价**：显式传 `tf`（旧签名 `close_tf(pair)` 已删）。序列须 `need_klines` 声明预装；未预装/未收盘不可见 → `nil`。 |
+| `ctx:ema_tf(pair, tf, period)` | number? | **高周期 EMA**：显式传 `tf` 与 `period`（旧签名 `ema_tf(pair)` 已删）。序列须 `need_klines` 声明预装；`ta` 的 EMA 用**首值种**，序列起点越早越准 → 预热长度见下方"装配责任"。 |
+| `ctx:atr(pair, n)` | number? | 平均真实波幅（**主序列**口径；高周期见 `ctx:atr_tf`） |
+| `ctx:ema_cross(pair, tf, fast, slow)` | table? | **信号序列 EMA 快慢线**：显式传 `tf` 与 `fast`/`slow`（旧签名 `ema_cross(pair)` 已删），返回 `{fast=…, slow=…}`。序列须 `need_klines` 声明预装；未预装/可见 bar 不足 → `nil`。 |
 | `ctx:state_get(key)` | string? | **读策略持久化状态**（2026-09-22 新增，030 断点续接）：引擎启动时把上次会话保存的键值注回；键与值都是字符串，无记录 → `nil`。 |
 | `ctx:state_set(key, value)` | — | **写策略持久化状态**（2026-09-22 新增，030 断点续接）：引擎在**每笔成交后与停机时**取快照落库（表 `strategy_state`），下次启动自动注回 —— 支撑“关机/中止不清仓、重启继续跑”。 |
 
 数据不足阈值: EMA/SMA/WMA/BOLL/Stoch/CCI 需 ≥n 根; RSI/ATR/ROC 需 ≥n+1 根; MACD 需 ≥35 根; ADX 需 ≥2n 根。
 
-> **高周期通道的装配责任（023；2026-09-18 扩为多套）**: 引擎不替策略猜周期，装配层负责把序列重采样后预装（缓存键 = `pair|tf`，同一 pair 可同时装多套，例如 4h ATR + 日线趋势判据）。
-> - 回测：策略声明 `atr_interval`（网格间距）与/或 `regime_interval`（趋势判据）时，CLI 用**全段**（含预热段）主序列重采样装入；预热根数 = `max(ATR 预热, 趋势判据预热)`，趋势判据按 **3×(regime_ema_period+1) 根高周期 bar** 取（`ta` 的 EMA 用首值种，种子残差 `(1−2/(n+1))^k`：n=200 时 201 根 13.5% / 402 根 1.8% / 603 根 0.25%，±3% 带下必须取 3×），预热段只喂高周期指标、**不进 tick 循环与报告**；
-> - 模拟盘/实盘：**当前未接线**（`set_tf_klines` 只在回测装配层被调用）→ 实盘/模拟盘下 `ctx:atr_tf` `ctx:ema_tf` `ctx:close_tf` 恒为 `nil`，依赖它们的策略在实盘不会下单。若要让这些通道在实盘可用，需在 K 线刷新路径补"拉主序列 → 重采样 → 装入 (pair, tf)"；
-> - 重采样口径：只保留**完整桶**（首尾半桶与缺口桶丢弃，防"半小时当一小时"算错 ATR）；
-> - 与 `ctx:atr` 的区别：`ctx:atr` 算的是**主序列**（1m 主序列下就是 1m ATR），`ctx:atr_tf` 才是高周期 ATR；两者口径不同，不可混用。
-> - 信号序列（030）：策略声明 `ema_interval`（缺省 `1h`）时装配层预装该序列，供 `ctx:ema_cross` 取快慢线；跨平台桶缓存口径与 `atr_tf` 完全一致，预热取 **3×(ema_slow+1) 根高周期 bar**。
+> **高周期通道的装配责任（030，2026-09-24 收敛为声明驱动）**: 引擎不替策略猜周期，装配层负责把序列重采样后预装（缓存键 = `pair|tf`，同一 pair 可同时装多套）。
+> - **声明驱动**: 策略在 `on_init` 用 `need_klines` 声明要哪些 `tf`、各要多少根，引擎按声明拉取/重采样 —— 回测与实盘/模拟盘**同一条装配路径**（不再有"实盘未接线"的差别）。
+> - 回测两阶段：先跑一次 `on_init` 收集声明 → 按声明算预热根数并拉取全段 → 正式逐 bar 推进（预热段只喂高周期指标、**不进 tick 循环与报告**）。
+> - 预热根数 = 各 `aux` 声明的 `min_bars × tf_ms / 主时钟_ms`（向上取整）取最大；趋势判据建议声明 `3×(regime_ema_period+1)` 根（`ta` 的 EMA 用首值种，种子残差 `(1−2/(n+1))^k`：n=200 时 201 根 13.5% / 402 根 1.8% / 603 根 0.25%，±3% 带下必须取 3×）。
+> - **min_bars 语义（防陷阱）**: `min_bars` 是**该 tf 自身的最少根数**（不是主时钟根数，引擎按 `min_bars × tf_ms / 主时钟_ms` 换算预热）。要表达"至少 N 小时"这类余量，必须**换算成 tf 根数**再声明：`ceil(N小时 / tf)` 根 —— 如"24 小时"在 1h 下是 24 根、15m 下是 96 根、4h 下是 6 根。写死一个数字（如 24）会在 15m 下只留 6 小时，余量不足。
+> - 重采样口径：只保留**完整桶**（首尾半桶与缺口桶丢弃，防"半小时当一小时"算错 ATR）。
+> - 与 `ctx:atr` 的区别：`ctx:atr` 算的是**主序列**，`ctx:atr_tf` 才是高周期 ATR；两者口径不同，不可混用。
 
 ### 其他
 

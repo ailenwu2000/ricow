@@ -151,9 +151,9 @@ impl fmt::Display for OrderStatus {
 
 /// 订单指令类型 (2026-09-17, 023 香农 ETF 指数增加策略)。
 ///
-/// 策略层没有订单号通道 (`on_tick` 只回订单数组, 不回 ack, `on_order_update` 未接),
-/// 因此"成交后撤掉自己的其余挂单"只能按**本实例归属**整体撤: 回测/模拟盘清
-/// `pending_orders`(策略是 context 内唯一下单方), 实盘按 `clientOrderId` 归属前缀撤。
+/// 策略层没有订单号通道 (`on_tick` 只回订单数组, 不回 ack; 拒单/撤单经 `on_order_update`
+/// 回传, 但策略侧无 client_order_id 映射), 因此"成交后撤掉自己的其余挂单"只能按**本实例归属**
+/// 整体撤: 回测/模拟盘清 `pending_orders`(策略是 context 内唯一下单方), 实盘按 `clientOrderId` 归属前缀撤。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum OrderAction {
     /// 普通下单 (默认)。
@@ -232,6 +232,22 @@ pub struct OrderAck {
     pub size: Decimal,
     pub filled_size: Decimal,
     pub status: OrderStatus,
+}
+
+impl OrderAck {
+    /// 转成 [`OrderUpdate`] (审计 #3): 引擎在拒单/撤单等终态时回传给策略 `on_order_update`。
+    pub fn to_update(&self, timestamp: DateTime<Utc>) -> OrderUpdate {
+        OrderUpdate {
+            exchange_order_id: self.exchange_order_id.clone(),
+            client_order_id: self.client_order_id.clone(),
+            pair: self.pair.clone(),
+            status: self.status,
+            filled_size: self.filled_size,
+            remaining_size: self.size - self.filled_size,
+            avg_price: None,
+            timestamp,
+        }
+    }
 }
 
 /// 未成交挂单 (停机清理用: 撤单兜底与残留明细)。

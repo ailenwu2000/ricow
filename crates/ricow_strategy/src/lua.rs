@@ -19,6 +19,7 @@ use crate::config::{ConfigValue, StrategyConfig};
 use crate::context::Context;
 use crate::indicators_api;
 use crate::lua_sandbox::create_lua_sandbox;
+use crate::multiframe::tf_key;
 use crate::strategy::Strategy;
 
 // ============================================================================
@@ -76,19 +77,10 @@ pub(crate) struct LuaCtxData {
     /// 当前 tick 时间 (UTC); None = 通道不可用 (单标的/实盘未接)。ctx:now() 用。
     now: Option<chrono::DateTime<chrono::Utc>>,
     klines_map: HashMap<String, Vec<Kline>>,
-    /// 高周期 ATR 快照 (023): 键 = pair, 值 = 高周期 ATR(周期来自配置 `atr_interval` 与
-    /// `atr_period`)。引擎侧按高周期桶缓存, 同一根高周期 bar 内不会重算。
-    /// 未声明 `atr_interval` 或通道未就绪时不含该 pair(策略用 `if v then` guard)。
-    tf_atr: HashMap<String, f64>,
-    /// 高周期 EMA 快照 (2026-09-18 日线趋势判据): 键 = pair, 值 = `regime_interval` 序列
-    /// (缺省 "1d") 的 EMA(`regime_ema_period`, 缺省 200)。同款按桶缓存 + 无前视。
-    tf_ema: HashMap<String, f64>,
-    /// **上一根已收盘**高周期 bar 的 close 快照(序列同 `tf_ema`): 趋势判据的逐字输入。
-    tf_close: HashMap<String, f64>,
-    /// 信号序列 EMA 快慢线快照 (2026-09-22, 030): 键 = pair, 值 = (fast, slow)。
-    /// 序列来自配置 `ema_interval`(如 "1h"), 周期来自 `ema_fast` / `ema_slow`(默认 3/5);
-    /// 供金叉/死叉判据。与 `tf_atr` 同一缓存与同一无前视口径。
-    tf_ema_cross: HashMap<String, (f64, f64)>,
+    /// 高周期 (第二序列) 已收盘 K 线快照: 键 = `pair|tf`, 值 = 可见前缀(无前视)。
+    /// 由 `fill_snapshot` 按策略声明 (need_klines) 从 ctx.tf_klines 填充;
+    /// 指标 (ATR/EMA/close) 由策略侧显式 tf/period 现算(见 `atr_tf`/`ema_tf`/`close_tf` 绑定)。
+    tf_klines: HashMap<String, Vec<Kline>>,
     /// 组合信号模式标志 (bs_momentum Lua 化, T3): true → ctx:klines 返回全段
     /// (引擎已截断至执行日, ≥253 根供 IBD RS/EMA200 打分), 不套单标的 100 根 cap;
     /// false (默认) → 单标的路径维持 cap 100 (行为边界, 回归约束)。
@@ -114,10 +106,7 @@ impl LuaCtxData {
             config_bool_map: HashMap::new(),
             now: None,
             klines_map: HashMap::new(),
-            tf_atr: HashMap::new(),
-            tf_ema: HashMap::new(),
-            tf_close: HashMap::new(),
-            tf_ema_cross: HashMap::new(),
+            tf_klines: HashMap::new(),
             full_klines: false,
         }
     }
@@ -166,6 +155,10 @@ impl LuaCtxData {
     /// 已收盘 K 线历史 (指标数据源, 无前视)。
     fn klines(&self, pair: &str) -> Option<Vec<Kline>> {
         self.klines_map.get(pair).cloned()
+    }
+    /// 高周期 (第二序列) 已收盘 K 线 (无前视): 键 = `pair|tf`。
+    fn tf_klines(&self, pair: &str, tf: &str) -> Option<Vec<Kline>> {
+        self.tf_klines.get(&tf_key(pair, tf)).cloned()
     }
 }
 
@@ -261,28 +254,51 @@ impl UserData for LuaCtxData {
             let k = data.klines(&pair).unwrap_or_default();
             Ok(indicators_api::atr(&k, period))
         });
-        // 高周期 (第二序列) ATR (023 香农 ETF 指数增加策略): 周期由策略配置决定
-        // (`atr_interval` 如 "1h" + `atr_period` 如 14), 不是每调用一次现算 ——
-        // 引擎按高周期桶缓存(每小时一次)。装配层须预装高周期序列: 回测声明
-        // `atr_interval` 即自动预热 24h + 重采样; 模拟盘/实盘由 K 线刷新任务装入。
-        // 未预装/数据不足(< period+1 根高周期 bar) → nil, 策略必须 `if v then` guard。
-        methods.add_method("atr_tf", |_, data, pair: String| Ok(data.tf_atr.get(&pair).copied()));
-        // 高周期 EMA 与"上一根已收盘 bar 的 close" (2026-09-18 日线趋势判据):
-        // 序列周期来自策略配置 `regime_interval`(缺省 "1d"), EMA 周期来自 `regime_ema_period`
-        // (缺省 200)。与 `atr_tf` 同一缓存与同一无前视口径, 每根高周期 bar 只算一次。
-        // 未预装/数据不足 → nil, 策略必须 `if v then` guard。
-        methods.add_method("ema_tf", |_, data, pair: String| Ok(data.tf_ema.get(&pair).copied()));
-        // 信号序列 EMA 快慢线 (2026-09-22, 030): `ctx:ema_cross(pair)` → {fast=…, slow=…} 或 nil。
-        // 序列来自配置 `ema_interval`(缺省 "1h"), 周期来自 `ema_fast`/`ema_slow`(缺省 3/5)。
-        methods.add_method("ema_cross", |lua, data, pair: String| match data.tf_ema_cross.get(&pair) {
-            Some((f, sl)) => {
-                let t = lua.create_table()?;
-                t.set("fast", *f)?;
-                t.set("slow", *sl)?;
-                Ok(Value::Table(t))
-            }
-            None => Ok(Value::Nil),
+        // 数据需求声明 (策略 → 引擎): 写入 Lua 全局表 `_RICOW_DECLARATIONS`,
+        // `LuaStrategy::on_init` 回调后读回并写进 ctx (引擎装配阶段据此拉数)。
+        methods.add_method("need_klines", |lua, _, (role, tf, min_bars): (String, String, u32)| {
+            let g = lua.globals();
+            let t = match g.get::<Option<Table>>("_RICOW_DECLARATIONS")? {
+                Some(t) => t,
+                None => {
+                    let t = lua.create_table()?;
+                    g.set("_RICOW_DECLARATIONS", &t)?;
+                    t
+                }
+            };
+            let row = lua.create_table()?;
+            row.set("role", role)?;
+            row.set("tf", tf)?;
+            row.set("min_bars", min_bars)?;
+            t.set(t.raw_len() + 1, row)?;
+            Ok(())
         });
+        // 高周期 ATR: 在已预装的 `tf` 序列上现算(周期显式传入), 数据不足 → nil。
+        methods.add_method("atr_tf", |_, data, (pair, tf, period): (String, String, usize)| {
+            let k = data.tf_klines(&pair, &tf).unwrap_or_default();
+            Ok(indicators_api::atr(&k, period))
+        });
+        // 高周期 EMA: 在已预装的 `tf` 序列上现算(周期显式传入), 数据不足 → nil。
+        methods.add_method("ema_tf", |_, data, (pair, tf, period): (String, String, usize)| {
+            let k = data.tf_klines(&pair, &tf).unwrap_or_default();
+            Ok(indicators_api::ema(&k, period))
+        });
+        // 高周期 EMA 快慢线: `ctx:ema_cross(pair, tf, fast, slow)` → {fast=…, slow=…} 或 nil。
+        methods.add_method(
+            "ema_cross",
+            |lua, data, (pair, tf, fast, slow): (String, String, usize, usize)| {
+                let k = data.tf_klines(&pair, &tf).unwrap_or_default();
+                match (indicators_api::ema(&k, fast), indicators_api::ema(&k, slow)) {
+                    (Some(f), Some(s)) => {
+                        let t = lua.create_table()?;
+                        t.set("fast", f)?;
+                        t.set("slow", s)?;
+                        Ok(Value::Table(t))
+                    }
+                    _ => Ok(Value::Nil),
+                }
+            },
+        );
         // 策略状态持久化 (2026-09-22, 030): `ctx:state_get(key)` / `ctx:state_set(key, value)`。
         // 存储在 Lua 全局表 `_RICOW_STATE` 内(策略实例生命周期内常驻), 引擎在成交后/停机时
         // 取快照落库、重启时注回 —— 支撑"关机不清仓、重启继续跑"。键与值都是字符串。
@@ -306,8 +322,11 @@ impl UserData for LuaCtxData {
             t.set(key, value)?;
             Ok(())
         });
-        methods
-            .add_method("close_tf", |_, data, pair: String| Ok(data.tf_close.get(&pair).copied()));
+        // 高周期上一根已收盘 close: `ctx:close_tf(pair, tf)`。
+        methods.add_method("close_tf", |_, data, (pair, tf): (String, String)| {
+            let k = data.tf_klines(&pair, &tf).unwrap_or_default();
+            Ok(k.last().and_then(|b| b.close.to_f64()))
+        });
         methods.add_method("adx", |_, data, (pair, period): (String, usize)| {
             let k = data.klines(&pair).unwrap_or_default();
             Ok(indicators_api::adx(&k, period))
@@ -445,45 +464,10 @@ impl LuaStrategy {
             if let Some(k) = ctx.klines(&pair) {
                 data.klines_map.insert(pair.clone(), k);
             }
-            // 高周期 ATR (023): 仅在策略声明 `atr_interval` 时取, 周期取 `atr_period`
-            // (缺省 14)。引擎侧用 (pair, tf) 缓存 + 桶内记忆 → 每根高周期 bar 只算一次。
-            if ctx.config().get_str("atr_interval").is_some() {
-                let period = ctx.config().get_i64("atr_period").unwrap_or(14).max(0) as usize;
-                if period > 0 {
-                    if let Some(v) = ctx.atr_tf(&pair, period) {
-                        data.tf_atr.insert(pair.clone(), v);
-                    }
-                }
-            }
-            // 高周期 EMA + 上一根已收盘 close (2026-09-18 日线趋势判据): 仅在策略声明
-            // `regime_interval` 时取, EMA 周期取 `regime_ema_period`(缺省 200)。
-            // 同一根日线 bar 内不重算(TfCache 桶内记忆); 未就绪 → 不插入(策略读到 nil)。
-            if ctx.config().get_str("regime_interval").is_some() {
-                let period =
-                    ctx.config().get_i64("regime_ema_period").unwrap_or(200).max(0) as usize;
-                if period > 0 {
-                    if let Some(v) = ctx.ema_tf(&pair, period) {
-                        data.tf_ema.insert(pair.clone(), v);
-                    }
-                }
-                if let Some(c) = ctx.close_tf(&pair) {
-                    data.tf_close.insert(pair.clone(), c);
-                }
-            }
-            // 信号序列 EMA 快慢线 (2026-09-22, 030): 仅在策略声明 `ema_interval` 时取,
-            // 周期取 `ema_fast` / `ema_slow`(缺省 3/5)。未就绪 → 不插入(策略读到 nil)。
-            {
-                let sig_tf = ctx
-                    .config()
-                    .get_str("ema_interval")
-                    .unwrap_or("1h")
-                    .to_string();
-                let f = ctx.config().get_i64("ema_fast").unwrap_or(3).max(1) as usize;
-                let sl = ctx.config().get_i64("ema_slow").unwrap_or(5).max(1) as usize;
-                if let (Some(fv), Some(sv)) =
-                    (ctx.ema_tf_on(&pair, &sig_tf, f), ctx.ema_tf_on(&pair, &sig_tf, sl))
-                {
-                    data.tf_ema_cross.insert(pair.clone(), (fv, sv));
+            // 高周期 K 线: 按策略声明 (need_klines) 供给, 键 = `pair|tf`; 指标由策略侧现算。
+            for d in ctx.declarations() {
+                if let Some(k) = ctx.tf_klines(&pair, &d.tf) {
+                    data.tf_klines.insert(tf_key(&pair, &d.tf), k);
                 }
             }
         }
@@ -537,6 +521,21 @@ impl LuaStrategy {
                     }
                 }
             }
+        }
+    }
+
+    /// 从 Lua 全局表 `_RICOW_DECLARATIONS` 读出策略声明的数据需求, 写回 ctx。
+    fn collect_declarations(&self, ctx: &mut dyn Context) {
+        let g = self.lua.globals();
+        let Ok(Some(t)) = g.get::<Option<Table>>("_RICOW_DECLARATIONS") else {
+            return;
+        };
+        for row in t.sequence_values::<Table>() {
+            let Ok(row) = row else { continue };
+            let Ok(role) = row.get::<String>("role") else { continue };
+            let Ok(tf) = row.get::<String>("tf") else { continue };
+            let Ok(min_bars) = row.get::<u32>("min_bars") else { continue };
+            ctx.need_klines(&role, &tf, min_bars);
         }
     }
 
@@ -671,6 +670,17 @@ impl LuaStrategy {
         t.set("fee", fill.fee.to_f64().unwrap_or(0.0))?;
         Ok(t)
     }
+
+    fn update_to_table(&self, upd: &OrderUpdate) -> Result<Table, mlua::Error> {
+        let t = self.lua.create_table()?;
+        t.set("pair", upd.pair.clone())?;
+        t.set("status", upd.status.to_string())?;
+        t.set("filled_size", upd.filled_size.to_f64().unwrap_or(0.0))?;
+        t.set("remaining_size", upd.remaining_size.to_f64().unwrap_or(0.0))?;
+        t.set("client_order_id", upd.client_order_id.clone())?;
+        t.set("exchange_order_id", upd.exchange_order_id.clone())?;
+        Ok(t)
+    }
 }
 
 impl Strategy for LuaStrategy {
@@ -678,6 +688,8 @@ impl Strategy for LuaStrategy {
         let mut data = LuaCtxData::new();
         self.fill_snapshot(ctx, &mut data);
         self.call("on_init", data, vec![]);
+        // 收集策略声明的数据需求 (need_klines), 写回 ctx 供引擎装配阶段读取。
+        self.collect_declarations(ctx);
     }
 
     fn on_tick(&mut self, ctx: &mut dyn Context) -> Vec<OrderRequest> {
@@ -702,8 +714,13 @@ impl Strategy for LuaStrategy {
         }
     }
 
-    fn on_order_update(&mut self, _ctx: &mut dyn Context, _update: OrderUpdate) {
-        // Lua 策略不处理 order_update 回调。
+    fn on_order_update(&mut self, ctx: &mut dyn Context, update: OrderUpdate) {
+        // 审计 #3: 拒单/撤单对 Lua 可见 —— 经 on_order_update 回调传给策略。
+        let mut data = LuaCtxData::new();
+        self.fill_snapshot(ctx, &mut data);
+        if let Ok(t) = self.update_to_table(&update) {
+            self.call("on_order_update", data, vec![Value::Table(t)]);
+        }
     }
 
     fn on_stop(&mut self, ctx: &mut dyn Context) {
@@ -966,20 +983,21 @@ mod tests {
 
     #[test]
     fn test_atr_tf_exposed_to_lua() {
-        // 023: `ctx:atr_tf(pair)` —— 高周期(1h)ATR 暴露给 Lua, 周期来自配置
-        // (`atr_interval` + `atr_period`); 通道未就绪时必须是 nil(策略靠它 guard)。
+        // `ctx:atr_tf(pair, tf, period)`: 高周期 ATR 暴露给 Lua, tf 与周期显式传入;
+        // 序列由策略 `need_klines` 声明预装; 通道未就绪时必须是 nil(策略靠它 guard)。
         let script = r#"
             seen = -1
+            function on_init(ctx)
+                ctx:need_klines("aux", "1h", 20)
+            end
             function on_tick(ctx)
-                local v = ctx:atr_tf("ETHUSDT")
+                local v = ctx:atr_tf("ETHUSDT", "1h", 14)
                 if v then seen = v end
                 return {}
             end
         "#;
         let mut params = std::collections::HashMap::new();
         params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
-        params.insert("atr_interval".to_string(), crate::config::ConfigValue::String("1h".into()));
-        params.insert("atr_period".to_string(), crate::config::ConfigValue::Integer(14));
         let config = StrategyConfig {
             name: "t".into(),
             strategy_type: "shannon_spot_grid".into(),
@@ -1000,6 +1018,7 @@ mod tests {
             Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
         );
         ctx.set_tf_klines("ETHUSDT", "1h", crate::resample_complete(&bars, tf_ms));
+        strategy.on_init(&mut ctx);
 
         // 14:00(第 841 根): 可见 14 个 1h 桶 < 15 → Lua 侧 nil → seen 保持 -1。
         for k in &bars[..=840] {
@@ -1022,15 +1041,17 @@ mod tests {
 
     #[test]
     fn test_ema_tf_and_close_tf_exposed_to_lua() {
-        // 2026-09-18 日线趋势判据: `ctx:ema_tf(pair)`(`regime_interval` 序列的 EMA)与
-        // `ctx:close_tf(pair)`(上一根**已收盘**高周期 bar 的 close)必须暴露给 Lua, 且:
+        // `ctx:ema_tf(pair, tf, period)` 与 `ctx:close_tf(pair, tf)` 暴露给 Lua, 且:
         //   ① 未就绪时是 nil(不猜值); ② 无前视 —— 未收盘的那根不可见。
         let script = r#"
             seen_close = -1
             seen_ema = -1
+            function on_init(ctx)
+                ctx:need_klines("aux", "1d", 3)
+            end
             function on_tick(ctx)
-                local c = ctx:close_tf("ETHUSDT")
-                local e = ctx:ema_tf("ETHUSDT")
+                local c = ctx:close_tf("ETHUSDT", "1d")
+                local e = ctx:ema_tf("ETHUSDT", "1d", 2)
                 if c then seen_close = c end
                 if e then seen_ema = e end
                 return {}
@@ -1038,9 +1059,6 @@ mod tests {
         "#;
         let mut params = std::collections::HashMap::new();
         params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
-        params
-            .insert("regime_interval".to_string(), crate::config::ConfigValue::String("1d".into()));
-        params.insert("regime_ema_period".to_string(), crate::config::ConfigValue::Integer(2));
         let config = StrategyConfig {
             name: "t".into(),
             strategy_type: "shannon_spot_grid".into(),
@@ -1081,6 +1099,7 @@ mod tests {
             Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
         );
         ctx.set_tf_klines("ETHUSDT", "1d", daily);
+        strategy.on_init(&mut ctx);
         let seen =
             |strategy: &LuaStrategy, key: &str| -> f64 { strategy.lua.globals().get(key).unwrap() };
 

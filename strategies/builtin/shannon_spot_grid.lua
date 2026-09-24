@@ -89,7 +89,6 @@ v_cash = 0
 -- 状态
 built = false
 balance_price = nil
-last_side = nil
 last_bar_ts = nil
 finished = false        -- 实际仓位清空 -> 策略结束(用户 2026-09-23)
 tick_diag = 0            -- 诊断: on_tick 调用计数(定位"实时下卡在哪一步")
@@ -102,17 +101,13 @@ entry_price = 0          -- 初始建仓成交价(收益分解的持仓成本基
 entry_size = 0           -- 初始建仓数量
 invested0 = 0            -- 激活时刻的账户权益(= 投入本金, 收益分解基准)
 rehang_count = 0
-grid_buy_px = 0
-grid_sell_px = 0
 last_price = 0
 -- 计数(可观测性)
 fill_count = 0
 buy_count = 0
 sell_count = 0
-buy_capped = 0          -- R4 买入被现金截断的次数
 skip_no_atr = 0
 skip_notional = 0
-skip_signal = 0         -- 被趋势判据拦下的信号次数
 -- 趋势判据(1h EMA200)(默认开): BULL 不卖 / BEAR 不买 / RANGE 正常
 regime_state = "?"
 regime_switch = 0
@@ -148,8 +143,10 @@ end
 -- 日内不变且无前视。通道未装 / 可见 bar 不足 period 根 → 返回 nil(未就绪, 由调用方决定不下单)。
 local function regime_of(ctx)
     local pair = ctx:config_str("pair")
-    local close = ctx:close_tf(pair)
-    local ema = ctx:ema_tf(pair)
+    local tf = cfg_str(ctx, "regime_interval", "1h")
+    local period = ctx:config_i64("regime_ema_period") or 200
+    local close = ctx:close_tf(pair, tf)
+    local ema = ctx:ema_tf(pair, tf, period)
     if not close or not ema or ema <= 0 then
         return nil
     end
@@ -225,15 +222,6 @@ local function cash_basis(ctx)
         return r
     end
     return ctx:equity() or 0
-end
-
--- 恒定杠杆: 每 tick 把账本按"名义规模变化"等比缩放(保持币/现金权重, 等价于账本继续持有,
--- 绝对值(沙箱不含 math 库, 手写)
-local function fabs(x)
-    if x < 0 then
-        return -x
-    end
-    return x
 end
 
 -- Kaufman 效率比 ER = |close_t - close_{t-n}| / 总路径 (主序列尾窗, 无前视)。
@@ -323,6 +311,19 @@ end
 function on_init(ctx)
     local pair = ctx:config_str("pair")
     quote_asset = exec.detect_quote(pair)
+    -- 数据需求声明(策略 → 引擎): 主时钟 + ATR 序列 + 趋势判据序列。
+    -- 周期与根数全部由策略显式给出, 引擎只按声明拉取/预装, 不硬编码任何策略参数名。
+    ctx:need_klines("primary", cfg_str(ctx, "interval", "1h"), 1000)
+    -- ATR 最少 (period+1) 根; 24 根 = 通用余量(约 15 根的 1.6 倍)。注意 min_bars 是 tf 自身根数,
+    -- 不是"24 小时"——要表达"至少 24h"须写成 ceil(24h/tf) 根(1h→24, 15m→96), 见 lua-api.md。
+    local atr_need = (ctx:config_i64("atr_period") or 14) + 1
+    if atr_need < 24 then atr_need = 24 end
+    ctx:need_klines("aux", cfg_str(ctx, "atr_interval", "1h"), atr_need)
+    ctx:need_klines(
+        "aux",
+        cfg_str(ctx, "regime_interval", "1h"),
+        3 * ((ctx:config_i64("regime_ema_period") or 200) + 1)
+    )
     balance_price = nil
     last_bar_ts = nil
     regime_state = "?"
@@ -407,10 +408,13 @@ function on_tick(ctx)
             ctx:log(string.format(
                 "[shannon_spot_grid] diag #%d klines=%d ts=%s price=%s atr=%s built=%s 持仓=%.6f",
                 tick_diag, n0, tostring(n0 > 0 and kk0[n0].ts or nil), tostring(ctx:price(p0)),
-                tostring(ctx:atr_tf(p0)), tostring(built), ctx:position_size(p0) or 0))
+                tostring(ctx:atr_tf(p0, cfg_str(ctx, "atr_interval", "1h"), ctx:config_i64("atr_period") or 14)),
+                tostring(built), ctx:position_size(p0) or 0))
         end
     end
     local pair = ctx:config_str("pair")
+    local atr_intv = cfg_str(ctx, "atr_interval", "1h")
+    local atr_period = ctx:config_i64("atr_period") or 14
     local atr_mult = num(ctx, "atr_mult", 2)
     local min_notional = num(ctx, "min_notional", 5)
     -- R7: 单边费率(现货 0.1%/边 → 0.001); fee_bps = 万分之一单位(供 cap_size 的余量计算)
@@ -449,7 +453,7 @@ function on_tick(ctx)
     -- 运行状态行(每根主时钟 K 线一行): 实时观察与留档用 —— 能一眼看出
     -- "ATR 是否就绪 / 是否已激活 / 平衡价与挂单基准 / 真实持仓与虚拟账本"。
     do
-        local a = ctx:atr_tf(pair)
+        local a = ctx:atr_tf(pair, atr_intv, atr_period)
         local a_s = (a and a > 0) and string.format("%.4f", a) or "未就绪"
         ctx:log(string.format(
             "[shannon_spot_grid] tick price=%.4f atr=%s 平衡价=%s built=%s 持仓=%.6f v_coin=%.6f v_cash=%.2f v_cap=%.2f 判据=%s",
@@ -458,7 +462,7 @@ function on_tick(ctx)
             tostring(built), ctx:position_size(pair) or 0, v_coin, v_cash, v_cap, tostring(regime_state)))
     end
 
-    local atr = ctx:atr_tf(pair)
+    local atr = ctx:atr_tf(pair, atr_intv, atr_period)
     if not atr or atr <= 0 then
         skip_no_atr = skip_no_atr + 1
         if skip_no_atr == 1 or skip_no_atr % 240 == 0 then
@@ -634,8 +638,6 @@ function on_tick(ctx)
     end
     need_rehang = false
     rehang_count = rehang_count + 1
-    grid_buy_px = buy_px
-    grid_sell_px = sell_px
     save_state(ctx)
     ctx:log(string.format(
         "[shannon_spot_grid] 网格重挂 #%d: 平衡价 %.4f -> 买 %.4f (%.6f) / 卖 %.4f (%.6f), 真实持仓 %.6f 账本规模 %.0f",
@@ -680,7 +682,6 @@ function on_fill(ctx, fill)
     else
         sell_count = sell_count + 1
     end
-    last_side = fill.side
     fill_count = fill_count + 1
     need_rehang = true
     local pair_ = ctx:config_str("pair")
@@ -697,6 +698,18 @@ function on_fill(ctx, fill)
         fill_count, last_bar_ts or 0, fill.side, size, px, size * px, eq_now, pos_now, balance_price, v_coin, v_cash, v_cap))
 end
 
+-- 审计 #3: 拒单/撤单回传。挂单被拒/撤时重挂(need_rehang = true), 防停摆。
+-- 触发: 引擎 place_order 返回 Rejected/Cancelled/Expired 终态 → on_order_update。
+function on_order_update(ctx, upd)
+    local status = upd and upd.status
+    if status == "rejected" or status == "cancelled" then
+        need_rehang = true
+        ctx:log(string.format(
+            "[shannon_spot_grid] 订单 %s: pair=%s filled=%.6f remaining=%.6f → 重挂",
+            status, upd.pair, upd.filled_size or 0, upd.remaining_size or 0))
+    end
+end
+
 function on_stop(ctx)
     log_state(ctx, "收尾")
     if cfg_str(ctx, "regime_filter", "ema200") == "ema200" then
@@ -707,10 +720,10 @@ function on_stop(ctx)
             regime_block_buy, regime_block_sell, regime_ready_skip))
     end
     ctx:log(string.format(
-        "[shannon_spot_grid] 停机(**不清仓**): 成交 %d(买 %d 卖 %d) / 跳过(ATR未就绪 %d, 小名义 %d, 判据拦 %d) / " ..
-        "门控(BULL拦卖 %d BEAR拦买 %d) / 受限(买入现金截断 %d) / %s / 账本末态(币 %.6f 现金 %.0f 总计 %.0f) 杠杆 %.1f",
-        fill_count, buy_count, sell_count, skip_no_atr, skip_notional, skip_signal,
-        regime_block_sell, regime_block_buy, buy_capped, finished and "已结束(仓位清空)" or (halted and "已停机(R7 成本门槛)" or "正常运行"),
+        "[shannon_spot_grid] 停机(**不清仓**): 成交 %d(买 %d 卖 %d) / 跳过(ATR未就绪 %d, 小名义 %d) / " ..
+        "门控(BULL拦卖 %d BEAR拦买 %d) / %s / 账本末态(币 %.6f 现金 %.0f 总计 %.0f) 杠杆 %.1f",
+        fill_count, buy_count, sell_count, skip_no_atr, skip_notional,
+        regime_block_sell, regime_block_buy, finished and "已结束(仓位清空)" or (halted and "已停机(R7 成本门槛)" or "正常运行"),
         v_coin, v_cash, v_coin * last_price + v_cash, num(ctx, "leverage_mult", 2)) .. string.format(" (账本规模 %.0f)", v_cap))
     -- 收益分解(用户 2026-09-23): 持仓收益 = 期末持仓量 ×(末价 − 初始建仓价); 交易收益 = 总收益 − 持仓收益。
     local q1 = ctx:position_size(ctx:config_str("pair")) or 0

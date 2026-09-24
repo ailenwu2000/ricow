@@ -7,8 +7,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::NaiveDate;
-use ricow_core::{Balance, Kline};
+use chrono::{NaiveDate, Utc};
+use ricow_core::{Balance, Kline, OrderStatus};
 use ricow_strategy::{BacktestContext, BacktestReport, Context, Strategy, StrategyConfig};
 
 /// 在历史 K 线上运行一次回测 (单标的)。
@@ -20,44 +20,48 @@ pub fn run_backtest(
     klines: &[Kline],
     strategy: &mut dyn Strategy,
 ) -> BacktestReport {
-    // 023 高周期序列预装: 策略声明 `atr_interval`(网格间距) 与/或 `regime_interval`(趋势判据) 时,
-    // 用**全段** klines(含预热段)重采样一次装入 ctx —— 键 = `pair|tf`, 同一 pair 可同时装多套;
-    // 重采样在装配层只做一次, 引擎不逐 tick 重算。预热段(前 `warmup_bars` 根)只喂高周期指标,
-    // 不进 tick 循环与报告。
-    let tf_pair = config.get_str("pair").map(str::to_string);
-    let mut tf_labels: Vec<String> = Vec::new();
-    for key in ["atr_interval", "regime_interval", "ema_interval"] {
-        if let Some(tf) = config.get_str(key) {
-            if !tf_labels.iter().any(|t| t == tf) {
-                tf_labels.push(tf.to_string());
-            }
-        }
-    }
-    let warmup = config.get_i64("warmup_bars").unwrap_or(0).max(0) as usize;
+    let pair = config.get_str("pair").map(str::to_string);
     let mut ctx = BacktestContext::new(config, initial_balance);
-    if let Some(pair) = tf_pair.as_deref() {
-        for tf in &tf_labels {
-            match ricow_strategy::tf_ms_of(tf) {
-                Some(tf_ms) => {
-                    let bars = ricow_strategy::resample_complete(klines, tf_ms);
-                    tracing::info!(
-                        target: "multiframe",
-                        pair = pair,
-                        tf = tf.as_str(),
-                        buckets = bars.len(),
-                        "高周期序列预装"
-                    );
-                    ctx.set_tf_klines(pair, tf, bars);
-                }
-                None => tracing::warn!(
-                    target: "multiframe",
-                    tf = tf.as_str(),
-                    "高周期标签不是受支持周期, 该通道关闭"
-                ),
+
+    // 阶段一: 声明收集。on_init 里策略 need_klines 写入 declarations(幂等, 只依赖 config)。
+    strategy.on_init(&mut ctx);
+
+    // 阶段二: 按声明从主时钟全段重采样出高周期序列, 并据此推 warmup(预热根数)。
+    // primary 声明给出主时钟周期(换算用); aux 声明给出要重采样的 tf 与最少根数。
+    let declarations = ctx.declarations();
+    let main_tf_ms = declarations
+        .iter()
+        .find(|d| d.role == "primary")
+        .and_then(|d| ricow_strategy::tf_ms_of(&d.tf))
+        .unwrap_or_else(|| infer_main_tf_ms(klines));
+    let mut warmup = 0usize;
+    if let Some(pair) = pair.as_deref() {
+        for d in &declarations {
+            if d.role != "aux" {
+                continue;
             }
+            let Some(tf_ms) = ricow_strategy::tf_ms_of(&d.tf) else {
+                tracing::warn!(
+                    target: "multiframe",
+                    tf = d.tf.as_str(),
+                    "声明的周期不受支持, 该通道关闭"
+                );
+                continue;
+            };
+            let bars = ricow_strategy::resample_complete(klines, tf_ms);
+            tracing::info!(
+                target: "multiframe",
+                pair,
+                tf = d.tf.as_str(),
+                buckets = bars.len(),
+                "高周期序列预装"
+            );
+            ctx.set_tf_klines(pair, &d.tf, bars);
+            // 向上取整 (div_ceil 在部分工具链 unstable, 用 (a+b-1)/b 等价实现)。
+            let need = ((i64::from(d.min_bars) * tf_ms + main_tf_ms - 1) / main_tf_ms) as usize;
+            warmup = warmup.max(need.max(1));
         }
     }
-    strategy.on_init(&mut ctx);
 
     // 预热段跳过(仅当预热段短于全段时; 数据不足时退化为整段回测, 不静默丢数据)。
     let skip = if warmup > 0 && warmup < klines.len() { warmup } else { 0 };
@@ -65,7 +69,21 @@ pub fn run_backtest(
         ctx.step_bar(k.clone());
         let orders = strategy.on_tick(&mut ctx);
         for req in orders {
-            let _ = ctx.place_order(req);
+            match ctx.place_order(req) {
+                Ok(ack)
+                    if matches!(
+                        ack.status,
+                        OrderStatus::Rejected | OrderStatus::Cancelled | OrderStatus::Expired
+                    ) =>
+                {
+                    // 审计 #3: 拒单/撤单回传给策略 (终态非成交)。
+                    strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(target: "backtest", "下单失败: {e}");
+                }
+            }
         }
         let fills = ctx.drain_fills();
         for fill in fills {
@@ -80,6 +98,17 @@ pub fn run_backtest(
     // 无关(回测没有交易所资源可清); 当前无内置策略在 on_stop 里下单。
     strategy.on_stop(&mut ctx);
     ctx.report()
+}
+
+/// 主时钟周期推断: 策略未声明 primary 时(异常), 用相邻 bar 时间差兜底; 无法推断则 1h。
+fn infer_main_tf_ms(klines: &[Kline]) -> i64 {
+    if klines.len() >= 2 {
+        let d = klines[1].open_time.timestamp_millis() - klines[0].open_time.timestamp_millis();
+        if d > 0 {
+            return d;
+        }
+    }
+    3_600_000
 }
 
 /// 把多标的日线对齐成统一日历 tick 序列 (组合回测驱动数据, M2-2)。
@@ -167,7 +196,21 @@ pub fn run_portfolio_backtest(
         ctx.step_portfolio(bars);
         let orders = strategy.on_tick(&mut ctx);
         for req in orders {
-            let _ = ctx.place_order(req);
+            match ctx.place_order(req) {
+                Ok(ack)
+                    if matches!(
+                        ack.status,
+                        OrderStatus::Rejected | OrderStatus::Cancelled | OrderStatus::Expired
+                    ) =>
+                {
+                    // 审计 #3: 拒单/撤单回传给策略 (终态非成交)。
+                    strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(target: "backtest", "下单失败: {e}");
+                }
+            }
         }
         let fills = ctx.drain_fills();
         for fill in fills {
@@ -387,5 +430,78 @@ mod tests {
         let fe = report.final_equity.to_f64().unwrap();
         assert!(fe > 110_000.0 && fe < 130_000.0, "期末权益异常 (期望≈121k): {fe}");
         assert_eq!(report.fills[0].pair, "TSLABUSDT", "先建 TSLA 后建 NVDA (名单序)");
+    }
+
+    #[test]
+    fn test_rejected_order_visible_to_lua() {
+        // 审计 #3: 拒单/撤单必须对 Lua 可见。脚本下一笔巨额买单 → 资金不足拒单 →
+        // 引擎经 on_order_update 回传 Rejected, Lua 侧 seen_status 记为 "rejected"。
+        let script = r#"
+            function on_tick(ctx)
+                return { { pair = "TSLABUSDT", side = "buy", order_type = "market", size = 999999 } }
+            end
+            function on_order_update(ctx, upd)
+                ctx:state_set("seen_status", upd.status)
+            end
+        "#;
+        let mut cfg = strategy_config();
+        cfg.params.insert("script".into(), ConfigValue::String(script.into()));
+        let mut s = LuaStrategy::from_source(script, cfg.clone()).expect("脚本应编译通过");
+
+        let initial = balance(1_000);
+        let ticks = vec![vec![("TSLABUSDT".to_string(), kline(1, 100, 101))]];
+
+        let report = run_portfolio_backtest(cfg, initial, &ticks, &mut s, HashMap::new());
+
+        assert_eq!(report.rejected_count, 1, "巨额买单必被资金不足拒单");
+        let snap = s.state_snapshot();
+        let seen = snap
+            .iter()
+            .find(|(k, _)| k == "seen_status")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(seen, "rejected", "拒单必须经 on_order_update 回传给 Lua");
+    }
+
+    #[test]
+    fn test_cancelled_order_visible_to_lua() {
+        // 审计 #3 (撤单路径): 策略先挂限价买单(不成交), 下一 tick 撤单 → 引擎经
+        // on_order_update 回传 Cancelled, Lua 侧 seen_status 记为 "cancelled"。
+        let script = r#"
+            tickn = 0
+            function on_tick(ctx)
+                tickn = tickn + 1
+                if tickn == 1 then
+                    return { { pair = "TSLABUSDT", side = "buy", order_type = "limit", price = 50, size = 1 } }
+                elseif tickn == 2 then
+                    return { { pair = "TSLABUSDT", action = "cancel_pending" } }
+                end
+                return {}
+            end
+            function on_order_update(ctx, upd)
+                ctx:state_set("seen_status", upd.status)
+            end
+        "#;
+        let mut cfg = strategy_config();
+        cfg.params.insert("script".into(), ConfigValue::String(script.into()));
+        let mut s = LuaStrategy::from_source(script, cfg.clone()).expect("脚本应编译通过");
+
+        let initial = balance(1_000);
+        // 两个 tick: 第一个挂限价买单(价 50 < 现价 100, 挂单不成交), 第二个撤单。
+        let ticks = vec![
+            vec![("TSLABUSDT".to_string(), kline(1, 100, 101))],
+            vec![("TSLABUSDT".to_string(), kline(2, 100, 101))],
+        ];
+
+        let report = run_portfolio_backtest(cfg, initial, &ticks, &mut s, HashMap::new());
+
+        assert_eq!(report.fills.len(), 0, "限价买单价 50 低于现价 100, 不应成交");
+        let snap = s.state_snapshot();
+        let seen = snap
+            .iter()
+            .find(|(k, _)| k == "seen_status")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(seen, "cancelled", "撤单必须经 on_order_update 回传给 Lua");
     }
 }

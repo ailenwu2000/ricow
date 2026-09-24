@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use crate::config::{BacktestParams, BacktestToml, ConfigValue, StrategyConfig};
-use crate::context::Context;
+use crate::context::{Context, Declaration};
 use crate::fee::FeeModel;
 use crate::multiframe::{tf_key, TfCache};
 use crate::order_guard::OrderGuard;
@@ -223,6 +223,8 @@ pub struct BacktestContext {
     /// 装配层预装(已剔除不完整桶)。`atr_tf`/`ema_tf`/`close_tf` 按当前 tick 时间取可见前缀
     /// 计算, 每根高周期 bar 只算一次(TfCache 内部缓存)。
     tf_caches: HashMap<String, TfCache>,
+    /// 策略数据需求声明 (need_klines 写入, 回测两阶段的声明入口读取)。
+    declarations: Vec<Declaration>,
     default_exchange: String,
     slippage_bps: u32,
     initial_equity: Decimal,
@@ -323,6 +325,7 @@ impl BacktestContext {
             holdings_snapshots: Vec::new(),
             signal_klines: HashMap::new(),
             tf_caches: HashMap::new(),
+            declarations: Vec::new(),
             first_fill_price: None,
             first_fill_time: None,
             entry_equity: None,
@@ -1965,35 +1968,26 @@ impl Context for BacktestContext {
         }
     }
 
-    /// 高周期 ATR (023): 无前视 —— 可见桶判据 = `桶起点 + tf ≤ 本 tick 时间`, 与
-    /// `now_utc`/`klines_for` 的截断口径同源(单标的 = 当前 bar open_time)。
-    /// 序列 = 配置 `atr_interval`(缺失 → None, 与"未预装"同处理)。
-    fn atr_tf(&self, pair: &str, period: usize) -> Option<f64> {
-        let now_ms = self.now_utc()?.timestamp_millis();
-        let tf = self.config.get_str("atr_interval")?.to_string();
-        self.tf_caches.get(&tf_key(&self.resolve_key(pair), &tf))?.atr(period, now_ms)
+    fn need_klines(&mut self, role: &str, tf: &str, min_bars: u32) {
+        if role == "primary" && self.declarations.iter().any(|d| d.role == "primary") {
+            tracing::error!(target: "context", tf, "主时钟(primary)重复声明: 至多一个 primary 序列");
+            return;
+        }
+        if let Some(existing) = self.declarations.iter_mut().find(|d| d.role == role && d.tf == tf) {
+            existing.min_bars = existing.min_bars.max(min_bars);
+            return;
+        }
+        self.declarations.push(Declaration { role: role.to_string(), tf: tf.to_string(), min_bars });
     }
 
-    /// 高周期 EMA(指定序列, 030): 信号序列(如 "1h")上的 EMA 快慢线交叉判据用。
-    /// 与 `atr_tf` 同一缓存与同一**回测时钟**口径(无前视: 只看到已收盘的桶)。
-    fn ema_tf_on(&self, pair: &str, tf: &str, period: usize) -> Option<f64> {
-        let now_ms = self.now_utc()?.timestamp_millis();
-        self.tf_caches.get(&tf_key(&self.resolve_key(pair), tf))?.ema(period, now_ms)
+    fn declarations(&self) -> Vec<Declaration> {
+        self.declarations.clone()
     }
 
-    /// 高周期 EMA (2026-09-18 日线趋势判据): 序列 = 配置 `regime_interval`(缺省 "1d"),
-    /// 与 `atr_tf` 同一缓存与同一无前视口径; 可见桶不足 period → None。
-    fn ema_tf(&self, pair: &str, period: usize) -> Option<f64> {
+    fn tf_klines(&self, pair: &str, tf: &str) -> Option<Vec<Kline>> {
         let now_ms = self.now_utc()?.timestamp_millis();
-        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
-        self.tf_caches.get(&tf_key(&self.resolve_key(pair), &tf))?.ema(period, now_ms)
-    }
-
-    /// 上一根已收盘高周期 bar 的 close (趋势判据输入); 序列同 `ema_tf`。
-    fn close_tf(&self, pair: &str) -> Option<f64> {
-        let now_ms = self.now_utc()?.timestamp_millis();
-        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
-        self.tf_caches.get(&tf_key(&self.resolve_key(pair), &tf))?.close(now_ms)
+        let c = self.tf_caches.get(&tf_key(&self.resolve_key(pair), tf))?;
+        Some(c.visible(now_ms).to_vec())
     }
 
     fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
@@ -2163,14 +2157,11 @@ mod tests {
     }
 
     #[test]
-    fn test_atr_tf_preloaded_visibility_and_cache() {
-        // 023: 高周期 (1h) ATR 通道 —— 装配层用全段(含预热)重采样预装; 可见桶判据 =
-        // `桶起点 + tf ≤ 本 tick 时间`(无前视, 与 now_utc/klines_for 同源); 同桶只算一次。
+    fn test_tf_klines_preloaded_visibility() {
+        // 高周期 (1h) 通道: 装配层用全段(含预热)重采样预装; `tf_klines` 返回可见前缀
+        // (无前视, 与 now_utc/klines_for 同源); 指标由策略侧显式现算。
         let mut params = std::collections::HashMap::new();
         params.insert("pair".to_string(), crate::config::ConfigValue::String("ETHUSDT".into()));
-        // 2026-09-18: 高周期缓存键改为 `pair|tf`, 且 `atr_tf` 的序列由配置 `atr_interval`
-        // 决定 → 单测同样要声明它(与装配层一致)。
-        params.insert("atr_interval".to_string(), crate::config::ConfigValue::String("1h".into()));
         let config = StrategyConfig {
             name: "t".into(),
             strategy_type: "shannon_spot_grid".into(),
@@ -2193,36 +2184,33 @@ mod tests {
         ctx.set_tf_klines("ETHUSDT", "1h", crate::resample_complete(&bars, tf_ms));
 
         // 推进到 14:00(即第 841 根) → 已收盘 1m bar = 0..839 分钟 → 完整桶 0..13 共 14 个
-        // < period+1 = 15 → None(不能猜)。注: 当前 bar 自己那一分钟尚未收盘, 故 14:00 只能
-        // 看到 0..13 桶 —— 这个 off-by-one 是本单测第一次跑红抓出来的。
+        // < period+1 = 15 → ATR 不可算(None)。注: 当前 bar 自己那一分钟尚未收盘, 故 14:00
+        // 只能看到 0..13 桶 —— 这个 off-by-one 是本单测第一次跑红抓出来的。
         for k in &bars[..=840] {
             ctx.step_bar(k.clone());
         }
-        assert_eq!(ctx.atr_tf("ETHUSDT", 14), None, "可见桶不足必须 None");
+        let visible = ctx.tf_klines("ETHUSDT", "1h").expect("已预装 1h 序列");
+        assert_eq!(visible.len(), 14, "可见桶 14 < 15(period+1)");
+        assert_eq!(crate::indicators_api::atr(&visible, 14), None, "可见桶不足必须 None");
 
         // 推进到 15:00(第 901 根) → 完整桶 0..14 共 15 个 → 有值, 且等于对"可见段"
         // (前 900 根 = 0..899 分钟)独立重采样的直算结果。
         for k in &bars[841..=900] {
             ctx.step_bar(k.clone());
         }
-        let got = ctx.atr_tf("ETHUSDT", 14).expect("15 桶应有 ATR");
+        let visible = ctx.tf_klines("ETHUSDT", "1h").unwrap();
+        let got = crate::indicators_api::atr(&visible, 14).expect("15 桶应有 ATR");
         let expected =
             crate::indicators_api::atr(&crate::resample_complete(&bars[..900], tf_ms), 14)
                 .expect("独立重采样应可算 ATR");
         assert!((got - expected).abs() < 1e-9, "got={got} expected={expected}");
 
-        // 同桶内重复调用不重算; 跨入下一桶重算一次。
-        let key = "bn:ETHUSDT|1h";
-        assert_eq!(ctx.tf_caches.get(key).unwrap().computes(), 1);
-        for _ in 0..3 {
-            let _ = ctx.atr_tf("ETHUSDT", 14);
-        }
-        assert_eq!(ctx.tf_caches.get(key).unwrap().computes(), 1, "同桶内只算一次");
+        // 无前视: 跨入下一桶后可见前缀才增长。
         for k in &bars[901..=960] {
             ctx.step_bar(k.clone());
         }
-        assert!(ctx.atr_tf("ETHUSDT", 14).is_some());
-        assert_eq!(ctx.tf_caches.get(key).unwrap().computes(), 2, "跨桶重算一次");
+        let visible = ctx.tf_klines("ETHUSDT", "1h").unwrap();
+        assert!(visible.len() > 15, "跨桶后可见前缀应增长");
     }
 
     #[test]

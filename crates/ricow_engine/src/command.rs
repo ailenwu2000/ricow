@@ -600,47 +600,7 @@ impl Engine {
         let mode = RunMode::DryRun;
 
         let mut ctx = DryRunContext::new(exchange.clone(), config.clone(), initial_balance);
-        // 030: 为实盘/demo **预装 K 线历史** —— 此前实盘路径的 klines_cache 无人填充,
-        // 于是 ctx:klines 恒空、策略在第一个守卫就 return(2026-09-24 demo 实测定位)。
-        // 主时钟用策略 `interval`; 策略声明的高周期(atr/regime)单独预取并重采样为"完整桶"。
-        {
-            let main_tf = config.get_str("interval").unwrap_or("1h");
-            match exchange.get_klines(&pair, &main_tf, 1000).await {
-                Ok(bars) if !bars.is_empty() => {
-                    tracing::info!(target: "engine", tf = %main_tf, n = bars.len(), "预装主时钟 K 线历史");
-                    // 主时钟序列**同时**装入高周期缓存: 策略的 atr_interval/regime_interval 常与
-                    // 主时钟同周期, 不装则 atr_tf/close_tf/ema_tf 仍返回 nil(demo 复测发现)。
-                    let tf_ms = ricow_strategy::tf_ms_of(&main_tf).unwrap_or(3_600_000) as i64;
-                    let complete = ricow_strategy::resample_complete(&bars, tf_ms);
-                    ctx.set_tf_klines(&pair, &main_tf, complete);
-                    ctx.update_klines(&pair, bars);
-                }
-                Ok(_) => tracing::warn!(target: "engine", tf = %main_tf, "主时钟 K 线历史为空"),
-                Err(e) => tracing::warn!(target: "engine", tf = %main_tf, "取主时钟 K 线失败: {e}"),
-            }
-            for key in ["atr_interval", "regime_interval"] {
-                let Some(tf) = config.get_str(key) else { continue };
-                if tf == main_tf {
-                    continue;
-                }
-                let need: u32 = if key == "regime_interval" {
-                    let period = config.get_f64("regime_ema_period").unwrap_or(200.0);
-                    ((3.0 * (period + 1.0)) as u32).clamp(600, 1000)
-                } else {
-                    300
-                };
-                match exchange.get_klines(&pair, &tf, need).await {
-                    Ok(bars) if !bars.is_empty() => {
-                        let tf_ms = ricow_strategy::tf_ms_of(&tf).unwrap_or(3_600_000) as i64;
-                        let complete = ricow_strategy::resample_complete(&bars, tf_ms);
-                        tracing::info!(target: "engine", tf = %tf, n = complete.len(), "预装高周期 K 线历史");
-                        ctx.set_tf_klines(&pair, &tf, complete);
-                    }
-                    Ok(_) => tracing::warn!(target: "engine", tf = %tf, "高周期 K 线历史为空"),
-                    Err(e) => tracing::warn!(target: "engine", tf = %tf, "取高周期 K 线失败: {e}"),
-                }
-            }
-        }
+        // 预装 K 线历史见 on_init 之后 —— 须先跑声明阶段收集 need_klines。
 
         let mut strategy = load_strategy(&config)?;
         // 030 断点续接: 把上次会话保存的策略状态注回 (无记录 = 首次运行)。
@@ -657,6 +617,32 @@ impl Engine {
             }
         }
         strategy.on_init(&mut ctx);
+
+        // 按策略声明 (need_klines) 预装 K 线历史 —— 不读任何策略参数名。
+        {
+            let mut by_tf: std::collections::HashMap<String, (bool, u32)> =
+                std::collections::HashMap::new();
+            for d in ctx.declarations() {
+                let e = by_tf.entry(d.tf.clone()).or_insert((false, 0));
+                e.0 |= d.role == "primary";
+                e.1 = e.1.max(d.min_bars);
+            }
+            for (tf, (is_primary, need)) in by_tf {
+                match exchange.get_klines(&pair, &tf, need).await {
+                    Ok(bars) if !bars.is_empty() => {
+                        let tf_ms = ricow_strategy::tf_ms_of(&tf).unwrap_or(3_600_000) as i64;
+                        let complete = ricow_strategy::resample_complete(&bars, tf_ms);
+                        tracing::info!(target: "engine", tf = %tf, n = complete.len(), "预装 K 线历史");
+                        ctx.set_tf_klines(&pair, &tf, complete);
+                        if is_primary {
+                            ctx.update_klines(&pair, bars);
+                        }
+                    }
+                    Ok(_) => tracing::warn!(target: "engine", tf = %tf, "K 线历史为空"),
+                    Err(e) => tracing::warn!(target: "engine", tf = %tf, "取 K 线历史失败: {e}"),
+                }
+            }
+        }
 
         let mut stream = market::subscribe_orderbook(&exchange, &pair).await?;
         tracing::info!(target: "engine", name = %config.name, pair = %pair, "dry run started");
@@ -702,8 +688,13 @@ impl Engine {
                         // 风控/参数对齐拒单: 与"下单失败"区分计数 (策略循环不中断)
                         // 026 时点① 只记**已提交**的单 —— 拒单未到交易所, 不产生订单行
                         outcome.rejections += 1;
+                        // 审计 #3: 拒单回传给策略。
+                        strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
                     }
                     Ok(ack) => {
+                        if ack.status == OrderStatus::Cancelled {
+                            strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
+                        }
                         if let Some(db) = db {
                             persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode).await;
                         }
@@ -863,47 +854,7 @@ impl Engine {
 
         let rt = tokio::runtime::Handle::current();
         let mut ctx = LiveContext::new(exchange.clone(), config.clone(), rt);
-        // 030: 为实盘/demo **预装 K 线历史** —— 此前实盘路径的 klines_cache 无人填充,
-        // 于是 ctx:klines 恒空、策略在第一个守卫就 return(2026-09-24 demo 实测定位)。
-        // 主时钟用策略 `interval`; 策略声明的高周期(atr/regime)单独预取并重采样为"完整桶"。
-        {
-            let main_tf = config.get_str("interval").unwrap_or("1h");
-            match exchange.get_klines(&pair, &main_tf, 1000).await {
-                Ok(bars) if !bars.is_empty() => {
-                    tracing::info!(target: "engine", tf = %main_tf, n = bars.len(), "预装主时钟 K 线历史");
-                    // 主时钟序列**同时**装入高周期缓存: 策略的 atr_interval/regime_interval 常与
-                    // 主时钟同周期, 不装则 atr_tf/close_tf/ema_tf 仍返回 nil(demo 复测发现)。
-                    let tf_ms = ricow_strategy::tf_ms_of(&main_tf).unwrap_or(3_600_000) as i64;
-                    let complete = ricow_strategy::resample_complete(&bars, tf_ms);
-                    ctx.set_tf_klines(&pair, &main_tf, complete);
-                    ctx.update_klines(&pair, bars);
-                }
-                Ok(_) => tracing::warn!(target: "engine", tf = %main_tf, "主时钟 K 线历史为空"),
-                Err(e) => tracing::warn!(target: "engine", tf = %main_tf, "取主时钟 K 线失败: {e}"),
-            }
-            for key in ["atr_interval", "regime_interval"] {
-                let Some(tf) = config.get_str(key) else { continue };
-                if tf == main_tf {
-                    continue;
-                }
-                let need: u32 = if key == "regime_interval" {
-                    let period = config.get_f64("regime_ema_period").unwrap_or(200.0);
-                    ((3.0 * (period + 1.0)) as u32).clamp(600, 1000)
-                } else {
-                    300
-                };
-                match exchange.get_klines(&pair, &tf, need).await {
-                    Ok(bars) if !bars.is_empty() => {
-                        let tf_ms = ricow_strategy::tf_ms_of(&tf).unwrap_or(3_600_000) as i64;
-                        let complete = ricow_strategy::resample_complete(&bars, tf_ms);
-                        tracing::info!(target: "engine", tf = %tf, n = complete.len(), "预装高周期 K 线历史");
-                        ctx.set_tf_klines(&pair, &tf, complete);
-                    }
-                    Ok(_) => tracing::warn!(target: "engine", tf = %tf, "高周期 K 线历史为空"),
-                    Err(e) => tracing::warn!(target: "engine", tf = %tf, "取高周期 K 线失败: {e}"),
-                }
-            }
-        }
+        // 预装 K 线历史见 on_init 之后 —— 须先跑声明阶段收集 need_klines。
 
         ctx.set_markets(&markets);
         let prefix = ctx.order_prefix().to_string();
@@ -1019,6 +970,33 @@ impl Engine {
             }
         }
         strategy.on_init(&mut ctx);
+
+        // 按策略声明 (need_klines) 预装 K 线历史 —— 不读任何策略参数名。
+        {
+            let mut by_tf: std::collections::HashMap<String, (bool, u32)> =
+                std::collections::HashMap::new();
+            for d in ctx.declarations() {
+                let e = by_tf.entry(d.tf.clone()).or_insert((false, 0));
+                e.0 |= d.role == "primary";
+                e.1 = e.1.max(d.min_bars);
+            }
+            for (tf, (is_primary, need)) in by_tf {
+                match exchange.get_klines(&pair, &tf, need).await {
+                    Ok(bars) if !bars.is_empty() => {
+                        let tf_ms = ricow_strategy::tf_ms_of(&tf).unwrap_or(3_600_000) as i64;
+                        let complete = ricow_strategy::resample_complete(&bars, tf_ms);
+                        tracing::info!(target: "engine", tf = %tf, n = complete.len(), "预装 K 线历史");
+                        ctx.set_tf_klines(&pair, &tf, complete);
+                        if is_primary {
+                            ctx.update_klines(&pair, bars);
+                        }
+                    }
+                    Ok(_) => tracing::warn!(target: "engine", tf = %tf, "K 线历史为空"),
+                    Err(e) => tracing::warn!(target: "engine", tf = %tf, "取 K 线历史失败: {e}"),
+                }
+            }
+        }
+
         let mut quote_stream = market::subscribe_orderbook(&exchange, &pair).await?;
         let mut user_stream = exchange
             .subscribe_user_events()
@@ -1106,9 +1084,13 @@ impl Engine {
                         match ctx.place_order(req) {
                             Ok(ack) if ack.status == OrderStatus::Rejected => {
                                 outcome.rejections += 1;
+                                strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
                             }
                             Ok(ack) => {
                                 // 026 时点①: 委托价/委托量在提交时落库
+                                if ack.status == OrderStatus::Cancelled {
+                                    strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
+                                }
                                 if let Some(db) = db {
                                     persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode)
                                         .await;

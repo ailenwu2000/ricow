@@ -66,6 +66,12 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 策略统一 Lua 5.4(mlua 嵌入式沙箱): 4 回调 `on_init/on_tick/on_fill/on_stop`, `on_tick` 返回订单数组; ctx 为只读快照
 - **ctx.\*** API(冒号调用): 行情 / 持仓余额 / 配置参数(config_f64 等)/ 指标(基于已收盘 K 线, 无前视)/ 时间 `now()`(2026-09-11 新增, 供"每日固定时刻动作"的盘中策略)
+- **数据供给与分层纪律(030, 2026-09-24 策略/引擎分层收敛)**:
+  - **分层铁律(最高约束)**: 引擎(`ricow_engine`)/ CLI(`ricow/src/commands`)/ 绑定层(`ricow_strategy` 的 `context.rs`/`lua.rs`)**零策略参数名** —— 策略参数(如 `atr_interval`/`regime_ema_period`/`atr_mult`)只能由 Lua 策略自己读; 上述各层不得出现策略参数名字面量, 由 `crates/ricow_strategy/tests/architecture_guard.rs` 机械锁死(注入即红, 反向验证通过)。
+  - **声明式取数**: 策略在 `on_init` 用 `ctx:need_klines(role, tf, min_bars)` 声明数据需求(`primary` = 主时钟驱动逐 bar / `aux` = 辅助周期供指标), 引擎按声明拉取/重采样供给 —— 对标 QuantConnect `AddEquity` / Freqtrade `informative_pairs`; 引擎不猜 tf、不猜根数。
+  - **Time Frontier(无前视)**: 策略永远读不到当前时间点之后的数据 —— 回测由引擎逐 bar 推进 + 可见前缀裁剪, 实盘由引擎按声明预装后逐 tick 供给; 可见性由引擎单方控制, 策略无法绕过。
+  - **回测/实盘对称**: 同一份策略代码在回测与实盘零改动可运行, 两路径都走「声明 → 供给 → 读」, 不允许为任一路径在引擎里硬编码。
+  - **on_init 幂等约定**: 声明阶段(`on_init` 里的 `need_klines`)只依赖 config, 不依赖 balance/K 线; 回测装配会先跑一次 `on_init` 收集声明再拉数, 故 `on_init` 必须可重复调用。
 - **exec.\*** 执行组件(引擎内置 Rust 实现, 加载时注册全局表, 脚本内可覆盖): `levels` / `pullback_triggered` / `detect_quote` / `ticks_per` / `slice_due` / `side_order`
 - 内置资产(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/commands/mod.rs:BUILTIN_SCRIPTS`):
   - `strategies/builtin/shannon_rebalance.lua` — 策略样板(香农 50:50 中轴再平衡, 单标的, `target_ratio` 中轴可调 + ATR 自适应 band)

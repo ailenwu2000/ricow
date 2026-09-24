@@ -17,6 +17,17 @@ use crate::multiframe::{tf_key, TfCache};
 use crate::order_guard::OrderGuard;
 use crate::pnl::PnlTracker;
 
+/// 策略的数据需求声明 (由 `need_klines` 写入, 引擎装配阶段读取)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    /// "primary"(主时钟, 驱动逐 bar 推进, 至多一个) | "aux"(辅助周期)。
+    pub role: String,
+    /// 周期标签, 如 "15m"/"1h"/"1d"。
+    pub tf: String,
+    /// 该 tf 所需最少已收盘根数(单位 = 该 tf 自己的根, 不是主时钟根)。
+    pub min_bars: u32,
+}
+
 /// 策略可见的上下文接口。
 ///
 /// pair 参数支持 `"exchange:pair"` 前缀 (如 `"binance:ETH"`), 无前缀路由到默认交易所。
@@ -55,30 +66,19 @@ pub trait Context: Send {
     fn now_utc(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         None
     }
-    /// 高周期 (第二序列) ATR: 由 [`Context::set_tf_klines`] 预装的高周期序列算出,
-    /// **按桶缓存**(同一根高周期 bar 内重复调用不重算)。未预装 / 数据不足 → None。
-    /// 用途: 策略在主序列(如 1m)上决策, 间距取自高周期(如 1h)ATR。默认无通道。
-    /// 序列周期由策略配置 `atr_interval` 决定(`set_tf_klines` 按 `pair|tf` 装)。
-    fn atr_tf(&self, _pair: &str, _period: usize) -> Option<f64> {
-        None
-    }
-    /// 高周期 (第二序列) EMA (2026-09-18, 日线趋势判据): 与 `atr_tf` 同一缓存,
-    /// 序列周期由策略配置 `regime_interval`(缺省 `"1d"`)决定, EMA 周期由调用参数给出。
-    /// 按桶缓存 + 无前视; 未预装 / 可见桶不足 period → None(策略须 guard)。默认无通道。
-    fn ema_tf(&self, _pair: &str, _period: usize) -> Option<f64> {
-        None
-    }
-    /// **上一根已收盘**高周期 bar 的收盘价(序列同 `ema_tf`): 趋势判据的逐字输入
-    /// "最近的日线 K 线的 close"。未预装 → None。默认无通道。
-    fn close_tf(&self, _pair: &str) -> Option<f64> {
-        None
-    }
-    /// 高周期 EMA, **序列周期由调用参数指定**(2026-09-22, 030): 与 `ema_tf` 同一缓存,
-    /// 但 tf 不再绑定 `regime_interval` —— 供策略在**信号序列**(如 `1h`)上取任意周期 EMA
-    /// (如 EMA3/EMA5 交叉判据)。按桶缓存 + 无前视; 未预装 / 可见桶不足 → None。默认无通道。
-    fn ema_tf_on(&self, _pair: &str, _tf: &str, _period: usize) -> Option<f64> {
-        None
-    }
+    /// 声明数据需求(策略 → 引擎): 记录 `(role, tf, min_bars)` 到登记容器, 引擎装配阶段读取。
+    /// role = "primary"(主时钟, 至多一个) | "aux"(辅助周期); tf = 周期标签;
+    /// min_bars = 该 tf 所需最少已收盘根数(单位 = 该 tf 自己的根)。
+    /// 同一 (role, tf) 重复声明取较大 min_bars; 同 role 多个 primary → 报错。
+    fn need_klines(&mut self, role: &str, tf: &str, min_bars: u32);
+
+    /// 已声明的数据需求(引擎装配阶段读取)。
+    fn declarations(&self) -> Vec<Declaration>;
+
+    /// 高周期(第二序列)K 线: 由 [`Context::set_tf_klines`] 预装, 返回**当前已收盘**的可见前缀
+    /// (无前视, 未收盘桶剔除)。未预装 / 无已收盘桶 → None。策略据此显式算 ATR/EMA/close。
+    fn tf_klines(&self, pair: &str, tf: &str) -> Option<Vec<Kline>>;
+
     /// 预装高周期 K 线 (第二序列)。`tf` = 周期标签(如 `"1h"`); 装配层须先用
     /// [`crate::resample_complete`] 剔除不完整/缺口桶再装入。同一 `pair` 可装多套
     /// (如 4h ATR + 日线趋势判据), 键 = `pair|tf`。默认 no-op。
@@ -111,9 +111,10 @@ pub struct LiveContext {
     balance_cache: RwLock<HashMap<String, Balance>>,
     klines_cache: RwLock<HashMap<String, Vec<Kline>>>,
     /// 高周期序列缓存 (023 香农 ETF 指数增加策略; 2026-09-18 扩为多套): 键 = `pair|tf`。
-    /// 由 `set_tf_klines` 预装(装配层已剔除不完整桶); `atr_tf`/`ema_tf`/`close_tf`
-    /// 按当前时刻取可见前缀(ATR 取 `atr_interval` 序列, EMA/close 取 `regime_interval` 序列)。
+    /// 由 `set_tf_klines` 预装(装配层已剔除不完整桶); `tf_klines` 按当前时刻取可见前缀。
     tf_cache: RwLock<HashMap<String, TfCache>>,
+    /// 策略数据需求声明 (need_klines 写入, 引擎装配阶段读取)。
+    declarations: Vec<Declaration>,
     rt: tokio::runtime::Handle,
 }
 
@@ -148,6 +149,7 @@ impl LiveContext {
             balance_cache: RwLock::new(HashMap::new()),
             klines_cache: RwLock::new(HashMap::new()),
             tf_cache: RwLock::new(HashMap::new()),
+            declarations: Vec::new(),
             rt,
         }
     }
@@ -528,39 +530,45 @@ impl Context for LiveContext {
         self.klines_cache.read().ok()?.get(pair).cloned()
     }
 
-    fn atr_tf(&self, pair: &str, period: usize) -> Option<f64> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let tf = self.config.get_str("atr_interval")?.to_string();
-        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.atr(period, now_ms)
+    fn need_klines(&mut self, role: &str, tf: &str, min_bars: u32) {
+        if role == "primary" && self.declarations.iter().any(|d| d.role == "primary") {
+            tracing::error!(target: "context", tf, "主时钟(primary)重复声明: 至多一个 primary 序列");
+            return;
+        }
+        if let Some(existing) = self
+            .declarations
+            .iter_mut()
+            .find(|d| d.role == role && d.tf == tf)
+        {
+            existing.min_bars = existing.min_bars.max(min_bars);
+            return;
+        }
+        self.declarations.push(Declaration { role: role.to_string(), tf: tf.to_string(), min_bars });
     }
 
-    /// 高周期 EMA (日线趋势判据): 序列 = `regime_interval`(缺省 "1d")。
-    fn ema_tf(&self, pair: &str, period: usize) -> Option<f64> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
-        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.ema(period, now_ms)
+    fn declarations(&self) -> Vec<Declaration> {
+        self.declarations.clone()
     }
 
-    /// 上一根已收盘高周期 bar 的 close (趋势判据输入): 序列 = `regime_interval`。
-    fn close_tf(&self, pair: &str) -> Option<f64> {
+    fn tf_klines(&self, pair: &str, tf: &str) -> Option<Vec<Kline>> {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
-        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.close(now_ms)
+        self.tf_cache.read().ok()?.get(&tf_key(pair, tf)).map(|c| c.visible(now_ms).to_vec())
     }
 
-    /// 高周期 EMA(指定序列, 030): 信号序列(如 1h)上的 EMA 快慢线交叉判据用。
-    fn ema_tf_on(&self, pair: &str, tf: &str, period: usize) -> Option<f64> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        self.tf_cache.read().ok()?.get(&tf_key(pair, tf))?.ema(period, now_ms)
-    }
-
-    /// 实盘/demo: 用最新价维护"当前未收盘"主时钟 K 线(周期 = 策略 `interval`)。
+    /// 实盘/demo: 用最新价维护"当前未收盘"主时钟 K 线(周期 = 策略声明的 primary)。
     /// 这是实盘侧 `ctx:klines` 能从空到有的关键 —— 此前实盘上下文的 klines_cache 无人填充,
     /// 导致策略在第一个守卫(K 线)就 return, 永不动作(2026-09-24 demo 实测定位)。
     fn tick_kline(&self, pair: &str, price: Decimal, now_ms: i64) {
-        // interval 缺省 1h: 否则省略该参数的实盘 TOML 会让 tick_kline 变成 no-op,
-        // 主时钟 K 线永不推进 -> 每个进程只决策一次(2026-09-24 审计 #7)。
-        let tf = self.config.get_str("interval").unwrap_or("1h").to_string();
+        // 主时钟周期 = 策略声明的 primary; 未声明 → no-op(如实暴露, 不猜默认)。
+        let Some(tf) = self
+            .declarations
+            .iter()
+            .find(|d| d.role == "primary")
+            .map(|d| d.tf.clone())
+        else {
+            tracing::warn!(target: "context", "策略未声明 primary 主时钟, tick_kline 跳过");
+            return;
+        };
         let Some(step) = crate::tf_ms_of(&tf) else {
             return;
         };
@@ -615,7 +623,7 @@ impl Context for LiveContext {
         // 不刷新的话 atr_tf / close_tf / ema_tf 会一直用启动时那份序列(长跑后失真)。
         // 必须在**释放 klines_cache 写锁之后**调用, 否则与本函数的读锁互等(死锁)。
         if opened_new_bar {
-            self.refresh_tf_cache(pair, &tf);
+            self.refresh_tf_cache(pair);
         }
     }
 
@@ -658,10 +666,11 @@ pub struct DryRunContext {
     virtual_positions: RwLock<HashMap<String, Position>>,
     virtual_balance: RwLock<HashMap<String, Balance>>,
     klines_cache: RwLock<HashMap<String, Vec<Kline>>>,
-    /// 高周期序列缓存 (023 香农 ETF 指数增加策略; 2026-09-18 扩为多套): 键 = `pair|tf`。
-    /// 由 `set_tf_klines` 预装(装配层已剔除不完整桶); `atr_tf`/`ema_tf`/`close_tf`
-    /// 按当前时刻取可见前缀(ATR 取 `atr_interval` 序列, EMA/close 取 `regime_interval` 序列)。
+    /// 高周期序列缓存: 键 = `pair|tf`。由 `set_tf_klines` 预装(装配层已剔除不完整桶);
+    /// 策略通过 `tf_klines(pair, tf)` 按声明读取, 可见前缀受当前时刻裁剪(无前视)。
     tf_cache: RwLock<HashMap<String, TfCache>>,
+    /// 策略数据需求声明 (need_klines 写入, 引擎装配阶段读取)。
+    declarations: Vec<Declaration>,
     pending_orders: Vec<(String, OrderRequest)>,
     fill_queue: Vec<OrderFill>,
 }
@@ -699,6 +708,7 @@ impl DryRunContext {
             virtual_balance: RwLock::new(balance_map),
             klines_cache: RwLock::new(HashMap::new()),
             tf_cache: RwLock::new(HashMap::new()),
+            declarations: Vec::new(),
             pending_orders: Vec::new(),
             fill_queue: Vec::new(),
         }
@@ -1079,39 +1089,45 @@ impl Context for DryRunContext {
         self.klines_cache.read().ok()?.get(pair).cloned()
     }
 
-    fn atr_tf(&self, pair: &str, period: usize) -> Option<f64> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let tf = self.config.get_str("atr_interval")?.to_string();
-        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.atr(period, now_ms)
+    fn need_klines(&mut self, role: &str, tf: &str, min_bars: u32) {
+        if role == "primary" && self.declarations.iter().any(|d| d.role == "primary") {
+            tracing::error!(target: "context", tf, "主时钟(primary)重复声明: 至多一个 primary 序列");
+            return;
+        }
+        if let Some(existing) = self
+            .declarations
+            .iter_mut()
+            .find(|d| d.role == role && d.tf == tf)
+        {
+            existing.min_bars = existing.min_bars.max(min_bars);
+            return;
+        }
+        self.declarations.push(Declaration { role: role.to_string(), tf: tf.to_string(), min_bars });
     }
 
-    /// 高周期 EMA (日线趋势判据): 序列 = `regime_interval`(缺省 "1d")。
-    fn ema_tf(&self, pair: &str, period: usize) -> Option<f64> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
-        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.ema(period, now_ms)
+    fn declarations(&self) -> Vec<Declaration> {
+        self.declarations.clone()
     }
 
-    /// 上一根已收盘高周期 bar 的 close (趋势判据输入): 序列 = `regime_interval`。
-    fn close_tf(&self, pair: &str) -> Option<f64> {
+    fn tf_klines(&self, pair: &str, tf: &str) -> Option<Vec<Kline>> {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let tf = self.config.get_str("regime_interval").unwrap_or("1d").to_string();
-        self.tf_cache.read().ok()?.get(&tf_key(pair, &tf))?.close(now_ms)
+        self.tf_cache.read().ok()?.get(&tf_key(pair, tf)).map(|c| c.visible(now_ms).to_vec())
     }
 
-    /// 高周期 EMA(指定序列, 030): 信号序列(如 1h)上的 EMA 快慢线交叉判据用。
-    fn ema_tf_on(&self, pair: &str, tf: &str, period: usize) -> Option<f64> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        self.tf_cache.read().ok()?.get(&tf_key(pair, tf))?.ema(period, now_ms)
-    }
-
-    /// 实盘/demo: 用最新价维护"当前未收盘"主时钟 K 线(周期 = 策略 `interval`)。
+    /// 实盘/demo: 用最新价维护"当前未收盘"主时钟 K 线(周期 = 策略声明的 primary)。
     /// 这是实盘侧 `ctx:klines` 能从空到有的关键 —— 此前实盘上下文的 klines_cache 无人填充,
     /// 导致策略在第一个守卫(K 线)就 return, 永不动作(2026-09-24 demo 实测定位)。
     fn tick_kline(&self, pair: &str, price: Decimal, now_ms: i64) {
-        // interval 缺省 1h: 否则省略该参数的实盘 TOML 会让 tick_kline 变成 no-op,
-        // 主时钟 K 线永不推进 -> 每个进程只决策一次(2026-09-24 审计 #7)。
-        let tf = self.config.get_str("interval").unwrap_or("1h").to_string();
+        // 主时钟周期 = 策略声明的 primary; 未声明 → no-op(如实暴露, 不猜默认)。
+        let Some(tf) = self
+            .declarations
+            .iter()
+            .find(|d| d.role == "primary")
+            .map(|d| d.tf.clone())
+        else {
+            tracing::warn!(target: "context", "策略未声明 primary 主时钟, tick_kline 跳过");
+            return;
+        };
         let Some(step) = crate::tf_ms_of(&tf) else {
             return;
         };
@@ -1166,7 +1182,7 @@ impl Context for DryRunContext {
         // 不刷新的话 atr_tf / close_tf / ema_tf 会一直用启动时那份序列(长跑后失真)。
         // 必须在**释放 klines_cache 写锁之后**调用, 否则与本函数的读锁互等(死锁)。
         if opened_new_bar {
-            self.refresh_tf_cache(pair, &tf);
+            self.refresh_tf_cache(pair);
         }
     }
 
@@ -1356,8 +1372,8 @@ mod tests {
 }
 
 impl LiveContext {
-    /// 用主时钟 K 线刷新高周期缓存(策略声明的 atr_interval / regime_interval, 含主时钟自身)。
-    fn refresh_tf_cache(&self, pair: &str, main_tf: &str) {
+    /// 用主时钟 K 线刷新高周期缓存(策略声明的全部 tf, 含 primary 与 aux)。
+    fn refresh_tf_cache(&self, pair: &str) {
         let bars = {
             let Ok(kc) = self.klines_cache.read() else {
                 return;
@@ -1370,14 +1386,11 @@ impl LiveContext {
         if bars.is_empty() {
             return;
         }
-        let mut targets: Vec<String> = vec![main_tf.to_string()];
-        // 覆盖全部高周期: atr_interval(ATR) / regime_interval(判据) / ema_interval(EMA 通道)。
-        // 漏掉任一个, 该序列长跑后就会停在启动那一刻(2026-09-24 审计 #8)。
-        for key in ["atr_interval", "regime_interval", "ema_interval"] {
-            if let Some(tf) = self.config.get_str(key) {
-                if !targets.iter().any(|t| t.as_str() == tf) {
-                    targets.push(tf.to_string());
-                }
+        // 目标周期 = 策略声明的全部 tf, 去重 —— 不读任何策略参数名。
+        let mut targets: Vec<String> = Vec::new();
+        for d in &self.declarations {
+            if !targets.iter().any(|t| t == &d.tf) {
+                targets.push(d.tf.clone());
             }
         }
         if let Ok(mut tfc) = self.tf_cache.write() {
@@ -1385,15 +1398,16 @@ impl LiveContext {
                 let Some(tf_ms) = crate::multiframe::tf_ms_of(&tf) else {
                     continue;
                 };
-                tfc.insert(tf_key(pair, &tf), TfCache::new(tf_ms, bars.clone()));
+                let resampled = crate::multiframe::resample_complete(&bars, tf_ms);
+                tfc.insert(tf_key(pair, &tf), TfCache::new(tf_ms, resampled));
             }
         }
     }
 }
 
 impl DryRunContext {
-    /// 用主时钟 K 线刷新高周期缓存(策略声明的 atr_interval / regime_interval, 含主时钟自身)。
-    fn refresh_tf_cache(&self, pair: &str, main_tf: &str) {
+    /// 用主时钟 K 线刷新高周期缓存(策略声明的全部 tf, 含 primary 与 aux)。
+    fn refresh_tf_cache(&self, pair: &str) {
         let bars = {
             let Ok(kc) = self.klines_cache.read() else {
                 return;
@@ -1406,14 +1420,11 @@ impl DryRunContext {
         if bars.is_empty() {
             return;
         }
-        let mut targets: Vec<String> = vec![main_tf.to_string()];
-        // 覆盖全部高周期: atr_interval(ATR) / regime_interval(判据) / ema_interval(EMA 通道)。
-        // 漏掉任一个, 该序列长跑后就会停在启动那一刻(2026-09-24 审计 #8)。
-        for key in ["atr_interval", "regime_interval", "ema_interval"] {
-            if let Some(tf) = self.config.get_str(key) {
-                if !targets.iter().any(|t| t.as_str() == tf) {
-                    targets.push(tf.to_string());
-                }
+        // 目标周期 = 策略声明的全部 tf, 去重 —— 不读任何策略参数名。
+        let mut targets: Vec<String> = Vec::new();
+        for d in &self.declarations {
+            if !targets.iter().any(|t| t == &d.tf) {
+                targets.push(d.tf.clone());
             }
         }
         if let Ok(mut tfc) = self.tf_cache.write() {
@@ -1421,7 +1432,8 @@ impl DryRunContext {
                 let Some(tf_ms) = crate::multiframe::tf_ms_of(&tf) else {
                     continue;
                 };
-                tfc.insert(tf_key(pair, &tf), TfCache::new(tf_ms, bars.clone()));
+                let resampled = crate::multiframe::resample_complete(&bars, tf_ms);
+                tfc.insert(tf_key(pair, &tf), TfCache::new(tf_ms, resampled));
             }
         }
     }

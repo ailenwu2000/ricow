@@ -9,7 +9,9 @@ use ricow_engine::Engine;
 use rust_decimal::Decimal;
 
 use crate::commands::format_backtest_report;
-use ricow_strategy::{BacktestParams, BacktestToml, ConfigValue, StrategyConfig};
+use ricow_strategy::{
+    BacktestParams, BacktestToml, ConfigValue, Context, StrategyConfig,
+};
 
 /// `YYYY-MM-DD` -> 当日 00:00 UTC 毫秒 (回测窗口边界用)。
 fn parse_ymd_ms(s: &str) -> CoreResult<i64> {
@@ -361,41 +363,31 @@ pub(crate) async fn run_backtest(
     }
     // 三层回测参数 (内置默认 < 策略 TOML [backtest] < CLI): 解析出全量有效值 + 写回 params。
     let params = apply_backtest_cli(&args, &mut config)?;
-    // 023 高周期预热: 策略声明 `atr_interval`(网格间距) 与/或 `regime_interval`(日线趋势判据) 时,
-    // 多取主序列做预热, 使高周期指标从窗口首根起就就绪(预热段由引擎跳过, 不进 tick 循环与报告)。
-    //   · ATR: 24h 或 (period+1) 根高周期 bar;
-    //   · 趋势判据 EMA: 3×(period+1) 根高周期 bar —— `ta` 的 EMA 用**首值种**, 种子残差 =
-    //     (1−2/(n+1))^k ⇒ n=200 时: 201 根 13.5% / 402 根 1.8% / 603 根 0.25%;
-    //     ±3% 带下 13.5% 的漂移会判错边界, 故取 3×(period+1)=603 天。交易所历史不足时
-    //     分页自然取到多少算多少(预热段只喂指标, 不影响报告窗口)。
-    let atr_warmup = if let Some(atr_iv) = config.get_str("atr_interval") {
-        // 24h 覆盖 1h ATR(24 根 ≥ 14 根); 4h/1d 主序列上 24h 只有 1~6 根 → 按
-        // "ATR 就绪所需 (period+1) 根" 取上限, 避免开窗前 15 根空转(2026-09-18)。
-        let period = config.get_f64("atr_period").unwrap_or(14.0);
-        let atr_ms = ricow_strategy::tf_ms_of(atr_iv).unwrap_or(3_600_000) as f64;
-        let bar_ms = hours_per_bar * 3_600_000.0;
-        let need = (((period + 1.0) * atr_ms / bar_ms).ceil() as u32).max(1);
-        need.max(((24.0 / hours_per_bar) as u32).max(1))
-    } else {
-        0
-    };
-    // 趋势判据只在 `regime_filter = ema200` 时需要日线序列 —— off/er 不额外取数。
-    let regime_warmup = if matches!(config.get_str("regime_filter"), Some("ema200")) {
-        match config.get_str("regime_interval") {
-            Some(tf) => {
-                let period = config.get_f64("regime_ema_period").unwrap_or(200.0);
-                let tf_ms = ricow_strategy::tf_ms_of(tf).unwrap_or(86_400_000) as f64;
-                let bar_ms = hours_per_bar * 3_600_000.0;
-                (((3.0 * (period + 1.0)) * tf_ms / bar_ms).ceil() as u32).max(1)
-            }
-            None => 0,
+    // 030 数据需求声明收集: 构造空 ctx 跑一次 on_init, 策略 need_klines 写入 declarations;
+    // 据此推 warmup(预热根数)。引擎不再读 atr_interval/regime_interval 等策略参数名。
+    // on_init 幂等约定: 声明阶段只依赖 config, 不依赖 balance/K 线(见 specs/architecture.md)。
+    let mut declare_strategy = ricow_engine::load_strategy(&config)?;
+    let mut declare_ctx = ricow_strategy::BacktestContext::new(
+        config.clone(),
+        Balance { asset: "USDT".into(), free: Decimal::ZERO, locked: Decimal::ZERO },
+    );
+    declare_strategy.on_init(&mut declare_ctx);
+    let declarations = declare_ctx.declarations();
+    // 主时钟周期 = primary 声明; 未声明(异常)时回退 CLI --interval 粒度。
+    let main_tf_ms = declarations
+        .iter()
+        .find(|d| d.role == "primary")
+        .and_then(|d| ricow_strategy::tf_ms_of(&d.tf))
+        .unwrap_or_else(|| (hours_per_bar * 3_600_000.0) as i64);
+    let mut warmup_bars: u32 = 0;
+    for d in &declarations {
+        if d.role != "aux" {
+            continue;
         }
-    } else {
-        0
-    };
-    let warmup_bars = atr_warmup.max(regime_warmup);
-    if warmup_bars > 0 {
-        config.params.insert("warmup_bars".into(), ConfigValue::Integer(warmup_bars as i64));
+        let Some(tf_ms) = ricow_strategy::tf_ms_of(&d.tf) else { continue };
+        // 向上取整: aux 最少根数换算成主时钟根数 (与引擎 run_backtest 同口径)。
+        let need = ((i64::from(d.min_bars) * tf_ms + main_tf_ms - 1) / main_tf_ms) as u32;
+        warmup_bars = warmup_bars.max(need.max(1));
     }
     let fetch_limit = limit + warmup_bars;
     // TOML 策略缺 pair 时用 --pair 兜底; 两者皆无报错。
