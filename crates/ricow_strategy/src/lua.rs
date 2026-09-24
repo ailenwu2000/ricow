@@ -513,9 +513,8 @@ impl LuaStrategy {
                 }
                 ConfigValue::String(s) => {
                     data.config_str_map.insert(key.clone(), s.clone());
-                    // CLI 直跑把网格类价格参数按 Decimal 字符串注入 (防精度噪声, run/backtest 的
-                    // lower_price/upper_price); Lua 无 config_dec, 字符串数字同时进 config_f64_map,
-                    // 否则 config_f64("lower_price") 恒 0 → ladder 直跑 0 成交 (Lua 化迁移遗留)。
+                    // 字符串数字同时进 config_f64_map (否则 config_f64 读字符串参数会恒 0);
+                    // Lua 无 config_dec, 由 --param 显式传的数值参数经此通道进 f64 口径。
                     if let Ok(f) = s.parse::<f64>() {
                         data.config_f64_map.insert(key.clone(), f);
                     }

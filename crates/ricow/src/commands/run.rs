@@ -70,7 +70,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
     let config = if strategies_dir.join(format!("{}.toml", args.strategy)).exists() {
         crate::commands::load_strategy_toml(&strategies_dir, &args.strategy)?
     } else {
-        inline_config(&args, &exchange).await?
+        inline_config(&args).await?
     };
 
     let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();
@@ -348,105 +348,23 @@ fn print_run_outcome(o: &RunOutcome) {
 }
 
 /// 旧逻辑: 按策略类型构造内联配置 (直跑调试通道)。
-async fn inline_config(
-    args: &RunArgs,
-    exchange: &std::sync::Arc<dyn ricow_core::Exchange>,
-) -> CoreResult<StrategyConfig> {
+async fn inline_config(args: &RunArgs) -> CoreResult<StrategyConfig> {
     let pair = args.pair.clone().ok_or_else(|| {
         CoreError::InvalidArgument("直跑模式需要 --pair <pair> (或使用已部署策略名)".into())
     })?;
 
-    // 网格区间围绕当前价 ±10% (动态)
-    let ref_price = exchange
-        .get_orderbook(&pair, 1)
-        .await
-        .ok()
-        .and_then(|ob| ob.mid_price())
-        .unwrap_or_else(|| Decimal::from(3000));
-    let lower = ref_price * Decimal::new(9, 1);
-    let upper = ref_price * Decimal::new(11, 1);
-
+    // 只传 pair(运行环境信息)与 --script(lua 策略脚本)。策略参数全部由 Lua 策略自己的
+    // fallback 默认值决定 —— 不在这里写任何策略参数名/默认值(目标 3: 新增/修改策略不改项目代码)。
     let mut params: HashMap<String, ConfigValue> = HashMap::new();
     params.insert("pair".into(), ConfigValue::String(pair.clone()));
-
-    // 各策略的默认参数 (示例, 可后续接 preset)
-    match args.strategy.as_str() {
-        "shannon_rebalance" => {
-            params.entry("order_size".into()).or_insert(ConfigValue::Float(0.01));
-            params.entry("rebalance_band".into()).or_insert(ConfigValue::Float(0.005));
-            params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
-            params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
-            params.entry("atr_mult".into()).or_insert(ConfigValue::Float(1.0));
-        }
-        "shannon_spot_grid" => {
-            params.entry("atr_interval".into()).or_insert(ConfigValue::String("1h".into()));
-            params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
-            params.entry("atr_mult".into()).or_insert(ConfigValue::Float(2.0));
-            // 趋势门控(方案 B, 用户 2026-09-23): 默认 off(=纯网格); on = BULL 暂停卖出 / BEAR 暂停买入。
-            params.entry("trend_gate".into()).or_insert(ConfigValue::String("off".into()));
-            params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
-            params.entry("min_notional".into()).or_insert(ConfigValue::Float(5.0));
-            // 虚拟账本口径(真实本金 × 杠杆)。
-            // 030: 虚拟杠杆默认 2、范围 1~5; 账本基准 cash; fee_side 供成本门槛硬校验。
-            params.entry("leverage_mult".into()).or_insert(ConfigValue::Float(2.0));
-            params.entry("leverage_basis".into()).or_insert(ConfigValue::String("cash".into()));
-            params.entry("fee_side".into()).or_insert(ConfigValue::Float(0.001));
-            // 日线趋势判据(用户 2026-09-18 定稿): BULL 可以买不卖 / BEAR 可以卖不买 /
-            // RANGE 正常; 判据序列 = 日线(`ctx:close_tf` + `ctx:ema_tf`)。
-            params.entry("regime_filter".into()).or_insert(ConfigValue::String("ema200".into()));
-            params.entry("regime_interval".into()).or_insert(ConfigValue::String("1h".into()));
-            params.entry("regime_ema_period".into()).or_insert(ConfigValue::Integer(200));
-            params.entry("regime_band_pct".into()).or_insert(ConfigValue::Float(0.03));
-            // 入口对齐开关: 第一根 K 线即建仓(不等金叉), 供不同粒度/参数对照回测
-            params.entry("enter_at_start".into()).or_insert(ConfigValue::Boolean(false));
-            // 旧 ER 判据的参数(§二十二 实测无效, 保留; 仅当显式设 `regime_filter=er` 时才生效)。
-            params.entry("er_period".into()).or_insert(ConfigValue::Integer(20));
-            params.entry("er_threshold".into()).or_insert(ConfigValue::Float(0.25));
-            params.entry("regime_sma".into()).or_insert(ConfigValue::Integer(50));
-            params.entry("leverage_basis".into()).or_insert(ConfigValue::String("cash".into()));
-            // 信号通道与过滤器(2026-09-18 实测: RSI 优于金叉死叉; "价 < SMA(n) 不买"提升最大)
-            params.entry("signal".into()).or_insert(ConfigValue::String("cross".into()));
-            params.entry("rsi_n".into()).or_insert(ConfigValue::Float(14.0));
-            params.entry("rsi_buy".into()).or_insert(ConfigValue::Float(30.0));
-            params.entry("rsi_sell".into()).or_insert(ConfigValue::Float(70.0));
-            params.entry("boll_n".into()).or_insert(ConfigValue::Float(20.0));
-            params.entry("boll_dev".into()).or_insert(ConfigValue::Float(2.0));
-            params.entry("trend_filter_sma".into()).or_insert(ConfigValue::Float(0.0));
-        }
-        "dca" => {
-            params.insert("order_size".into(), ConfigValue::Float(0.01));
-            params.insert("interval_secs".into(), ConfigValue::Integer(3600));
-        }
-        "twap" => {
-            params.insert("total_size".into(), ConfigValue::Float(1.0));
-            params.insert("num_slices".into(), ConfigValue::Integer(10));
-            params.insert("slice_interval_secs".into(), ConfigValue::Integer(60));
-        }
-        "vwap" => {
-            params.insert("total_size".into(), ConfigValue::Float(1.0));
-            params.insert("num_slices".into(), ConfigValue::Integer(10));
-            params.insert("slice_interval_secs".into(), ConfigValue::Integer(60));
-        }
-        "pullback" => {
-            params.insert("pullback_pct".into(), ConfigValue::Float(0.03));
-            params.insert("order_size".into(), ConfigValue::Float(0.01));
-        }
-        "ladder" => {
-            params.insert("total_size".into(), ConfigValue::Float(1.0));
-            params.insert("num_levels".into(), ConfigValue::Integer(10));
-            params.insert("lower_price".into(), ConfigValue::String(lower.to_string()));
-            params.insert("upper_price".into(), ConfigValue::String(upper.to_string()));
-        }
-        "lua" => {
-            let script = args
-                .script
-                .as_ref()
-                .ok_or_else(|| CoreError::InvalidArgument("lua 策略需要 --script <path>".into()))?;
-            let code = std::fs::read_to_string(script)
-                .map_err(|e| CoreError::InvalidArgument(format!("读取脚本失败: {e}")))?;
-            params.insert("script".into(), ConfigValue::String(code));
-        }
-        other => return Err(CoreError::InvalidArgument(format!("unsupported strategy: {other}"))),
+    if args.strategy.as_str() == "lua" {
+        let script = args
+            .script
+            .as_ref()
+            .ok_or_else(|| CoreError::InvalidArgument("lua 策略需要 --script <path>".into()))?;
+        let code = std::fs::read_to_string(script)
+            .map_err(|e| CoreError::InvalidArgument(format!("读取脚本失败: {e}")))?;
+        params.insert("script".into(), ConfigValue::String(code));
     }
 
     crate::commands::resolve_builtin_script(StrategyConfig {

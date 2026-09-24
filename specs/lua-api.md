@@ -132,6 +132,8 @@ end
 | `ctx:config_str(key)` | string | 字符串参数 |
 | `ctx:config_bool(key)` | boolean | 布尔参数 |
 
+> **🔴 Lua `or` 陷阱（2026-09-24 实测踩坑）**：`config_i64/config_f64` 在参数**未配置时返回 `0`**（不是 `nil`），而 Lua 的 `or` 只对 `nil`/`false` 回退 —— `0` 是 truthy，所以 `ctx:config_f64("x") or 200` 在未配置时得到 `0` 而非 `200`。**正确写法**：用 `num(ctx, key, 缺省)` / `cfg_str(ctx, key, 缺省)` 辅助函数（见内置策略文件头），或显式判 `v == nil or v == 0`。
+
 参数在提交策略时通过 `create_strategy` 的 `params` 传入（部署后存于策略 TOML）。
 注意: 使用了 `config_xxx(key)` 的参数必须通过 `params` 传入, 未传的参数返回 0/空字符串, 不报错。
 

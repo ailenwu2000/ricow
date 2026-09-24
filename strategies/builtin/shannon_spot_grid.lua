@@ -144,7 +144,7 @@ end
 local function regime_of(ctx)
     local pair = ctx:config_str("pair")
     local tf = cfg_str(ctx, "regime_interval", "1h")
-    local period = ctx:config_i64("regime_ema_period") or 200
+    local period = num(ctx, "regime_ema_period", 200)
     local close = ctx:close_tf(pair, tf)
     local ema = ctx:ema_tf(pair, tf, period)
     if not close or not ema or ema <= 0 then
@@ -316,7 +316,7 @@ function on_init(ctx)
     ctx:need_klines("primary", cfg_str(ctx, "interval", "1h"), 1000)
     -- ATR 最少 (period+1) 根; 24 根 = 通用余量(约 15 根的 1.6 倍)。注意 min_bars 是 tf 自身根数,
     -- 不是"24 小时"——要表达"至少 24h"须写成 ceil(24h/tf) 根(1h→24, 15m→96), 见 lua-api.md。
-    local atr_need = (ctx:config_i64("atr_period") or 14) + 1
+    local atr_need = num(ctx, "atr_period", 14) + 1
     if atr_need < 24 then atr_need = 24 end
     ctx:need_klines("aux", cfg_str(ctx, "atr_interval", "1h"), atr_need)
     ctx:need_klines(
@@ -414,7 +414,7 @@ function on_tick(ctx)
     end
     local pair = ctx:config_str("pair")
     local atr_intv = cfg_str(ctx, "atr_interval", "1h")
-    local atr_period = ctx:config_i64("atr_period") or 14
+    local atr_period = num(ctx, "atr_period", 14)
     local atr_mult = num(ctx, "atr_mult", 2)
     local min_notional = num(ctx, "min_notional", 5)
     -- R7: 单边费率(现货 0.1%/边 → 0.001); fee_bps = 万分之一单位(供 cap_size 的余量计算)

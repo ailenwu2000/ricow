@@ -108,10 +108,7 @@ pub(crate) fn parse_param(s: &str) -> Option<(String, ConfigValue)> {
 /// Option<f64> 格式化: None → "n/a"。
 /// 构造回测配置: 命中 strategies/<name>.toml → TOML 加载 (--param 透传覆盖);
 /// 未命中 → 策略类型直跑 (旧逻辑, 默认参数)。
-async fn resolve_config(
-    args: &BacktestArgs,
-    exchange: &std::sync::Arc<dyn ricow_core::Exchange>,
-) -> CoreResult<StrategyConfig> {
+async fn resolve_config(args: &BacktestArgs) -> CoreResult<StrategyConfig> {
     let strategies_dir = crate::commands::ensure_strategies_dir()?;
     let toml_path = strategies_dir.join(format!("{}.toml", args.strategy));
     if toml_path.exists() {
@@ -123,115 +120,31 @@ async fn resolve_config(
         }
         return Ok(config);
     }
-    let config = inline_config(args, exchange).await?;
+    let config = inline_config(args).await?;
     Ok(config)
 }
 
-/// 直跑模式: 按策略类型构造内联配置。
-async fn inline_config(
-    args: &BacktestArgs,
-    exchange: &std::sync::Arc<dyn ricow_core::Exchange>,
-) -> CoreResult<StrategyConfig> {
+/// 直跑模式: 只传运行环境信息(pair)与 lua 脚本(--script)。
+/// 策略参数全部由 Lua 策略自己的 fallback 默认值决定 —— 不在这里写任何策略参数名/默认值
+/// (目标 3: 新增/修改策略不改项目代码)。
+async fn inline_config(args: &BacktestArgs) -> CoreResult<StrategyConfig> {
     let pair = args.pair.clone().ok_or_else(|| {
         CoreError::InvalidArgument("直跑模式需要 --pair <pair> (或使用已部署策略名)".into())
     })?;
 
-    // 网格区间围绕当前价 ±10% (与 run 直跑口径一致; 取不到盘口回退 3000)。
-    let ref_price = exchange
-        .get_orderbook(&pair, 1)
-        .await
-        .ok()
-        .and_then(|ob| ob.mid_price())
-        .unwrap_or_else(|| Decimal::from(3000));
-    let lower = ref_price * Decimal::new(9, 1);
-    let upper = ref_price * Decimal::new(11, 1);
-
     let mut params: HashMap<String, ConfigValue> = HashMap::new();
     params.insert("pair".into(), ConfigValue::String(pair.clone()));
-    match args.strategy.as_str() {
-        "shannon_rebalance" => {
-            params.entry("order_size".into()).or_insert(ConfigValue::Float(0.01));
-            params.entry("rebalance_band".into()).or_insert(ConfigValue::Float(0.005));
-            params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
-            params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
-            params.entry("atr_mult".into()).or_insert(ConfigValue::Float(1.0));
-        }
-        "shannon_spot_grid" => {
-            params.entry("atr_interval".into()).or_insert(ConfigValue::String("1h".into()));
-            params.entry("atr_period".into()).or_insert(ConfigValue::Integer(14));
-            params.entry("atr_mult".into()).or_insert(ConfigValue::Float(2.0));
-            // 趋势门控(方案 B, 用户 2026-09-23): BULL 暂停卖出 / BEAR 暂停买入; 默认 off。
-            params.entry("trend_gate".into()).or_insert(ConfigValue::String("off".into()));
-            params.entry("target_ratio".into()).or_insert(ConfigValue::Float(0.5));
-            params.entry("min_notional".into()).or_insert(ConfigValue::Float(5.0));
-            // 虚拟账本口径(真实本金 × 杠杆)。
-            // 虚拟杠杆默认 2、范围 1~5; 账本基准 cash;
-            // fee_side = 现货单边费率, 供成本门槛硬校验(atr_mult×ATR > 4×fee_side×价格)。
-            params.entry("leverage_mult".into()).or_insert(ConfigValue::Float(2.0));
-            params.entry("leverage_basis".into()).or_insert(ConfigValue::String("cash".into()));
-            params.entry("fee_side".into()).or_insert(ConfigValue::Float(0.001));
-            // 趋势判据(1h EMA200): BULL(`close > EMA200×(1+band)`) 暂停卖出 /
-            // BEAR(`close < EMA200×(1−band)`) 暂停买入 / RANGE(带内) 两侧正常。判据序列 = 1h
-            // (`ctx:close_tf` + `ctx:ema_tf`), 预热见下方 warmup。
-            params.entry("regime_filter".into()).or_insert(ConfigValue::String("ema200".into()));
-            params.entry("regime_interval".into()).or_insert(ConfigValue::String("1h".into()));
-            params.entry("regime_ema_period".into()).or_insert(ConfigValue::Integer(200));
-            params.entry("regime_band_pct".into()).or_insert(ConfigValue::Float(0.03));
-            // 入口对齐开关: 第一根 K 线即建仓(不等金叉), 供不同粒度/参数对照回测
-            params.entry("enter_at_start".into()).or_insert(ConfigValue::Boolean(false));
-            // 旧 ER 判据的参数(§二十二 实测无效, 保留; 仅当显式设 `regime_filter=er` 时才生效)。
-            params.entry("er_period".into()).or_insert(ConfigValue::Integer(20));
-            params.entry("er_threshold".into()).or_insert(ConfigValue::Float(0.25));
-            params.entry("regime_sma".into()).or_insert(ConfigValue::Integer(50));
-            params.entry("leverage_basis".into()).or_insert(ConfigValue::String("cash".into()));
-            // 信号通道与过滤器(2026-09-18 实测: RSI 优于金叉死叉; "价 < SMA(n) 不买"提升最大)
-            params.entry("signal".into()).or_insert(ConfigValue::String("cross".into()));
-            params.entry("rsi_n".into()).or_insert(ConfigValue::Float(14.0));
-            params.entry("rsi_buy".into()).or_insert(ConfigValue::Float(30.0));
-            params.entry("rsi_sell".into()).or_insert(ConfigValue::Float(70.0));
-            params.entry("boll_n".into()).or_insert(ConfigValue::Float(20.0));
-            params.entry("boll_dev".into()).or_insert(ConfigValue::Float(2.0));
-            params.entry("trend_filter_sma".into()).or_insert(ConfigValue::Float(0.0));
-        }
-        "dca" => {
-            params.insert("order_size".into(), ConfigValue::Float(0.01));
-            params.insert("interval_secs".into(), ConfigValue::Integer(3600));
-        }
-        "twap" => {
-            params.insert("total_size".into(), ConfigValue::Float(1.0));
-            params.insert("num_slices".into(), ConfigValue::Integer(10));
-            params.insert("slice_interval_secs".into(), ConfigValue::Integer(60));
-        }
-        "vwap" => {
-            params.insert("total_size".into(), ConfigValue::Float(1.0));
-            params.insert("num_slices".into(), ConfigValue::Integer(10));
-            params.insert("slice_interval_secs".into(), ConfigValue::Integer(60));
-        }
-        "pullback" => {
-            params.insert("pullback_pct".into(), ConfigValue::Float(0.03));
-            params.insert("order_size".into(), ConfigValue::Float(0.01));
-        }
-        "ladder" => {
-            params.insert("total_size".into(), ConfigValue::Float(1.0));
-            params.insert("num_levels".into(), ConfigValue::Integer(10));
-            params.insert("lower_price".into(), ConfigValue::String(lower.to_string()));
-            params.insert("upper_price".into(), ConfigValue::String(upper.to_string()));
-        }
-        "lua" => {
-            let script = args
-                .script
-                .as_ref()
-                .ok_or_else(|| CoreError::InvalidArgument("lua 策略需要 --script <path>".into()))?;
-            let code = std::fs::read_to_string(script)
-                .map_err(|e| CoreError::InvalidArgument(format!("读取脚本失败: {e}")))?;
-            params.insert("script".into(), ConfigValue::String(code));
-        }
-        other => {
-            return Err(CoreError::InvalidArgument(format!("unsupported strategy: {other}")));
-        }
+    if args.strategy.as_str() == "lua" {
+        let script = args
+            .script
+            .as_ref()
+            .ok_or_else(|| CoreError::InvalidArgument("lua 策略需要 --script <path>".into()))?;
+        let code = std::fs::read_to_string(script)
+            .map_err(|e| CoreError::InvalidArgument(format!("读取脚本失败: {e}")))?;
+        params.insert("script".into(), ConfigValue::String(code));
     }
-    // --param 透传覆盖默认 (必须在默认值插入之后; 曾置于 match 前被 dca 等分支的
-    // params.insert 默认值覆盖, 用户参数静默失效)。
+
+    // --param 透传覆盖(用户显式传参, 非写死默认值)。
     for p in &args.params {
         if let Some((k, v)) = parse_param(p) {
             params.insert(k, v);
@@ -343,7 +256,7 @@ pub(crate) async fn run_backtest(
     let limit = ((days as f64) * 24.0 / hours_per_bar) as u32;
 
     let exchange = crate::commands::bn_exchange()?;
-    let mut config = resolve_config(&args, &exchange).await?;
+    let mut config = resolve_config(&args).await?;
     // CLI 覆盖 market/position_mode (三层最上层; market 同时决定数据源分支, 见下)。
     if let Some(m) = &args.market {
         if m != "spot" && m != "futures" {
@@ -363,6 +276,13 @@ pub(crate) async fn run_backtest(
     }
     // 三层回测参数 (内置默认 < 策略 TOML [backtest] < CLI): 解析出全量有效值 + 写回 params。
     let params = apply_backtest_cli(&args, &mut config)?;
+    // --interval 是主时钟粒度(通用配置, 与 pair 同类): 写入 params 供策略 need_klines("primary", ...)
+    // 声明使用。用户显式 --param interval 优先(不覆盖)。若不写, 策略 primary 声明会 fallback "1h",
+    // 与 --interval 拉的 K 线粒度错位 → warmup 换算错 → 高周期指标永不就绪(实测 0 成交)。
+    config
+        .params
+        .entry("interval".into())
+        .or_insert(ConfigValue::String(interval.clone()));
     // 030 数据需求声明收集: 构造空 ctx 跑一次 on_init, 策略 need_klines 写入 declarations;
     // 据此推 warmup(预热根数)。引擎不再读 atr_interval/regime_interval 等策略参数名。
     // on_init 幂等约定: 声明阶段只依赖 config, 不依赖 balance/K 线(见 specs/architecture.md)。
@@ -583,7 +503,7 @@ order_size = 0.02
             market: None,
             position_mode: None,
         };
-        let cfg = resolve_config(&args, &exchange).await.unwrap();
+        let cfg = resolve_config(&args).await.unwrap();
         assert_eq!(cfg.strategy_type, "lua", "内置名 TOML 应 Lua 化");
         assert_eq!(cfg.get_str("pair"), Some("ETH"));
         assert_eq!(cfg.get_f64("order_size"), Some(0.02));
@@ -634,7 +554,7 @@ exchange = "binance"
             market: None,
             position_mode: None,
         };
-        let cfg = resolve_config(&args, &exchange).await.unwrap();
+        let cfg = resolve_config(&args).await.unwrap();
         assert!(cfg.get_str("pair").is_none(), "TOML 无 pair 时 resolve 不注入");
         std::env::remove_var("RICOW_ROOT");
     }
