@@ -11,7 +11,7 @@
 --      多个 lot(方便配对)。**建仓不计入 flag**(flag 从建仓后的网格交易才起算)。
 --   3) 网格: 参考价 = 最近成交价(ref_price); 下方挂 1 张买单(ref ÷ (1+下方间距%), 金额 order_amount),
 --      上方挂 1 张卖单(ref × (1+上方间距%), 数量 = 栈顶 lot 的币数), 仅当有待配对仓(lots 非空)才挂卖单。
---   4) 间距(等比): 固定百分比 spacing_pct(默认 0.5%), 上下用等比公比对称(向上 ×(1+s), 向下 ÷(1+s))。
+--   4) 间距(等比): 固定百分比 spacing_pct(默认 1%), 上下用等比公比对称(向上 ×(1+s), 向下 ÷(1+s))。
 --      买价 = ref ÷ (1 + 下方间距%), 卖价 = ref × (1 + 上方间距%)
 --      下方间距% = spacing_pct × (flag<0 ? 1+|flag|×direction_offset : 1)
 --      上方间距% = spacing_pct × (flag>0 ? 1+|flag|×direction_offset : 1)
@@ -31,7 +31,7 @@
 --   pair              必填, 交易对(现货)
 --   start_price       必填, 开始价格(低于它才激活)
 --   interval          主时钟, 默认 1h
---   spacing_pct       间距百分比(小数, 0.005=0.5%), 默认 0.005
+--   spacing_pct       间距百分比(小数, 0.01=1%), 默认 0.01
 --   order_amount      每笔买入资金(计价币, 如 U), 默认 10
 --   initial_buy_amount  初始建仓金额, 默认 0(=不建仓)
 --   direction_offset  方向偏移, 默认 0.2
@@ -197,7 +197,7 @@ function on_init(ctx)
     ctx:log(string.format(
         "[paired_grid] init pair=%s quote=%s 间距=%.2f%% 每笔=%.2f 建仓=%.2f " ..
         "偏移=%.2f 模式=%s min_notional=%.2f fee_side=%.4f",
-        pair, quote_asset, num(ctx, "spacing_pct", 0.005) * 100,
+        pair, quote_asset, num(ctx, "spacing_pct", 0.01) * 100,
         num(ctx, "order_amount", 10), num(ctx, "initial_buy_amount", 0),
         num(ctx, "direction_offset", 0.2), cfg_str(ctx, "accumulate_mode", "u"),
         num(ctx, "min_notional", 5), num(ctx, "fee_side", 0.001)))
@@ -235,7 +235,7 @@ function on_tick(ctx)
     -- 决策条件齐备 -> 现在才落节流标记(防取不到价格时白白消耗决策机会)
     last_bar_ts = t.ts
 
-    local spacing_pct = num(ctx, "spacing_pct", 0.005)
+    local spacing_pct = num(ctx, "spacing_pct", 0.01)
     local order_amount = num(ctx, "order_amount", 10)
     local direction_offset = num(ctx, "direction_offset", 0.2)
     local accumulate_mode = cfg_str(ctx, "accumulate_mode", "u")
