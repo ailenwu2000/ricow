@@ -1022,20 +1022,6 @@ pub(crate) fn format_backtest_report(
                     2
                 )
             );
-            match (report.benchmark_exposure_return_pct, report.benchmark_exposure_max_drawdown) {
-                (Some(er), Some(ed)) => {
-                    line!(
-                        out,
-                        "  敞口对齐 (同 target_ratio 买入持有): {:+.2}%  最大回撤 {:.2}%",
-                        er,
-                        ed.to_f64().unwrap_or(0.0) * 100.0
-                    );
-                    if let Some(s) = report.strategy_return_since_entry_pct {
-                        line!(out, "  → 策略行为净贡献 (策略 − 敞口对齐): {:+.2} 个百分点", s - er);
-                    }
-                }
-                _ => line!(out, "  敞口对齐基准: n/a"),
-            }
         }
         _ => line!(out, "  基准对照: 窗口内无成交(未建仓), 无满仓持有基准可比"),
     }

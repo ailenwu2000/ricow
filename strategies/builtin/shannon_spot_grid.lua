@@ -741,5 +741,14 @@ function on_stop(ctx)
             "[shannon_spot_grid] 收益分解: 投入 %.0f | 期初建仓 %.6f@%.4f | 期末持仓 %.6f@%.4f 权益 %.2f | " ..
             "合计收益 %+.2f = 持仓收益 %+.2f + 交易收益 %+.2f",
             inv, entry_size, entry_price, q1, p1, eq1, total, hold, total - hold))
+        -- 同 target_ratio 买入持有对照(引擎已不再算敞口对齐基准, 由策略自报; 只给收益、无回撤)
+        if entry_price > 0 then
+            local tr = target_ratio_of(ctx)
+            local expo_pct = tr * (p1 / entry_price - 1) * 100
+            local total_pct = total / inv * 100
+            ctx:log(string.format(
+                "[shannon_spot_grid] 基准对照: 同 target_ratio(%.2f)买入持有 %+.2f%% | 合计 %+.2f%% | 净贡献 %+.2f 个百分点",
+                tr, expo_pct, total_pct, total_pct - expo_pct))
+        end
     end
 end

@@ -389,7 +389,7 @@ pub(crate) async fn run_backtest(
             return Err(CoreError::InvalidArgument(format!(
                 "预热段不足, 拒绝回测: 请求 {warmup_bars} 根高周期历史, 交易所只有 {actual} 根 —— \
                  指标初值会失真(用到日线判据时很可能永久未就绪而静默不下单)。\
-                 请扩大窗口、缩短高周期预热需求(如 regime_ema_period), 或关闭该判据(regime_filter=off)。"
+                 请扩大窗口或减少高周期数据需求(见所用策略的数据声明与周期参数)。"
             )));
         }
     }

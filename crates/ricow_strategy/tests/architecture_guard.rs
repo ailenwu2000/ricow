@@ -151,6 +151,7 @@ fn engine_and_binding_layer_zero_strategy_params() {
     collect_rs(&format!("{ROOT}/crates/ricow_engine/src"), &mut files);
     files.push(format!("{ROOT}/crates/ricow_strategy/src/context.rs"));
     files.push(format!("{ROOT}/crates/ricow_strategy/src/lua.rs"));
+    files.push(format!("{ROOT}/crates/ricow_strategy/src/backtest.rs"));
     for f in &files {
         let src = read(f);
         let prod = production_lines(&src);

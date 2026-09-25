@@ -107,10 +107,6 @@ pub struct BacktestReport {
     pub benchmark_max_drawdown: Option<Decimal>,
     /// 满仓持有年化波动率 (比率)。
     pub benchmark_annual_volatility: Option<f64>,
-    /// 敞口对齐基准收益 % (同 `target_ratio` 仓位买入持有, 不再平衡) —— **策略行为的正确对照**。
-    pub benchmark_exposure_return_pct: Option<f64>,
-    /// 敞口对齐基准最大回撤 (比率)。
-    pub benchmark_exposure_max_drawdown: Option<Decimal>,
     // ---- 组合回测口径 (M2; 单标的: equity_curve/turnover_ratio 亦填, holdings_snapshots 为空) ----
     /// 净值曲线 (quote; 起点 = 初始现金, 逐 bar/tick 收盘估值 + 末根补估)。
     pub equity_curve: Vec<Decimal>,
@@ -1099,8 +1095,6 @@ impl BacktestContext {
             benchmark_return_pct: None,
             benchmark_max_drawdown: None,
             benchmark_annual_volatility: None,
-            benchmark_exposure_return_pct: None,
-            benchmark_exposure_max_drawdown: None,
         }
     }
 
@@ -1205,10 +1199,8 @@ impl BacktestContext {
         );
         // ---- 023 T8: 基准对照 ----
         // 口径(users 指定): 以**首次成交价同时点、同本金**满仓买入持有到期末; 建仓前策略空仓
-        // 不计入对比(排除择时运气)。另算「敞口对齐」基准 = 同 `target_ratio` 仓位买入持有,
-        // 它是判断"策略行为本身有没有加分"的正确对照(默认 50:50 下与满仓的差主要是敞口, 不是技能)。
-        // 回撤用价格序列直接算(比率与尺度无关); 混合组合序列 = (1−r)·p0 + r·p, 同样尺度无关。
-        let (bm_entry, bm_ret, bm_dd, bm_vol, bm_expo_ret, bm_expo_dd, strat_since_entry) =
+        // 不计入对比(排除择时运气)。回撤用价格序列直接算(比率与尺度无关)。
+        let (bm_entry, bm_ret, bm_dd, bm_vol, strat_since_entry) =
             match (self.first_fill_price, self.first_fill_time) {
                 (Some(p0), Some(t0)) if p0 > Decimal::ZERO => {
                     let mut prices: Vec<Decimal> = vec![p0];
@@ -1235,19 +1227,11 @@ impl BacktestContext {
                     } else {
                         (None, None)
                     };
-                    let target = self.config.get_f64("target_ratio").unwrap_or(0.5).clamp(0.0, 1.0);
-                    let rt = Decimal::from_f64_retain(target).unwrap_or(Decimal::ZERO);
-                    let mixed: Vec<Decimal> =
-                        prices.iter().map(|p| (Decimal::ONE - rt) * p0 + rt * *p).collect();
-                    // 混合组合收益 = r × 满仓收益(线性, 现金腿零收益)。
-                    let expo_ret = ret.map(|v| v * target);
                     (
                         Some(p0),
                         ret,
                         Some(crate::pnl::max_drawdown(&prices)),
                         vol,
-                        expo_ret,
-                        Some(crate::pnl::max_drawdown(&mixed)),
                         match self.entry_equity {
                             Some(e0) if e0 > Decimal::ZERO => {
                                 ((final_equity - e0) / e0).to_f64().map(|v| v * 100.0)
@@ -1256,7 +1240,7 @@ impl BacktestContext {
                         },
                     )
                 }
-                _ => (None, None, None, None, None, None, None),
+                _ => (None, None, None, None, None),
             };
 
         BacktestReport {
@@ -1314,8 +1298,6 @@ impl BacktestContext {
             benchmark_return_pct: bm_ret,
             benchmark_max_drawdown: bm_dd,
             benchmark_annual_volatility: bm_vol,
-            benchmark_exposure_return_pct: bm_expo_ret,
-            benchmark_exposure_max_drawdown: bm_expo_dd,
         }
     }
 
