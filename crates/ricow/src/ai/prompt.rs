@@ -51,7 +51,7 @@ pub const GATES_GUIDE: &str = r#"【运行四档(同一策略, 风险递增)】
 pub const TRAPS_GUIDE: &str = r#"【最容易跑偏的点(逐条核对)】
 1. 交易对必须带报价币: 现货写 ETHUSDT 不是 ETH(否则交易所报 Invalid symbol); bStock 美股代币形如 <代码>BUSDT。
 2. 策略名只允许 [A-Za-z0-9_-], 长度 ≤ 24(中文名会被拒), 且不得与既有名字互为前缀(如 abc 与 abc-x): 名字派生订单归属前缀, 塌缩会导致停机清理误撤他人挂单。
-3. 内置脚本是编译期嵌入: 改 strategies/builtin/*.lua 不重编译不生效; 自定义请复制到 strategies/scripts/ 再改。
+3. 内置脚本是编译期嵌入: 改 strategies/spot/*.lua 不重编译不生效; 自定义请复制到 strategies/{spot,futures}/ 改 id 再改。
 4. 回测与预览用交易所真实 K 线(需联网); 本地 K 线库是另一套(`ricow db sync|stats|export`)。
 5. 资金口径要一致: Dry Run 虚拟本金 = [strategy.params] initial_cash(缺省 100000); 回测用 --cash —— 两者都按策略的真实资金规模设置, 否则仓位/网格步长的预演结论会失真。平台不设投资风控限额(盈亏与仓位由策略自己负责), 仅有固定 100 单/秒的下单频率工程护栏防程序失控。
 6. 数据目录: 当前目录有 ricow.db 或 strategies/ 即用当前目录, 否则用平台标准目录; 显式指定用 RICOW_ROOT=<项目根>。

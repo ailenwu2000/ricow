@@ -93,9 +93,7 @@ impl Exchange for BnSpotExchange {
         limit: u32,
         end_ms: i64,
     ) -> CoreResult<Vec<Kline>> {
-        self.client
-            .get_klines_ending_at(pair, interval, limit, end_ms)
-            .await
+        self.client.get_klines_ending_at(pair, interval, limit, end_ms).await
     }
 
     async fn get_orderbook(&self, pair: &str, depth: u32) -> CoreResult<OrderBook> {

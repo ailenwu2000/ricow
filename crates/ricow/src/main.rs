@@ -3,6 +3,7 @@
 mod ai;
 mod commands;
 mod i18n;
+mod strategies;
 mod supervisor;
 mod web;
 

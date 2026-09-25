@@ -25,6 +25,8 @@
     fills: document.getElementById("fills"),
     logName: document.getElementById("log-name"),
     logLines: document.getElementById("log-lines"),
+    strategyList: document.getElementById("strategy-list"),
+    strategyDetail: document.getElementById("strategy-detail"),
   };
 
   // 运行时文案(页面静态标签走 `data-zh` / `data-en`, 见 `applyLang`)。
@@ -56,6 +58,12 @@
       noLogs: "还没有任何策略日志(策略启动后才会生成)。",
       rotated: "日志已轮转(或被截断), 已从头重读 —— 不丢行、不重复",
       logUnreadable: "日志读不到",
+      spot: "现货",
+      futures: "合约",
+      noStrategies: "无策略",
+      required: "必填",
+      suitable: "适合: ",
+      unsuitable: "不适合: ",
     },
     en: {
       thinking: "thinking…",
@@ -84,6 +92,12 @@
       noLogs: "No strategy logs yet (a log appears once a strategy has been started).",
       rotated: "Log rotated (or truncated); re-read from the start — no line dropped or repeated",
       logUnreadable: "Log unreadable",
+      spot: "Spot",
+      futures: "Futures",
+      noStrategies: "No strategies",
+      required: "required",
+      suitable: "Fits: ",
+      unsuitable: "Unfits: ",
     },
   };
 
@@ -98,6 +112,8 @@
     trade: null, // 交易面板最近一次读到的快照(还没读到就是 null, 不冒充"无持仓")
     logName: null, // 日志面板正在跟的策略
     logStream: null, // 日志面板那条流, 与会话流 state.source 各走各的(R5)
+    strategyList: [], // 策略面板最近一次读到的列表(切语言重渲染用, 不重取)
+    strategyDetail: null, // 策略面板正在展示详情的清单(null = 未点开)
   };
 
   const t = (key) => TEXT[state.lang][key];
@@ -139,6 +155,11 @@
     }
     renderList();
     renderTrade();
+    // 策略面板(031): 内容静态不轮询, 但切语言要跟着换分组标题/必填/适合文案 —— 用缓存重渲染, 不重取。
+    if (els.strategyList) {
+      renderStrategyList(state.strategyList);
+      if (state.strategyDetail) renderStrategyDetail(state.strategyDetail);
+    }
     // 日志**内容**不重译(那是文件里的原样行, FR-018); 只有宿主自己写的提示语要跟着切。
     for (const node of els.logLines.querySelectorAll("[data-note]")) {
       node.textContent = noteText(node.dataset.note, node.dataset.reason);
@@ -948,6 +969,130 @@
     openLog(els.logName.value);
   });
 
+  // ---------- 策略目录 (031 FR-013 / FR-014): 只读展示, 配置走对话确认 ----------
+
+  /// 拉一次策略目录(内置示例 + 用户自写), 按现货/合约分组展示。
+  async function loadStrategies() {
+    const list = await api("/api/strategies");
+    state.strategyList = list;
+    renderStrategyList(list);
+  }
+
+  function renderStrategyList(list) {
+    els.strategyList.textContent = "";
+    if (!list.length) {
+      els.strategyList.appendChild(emptyRow(t("noStrategies")));
+      return;
+    }
+    for (const market of ["spot", "futures"]) {
+      const group = list.filter((s) => s.market === market);
+      if (!group.length) continue;
+      const head = document.createElement("div");
+      head.className = "strategy-group";
+      head.textContent = market === "spot" ? t("spot") : t("futures");
+      els.strategyList.appendChild(head);
+      for (const s of group) {
+        const item = document.createElement("div");
+        item.className = "strategy-item";
+        const name = document.createElement("span");
+        name.className = "strategy-name";
+        name.textContent = s.name;
+        const summary = document.createElement("div");
+        summary.className = "strategy-summary";
+        summary.textContent = s.summary;
+        item.appendChild(name);
+        item.appendChild(summary);
+        item.addEventListener("click", () => openStrategy(s.id).catch(strategyError));
+        els.strategyList.appendChild(item);
+      }
+    }
+  }
+
+  /// 点开某策略 → 取完整清单(含参数 schema)渲染详情。
+  async function openStrategy(id) {
+    const detail = await api("/api/strategies/" + encodeURIComponent(id));
+    state.strategyDetail = detail;
+    renderStrategyDetail(detail);
+  }
+
+  function renderStrategyDetail(m) {
+    const box = els.strategyDetail;
+    box.textContent = "";
+    box.hidden = false;
+    const title = document.createElement("div");
+    title.className = "strategy-title";
+    title.textContent = m.name;
+    box.appendChild(title);
+    if (m.description) {
+      const desc = document.createElement("div");
+      desc.className = "strategy-desc";
+      desc.textContent = m.description;
+      box.appendChild(desc);
+    }
+    if (m.suitable || m.unsuitable) {
+      const fit = document.createElement("div");
+      fit.className = "strategy-fit";
+      let text = "";
+      if (m.suitable) text += t("suitable") + m.suitable;
+      if (m.unsuitable) text += (text ? " · " : "") + t("unsuitable") + m.unsuitable;
+      fit.textContent = text;
+      box.appendChild(fit);
+    }
+    for (const p of m.params) box.appendChild(paramRow(p));
+  }
+
+  /// 一个参数的只读展示: 中文名(+ 必填)、说明、按类型预填默认值的控件。
+  function paramRow(p) {
+    const row = document.createElement("div");
+    row.className = "param";
+    const label = document.createElement("div");
+    label.className = "param-label";
+    label.textContent = p.name + (p.required ? " (" + t("required") + ")" : "");
+    const desc = document.createElement("div");
+    desc.className = "param-desc";
+    desc.textContent = p.desc;
+    row.appendChild(label);
+    row.appendChild(desc);
+    row.appendChild(paramInput(p));
+    return row;
+  }
+
+  /// 控件一律 disabled(只读展示 + 默认值预填) —— 改参数走对话确认, 前端无写按钮(FR-016)。
+  function paramInput(p) {
+    const dflt = p.default;
+    if (p.type === "enum") {
+      const sel = document.createElement("select");
+      sel.disabled = true;
+      for (const o of p.options || []) {
+        const opt = document.createElement("option");
+        opt.value = o;
+        opt.textContent = o;
+        if (dflt !== undefined && dflt !== null && String(dflt) === o) opt.selected = true;
+        sel.appendChild(opt);
+      }
+      return sel;
+    }
+    if (p.type === "bool") {
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.disabled = true;
+      cb.checked = dflt === true;
+      return cb;
+    }
+    const inp = document.createElement("input");
+    inp.disabled = true;
+    inp.type = p.type === "f64" || p.type === "i64" ? "number" : "text";
+    if (dflt !== undefined && dflt !== null) inp.value = String(dflt);
+    return inp;
+  }
+
+  function strategyError(err) {
+    state.strategyDetail = null; // 别让切语言把旧详情盖回错误提示
+    els.strategyDetail.hidden = false;
+    els.strategyDetail.textContent = "";
+    els.strategyDetail.appendChild(emptyRow(t("failed") + (err && err.message)));
+  }
+
   // ---------- 启动 ----------
 
   async function boot() {
@@ -972,6 +1117,8 @@
     // 右侧两块面板(026): 启动先各取一次, 之后交易每 5s 自动跟, 日志靠流推。
     refreshTrades().catch(tradeError);
     refreshLogList().catch((err) => appendLine("error", t("failed") + err.message));
+    // 策略目录(031): 启动取一次, 内容静态(清单), 不轮询。
+    loadStrategies().catch((err) => appendLine("error", t("failed") + err.message));
     window.setInterval(() => {
       refreshTrades().catch(tradeError);
     }, TRADE_POLL_MS);

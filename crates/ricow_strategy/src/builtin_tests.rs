@@ -1,6 +1,6 @@
 //! 内置脚本 Lua 集成测试 (回测冒烟, 不依赖网络)。
 //!
-//! 脚本源: `strategies/builtin/`(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格),
+//! 脚本源: `strategies/spot/`(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格),
 //! include_str! 编译期嵌入。
 //! 断言每个内置脚本的关键行为 (建仓/激活/配对/挂单), 对齐 Rust 版已知向量。
 
@@ -17,7 +17,7 @@ use crate::lua::LuaStrategy;
 use crate::strategy::Strategy;
 use rust_decimal::prelude::ToPrimitive;
 
-const SHANNON_ETF_ACCUM: &str = include_str!("../../../strategies/builtin/shannon_spot_grid.lua");
+const SHANNON_ETF_ACCUM: &str = include_str!("../../../strategies/spot/shannon_spot_grid.lua");
 
 fn config(script: &str, params: &[(&str, ConfigValue)]) -> StrategyConfig {
     let mut map = HashMap::new();
@@ -38,7 +38,6 @@ fn config(script: &str, params: &[(&str, ConfigValue)]) -> StrategyConfig {
         backtest: None,
     }
 }
-
 
 // ============================================================================
 // 023 香农 ETF 指数增加策略 (shannon_spot_grid) 集成测试
@@ -176,10 +175,7 @@ fn test_shannon_spot_grid_requires_signal_ema_channel() {
         &bars,
         Some(tf_bars_up(20, 40, 5)),
     );
-    assert!(
-        orders.iter().all(|o| o.is_empty()),
-        "信号 EMA 通道未就绪时必须完全不动"
-    );
+    assert!(orders.iter().all(|o| o.is_empty()), "信号 EMA 通道未就绪时必须完全不动");
 }
 
 #[test]
@@ -191,10 +187,7 @@ fn test_shannon_spot_grid_thin_spacing_halts() {
         &bars,
         Some(tf_bars_up(20, 60, 1)),
     );
-    assert!(
-        orders.iter().all(|o| o.is_empty()),
-        "成本门槛不满足时必须停机且不下任何单"
-    );
+    assert!(orders.iter().all(|o| o.is_empty()), "成本门槛不满足时必须停机且不下任何单");
     assert_eq!(st.global_f64("buy_count"), None.or(Some(0.0)), "不得建仓");
     assert_eq!(st.global_f64("fill_count"), Some(0.0), "不得有成交");
 }
@@ -210,7 +203,6 @@ fn test_shannon_spot_grid_leverage_clamped_to_5() {
     );
     assert_eq!(st.global_f64("v_cap"), Some(50000.0), "杠杆应钳制到 5");
 }
-
 
 // ─────────────────── 030-A 网格挂单语义(2026-09-23 用户口径) ───────────────────
 
@@ -228,10 +220,7 @@ fn drop_main(n: i64, base: i64, then: i64, at: i64) -> Vec<Kline> {
 fn test_shannon_spot_grid_requires_start_price() {
     let bars = drop_main(40, 200, 100, 10);
     let (orders, _ctx, st) = run_accum_full(accum_cfg(&[]), &bars, Some(tf_bars(60)));
-    assert!(
-        orders.iter().all(|o| o.is_empty()),
-        "缺必填 start_price 时不得下任何单"
-    );
+    assert!(orders.iter().all(|o| o.is_empty()), "缺必填 start_price 时不得下任何单");
     assert_eq!(st.global_f64("fill_count"), Some(0.0), "缺参数 -> 无成交");
 }
 
@@ -243,18 +232,11 @@ fn test_shannon_spot_grid_activate_with_initial_buy_then_ladder() {
     ]);
     let bars = drop_main(60, 200, 100, 10);
     let (orders, _ctx, st) = run_accum_full(cfg, &bars, Some(tf_bars(60)));
-    let market: Vec<_> = orders
-        .iter()
-        .flatten()
-        .filter(|o| o.order_type == OrderType::Market)
-        .collect();
+    let market: Vec<_> =
+        orders.iter().flatten().filter(|o| o.order_type == OrderType::Market).collect();
     assert_eq!(market.len(), 1, "激活时应恰有一笔市价初始建仓");
     assert_eq!(market[0].side, OrderSide::Buy);
-    assert_eq!(
-        st.global_f64("balance_price"),
-        Some(100.0),
-        "初始建仓成交价应成为第一次平衡价"
-    );
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "初始建仓成交价应成为第一次平衡价");
     // 挂单: 平衡价 ± atr_mult×ATR = 100 ± 2×2 = 96 / 104; 无仓可卖(真实持仓很少) -> 只有买单
     let limits: Vec<_> = orders
         .iter()
@@ -280,22 +262,14 @@ fn test_shannon_spot_grid_activate_without_initial_buy() {
     let bars = drop_main(60, 200, 100, 10);
     let (orders, _ctx, st) = run_accum_full(cfg, &bars, Some(tf_bars(60)));
     assert_eq!(st.global_f64("fill_count"), Some(0.0), "未设初始仓位 -> 无成交");
-    assert_eq!(
-        st.global_f64("balance_price"),
-        Some(100.0),
-        "未设初始仓位 -> 平衡价 := 激活时现价"
-    );
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "未设初始仓位 -> 平衡价 := 激活时现价");
     let limits: Vec<_> = orders
         .iter()
         .flatten()
         .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
         .collect();
     assert!(!limits.is_empty(), "未设初始仓位也应挂出买单");
-    assert_eq!(
-        limits[0].price.expect("限价单必须带价格"),
-        dec!(96),
-        "买单价位 = 平衡价 − 2×ATR"
-    );
+    assert_eq!(limits[0].price.expect("限价单必须带价格"), dec!(96), "买单价位 = 平衡价 − 2×ATR");
 }
 
 #[test]
@@ -311,10 +285,7 @@ fn test_shannon_spot_grid_state_snapshot_has_anchor_and_cap() {
         snap.iter().any(|(k, _)| k == "balance_price"),
         "状态快照应含平衡价(断点续接的最小必需项)"
     );
-    assert!(
-        snap.iter().any(|(k, _)| k == "v_cap"),
-        "状态快照应含账本规模"
-    );
+    assert!(snap.iter().any(|(k, _)| k == "v_cap"), "状态快照应含账本规模");
 }
 
 /// 030 门控: trend_gate=off(默认, 纯网格)在 BULL 状态下仍挂卖单。
@@ -407,7 +378,7 @@ fn test_shannon_spot_grid_records_entry_for_pnl_split() {
 // paired_grid 现货动态非对称网格 集成测试 (2026-09-24)
 // ============================================================================
 
-const PAIRED_GRID: &str = include_str!("../../../strategies/builtin/paired_grid.lua");
+const PAIRED_GRID: &str = include_str!("../../../strategies/spot/paired_grid.lua");
 
 fn paired_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
     let mut params = vec![
@@ -431,11 +402,8 @@ fn test_paired_grid_activate_build_and_grid_structure() {
     let (orders, _ctx, st) = run_accum_full(cfg, &bars, None);
 
     // 建仓市价单
-    let market: Vec<_> = orders
-        .iter()
-        .flatten()
-        .filter(|o| o.order_type == OrderType::Market)
-        .collect();
+    let market: Vec<_> =
+        orders.iter().flatten().filter(|o| o.order_type == OrderType::Market).collect();
     assert!(!market.is_empty(), "激活后应建仓市价买入, 实际无市价单");
     assert_eq!(market[0].side, OrderSide::Buy);
 
@@ -462,11 +430,7 @@ fn test_paired_grid_activate_build_and_grid_structure() {
     );
 
     // 建仓不计 flag; 本序列无网格成交 -> flag 恒 0
-    assert_eq!(
-        st.global_f64("flag"),
-        Some(0.0),
-        "建仓不计 flag, 无网格成交时 flag 应恒为 0"
-    );
+    assert_eq!(st.global_f64("flag"), Some(0.0), "建仓不计 flag, 无网格成交时 flag 应恒为 0");
 }
 
 #[test]
@@ -494,11 +458,7 @@ fn test_paired_grid_pair_sell_above_buy() {
     );
 
     // 买单成交(flag−1) + 卖单成交(flag+1) -> 归 0
-    assert_eq!(
-        st.global_f64("flag"),
-        Some(0.0),
-        "一买一卖配对完成后 flag 应归 0"
-    );
+    assert_eq!(st.global_f64("flag"), Some(0.0), "一买一卖配对完成后 flag 应归 0");
 }
 
 #[test]
@@ -516,4 +476,3 @@ fn test_paired_grid_flag_negative_on_downtrend() {
     let flag = st.global_f64("flag").expect("flag 应可读");
     assert!(flag < 0.0, "连续下跌只买不卖 → flag 应为负, 实际 {flag}");
 }
-

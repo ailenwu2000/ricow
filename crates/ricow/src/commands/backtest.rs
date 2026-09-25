@@ -9,9 +9,7 @@ use ricow_engine::Engine;
 use rust_decimal::Decimal;
 
 use crate::commands::format_backtest_report;
-use ricow_strategy::{
-    BacktestParams, BacktestToml, ConfigValue, Context, StrategyConfig,
-};
+use ricow_strategy::{BacktestParams, BacktestToml, ConfigValue, Context, StrategyConfig};
 
 /// `YYYY-MM-DD` -> 当日 00:00 UTC 毫秒 (回测窗口边界用)。
 fn parse_ymd_ms(s: &str) -> CoreResult<i64> {
@@ -22,7 +20,7 @@ fn parse_ymd_ms(s: &str) -> CoreResult<i64> {
 
 #[derive(Args, Default)]
 pub struct BacktestArgs {
-    /// 策略类型 (shannon_spot_grid/paired_grid/lua 或已部署策略名; exec API 见 specs/lua-api.md)
+    /// 策略 (内置策略 id 或已部署策略名; 内置策略与中文名见 `ricow ai` 的 list_templates 或 Web 策略面板; exec API 见 specs/lua-api.md)
     #[arg(long)]
     pub strategy: String,
     /// 交易对 (TOML 策略已含 pair 时可省略; 直跑模式必填)
@@ -279,10 +277,7 @@ pub(crate) async fn run_backtest(
     // --interval 是主时钟粒度(通用配置, 与 pair 同类): 写入 params 供策略 need_klines("primary", ...)
     // 声明使用。用户显式 --param interval 优先(不覆盖)。若不写, 策略 primary 声明会 fallback "1h",
     // 与 --interval 拉的 K 线粒度错位 → warmup 换算错 → 高周期指标永不就绪(实测 0 成交)。
-    config
-        .params
-        .entry("interval".into())
-        .or_insert(ConfigValue::String(interval.clone()));
+    config.params.entry("interval".into()).or_insert(ConfigValue::String(interval.clone()));
     // 030 数据需求声明收集: 构造空 ctx 跑一次 on_init, 策略 need_klines 写入 declarations;
     // 据此推 warmup(预热根数)。引擎不再读 atr_interval/regime_interval 等策略参数名。
     // on_init 幂等约定: 声明阶段只依赖 config, 不依赖 balance/K 线(见 specs/architecture.md)。
@@ -298,7 +293,7 @@ pub(crate) async fn run_backtest(
         .iter()
         .find(|d| d.role == "primary")
         .and_then(|d| ricow_strategy::tf_ms_of(&d.tf))
-        .unwrap_or_else(|| (hours_per_bar * 3_600_000.0) as i64);
+        .unwrap_or((hours_per_bar * 3_600_000.0) as i64);
     let mut warmup_bars: u32 = 0;
     for d in &declarations {
         if d.role != "aux" {
@@ -379,7 +374,8 @@ pub(crate) async fn run_backtest(
         let step_ms = (hours_per_bar * 3_600_000.0) as i64;
         let e_ms = end_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
         let start_ms = e_ms - (limit as i64) * step_ms;
-        let available = klines.partition_point(|k| k.open_time.timestamp_millis() < start_ms) as u32;
+        let available =
+            klines.partition_point(|k| k.open_time.timestamp_millis() < start_ms) as u32;
         let actual = warmup_bars.min(available);
         if actual != warmup_bars {
             // 030(2026-09-23): 预热段不足 = 指标初值不可信, 甚至会让判据**永久未就绪**而静默不下单。

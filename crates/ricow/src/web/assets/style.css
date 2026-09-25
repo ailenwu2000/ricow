@@ -534,3 +534,86 @@ body {
   border-color: var(--error);
   color: var(--error);
 }
+
+/* 策略目录(031): 只读展示, 按现货/合约分组 + 参数表单(disabled 预填)。 */
+#strategy-list {
+  padding: 4px 0;
+}
+.strategy-group {
+  margin: 8px 14px 2px;
+  color: var(--accent);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.strategy-item {
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.strategy-item:hover {
+  background: #1d232b;
+}
+.strategy-name {
+  display: block;
+  color: var(--fg);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.strategy-summary {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.4;
+}
+.strategy-detail {
+  margin: 8px 14px 12px;
+  padding: 10px;
+  background: #1d232b;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.strategy-detail[hidden] {
+  display: none;
+}
+.strategy-title {
+  color: var(--accent);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.strategy-desc {
+  margin-top: 4px;
+  color: var(--fg);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.strategy-fit {
+  margin-top: 6px;
+  color: var(--warn);
+  font-size: 0.74rem;
+}
+.param {
+  margin-top: 8px;
+}
+.param-label {
+  color: var(--fg);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.param-desc {
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+.param input,
+.param select {
+  margin-top: 3px;
+  width: 100%;
+  padding: 3px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.78rem;
+}

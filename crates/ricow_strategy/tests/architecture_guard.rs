@@ -12,61 +12,55 @@
 //! 不匹配裸字面量 —— 避免误伤同名 struct/订单字段 (如 OrderRequest 的 `side`、SymbolInfo
 //! 的 `min_notional` 都是字段名, 不是策略参数)。
 //!
-//! 黑名单 = 全部内置策略参数名的全集, 来源 = `strategies/builtin/**` 的 config_xxx/num/cfg_str
-//! 调用键(实测提取) + templates.rs 的 params 数组。新增内置策略参数须同步加入(否则漏拦)。
-//! 注意 `pair` 是通用配置(交易对, CLI/引擎本来就该知道), 不在此黑名单。
+//! 黑名单(031 起) = 派生自策略清单 `strategies/{spot,futures}/*.toml` 的 `[[params]]` 键
+//! (单一来源, 新增内置策略参数无需手动同步本文件)。通用配置键(`pair` 交易对 / `script` 脚本 /
+//! `interval` 主时钟)不在此黑名单 —— 它们本就是 CLI/引擎要透传的通用项。
 
 use std::path::Path;
 
 /// workspace 根 (相对 crate 目录 `crates/ricow_strategy` 上溯两级)。
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
-/// 策略参数名全集(策略逻辑专属, 只允许出现在 Lua 策略与测试代码里)。
-const STRATEGY_PARAMS: &[&str] = &[
-    "accumulate_mode",
-    "activation_price",
-    "atr_interval",
-    "atr_mult",
-    "atr_period",
-    "bar_seconds",
-    "dd_stop_pct",
-    "direction_offset",
-    "distribution",
-    "fee_side",
-    "initial_buy_amount",
-    "interval_secs",
-    "leverage_basis",
-    "leverage_mult",
-    "lookback_bars",
-    "lower_price",
-    "max_buys",
-    "min_notional",
-    "num_levels",
-    "num_slices",
-    "order_amount",
-    "order_size",
-    "pause_bars",
-    "pause_pct",
-    "pullback_abs",
-    "pullback_pct",
-    "real_cash",
-    "rebalance_band",
-    "regime_band_pct",
-    "regime_ema_period",
-    "regime_filter",
-    "regime_interval",
-    "side",
-    "slice_interval_secs",
-    "start_price",
-    "target_ratio",
-    "total_size",
-    "trend_gate",
-    "upper_price",
-];
+/// 策略参数名全集(派生自清单, 非手抄): 扫描 `strategies/{spot,futures}/*.toml` 的 `[[params]]` 键。
+/// 排除 `pair`(通用交易对配置)与 `script`(通用脚本注入)。
+fn strategy_params() -> Vec<String> {
+    let mut keys = Vec::new();
+    for market in ["spot", "futures"] {
+        let dir = Path::new(ROOT).join("strategies").join(market);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            for line in text.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("key = \"") {
+                    if let Some(end) = rest.find('"') {
+                        let k = &rest[..end];
+                        if k != "pair" && k != "script" && k != "interval" {
+                            keys.push(k.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
 
 /// 读配置的方法 (策略参数只能通过这些方法从配置池读出)。
 const READ_METHODS: &[&str] = &[
-    "get_str", "get_f64", "get_i64", "get_bool", "config_str", "config_f64", "config_i64",
+    "get_str",
+    "get_f64",
+    "get_i64",
+    "get_bool",
+    "config_str",
+    "config_f64",
+    "config_i64",
     "config_bool",
 ];
 
@@ -133,11 +127,11 @@ fn extract_str_arg<'a>(line: &'a str, method: &str) -> Option<&'a str> {
 }
 
 /// 检查一行是否出现「读/写策略参数」, 命中则 panic。
-fn assert_no_strategy_param(f: &str, line: &str, rule: &str) {
+fn assert_no_strategy_param(params: &[String], f: &str, line: &str, rule: &str) {
     for m in READ_METHODS.iter().chain(WRITE_METHODS) {
         if let Some(key) = extract_str_arg(line, m) {
             assert!(
-                !STRATEGY_PARAMS.contains(&key),
+                !params.iter().any(|k| k == key),
                 "架构违规({rule}): {f} 生产代码读/写策略参数 `{key}` (行: {line})"
             );
         }
@@ -147,6 +141,8 @@ fn assert_no_strategy_param(f: &str, line: &str, rule: &str) {
 /// 规则 A: 引擎层 + 绑定层生产代码零策略参数名。
 #[test]
 fn engine_and_binding_layer_zero_strategy_params() {
+    let params = strategy_params();
+    assert!(!params.is_empty(), "策略清单未派生到任何参数名(清单缺失?)");
     let mut files = Vec::new();
     collect_rs(&format!("{ROOT}/crates/ricow_engine/src"), &mut files);
     files.push(format!("{ROOT}/crates/ricow_strategy/src/context.rs"));
@@ -160,7 +156,7 @@ fn engine_and_binding_layer_zero_strategy_params() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            assert_no_strategy_param(f, line, "规则 A");
+            assert_no_strategy_param(&params, f, line, "规则 A");
         }
     }
 }
@@ -168,6 +164,7 @@ fn engine_and_binding_layer_zero_strategy_params() {
 /// 规则 B: CLI 层不得读/写策略参数名。
 #[test]
 fn cli_must_not_read_or_write_strategy_params() {
+    let params = strategy_params();
     let mut files = Vec::new();
     collect_rs(&format!("{ROOT}/crates/ricow/src/commands"), &mut files);
     for f in &files {
@@ -177,7 +174,89 @@ fn cli_must_not_read_or_write_strategy_params() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            assert_no_strategy_param(f, line, "规则 B");
+            assert_no_strategy_param(&params, f, line, "规则 B");
         }
     }
+}
+
+/// 清单参数键 == 同名 Lua 读取键(防清单与 Lua 漂移, FR-018)。
+///
+/// 按**同名配对**逐策略比较(.toml ↔ 同目录同 stem 的 .lua), 而非全目录并集 ——
+/// 031 起 `ricow deploy` 会把无清单的用户策略 .lua 落进 `spot/`, 并集比较会被其读取键污染。
+/// 有清单无脚本 / 有脚本无清单 的半边缺失不在本校验范围(前者由 catalog 扫描报错, 后者合成最小清单)。
+#[test]
+fn manifest_keys_match_lua_read_keys() {
+    let mut checked = 0;
+    for market in ["spot", "futures"] {
+        let dir = Path::new(ROOT).join("strategies").join(market);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let lua_path = path.with_extension("lua");
+            if !lua_path.exists() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(src) = std::fs::read_to_string(&lua_path) else { continue };
+
+            let mut manifest: Vec<String> = text
+                .lines()
+                .filter_map(|l| {
+                    let rest = l.trim().strip_prefix("key = \"")?;
+                    rest.find('"').map(|end| rest[..end].to_string())
+                })
+                .filter(|k| k != "pair" && k != "script" && k != "interval")
+                .collect();
+            manifest.sort();
+            manifest.dedup();
+            let mut lua: Vec<String> = lua_read_keys(&src)
+                .into_iter()
+                .filter(|k| k != "pair" && k != "script" && k != "interval")
+                .collect();
+            lua.sort();
+            lua.dedup();
+
+            assert_eq!(
+                manifest,
+                lua,
+                "清单 {} 的参数键必须与同名 Lua 读取键(config_*/num/cfg_str)一致",
+                path.display()
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 2, "至少应校验两个内置策略的清单↔Lua 一致性, 实际 {checked}");
+}
+
+/// 提取 Lua 源码里读取的策略参数键: `config_*(` / `num(ctx, ` / `cfg_str(ctx, ` 后的第一个引号串。
+fn lua_read_keys(src: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for m in ["config_f64(", "config_i64(", "config_str(", "config_bool("] {
+        for (i, _) in src.match_indices(m) {
+            if let Some(k) = quoted_arg(&src[i + m.len()..]) {
+                keys.push(k);
+            }
+        }
+    }
+    for m in ["num(ctx, ", "cfg_str(ctx, "] {
+        for (i, _) in src.match_indices(m) {
+            if let Some(k) = quoted_arg(&src[i + m.len()..]) {
+                keys.push(k);
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// 从 `"key"...` 提取第一个引号串。
+fn quoted_arg(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let s = s.strip_prefix('"')?;
+    let end = s.find('"')?;
+    Some(s[..end].to_string())
 }

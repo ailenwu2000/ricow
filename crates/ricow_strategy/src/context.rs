@@ -545,15 +545,16 @@ impl Context for LiveContext {
             tracing::error!(target: "context", tf, "主时钟(primary)重复声明: 至多一个 primary 序列");
             return;
         }
-        if let Some(existing) = self
-            .declarations
-            .iter_mut()
-            .find(|d| d.role == role && d.tf == tf)
+        if let Some(existing) = self.declarations.iter_mut().find(|d| d.role == role && d.tf == tf)
         {
             existing.min_bars = existing.min_bars.max(min_bars);
             return;
         }
-        self.declarations.push(Declaration { role: role.to_string(), tf: tf.to_string(), min_bars });
+        self.declarations.push(Declaration {
+            role: role.to_string(),
+            tf: tf.to_string(),
+            min_bars,
+        });
     }
 
     fn declarations(&self) -> Vec<Declaration> {
@@ -574,11 +575,7 @@ impl Context for LiveContext {
     /// 导致策略在第一个守卫(K 线)就 return, 永不动作(2026-09-24 demo 实测定位)。
     fn tick_kline(&self, pair: &str, price: Decimal, now_ms: i64) {
         // 主时钟周期 = 策略声明的 primary; 未声明 → no-op(如实暴露, 不猜默认)。
-        let Some(tf) = self
-            .declarations
-            .iter()
-            .find(|d| d.role == "primary")
-            .map(|d| d.tf.clone())
+        let Some(tf) = self.declarations.iter().find(|d| d.role == "primary").map(|d| d.tf.clone())
         else {
             tracing::warn!(target: "context", "策略未声明 primary 主时钟, tick_kline 跳过");
             return;
@@ -589,49 +586,49 @@ impl Context for LiveContext {
         let bucket_ms = now_ms / step * step;
         let mut opened_new_bar = false;
         {
-        let Ok(mut cache) = self.klines_cache.write() else {
-            return;
-        };
-        let v = cache.entry(pair.to_string()).or_default();
-        let cur = v.last().map(|k| k.open_time.timestamp_millis());
-        match cur {
-            // 同一根未收盘 bar: 更新 high/low/close
-            Some(b) if b == bucket_ms => {
-                if let Some(last) = v.last_mut() {
-                    if price > last.high {
-                        last.high = price;
+            let Ok(mut cache) = self.klines_cache.write() else {
+                return;
+            };
+            let v = cache.entry(pair.to_string()).or_default();
+            let cur = v.last().map(|k| k.open_time.timestamp_millis());
+            match cur {
+                // 同一根未收盘 bar: 更新 high/low/close
+                Some(b) if b == bucket_ms => {
+                    if let Some(last) = v.last_mut() {
+                        if price > last.high {
+                            last.high = price;
+                        }
+                        if price < last.low {
+                            last.low = price;
+                        }
+                        last.close = price;
                     }
-                    if price < last.low {
-                        last.low = price;
+                }
+                // 乱序/过期的 tick: 忽略
+                Some(b) if b > bucket_ms => {}
+                // 跨桶: 开新 bar(open = 该 tick 的价格), 并裁剪窗口
+                _ => {
+                    let open_time = chrono::DateTime::from_timestamp_millis(bucket_ms)
+                        .unwrap_or_else(chrono::Utc::now);
+                    let close_time = chrono::DateTime::from_timestamp_millis(bucket_ms + step - 1)
+                        .unwrap_or_else(chrono::Utc::now);
+                    v.push(Kline {
+                        open_time,
+                        open: price,
+                        high: price,
+                        low: price,
+                        close: price,
+                        volume: Decimal::ZERO,
+                        close_time,
+                    });
+                    let max_keep = 1500usize;
+                    if v.len() > max_keep {
+                        let drop_n = v.len() - max_keep;
+                        v.drain(0..drop_n);
                     }
-                    last.close = price;
+                    opened_new_bar = true;
                 }
             }
-            // 乱序/过期的 tick: 忽略
-            Some(b) if b > bucket_ms => {}
-            // 跨桶: 开新 bar(open = 该 tick 的价格), 并裁剪窗口
-            _ => {
-                let open_time = chrono::DateTime::from_timestamp_millis(bucket_ms)
-                    .unwrap_or_else(chrono::Utc::now);
-                let close_time = chrono::DateTime::from_timestamp_millis(bucket_ms + step - 1)
-                    .unwrap_or_else(chrono::Utc::now);
-                v.push(Kline {
-                    open_time,
-                    open: price,
-                    high: price,
-                    low: price,
-                    close: price,
-                    volume: Decimal::ZERO,
-                    close_time,
-                });
-                let max_keep = 1500usize;
-                if v.len() > max_keep {
-                    let drop_n = v.len() - max_keep;
-                    v.drain(0..drop_n);
-                }
-                opened_new_bar = true;
-            }
-        }
         }
         // 跨桶 = 上一根主时钟 K 线已收盘 -> 重采样刷新高周期缓存。
         // 不刷新的话 atr_tf / close_tf / ema_tf 会一直用启动时那份序列(长跑后失真)。
@@ -640,7 +637,6 @@ impl Context for LiveContext {
             self.refresh_tf_cache(pair);
         }
     }
-
 
     fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
         let Some(tf_ms) = crate::multiframe::tf_ms_of(tf) else {
@@ -1108,15 +1104,16 @@ impl Context for DryRunContext {
             tracing::error!(target: "context", tf, "主时钟(primary)重复声明: 至多一个 primary 序列");
             return;
         }
-        if let Some(existing) = self
-            .declarations
-            .iter_mut()
-            .find(|d| d.role == role && d.tf == tf)
+        if let Some(existing) = self.declarations.iter_mut().find(|d| d.role == role && d.tf == tf)
         {
             existing.min_bars = existing.min_bars.max(min_bars);
             return;
         }
-        self.declarations.push(Declaration { role: role.to_string(), tf: tf.to_string(), min_bars });
+        self.declarations.push(Declaration {
+            role: role.to_string(),
+            tf: tf.to_string(),
+            min_bars,
+        });
     }
 
     fn declarations(&self) -> Vec<Declaration> {
@@ -1137,11 +1134,7 @@ impl Context for DryRunContext {
     /// 导致策略在第一个守卫(K 线)就 return, 永不动作(2026-09-24 demo 实测定位)。
     fn tick_kline(&self, pair: &str, price: Decimal, now_ms: i64) {
         // 主时钟周期 = 策略声明的 primary; 未声明 → no-op(如实暴露, 不猜默认)。
-        let Some(tf) = self
-            .declarations
-            .iter()
-            .find(|d| d.role == "primary")
-            .map(|d| d.tf.clone())
+        let Some(tf) = self.declarations.iter().find(|d| d.role == "primary").map(|d| d.tf.clone())
         else {
             tracing::warn!(target: "context", "策略未声明 primary 主时钟, tick_kline 跳过");
             return;
@@ -1152,49 +1145,49 @@ impl Context for DryRunContext {
         let bucket_ms = now_ms / step * step;
         let mut opened_new_bar = false;
         {
-        let Ok(mut cache) = self.klines_cache.write() else {
-            return;
-        };
-        let v = cache.entry(pair.to_string()).or_default();
-        let cur = v.last().map(|k| k.open_time.timestamp_millis());
-        match cur {
-            // 同一根未收盘 bar: 更新 high/low/close
-            Some(b) if b == bucket_ms => {
-                if let Some(last) = v.last_mut() {
-                    if price > last.high {
-                        last.high = price;
+            let Ok(mut cache) = self.klines_cache.write() else {
+                return;
+            };
+            let v = cache.entry(pair.to_string()).or_default();
+            let cur = v.last().map(|k| k.open_time.timestamp_millis());
+            match cur {
+                // 同一根未收盘 bar: 更新 high/low/close
+                Some(b) if b == bucket_ms => {
+                    if let Some(last) = v.last_mut() {
+                        if price > last.high {
+                            last.high = price;
+                        }
+                        if price < last.low {
+                            last.low = price;
+                        }
+                        last.close = price;
                     }
-                    if price < last.low {
-                        last.low = price;
+                }
+                // 乱序/过期的 tick: 忽略
+                Some(b) if b > bucket_ms => {}
+                // 跨桶: 开新 bar(open = 该 tick 的价格), 并裁剪窗口
+                _ => {
+                    let open_time = chrono::DateTime::from_timestamp_millis(bucket_ms)
+                        .unwrap_or_else(chrono::Utc::now);
+                    let close_time = chrono::DateTime::from_timestamp_millis(bucket_ms + step - 1)
+                        .unwrap_or_else(chrono::Utc::now);
+                    v.push(Kline {
+                        open_time,
+                        open: price,
+                        high: price,
+                        low: price,
+                        close: price,
+                        volume: Decimal::ZERO,
+                        close_time,
+                    });
+                    let max_keep = 1500usize;
+                    if v.len() > max_keep {
+                        let drop_n = v.len() - max_keep;
+                        v.drain(0..drop_n);
                     }
-                    last.close = price;
+                    opened_new_bar = true;
                 }
             }
-            // 乱序/过期的 tick: 忽略
-            Some(b) if b > bucket_ms => {}
-            // 跨桶: 开新 bar(open = 该 tick 的价格), 并裁剪窗口
-            _ => {
-                let open_time = chrono::DateTime::from_timestamp_millis(bucket_ms)
-                    .unwrap_or_else(chrono::Utc::now);
-                let close_time = chrono::DateTime::from_timestamp_millis(bucket_ms + step - 1)
-                    .unwrap_or_else(chrono::Utc::now);
-                v.push(Kline {
-                    open_time,
-                    open: price,
-                    high: price,
-                    low: price,
-                    close: price,
-                    volume: Decimal::ZERO,
-                    close_time,
-                });
-                let max_keep = 1500usize;
-                if v.len() > max_keep {
-                    let drop_n = v.len() - max_keep;
-                    v.drain(0..drop_n);
-                }
-                opened_new_bar = true;
-            }
-        }
         }
         // 跨桶 = 上一根主时钟 K 线已收盘 -> 重采样刷新高周期缓存。
         // 不刷新的话 atr_tf / close_tf / ema_tf 会一直用启动时那份序列(长跑后失真)。
@@ -1203,7 +1196,6 @@ impl Context for DryRunContext {
             self.refresh_tf_cache(pair);
         }
     }
-
 
     fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
         let Some(tf_ms) = crate::multiframe::tf_ms_of(tf) else {
@@ -1218,6 +1210,74 @@ impl Context for DryRunContext {
     /// Dry Run 当前时刻 (真实 UTC, 与实盘同源): 风控窗口/结算周期与 `ctx:now()` 用。
     fn now_utc(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         Some(chrono::Utc::now())
+    }
+}
+
+impl LiveContext {
+    /// 用主时钟 K 线刷新高周期缓存(策略声明的全部 tf, 含 primary 与 aux)。
+    fn refresh_tf_cache(&self, pair: &str) {
+        let bars = {
+            let Ok(kc) = self.klines_cache.read() else {
+                return;
+            };
+            match kc.get(pair) {
+                Some(b) => b.clone(),
+                None => return,
+            }
+        };
+        if bars.is_empty() {
+            return;
+        }
+        // 目标周期 = 策略声明的全部 tf, 去重 —— 不读任何策略参数名。
+        let mut targets: Vec<String> = Vec::new();
+        for d in &self.declarations {
+            if !targets.iter().any(|t| t == &d.tf) {
+                targets.push(d.tf.clone());
+            }
+        }
+        if let Ok(mut tfc) = self.tf_cache.write() {
+            for tf in targets {
+                let Some(tf_ms) = crate::multiframe::tf_ms_of(&tf) else {
+                    continue;
+                };
+                let resampled = crate::multiframe::resample_complete(&bars, tf_ms);
+                tfc.insert(tf_key(pair, &tf), Arc::new(TfCache::new(tf_ms, resampled)));
+            }
+        }
+    }
+}
+
+impl DryRunContext {
+    /// 用主时钟 K 线刷新高周期缓存(策略声明的全部 tf, 含 primary 与 aux)。
+    fn refresh_tf_cache(&self, pair: &str) {
+        let bars = {
+            let Ok(kc) = self.klines_cache.read() else {
+                return;
+            };
+            match kc.get(pair) {
+                Some(b) => b.clone(),
+                None => return,
+            }
+        };
+        if bars.is_empty() {
+            return;
+        }
+        // 目标周期 = 策略声明的全部 tf, 去重 —— 不读任何策略参数名。
+        let mut targets: Vec<String> = Vec::new();
+        for d in &self.declarations {
+            if !targets.iter().any(|t| t == &d.tf) {
+                targets.push(d.tf.clone());
+            }
+        }
+        if let Ok(mut tfc) = self.tf_cache.write() {
+            for tf in targets {
+                let Some(tf_ms) = crate::multiframe::tf_ms_of(&tf) else {
+                    continue;
+                };
+                let resampled = crate::multiframe::resample_complete(&bars, tf_ms);
+                tfc.insert(tf_key(pair, &tf), Arc::new(TfCache::new(tf_ms, resampled)));
+            }
+        }
     }
 }
 
@@ -1385,74 +1445,6 @@ mod tests {
             apply_fill_to_net_position(&mut p, OrderSide::Buy, dec!(0.27), dec!(2500));
             assert_eq!(p.side, OrderSide::Buy);
             assert_eq!(p.size, dec!(0.27));
-        }
-    }
-}
-
-impl LiveContext {
-    /// 用主时钟 K 线刷新高周期缓存(策略声明的全部 tf, 含 primary 与 aux)。
-    fn refresh_tf_cache(&self, pair: &str) {
-        let bars = {
-            let Ok(kc) = self.klines_cache.read() else {
-                return;
-            };
-            match kc.get(pair) {
-                Some(b) => b.clone(),
-                None => return,
-            }
-        };
-        if bars.is_empty() {
-            return;
-        }
-        // 目标周期 = 策略声明的全部 tf, 去重 —— 不读任何策略参数名。
-        let mut targets: Vec<String> = Vec::new();
-        for d in &self.declarations {
-            if !targets.iter().any(|t| t == &d.tf) {
-                targets.push(d.tf.clone());
-            }
-        }
-        if let Ok(mut tfc) = self.tf_cache.write() {
-            for tf in targets {
-                let Some(tf_ms) = crate::multiframe::tf_ms_of(&tf) else {
-                    continue;
-                };
-                let resampled = crate::multiframe::resample_complete(&bars, tf_ms);
-                tfc.insert(tf_key(pair, &tf), Arc::new(TfCache::new(tf_ms, resampled)));
-            }
-        }
-    }
-}
-
-impl DryRunContext {
-    /// 用主时钟 K 线刷新高周期缓存(策略声明的全部 tf, 含 primary 与 aux)。
-    fn refresh_tf_cache(&self, pair: &str) {
-        let bars = {
-            let Ok(kc) = self.klines_cache.read() else {
-                return;
-            };
-            match kc.get(pair) {
-                Some(b) => b.clone(),
-                None => return,
-            }
-        };
-        if bars.is_empty() {
-            return;
-        }
-        // 目标周期 = 策略声明的全部 tf, 去重 —— 不读任何策略参数名。
-        let mut targets: Vec<String> = Vec::new();
-        for d in &self.declarations {
-            if !targets.iter().any(|t| t == &d.tf) {
-                targets.push(d.tf.clone());
-            }
-        }
-        if let Ok(mut tfc) = self.tf_cache.write() {
-            for tf in targets {
-                let Some(tf_ms) = crate::multiframe::tf_ms_of(&tf) else {
-                    continue;
-                };
-                let resampled = crate::multiframe::resample_complete(&bars, tf_ms);
-                tfc.insert(tf_key(pair, &tf), Arc::new(TfCache::new(tf_ms, resampled)));
-            }
         }
     }
 }

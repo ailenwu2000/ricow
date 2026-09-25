@@ -11,9 +11,11 @@
 - 只处理项目内文件，不访问 C:\Windows、AppData 以外的系统目录
 - 文件操作：Get-ChildItem / Copy-Item / Move-Item / Rename-Item / Set-Content / New-Item
 - 不输出命令让用户手敲，Agent 直接执行
-
+- 下载k线数据，可以使用本机http代理，1080端口
 
 ## Python 环境
+
 - 本项目用 uv 管理 Python 环境与依赖
 - 运行脚本：uv run python xxx.py
 - 运行模块：uv run python -m xxx
+

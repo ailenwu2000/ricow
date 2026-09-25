@@ -3,7 +3,7 @@
 //! 三步链路 (写操作**不得一步落盘**):
 //! 1. `ricow create --name <n> --pair <p> [--script <file|->]` —— 本命令: 只产出 preview, 不写任何策略文件
 //! 2. `ricow approve <preview_id>` —— 用户批准, 得一次性 token (15 分钟有效)
-//! 3. `ricow deploy <preview_id> --token <t>` —— 落盘 `strategies/<name>.toml` + `<name>.lua`
+//! 3. `ricow deploy <preview_id> --token <t>` —— 落盘实例 `strategies/<name>.toml` + 脚本 `strategies/{market}/<name>.lua` (031)
 //!
 //! 代码来源支持 AI 响应全文(带 ``` 围栏也可), `extract_code` 会剥出代码块。
 //!

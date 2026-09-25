@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/ailenwu2000/ricow/
 <pre><code>ricow create --name my_strategy --pair ETHUSDT --script my_strategy.lua   # 编译门禁 + 真实 K 线沙箱回测
 ricow approve                                                             # 由你在交互终端逐字确认
 ricow deploy &lt;preview_id&gt; --token &lt;token&gt;                                 # 落盘到 strategies/</code></pre>
-  <p class="note">内置策略: <code>strategies/builtin/shannon_spot_grid.lua</code>(香农现货网格) 与 <code>strategies/builtin/paired_grid.lua</code>(现货动态非对称网格),照它们写即可。
+  <p class="note">内置策略: <code>strategies/spot/shannon_spot_grid.lua</code>(香农现货网格) 与 <code>strategies/spot/paired_grid.lua</code>(现货动态非对称网格),照它们写即可。
   完整 API 见 <a href="https://github.com/ailenwu2000/ricow/blob/main/specs/lua-api.md">specs/lua-api.md</a>。</p>
 </section>
 

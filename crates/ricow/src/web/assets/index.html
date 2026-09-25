@@ -61,6 +61,15 @@
         按钮; 撤单 / 平仓 / 停机仍然只能走上面的对话确认流程(D17 / FR-013)。
       -->
       <aside id="panels">
+        <section class="panel" id="strategy-panel">
+          <div class="panel-head">
+            <span data-zh="策略" data-en="Strategies">策略</span>
+          </div>
+          <!-- 031: 策略目录(内置示例 + 用户自写), 按现货/合约分组; 只读, 配置走对话确认。 -->
+          <div id="strategy-list" class="rows"></div>
+          <div id="strategy-detail" class="strategy-detail" hidden></div>
+        </section>
+
         <section class="panel" id="trade-panel">
           <div class="panel-head">
             <span data-zh="交易" data-en="Trades">交易</span>

@@ -73,16 +73,16 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   - **回测/实盘对称**: 同一份策略代码在回测与实盘零改动可运行, 两路径都走「声明 → 供给 → 读」, 不允许为任一路径在引擎里硬编码。
   - **on_init 幂等约定**: 声明阶段(`on_init` 里的 `need_klines`)只依赖 config, 不依赖 balance/K 线; 回测装配会先跑一次 `on_init` 收集声明再拉数, 故 `on_init` 必须可重复调用。
 - **exec.\*** 执行组件(引擎内置 Rust 实现, 加载时注册全局表, 脚本内可覆盖): `levels` / `pullback_triggered` / `detect_quote` / `ticks_per` / `slice_due` / `side_order`
-- 内置资产(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/commands/mod.rs:BUILTIN_SCRIPTS`):
-  - `strategies/builtin/shannon_spot_grid.lua` — 香农现货网格(030): 虚拟账本(本金 × 杠杆 1~5, `v_cap` 动态 = 币×现价+现金)决定目标持币量; `start_price` 触发激活(可选 `initial_buy_amount` 建初始仓); 平衡价 ± `atr_mult×ATR` 双边限价网格, 成交即以该价为新平衡价并重挂两侧; 挂单量 = 使账本在该价回到 `target_ratio` 权重; 卖量受真实持仓兜底; 趋势门控可选(`trend_gate`, 默认关); 成本门槛硬校验(R7) + `strategy_state` 断点续接; 仓位清空即结束
-  - `strategies/builtin/paired_grid.lua` — 现货动态非对称网格(2026-09-24): 固定金额(`order_amount`)配对网格; 价格低于 `start_price` 激活; 以最近成交价为参考价上下各挂一单(下方固定金额买单、上方配对卖单, 配对 = LIFO 保证卖价恒 > 买价); 方向标志(买 −1 / 卖 +1)驱动上下间距不对称放大 `1+|flag|×direction_offset`, 抑制单向成交; 可选建仓(不计 flag)与 `accumulate_mode`(u 积累 U / coin 积累币); 成交全撤重挂 + 追踪(栈空时买单跟随上涨价格); 成本门槛(间距 > 2×单边费) + 断点续接; 仓位清空即结束
+- 内置示例(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/strategies/catalog.rs`; 031 起内置与用户策略统一由 catalog 管理, 现货/合约分 `spot/`/`futures/` 目录):
+  - `strategies/spot/shannon_spot_grid.lua` — 香农现货网格(030): 虚拟账本(本金 × 杠杆 1~5, `v_cap` 动态 = 币×现价+现金)决定目标持币量; `start_price` 触发激活(可选 `initial_buy_amount` 建初始仓); 平衡价 ± `atr_mult×ATR` 双边限价网格, 成交即以该价为新平衡价并重挂两侧; 挂单量 = 使账本在该价回到 `target_ratio` 权重; 卖量受真实持仓兜底; 趋势门控可选(`trend_gate`, 默认关); 成本门槛硬校验(R7) + `strategy_state` 断点续接; 仓位清空即结束
+  - `strategies/spot/paired_grid.lua` — 现货动态非对称网格(2026-09-24): 固定金额(`order_amount`)配对网格; 价格低于 `start_price` 激活; 以最近成交价为参考价上下各挂一单(下方固定金额买单、上方配对卖单, 配对 = LIFO 保证卖价恒 > 买价); 方向标志(买 −1 / 卖 +1)驱动上下间距不对称放大 `1+|flag|×direction_offset`, 抑制单向成交; 可选建仓(不计 flag)与 `accumulate_mode`(u 积累 U / coin 积累币); 成交全撤重挂 + 追踪(栈空时买单跟随上涨价格); 成本门槛(间距 > 2×单边费) + 断点续接; 仓位清空即结束
   - ~~`strategies/builtin/bs_momentum.lua`~~ — **已于 2026-09-11 删除** (真实 bStock 成交轨期望 ≈0:
     spot 91 天 每 bar −0.0198% / futures 220 天 +0.0367%; 七年 R1 数字含幸存者偏误不作证据);
     同批删除的还有 `bs_intraday_top5.lua`(日内 Top5, 成本算术否决)。证据见 specs/research/。
     **其引擎机制保留为通用能力**: 组合回测路径 `run_portfolio_backtest` + 组合信号模式
     (`universe` 键 / `signal_klines` / `SIGNAL_TAIL` 尾窗) + 任意 interval tick 对齐 `build_interval_ticks`,
     暂无内置消费者; 组合回测 CLI 入口随策略一并删除。
-- 用户策略: `<项目根>/strategies/<name>.toml` + `strategies/scripts/<name>.lua`(git 忽略默认私有; builtin 例外)
+- 用户策略: `<项目根>/strategies/<name>.toml`(实例) + `strategies/{spot,futures}/<id>.{lua,toml}`(源码 + 清单; git 忽略默认私有, 内置示例例外)
 - **单一配置文件**(019 D31, R4 修订): `$RICOW_ROOT/ricow.toml`(权限: **Unix 0600 / Windows 无 POSIX 权限位**, 写入时尽力收紧为仅当前用户 ACL —— 对外展示口径统一取 `commands/config_file.rs::permission_summary`, 不得无条件写"0600"; 进 `.gitignore`)—— `[ai]`(provider / model / base_url / max_turns / api_key)、
   `[exchange]`(demo_key / demo_secret / binance_key / binance_secret)与 `[market]`(show_all_pairs)同文件; 该文件**即界面**(无 `ricow keyring` / `ricow setup` / 写凭据命令), 未知键硬失败。
   **R4 起文件可写**: `commands/config_file.rs::set_values` 按行外科替换/缺键插入(**保留注释**、原子写 + 0600), 白名单 9 键, 白名单外一律拒绝 —— 入口是首次向导 `commands/onboard.rs` 与对话内 `/keys` `/market`, 仍无独立"写凭据命令"。

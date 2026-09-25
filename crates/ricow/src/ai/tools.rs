@@ -391,7 +391,7 @@ fn tool_run_backtest(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "run_backtest",
         "对某个策略在真实历史 K 线上跑一次回测并返回报告(与 `ricow backtest` 同一条代码路径、同一份格式化)。\
-只读: 不动资金、不落盘、不改配置。策略名可以是已部署策略名, 或内置名 shannon_spot_grid/paired_grid。",
+只读: 不动资金、不落盘、不改配置。策略名可以是已部署策略名, 或内置策略 id(见 list_templates)。",
         json!({
             "type": "object",
             "properties": {
@@ -786,7 +786,7 @@ fn tool_list_pairs(ctx: ToolCtx) -> DynamicTool {
 fn tool_list_templates(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "list_templates",
-        "列出**内置策略模板**(编译期内置, 不用网络): 完整策略 2 个(shannon_spot_grid 香农现货网格 / paired_grid 现货动态非对称网格)。\
+        "列出**全部策略**(内置示例 + 用户自写; 内置免网络): 每个策略含中文名与参数。\
          用户说\"从模板建\"或不知道从哪开始时先调用本工具, 再让用户挑一个; 取原文用 read_template。",
         json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         move |_c, _args| {
@@ -801,12 +801,12 @@ fn tool_list_templates(_ctx: ToolCtx) -> DynamicTool {
 fn tool_read_template(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "read_template",
-        "读取某个内置模板的**元数据 + Lua 原文**。\
+        "读取某个策略的**元数据 + Lua 原文**。\
          原文可直接作为 preview_strategy 的 script 提交(参数按用户回答填)。",
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "模板名, 取值见 list_templates(如 shannon_spot_grid / paired_grid)" }
+                "name": { "type": "string", "description": "策略 id, 取值见 list_templates(如 shannon_spot_grid / paired_grid)" }
             },
             "required": ["name"],
             "additionalProperties": false
@@ -815,15 +815,14 @@ fn tool_read_template(_ctx: ToolCtx) -> DynamicTool {
             Box::pin(async move {
                 let name = arg_str(&args, "name")?;
                 let t = commands::templates::find(&name).ok_or_else(|| {
-                    let mut known: Vec<&str> =
-                        commands::templates::ALL.iter().map(|t| t.name).collect();
+                    let mut known = commands::templates::names();
                     known.sort_unstable();
                     ToolExecutionError::invalid_args(format!(
-                        "没有模板 '{name}'; 可用: {}",
+                        "没有策略 '{name}'; 可用: {}",
                         known.join(" / ")
                     ))
                 })?;
-                Ok(ToolOutput::text(clamp_output(commands::templates::render_read(t))))
+                Ok(ToolOutput::text(clamp_output(commands::templates::render_read(&t))))
             })
         },
     )
@@ -2431,9 +2430,9 @@ mod tests {
             .expect("宿主执行落盘");
         assert!(msg.contains("已确认并完成落盘"), "{msg}");
 
-        // 双证据①: 真实落盘 toml + lua
+        // 双证据①: 真实落盘 toml(根) + lua(市场子目录, 031)
         assert!(root.join("strategies").join(format!("{name}.toml")).is_file());
-        assert!(root.join("strategies").join(format!("{name}.lua")).is_file());
+        assert!(root.join("strategies").join("spot").join(format!("{name}.lua")).is_file());
         // 双证据②: preview 已 consumed(一次性 token, 不可重放)
         let db = ricow_strategy::Database::open(&root.join("ricow.db")).await.unwrap();
         let rec = ricow_engine::get_preview(&db, &preview_id).await.unwrap();
@@ -2488,7 +2487,7 @@ mod tests {
     async fn fr044_replace_flow_backs_up_then_overwrites() {
         let root = r3_temp_root("fr044-over");
         let name = "aidp044b";
-        let lua_path = root.join("strategies").join(format!("{name}.lua"));
+        let lua_path = root.join("strategies").join("spot").join(format!("{name}.lua"));
 
         // 先正常部署一版, 记下原文
         let id1 = seed_pending_preview(&root, name).await;
@@ -2553,15 +2552,16 @@ mod tests {
         let now = std::fs::read_to_string(&lua_path).unwrap();
         assert!(now.contains("v = 2"), "新脚本应已落盘: {now}");
         assert_ne!(now, old_lua);
-        // 旧脚本仍在备份里(且逐字一致)
-        let backups: Vec<String> = std::fs::read_dir(root.join("strategies"))
+        // 旧脚本仍在备份里(且逐字一致; 031 起 .lua 备份随脚本落在市场子目录)
+        let backups: Vec<String> = std::fs::read_dir(root.join("strategies").join("spot"))
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.starts_with(&format!("{name}.lua.")) && n.ends_with(".bak"))
             .collect();
         assert_eq!(backups.len(), 1, "应恰好一个脚本备份: {backups:?}");
-        let saved = std::fs::read_to_string(root.join("strategies").join(&backups[0])).unwrap();
+        let saved = std::fs::read_to_string(root.join("strategies").join("spot").join(&backups[0]))
+            .unwrap();
         assert_eq!(saved, old_lua, "备份必须是旧脚本原文");
     }
 

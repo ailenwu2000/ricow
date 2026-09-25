@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use chrono::{Datelike, Timelike};
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
-use ricow_core::{Kline, OrderAction, OrderFill, OrderRequest, OrderSide, OrderType, OrderUpdate, Position};
+use ricow_core::{
+    Kline, OrderAction, OrderFill, OrderRequest, OrderSide, OrderType, OrderUpdate, Position,
+};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
@@ -294,10 +296,7 @@ impl UserData for LuaCtxData {
                     return Ok(Value::Nil);
                 };
                 let c = data.tf_cache.get(&tf_key(&pair, &tf));
-                match (
-                    c.and_then(|c| c.ema(fast, now_ms)),
-                    c.and_then(|c| c.ema(slow, now_ms)),
-                ) {
+                match (c.and_then(|c| c.ema(fast, now_ms)), c.and_then(|c| c.ema(slow, now_ms))) {
                     (Some(f), Some(s)) => {
                         let t = lua.create_table()?;
                         t.set("fast", f)?;
@@ -745,10 +744,8 @@ impl Strategy for LuaStrategy {
         let mut out = Vec::new();
         let g = self.lua.globals();
         if let Ok(Some(t)) = g.get::<Option<Table>>("_RICOW_STATE") {
-            for pair in t.pairs::<String, String>() {
-                if let Ok((k, v)) = pair {
-                    out.push((k, v));
-                }
+            for (k, v) in t.pairs::<String, String>().flatten() {
+                out.push((k, v));
             }
         }
         out

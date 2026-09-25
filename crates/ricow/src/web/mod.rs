@@ -225,6 +225,9 @@ pub fn router(state: WebState) -> Router {
         .route("/api/terms", get(list_terms))
         // 语言读写(FR-029): 与 CLI 共用 `[ui].lang`。
         .route("/api/lang", get(get_lang).post(set_lang))
+        // 策略目录(031 FR-013 / FR-014): 只读展示策略清单 + 参数 schema。
+        .route("/api/strategies", get(list_strategies))
+        .route("/api/strategies/{id}", get(get_strategy))
         // 交易面板数据(026 FR-010 / FR-012): 全部**只读**, 数据来自与引擎同一份本地库(D1);
         // 挂在本 `.layer` 之内 → 与既有端点同一道 token 门禁(D14 / FR-011)。
         .route("/api/trades/fills", get(trades_fills))
@@ -421,6 +424,47 @@ async fn session_input(
 /// 服务端也不必为它记语言状态。
 async fn list_terms() -> Json<Vec<&'static terms::Term>> {
     Json(terms::all())
+}
+
+// ---- 策略目录 (031 FR-013 / FR-014): 只读展示策略清单与参数 schema ----
+
+/// 策略列表行(前端策略面板用)。
+#[derive(serde::Serialize)]
+struct StrategyRow {
+    id: String,
+    name: String,
+    market: String,
+    summary: String,
+    source: String,
+    param_count: usize,
+}
+
+/// 策略列表(只读): 内置示例 + 用户自写, 按注册顺序。
+async fn list_strategies() -> Json<Vec<StrategyRow>> {
+    let rows = crate::strategies::catalog::all()
+        .into_iter()
+        .map(|e| StrategyRow {
+            id: e.manifest.id,
+            name: e.manifest.name,
+            market: e.manifest.market,
+            summary: e.manifest.summary,
+            source: match e.source {
+                crate::strategies::catalog::Source::Builtin => "builtin".to_string(),
+                crate::strategies::catalog::Source::User => "user".to_string(),
+            },
+            param_count: e.manifest.params.len(),
+        })
+        .collect();
+    Json(rows)
+}
+
+/// 单个策略详情(只读): 完整清单(含参数 schema), 供前端参数表单渲染。
+async fn get_strategy(
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<crate::strategies::catalog::StrategyManifest>, WebError> {
+    let entry = crate::strategies::catalog::find(&id)
+        .ok_or_else(|| WebError::bad_request(format!("没有策略 {id}")))?;
+    Ok(Json(entry.manifest))
 }
 
 /// 语言读写(FR-029): 与 CLI 共用 `ricow.toml` 的 `[ui].lang`, 不新增第二处语言状态。

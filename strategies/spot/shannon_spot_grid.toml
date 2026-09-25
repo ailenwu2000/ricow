@@ -1,0 +1,139 @@
+# 策略清单(manifest): 展示元数据 + 参数 schema。仅供 UI/CLI/AI, 引擎不读(架构铁律)。
+id = "shannon_spot_grid"
+name = "香农现货网格"
+market = "spot"
+summary = "虚拟账本(本金 × 杠杆 1~5)决定应持币量, 平衡价上下 atr_mult×ATR 各挂一张限价单, 成交即以成交价为新平衡价并重挂两侧; 可选趋势门控"
+description = """
+用「虚拟账本」定义应该持多少币: 在平衡价上下 atr_mult × ATR 各挂一张限价单, 任一成交就把成交价当作新平衡价并立即重挂两侧。趋势门控(默认关)决定何时允许买、何时允许卖。
+"""
+suitable = "震荡市、温和上涨"
+unsuitable = "单边急涨(跑输同敞口持有)、单边下跌(库存填满浮亏放大)"
+
+[[params]]
+key = "pair"
+name = "交易对"
+type = "string"
+desc = "现货交易对(如 ETHUSDT)"
+required = true
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "价格低于它才激活(必填; 回测请设为窗口起点价, 勿前视)"
+required = true
+
+[[params]]
+key = "interval"
+name = "主时钟"
+type = "string"
+desc = "主时钟周期(回测常用 15m)"
+default = "1h"
+
+[[params]]
+key = "atr_interval"
+name = "ATR 周期"
+type = "string"
+desc = "算 ATR 的 K 线周期"
+default = "1h"
+
+[[params]]
+key = "atr_period"
+name = "ATR 根数"
+type = "i64"
+desc = "ATR 的样本根数"
+default = 14
+
+[[params]]
+key = "atr_mult"
+name = "网格间距倍数"
+type = "f64"
+desc = "网格间距 = atr_mult × ATR"
+default = 2
+
+[[params]]
+key = "initial_buy_amount"
+name = "初始建仓金额"
+type = "f64"
+desc = "激活时市价买入的金额(0 = 不建仓); 建议 = 本金的一半"
+default = 0
+
+[[params]]
+key = "leverage_mult"
+name = "虚拟杠杆"
+type = "f64"
+desc = "虚拟账本杠杆(钳制 1~5)"
+default = 2
+
+[[params]]
+key = "leverage_basis"
+name = "本金基准"
+type = "enum"
+desc = "cash = 用初始本金(规模恒定); equity = 用当前权益(倍数恒定)"
+default = "cash"
+options = ["cash", "equity"]
+
+[[params]]
+key = "real_cash"
+name = "本金"
+type = "f64"
+desc = "虚拟账本基准本金(0 = 用激活时账户权益)"
+default = 0
+
+[[params]]
+key = "target_ratio"
+name = "币权重"
+type = "f64"
+desc = "虚拟账本的币权重(0.5 = 币/现金各半)"
+default = 0.5
+
+[[params]]
+key = "trend_gate"
+name = "趋势门控"
+type = "enum"
+desc = "off = 纯网格; on = 上涨趋势暂停卖出 / 下跌趋势暂停买入"
+default = "off"
+options = ["off", "on"]
+
+[[params]]
+key = "regime_filter"
+name = "判据类型"
+type = "enum"
+desc = "趋势判据类型(off 关闭)"
+default = "ema200"
+options = ["ema200", "off"]
+
+[[params]]
+key = "regime_interval"
+name = "判据周期"
+type = "string"
+desc = "趋势判据的 K 线周期"
+default = "1h"
+
+[[params]]
+key = "regime_ema_period"
+name = "判据 EMA 根数"
+type = "i64"
+desc = "趋势判据的 EMA 周期"
+default = 200
+
+[[params]]
+key = "regime_band_pct"
+name = "判据带宽"
+type = "f64"
+desc = "趋势判据的带宽(小数, 0.03 = 3%)"
+default = 0.03
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额"
+default = 5
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "单边手续费率(0.001 = 现货 0.1%/边)"
+default = 0.001

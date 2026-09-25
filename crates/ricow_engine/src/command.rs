@@ -1195,15 +1195,16 @@ impl Engine {
                         )
                         .await;
                         strategy.on_fill(&mut ctx, fill);
-                // 030 断点续接: 成交后立即持久化策略状态(关机/中止后重启可继续)。
-                if let Some(db) = db {
-                    for (k, v) in strategy.state_snapshot() {
-                        if let Err(e) = db.strategy_state_set(&strategy_name, &k, &v).await {
-                            outcome.persist_errors += 1;
-                            tracing::error!(target: "engine", key = %k, "策略状态落库失败: {e}");
+                        // 030 断点续接: 成交后立即持久化策略状态(关机/中止后重启可继续)。
+                        if let Some(db) = db {
+                            for (k, v) in strategy.state_snapshot() {
+                                if let Err(e) = db.strategy_state_set(&strategy_name, &k, &v).await
+                                {
+                                    outcome.persist_errors += 1;
+                                    tracing::error!(target: "engine", key = %k, "策略状态落库失败: {e}");
+                                }
+                            }
                         }
-                    }
-                }
                         // 成交后刷新持仓 (P3: 不做高频轮询, 只在成交后刷; 覆盖式避免陈旧仓位)
                         let refreshed = refresh_positions(
                             &exchange,

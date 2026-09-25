@@ -14,7 +14,7 @@ pub struct RunArgs {
     /// 首次实盘使用需读风险披露后确认一次 (018; product.md §十)
     #[arg(long = "accept-risk")]
     pub accept_risk: bool,
-    /// 策略名 (已部署 TOML, 如 <项目根>/strategies/<name>.toml) 或策略类型直跑 (shannon_spot_grid/paired_grid)
+    /// 策略名 (已部署 TOML) 或内置策略 id 直跑 (全部策略见 `ricow ai` 的 list_templates)
     pub strategy: String,
     /// 交易对 (直跑模式必填; TOML 加载模式忽略)
     #[arg(long)]

@@ -166,8 +166,8 @@ xattr -d com.apple.quarantine ./ricow
 
 - `specs/` — 唯一文档体系: constitution(项目宪法)/ product(产品方案)/ architecture(架构)/ lua-api(Lua API 规范)/ roadmap(里程碑进度)/ research(调研资料)/ changes(变更档案, SDD 流程产物)
 - `crates/` — 5 crate workspace: core / binance / strategy / engine / cli
-- `strategies/builtin/` — 内置参考实现(编译期嵌入二进制): shannon_spot_grid.lua(香农现货网格)+ paired_grid.lua(现货动态非对称网格); exec 执行组件为引擎内置(Rust 实现, Lua 策略直接调用 exec.*)
-- 自建策略走 `create` 闭环:`ricow create --name <名字> --pair <交易对> --script <你的.lua>` → `ricow approve` → `ricow deploy <preview_id> --token <token>`(带编译门禁 + 真实 K 线沙箱回测, **确认前不落盘**;样板 = 内置 `strategies/builtin/shannon_spot_grid.lua`,见 [specs/lua-api.md](specs/lua-api.md) 第九节)
+- `strategies/spot/` / `strategies/futures/` — 策略源码(内置示例 + 用户自写, 统一管理): 每个策略 = `<id>.lua`(逻辑)+ `<id>.toml`(清单: 中文名/说明/参数 schema, 供 UI 与 CLI 展示); 内置示例编译期嵌入二进制: shannon_spot_grid(香农现货网格)+ paired_grid(现货动态非对称网格), 均为现货; exec 执行组件为引擎内置(Rust 实现, Lua 策略直接调用 exec.*)
+- 自建策略走 `create` 闭环:`ricow create --name <名字> --pair <交易对> --script <你的.lua>` → `ricow approve` → `ricow deploy <preview_id> --token <token>`(带编译门禁 + 真实 K 线沙箱回测, **确认前不落盘**;样板 = 内置 `strategies/spot/shannon_spot_grid.lua`,见 [specs/lua-api.md](specs/lua-api.md) 第九节)
 - `website/` — 官网落地页(<https://ricow.xyz>,纯静态 HTML/CSS,由 `.github/workflows/pages.yml` 部署到 GitHub Pages)
 - `crates/ricow/src/supervisor/` — 策略进程管理器(常驻 daemon + 本机控制通道 + 实例台账, 见 [specs/architecture.md §三](specs/architecture.md))
 

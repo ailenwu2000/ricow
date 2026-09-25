@@ -56,8 +56,7 @@ impl FuturesDataClient {
         interval: &str,
         limit: u32,
     ) -> CoreResult<Vec<Kline>> {
-        self.get_klines_ending_at(symbol, interval, limit, i64::MAX / 2)
-            .await
+        self.get_klines_ending_at(symbol, interval, limit, i64::MAX / 2).await
     }
 
     /// 截止到 `end_ms` 的 K 线 (回测按自然年月分段用); end_ms 取极大值时等价于"到最新"。

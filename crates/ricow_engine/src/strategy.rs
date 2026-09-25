@@ -103,8 +103,10 @@ pub struct DeployedStrategy {
 /// - **同名策略默认拒绝覆盖**(不覆盖用户已部署的策略, 也不静默改名) —— 默认路径是**换个新名**部署;
 /// - `allow_replace = true` 走 **FR-044 受控覆盖**: 必须由"已逐字确认"的调用方传入(对话内确认块),
 ///   覆盖前**先把旧 `.lua`/`.toml` 备份**成 `<name>.<ext>.<ts>.bak`, 备份失败即中止(不拿用户资产冒险);
-/// - 落盘形态: 代码进 `<name>.lua`, TOML 只留 `params.script_path` —— 避免把整段 Lua 内嵌回 TOML
-///   (loader 会把 `script_path` 的内容注入内存 `script`, 若不摘除就会在写回时被固化);
+/// - 落盘形态 (031): 代码进 `strategies/{market}/<name>.lua`(市场子目录, 与策略源码目录统一),
+///   实例 TOML 留在 `strategies/<name>.toml`(向后兼容), 只留 `params.script_path = "{market}/{name}.lua"`
+///   —— 避免把整段 Lua 内嵌回 TOML (loader 会把 `script_path` 的内容注入内存 `script`, 若不摘除就会在写回时被固化);
+/// - `market` 只允许 `spot`/`futures`(031 FR-006: 不存在第三个市场目录), 非法即拒、不落盘;
 /// - 写 TOML 失败时回收已写的 `.lua`, 不留半成品。
 pub async fn execute_strategy(
     db: &Database,
@@ -126,8 +128,16 @@ pub async fn execute_strategy(
         return Err(CoreError::InvalidArgument(format!("策略名非法: {e}")));
     }
 
+    // 031 FR-006: 策略源码落市场子目录, 实例 TOML 留根(向后兼容)。
+    let market = config.market.as_str();
+    if market != "spot" && market != "futures" {
+        return Err(CoreError::InvalidArgument(format!(
+            "market 仅支持 spot|futures, 收到 '{market}'"
+        )));
+    }
+    let src_dir = dir.join(market);
     let toml_path = dir.join(format!("{name}.toml"));
-    let lua_path = dir.join(format!("{name}.lua"));
+    let lua_path = src_dir.join(format!("{name}.lua"));
     let existed = toml_path.exists() || lua_path.exists();
     if existed && !allow_replace {
         return Err(CoreError::InvalidArgument(format!(
@@ -145,16 +155,16 @@ pub async fn execute_strategy(
             ))
         }
     };
-    config.params.insert("script_path".into(), ConfigValue::String(format!("{name}.lua")));
+    config.params.insert("script_path".into(), ConfigValue::String(format!("{market}/{name}.lua")));
     let toml_str =
         config.to_toml().map_err(|e| CoreError::Parse(format!("策略 TOML 序列化失败: {e}")))?;
 
-    std::fs::create_dir_all(dir)
-        .map_err(|e| CoreError::Exchange(format!("创建策略目录 {} 失败: {e}", dir.display())))?;
+    std::fs::create_dir_all(&src_dir).map_err(|e| {
+        CoreError::Exchange(format!("创建策略目录 {} 失败: {e}", src_dir.display()))
+    })?;
     // FR-044: 受控覆盖前先备份。放在写文件之前, 且备份失败即中止 —— 旧脚本是用户资产,
     // 一旦被覆盖就无从恢复(预览 TTL 过期后也拿不回原文)。
-    let backup =
-        if existed { Some(backup_existing(&name, dir, &toml_path, &lua_path)?) } else { None };
+    let backup = if existed { Some(backup_existing(&name, &toml_path, &lua_path)?) } else { None };
     std::fs::write(&lua_path, &code)
         .map_err(|e| CoreError::Exchange(format!("写 {} 失败: {e}", lua_path.display())))?;
     if let Err(e) = std::fs::write(&toml_path, &toml_str) {
@@ -164,22 +174,19 @@ pub async fn execute_strategy(
     Ok(DeployedStrategy { toml_path, lua_path, backup })
 }
 
-/// FR-044: 覆盖前把已有的 `<name>.{lua,toml}` 备份成 `<name>.<ext>.<ts>.bak`。
+/// FR-044: 覆盖前把已有的 `<name>.{lua,toml}` 备份成同目录下 `<name>.<ext>.<ts>.bak`。
 ///
 /// 返回首个备份路径(供如实回报给用户); 存在即备份、不存在就跳过。**任一步失败都要中止落盘**:
-/// 宁可不覆盖, 也不能在没有备份的情况下抹掉旧脚本。
-fn backup_existing(
-    name: &str,
-    dir: &Path,
-    toml_path: &Path,
-    lua_path: &Path,
-) -> CoreResult<PathBuf> {
+/// 宁可不覆盖, 也不能在没有备份的情况下抹掉旧脚本。备份落在各文件自己的父目录
+/// (031 起 `.lua` 在 `strategies/{market}/`、`.toml` 在 `strategies/` 根)。
+fn backup_existing(name: &str, toml_path: &Path, lua_path: &Path) -> CoreResult<PathBuf> {
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
     let mut first: Option<PathBuf> = None;
     for (src, ext) in [(lua_path, "lua"), (toml_path, "toml")] {
         if !src.exists() {
             continue;
         }
+        let dir = src.parent().unwrap_or_else(|| Path::new("."));
         let mut dst = dir.join(format!("{name}.{ext}.{ts}.bak"));
         // 时间戳只到秒: 同一秒内第二次覆盖会撞名, `copy` 会直接抹掉上一份备份 ——
         // 用户以为有两个回滚点, 实际只剩一个。依次加序号直到空位。
@@ -197,7 +204,7 @@ fn backup_existing(
         })?;
         first.get_or_insert(dst);
     }
-    Ok(first.unwrap_or_else(|| dir.join(format!("{name}.lua.{ts}.bak"))))
+    Ok(first.unwrap_or_else(|| lua_path.with_extension("lua.bak")))
 }
 
 #[cfg(test)]
@@ -248,18 +255,21 @@ mod tests {
         // 未批准 → 拒绝, 且不落任何文件
         assert!(execute_strategy(&db, &pid, "forged-token", &dir, false).await.is_err());
         assert!(!dir.join("ai-grid.toml").exists(), "未批准不得落盘");
-        assert!(!dir.join("ai-grid.lua").exists());
+        assert!(!dir.join("spot").join("ai-grid.lua").exists());
 
-        // 批准后成功
+        // 批准后成功 (031: 代码落市场子目录, 实例 TOML 留根)
         let token = crate::confirm::approve(&db, &pid).await.unwrap();
         let out = execute_strategy(&db, &pid, &token, &dir, false).await.unwrap();
         let (toml_path, lua_path) = (out.toml_path, out.lua_path);
         assert_eq!(toml_path, dir.join("ai-grid.toml"));
-        assert_eq!(lua_path, dir.join("ai-grid.lua"));
+        assert_eq!(lua_path, dir.join("spot").join("ai-grid.lua"));
         assert!(out.backup.is_none(), "全新部署不应产生备份");
 
         let body = std::fs::read_to_string(&toml_path).unwrap();
-        assert!(body.contains("script_path"), "TOML 应引用脚本文件: {body}");
+        assert!(
+            body.contains("script_path") && body.contains("spot/ai-grid.lua"),
+            "TOML 应以相对根的路径引用市场子目录脚本: {body}"
+        );
         assert!(!body.contains("function on_tick"), "R1: 代码不得内嵌进 TOML: {body}");
         let lua = std::fs::read_to_string(&lua_path).unwrap();
         assert!(lua.contains("function on_tick"), "脚本内容应与提交一致");
@@ -274,22 +284,15 @@ mod tests {
     async fn test_execute_strategy_refuses_overwrite() {
         let db = Database::open_in_memory().await.unwrap();
         let dir = tmp_dir("t2");
-        // 用户已有一个同名策略文件
+        // 用户已有一个同名实例 TOML (根目录)
         std::fs::write(dir.join("ai-grid.toml"), "[strategy]\nname = \"ai-grid\"\n").unwrap();
 
         let pid = preview_of(&db, "ai-grid").await;
         let token = crate::confirm::approve(&db, &pid).await.unwrap();
         let err = execute_strategy(&db, &pid, &token, &dir, false).await.unwrap_err();
         assert!(err.to_string().contains("拒绝覆盖"), "{err}");
-        // 不产生半成品: .lua 不应被写出来
-        assert!(!dir.join("ai-grid.lua").exists(), "拒绝覆盖时不得留下脚本文件");
-        assert!(
-            !dir.read_dir()
-                .unwrap()
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().contains(".bak")),
-            "拒绝覆盖时不该有备份"
-        );
+        // 不产生半成品: 市场子目录下的 .lua 不应被写出来
+        assert!(!dir.join("spot").join("ai-grid.lua").exists(), "拒绝覆盖时不得留下脚本文件");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -299,8 +302,10 @@ mod tests {
     async fn test_execute_strategy_replace_backs_up_old_script_first() {
         let db = Database::open_in_memory().await.unwrap();
         let dir = tmp_dir("t4");
+        let spot = dir.join("spot");
+        std::fs::create_dir_all(&spot).unwrap();
         let old_lua = "function on_tick(ctx)\n    return { old = true }\nend\n";
-        std::fs::write(dir.join("ai-grid.lua"), old_lua).unwrap();
+        std::fs::write(spot.join("ai-grid.lua"), old_lua).unwrap();
         std::fs::write(dir.join("ai-grid.toml"), "[strategy]\nname = \"ai-grid\"\n").unwrap();
 
         let pid = preview_of(&db, "ai-grid").await;

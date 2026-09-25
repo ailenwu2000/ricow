@@ -161,7 +161,7 @@ or use *System Settings → Privacy & Security → Open Anyway*. **Why we don't 
 
 - `specs/` — the single documentation tree: constitution / product / architecture / lua-api / roadmap / research / changes (SDD artefacts)
 - `crates/` — 5-crate workspace: core / binance / strategy / engine / cli
-- `strategies/builtin/` — built-in references, compiled into the binary: `shannon_spot_grid.lua` (Shannon spot grid) + `paired_grid.lua` (dynamic asymmetric grid); the `exec` components live in the engine (Rust) and are called from Lua via `exec.*`
+- `strategies/spot/` / `strategies/futures/` — strategy sources (built-in examples + your own, unified): each strategy = `<id>.lua` (logic) + `<id>.toml` (manifest: display name / description / param schema for UI & CLI); built-in examples are compiled into the binary (`shannon_spot_grid` Shannon spot grid + `paired_grid` dynamic asymmetric grid, both spot); the `exec` components live in the engine (Rust) and are called from Lua via `exec.*`
 - Writing your own strategy: `ricow create --name <name> --pair <pair> --script <file.lua>` → `ricow approve` → `ricow deploy <preview_id> --token <token>` (compile gate + real-K-line sandbox backtest; nothing is written to disk until you confirm in an interactive terminal) — see [specs/lua-api.md](specs/lua-api.md) §九
 - `website/` — the landing page served at <https://ricow.xyz> (plain static HTML/CSS, deployed to GitHub Pages by `.github/workflows/pages.yml`)
 - `crates/ricow/src/supervisor/` — strategy process manager (resident daemon + local control channel + instance ledger; see [specs/architecture.md §三](specs/architecture.md))

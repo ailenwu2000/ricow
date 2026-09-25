@@ -1,0 +1,88 @@
+# 策略清单(manifest): 展示元数据 + 参数 schema。仅供 UI/CLI/AI, 引擎不读(架构铁律)。
+id = "paired_grid"
+name = "现货动态非对称网格"
+market = "spot"
+summary = "固定金额配对网格: 价格低于 start_price 激活, 上下各挂一单, 配对卖价恒>买价; 方向偏移抑制单向成交; 可选建仓与积累币/积累 U 两种模式"
+description = """
+固定金额(order_amount)配对网格: 价格低于 start_price 激活, 以最近成交价为参考价上下各挂一单(下方固定金额买单、上方配对卖单, 配对 = LIFO 保证卖价恒 > 买价); 方向标志(买 −1 / 卖 +1)驱动上下间距不对称放大, 抑制单向成交、让方向标志回归 0。
+"""
+suitable = "震荡市"
+unsuitable = "单边急涨(跑输持有)、单边下跌(满仓套牢)"
+
+[[params]]
+key = "pair"
+name = "交易对"
+type = "string"
+desc = "现货交易对(如 SOLUSDT)"
+required = true
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "价格低于它才激活(必填; 回测请设为窗口起点价, 勿前视)"
+required = true
+
+[[params]]
+key = "interval"
+name = "主时钟"
+type = "string"
+desc = "主时钟周期"
+default = "1h"
+
+[[params]]
+key = "spacing_pct"
+name = "间距百分比"
+type = "f64"
+desc = "网格间距(小数, 0.01 = 1%)"
+default = 0.01
+
+[[params]]
+key = "order_amount"
+name = "每笔买入资金"
+type = "f64"
+desc = "每笔买入的计价币金额"
+default = 10
+
+[[params]]
+key = "initial_buy_amount"
+name = "初始建仓金额"
+type = "f64"
+desc = "激活时市价买入的金额(0 = 不建仓)"
+default = 0
+
+[[params]]
+key = "direction_offset"
+name = "方向偏移"
+type = "f64"
+desc = "方向标志驱动的上下间距不对称放大系数"
+default = 0.2
+
+[[params]]
+key = "accumulate_mode"
+name = "成交模式"
+type = "enum"
+desc = "u = 积累计价币; coin = 积累币"
+default = "u"
+options = ["u", "coin"]
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额"
+default = 5
+
+[[params]]
+key = "min_pair_profit"
+name = "配对保底利润"
+type = "f64"
+desc = "配对卖价 ≥ 买价 × (1 + 此值), 默认 0.2% = 往返手续费"
+default = 0.002
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "单边手续费率(0.001 = 现货 0.1%/边)"
+default = 0.001

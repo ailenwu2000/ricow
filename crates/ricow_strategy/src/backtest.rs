@@ -430,11 +430,8 @@ impl BacktestContext {
             // 引擎按声明供给尾窗 —— 不再每 tick 全量克隆已收盘序列(2026-09-24 撤销尾窗后,
             // 1m 主时钟 86400 根下每 tick 全量克隆是 O(n²), 回测从 ~13min 拖慢; 2026-09-25 修)。
             // 未声明 primary(旧策略未声明) → 回落全量, 行为不变。
-            let tail = self
-                .declarations
-                .iter()
-                .find(|d| d.role == "primary")
-                .map(|d| d.min_bars as usize);
+            let tail =
+                self.declarations.iter().find(|d| d.role == "primary").map(|d| d.min_bars as usize);
             match tail {
                 Some(t) if t > 0 => {
                     let start = self.closed_klines.len().saturating_sub(t);
@@ -1968,11 +1965,16 @@ impl Context for BacktestContext {
             tracing::error!(target: "context", tf, "主时钟(primary)重复声明: 至多一个 primary 序列");
             return;
         }
-        if let Some(existing) = self.declarations.iter_mut().find(|d| d.role == role && d.tf == tf) {
+        if let Some(existing) = self.declarations.iter_mut().find(|d| d.role == role && d.tf == tf)
+        {
             existing.min_bars = existing.min_bars.max(min_bars);
             return;
         }
-        self.declarations.push(Declaration { role: role.to_string(), tf: tf.to_string(), min_bars });
+        self.declarations.push(Declaration {
+            role: role.to_string(),
+            tf: tf.to_string(),
+            min_bars,
+        });
     }
 
     fn declarations(&self) -> Vec<Declaration> {

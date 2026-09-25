@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/ailenwu2000/ricow/
 <pre><code>ricow create --name my_strategy --pair ETHUSDT --script my_strategy.lua   # compile gate + real-K-line sandbox backtest
 ricow approve                                                             # you type the confirmation in your terminal
 ricow deploy &lt;preview_id&gt; --token &lt;token&gt;                                 # lands in strategies/</code></pre>
-  <p class="note">Built-in strategies: <code>strategies/builtin/shannon_spot_grid.lua</code> (Shannon spot grid) and <code>strategies/builtin/paired_grid.lua</code> (dynamic asymmetric grid) — read them as starting points.
+  <p class="note">Built-in strategies: <code>strategies/spot/shannon_spot_grid.lua</code> (Shannon spot grid) and <code>strategies/spot/paired_grid.lua</code> (dynamic asymmetric grid) — read them as starting points.
   Full API reference: <a href="https://github.com/ailenwu2000/ricow/blob/main/specs/lua-api.md">specs/lua-api.md</a>.</p>
 </section>
 

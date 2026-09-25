@@ -455,11 +455,7 @@ mod tests {
 
         assert_eq!(report.rejected_count, 1, "巨额买单必被资金不足拒单");
         let snap = s.state_snapshot();
-        let seen = snap
-            .iter()
-            .find(|(k, _)| k == "seen_status")
-            .map(|(_, v)| v.clone())
-            .unwrap();
+        let seen = snap.iter().find(|(k, _)| k == "seen_status").map(|(_, v)| v.clone()).unwrap();
         assert_eq!(seen, "rejected", "拒单必须经 on_order_update 回传给 Lua");
     }
 
@@ -497,11 +493,7 @@ mod tests {
 
         assert_eq!(report.fills.len(), 0, "限价买单价 50 低于现价 100, 不应成交");
         let snap = s.state_snapshot();
-        let seen = snap
-            .iter()
-            .find(|(k, _)| k == "seen_status")
-            .map(|(_, v)| v.clone())
-            .unwrap();
+        let seen = snap.iter().find(|(k, _)| k == "seen_status").map(|(_, v)| v.clone()).unwrap();
         assert_eq!(seen, "cancelled", "撤单必须经 on_order_update 回传给 Lua");
     }
 }

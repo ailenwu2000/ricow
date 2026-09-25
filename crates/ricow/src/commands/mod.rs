@@ -467,20 +467,25 @@ pub(crate) fn ensure_strategies_dir_in(root: &std::path::Path) -> CoreResult<std
     Ok(dir)
 }
 
-
-/// 内置脚本 Lua 化: strategy_type 命中内置名且无 script 参数时, 注入
-/// `strategies/builtin/` 对应脚本内容 (编译期嵌入), type 改 "lua"。
-/// 非内置名 / 已有 script(用户 lua 策略)原样返回。
-///
-/// 内置清单本身在 [`templates`](crate::commands::templates)(带类别/说明/参数摘要, 供 AI 工具复用)。
+/// 内置脚本 Lua 化: strategy_type 命中内置策略 id 且无 script 参数时, 注入
+/// 对应脚本内容 (编译期嵌入, 见 `strategies::catalog`), type 改 "lua"。
+/// 非内置 id / 已有 script(用户 lua 策略)原样返回。
 pub(crate) fn resolve_builtin_script(mut config: StrategyConfig) -> CoreResult<StrategyConfig> {
     let Some(code) = templates::code_of(&config.strategy_type) else {
+        // 命中不了 catalog: 若该 id 在扫描期有清单但被跳过(market 不一致 / 占用内置 id /
+        // 缺同名 .lua), 如实报错而非静默放行 —— 否则用户只看到"unsupported strategy type"。
+        if let Some(problem) = crate::strategies::catalog::problem_for(&config.strategy_type) {
+            return Err(CoreError::InvalidArgument(format!(
+                "策略 {} 无法加载: {problem}",
+                config.strategy_type
+            )));
+        }
         return Ok(config); // 非内置名
     };
     if config.get_str("script").is_some() {
         return Ok(config); // 已有 script(用户 lua 策略)
     }
-    config.params.insert("script".into(), ConfigValue::String(code.to_string()));
+    config.params.insert("script".into(), ConfigValue::String(code));
     config.strategy_type = "lua".into();
     Ok(config)
 }

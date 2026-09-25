@@ -340,25 +340,26 @@ end
 4. 回测:`ricow backtest --strategy <name>`(TOML 已含 pair 时可省 `--pair`);
 5. 启动:`ricow run <name>`(Dry Run;TOML 里 `enabled = false` 会被拒绝启动)。
 
-**没有独立的"策略模板文件"**: 样板就是下节的 `strategies/builtin/shannon_spot_grid.lua`, 直接读它照写。
+**没有独立的"策略模板文件"**: 样板就是下节 `strategies/spot/` 下的内置策略(031 起内置 = 示例, 与用户策略统一管理), 直接读它照写。
 手工建策略(不走 create 闭环)同样支持: 自己写 `strategies/<name>.toml` + `strategies/scripts/<name>.lua`,
 TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝对路径);旧部署(TOML 内嵌 `script` 代码字符串)依然兼容。
 
 目录定位:默认取**当前工作目录**(在项目根运行 `ricow`);从其他目录运行可设
 `RICOW_ROOT=<项目根>`;数据库路径可单独用 `RICOW_DB=<path>` 覆盖。
 
-内置脚本(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格)均为 Lua 脚本,参考实现见
-`strategies/builtin/`(git 跟踪,与用户策略同目录,复制即自定义):
+内置策略(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格)均为 Lua 脚本, 按市场分目录
+`strategies/spot/`(现货)与 `strategies/futures/`(合约), 每策略 = `<id>.lua`(逻辑) + `<id>.toml`(清单: 中文名/说明/参数 schema),
+参考实现见 `strategies/spot/`(git 跟踪, 与用户策略同目录, 复制即自定义):
 
-- `strategies/builtin/shannon_spot_grid.lua` — 香农现货网格(虚拟账本权重再平衡 + ATR 间距, 详见 §九)
-- `strategies/builtin/paired_grid.lua` — 现货动态非对称网格(固定金额 + 配对卖价恒>买价 + 方向偏移, 详见 §九)
+- `strategies/spot/shannon_spot_grid.lua`(+ `shannon_spot_grid.toml`) — 香农现货网格(虚拟账本权重再平衡 + ATR 间距, 详见 §九)
+- `strategies/spot/paired_grid.lua`(+ `paired_grid.toml`) — 现货动态非对称网格(固定金额 + 配对卖价恒>买价 + 方向偏移, 详见 §九)
 
-**builtin 脚本为编译期嵌入(include_str!), 直接改文件不重编译不生效**;
-自定义请复制到 `strategies/scripts/` 再改。
+**内置脚本为编译期嵌入(include_str!), 直接改文件不重编译不生效**;
+自定义请复制 `strategies/spot/` 下的 `.lua` + `.toml` 到新 id 再改。
 
 直接 `ricow backtest --strategy shannon_spot_grid --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
 **交易对必须带报价币**, 现货用 `ETHUSDT` 而非 `ETH`, 否则交易所返回 `Invalid symbol`);
-复制 `strategies/builtin/shannon_spot_grid.lua` 或 `strategies/builtin/paired_grid.lua` 到
-`strategies/scripts/` 修改即自定义(`strategies/` 下除 `builtin/` 外均被 git 忽略,
+复制 `strategies/spot/shannon_spot_grid.lua` 或 `strategies/spot/paired_grid.lua`(连同同名 `.toml` 清单)到
+新 `<id>`, 改清单里的 `id` 即自定义(`strategies/{spot,futures}/` 下除内置示例外均被 git 忽略,
 用户策略默认私有;想入库自行调整 `.gitignore`)。
 

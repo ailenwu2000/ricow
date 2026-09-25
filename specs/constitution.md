@@ -15,7 +15,7 @@
 
 ### 二、策略层统一 Lua + exec 组件
 策略 = 信号逻辑 + 调 `exec.*` 执行(Rust 实现, 引擎内置, 脚本内可覆盖)。
-内置资产(`strategies/builtin/`)编译期嵌入二进制; 用户策略复制即自定义。
+内置示例(`strategies/spot/`)编译期嵌入二进制; 用户策略复制即自定义(031 起现货/合约分 `spot/`/`futures/` 目录, 内置与用户统一管理)。
 DCA/TWAP/限价回调/阶梯是**执行算法**, 不是独立策略。
 **架构铁律(最高约束)**: 项目只提供策略的运行环境与数据 API, **所有交易逻辑都在策略(Lua)中**; 新增/修改策略**不改项目代码**; 引擎(`ricow_engine`)/ CLI / 绑定层**零策略参数名**(策略参数只能由 Lua 策略自己读), 数据由策略 `need_klines` 声明、引擎按声明供给(声明式、无前视), 由 `crates/ricow_strategy/tests/architecture_guard.rs` 机械锁死; 以后任何修改不得破坏此分层。详见 `specs/architecture.md` §四。
 
