@@ -14,7 +14,7 @@ pub struct RunArgs {
     /// 首次实盘使用需读风险披露后确认一次 (018; product.md §十)
     #[arg(long = "accept-risk")]
     pub accept_risk: bool,
-    /// 策略名 (已部署 TOML, 如 <项目根>/strategies/<name>.toml) 或策略类型直跑 (shannon_rebalance/shannon_spot_grid/dca/twap/vwap, 其余为执行模式示例)
+    /// 策略名 (已部署 TOML, 如 <项目根>/strategies/<name>.toml) 或策略类型直跑 (shannon_spot_grid/paired_grid)
     pub strategy: String,
     /// 交易对 (直跑模式必填; TOML 加载模式忽略)
     #[arg(long)]
@@ -409,7 +409,7 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "shannon_rebalance"
+type = "shannon_spot_grid"
 enabled = {enabled}
 exchange = "binance"
 

@@ -35,7 +35,8 @@
 
 ## 测试基线
 
-- **当前基线 (2026-09-19, Windows, 026 落地后实跑)**: `cargo test --workspace` = **504 passed / 0 failed / 21 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
+- **当前基线 (2026-09-25, Linux, 内置策略收敛 + paired_grid 等比化后实跑)**: `cargo test --workspace` = **529 passed / 0 failed / 22 ignored**; 较上次 544/22: **−15 通过 / ignored 不变**; 变化 = 删除 shannon_rebalance(4 例) + executors/{dca,twap,vwap,pullback,ladder}(约 10 例) + paired_grid ATR 未就绪(1 例); paired_grid 改名「现货动态非对称网格」并等比化(买价 = ref÷(1+间距), 卖价 = 栈顶买入价×(1+间距))。
+- **前基线 (2026-09-19, Windows, 026 落地后实跑)**: `cargo test --workspace` = **504 passed / 0 failed / 21 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
   较上次记录的 472/21: **+32 通过 / ignored 不变(仍 21)**; 增量全部来自 026(两张新表与幂等迁移、`recent_fills_with_mode` 的 mode 关联、`web/tail.rs` 尾读与轮转、交易/日志端点与只读红线、AI 工具三态与 Confirm 结果注入), 逐条见 `specs/changes/026-trade-visibility/tasks.md`。
 - **前基线 (2026-09-19, Windows, 023 + 025 落地后实跑)**: `cargo test --workspace` = **472 passed / 0 failed / 21 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
   较 2026-09-17 的 403/21: **+69 通过 / ignored 不变(仍 21)**; 增量来自 2026-09-18 起的对话体验重构(023)与 Web UI(025: axum 鉴权与回环绑定、会话缝第二个 sink、会话历史持久化与回放、术语表、启动脚本站位), 另含 025 实机收口补的 2 例(Web 输入「一次入站只投一行」回归、daemon 前置校验回归), 逐条见 `specs/changes/023-ai-chat-ux/` 与 `specs/changes/025-web-ui/tasks.md`。

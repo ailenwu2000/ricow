@@ -22,7 +22,7 @@ fn parse_ymd_ms(s: &str) -> CoreResult<i64> {
 
 #[derive(Args, Default)]
 pub struct BacktestArgs {
-    /// 策略类型 (shannon_rebalance/shannon_spot_grid/dca/twap/vwap/pullback/ladder/lua 或已部署策略名; 其余为执行模式示例, exec API 见 specs/lua-api.md)
+    /// 策略类型 (shannon_spot_grid/paired_grid/lua 或已部署策略名; exec API 见 specs/lua-api.md)
     #[arg(long)]
     pub strategy: String,
     /// 交易对 (TOML 策略已含 pair 时可省略; 直跑模式必填)
@@ -471,7 +471,7 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "shannon_rebalance"
+type = "shannon_spot_grid"
 enabled = true
 exchange = "binance"
 
@@ -481,7 +481,7 @@ order_size = 0.02
 "#,
         )
         .unwrap();
-        let exchange = crate::commands::bn_exchange().unwrap();
+        let _exchange = crate::commands::bn_exchange().unwrap();
         let args = BacktestArgs {
             start: None,
             end: None,
@@ -526,13 +526,13 @@ order_size = 0.02
             r#"
 [strategy]
 name = "nopair"
-type = "shannon_rebalance"
+type = "shannon_spot_grid"
 enabled = true
 exchange = "binance"
 "#,
         )
         .unwrap();
-        let exchange = crate::commands::bn_exchange().unwrap();
+        let _exchange = crate::commands::bn_exchange().unwrap();
         let args = BacktestArgs {
             start: None,
             end: None,

@@ -23,12 +23,14 @@ const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// 策略参数名全集(策略逻辑专属, 只允许出现在 Lua 策略与测试代码里)。
 const STRATEGY_PARAMS: &[&str] = &[
+    "accumulate_mode",
     "activation_price",
     "atr_interval",
     "atr_mult",
     "atr_period",
     "bar_seconds",
     "dd_stop_pct",
+    "direction_offset",
     "distribution",
     "fee_side",
     "initial_buy_amount",
@@ -41,6 +43,7 @@ const STRATEGY_PARAMS: &[&str] = &[
     "min_notional",
     "num_levels",
     "num_slices",
+    "order_amount",
     "order_size",
     "pause_bars",
     "pause_pct",

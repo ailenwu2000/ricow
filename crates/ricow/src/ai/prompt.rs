@@ -57,7 +57,7 @@ pub const TRAPS_GUIDE: &str = r#"【最容易跑偏的点(逐条核对)】
 6. 数据目录: 当前目录有 ricow.db 或 strategies/ 即用当前目录, 否则用平台标准目录; 显式指定用 RICOW_ROOT=<项目根>。
 7. demo ≠ Dry Run: demo 会真实连测试网下单(需要测试网凭据), Dry Run 纯本地虚拟撮合; 两者都不碰真钱, 但报错排查方向完全不同。
 8. 网络: 全程需访问币安。国内直连 api.binance.com 常超时, CLI 认 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY; RICOW_BN_BASE_URL/RICOW_FAPI_BASE_URL 是整体域名替换(公开数据+签名下单都变), 公开数据镜像域(如 data-api.binance.vision)只能看行情/回测, 下单会失败。报 network error 先查网络与代理, 不要当成策略缺陷。
-9. 盈亏政策属于策略(2026-09-15 起): 平台不再代做亏损熔断/峰值回撤; 策略用 ctx:net_pnl()/ctx:equity() 自实现回撤止损(内置 shannon_rebalance 的 dd_stop_pct 是参考写法)。平台只保留工程护栏(100 单/秒下单频率上限)防程序失控。
+9. 盈亏政策属于策略(2026-09-15 起): 平台不再代做亏损熔断/峰值回撤; 策略用 ctx:net_pnl()/ctx:equity() 自实现回撤止损。平台只保留工程护栏(100 单/秒下单频率上限)防程序失控。
 10. 改参数不会让实盘自动换血(023): dry_run / demo 实例按原模式自动重启, 实盘实例**不自动重启**(新参数暂不生效) —— 要让实盘生效必须单独再说一次"重启实盘 <名字>", 重过三判据。
 11. 删除与覆盖不可逆(023): 删除策略只删 strategies/<名字>.toml 与 .lua, **logs/ 保留**; 覆盖部署会先把旧脚本备份为 <名字>.lua.<时间戳>.bak, 但新脚本一落盘就没有"撤销"——只有手工把 .bak 复制回原文件名。
 "#;

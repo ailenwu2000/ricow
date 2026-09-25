@@ -698,15 +698,17 @@ function on_fill(ctx, fill)
         fill_count, last_bar_ts or 0, fill.side, size, px, size * px, eq_now, pos_now, balance_price, v_coin, v_cash, v_cap))
 end
 
--- 审计 #3: 拒单/撤单回传。挂单被拒/撤时重挂(need_rehang = true), 防停摆。
--- 触发: 引擎 place_order 返回 Rejected/Cancelled/Expired 终态 → on_order_update。
+-- 审计 #3: 拒单回传。挂单被拒时重挂(need_rehang = true), 防停摆。
+-- 触发: 引擎 place_order 返回 Rejected 终态 → on_order_update。
+-- 只处理 rejected: cancelled 是策略主动撤单(cancel_pending)的正常回传, 重挂已在 on_tick 里处理;
+-- 若把 cancelled 也设 need_rehang, 会形成"重挂→撤单→回调→再重挂"死循环(2026-09-24 回测实测)。
 function on_order_update(ctx, upd)
     local status = upd and upd.status
-    if status == "rejected" or status == "cancelled" then
+    if status == "rejected" then
         need_rehang = true
         ctx:log(string.format(
-            "[shannon_spot_grid] 订单 %s: pair=%s filled=%.6f remaining=%.6f → 重挂",
-            status, upd.pair, upd.filled_size or 0, upd.remaining_size or 0))
+            "[shannon_spot_grid] 挂单被拒: pair=%s filled=%.6f remaining=%.6f → 重挂",
+            upd.pair, upd.filled_size or 0, upd.remaining_size or 0))
     end
 end
 

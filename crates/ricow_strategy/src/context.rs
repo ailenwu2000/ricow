@@ -79,6 +79,16 @@ pub trait Context: Send {
     /// (无前视, 未收盘桶剔除)。未预装 / 无已收盘桶 → None。策略据此显式算 ATR/EMA/close。
     fn tf_klines(&self, pair: &str, tf: &str) -> Option<Vec<Kline>>;
 
+    /// 高周期序列缓存的共享引用 (键 = `pair|tf`)。
+    ///
+    /// Lua 快照 ([`crate::lua::LuaCtxData`]) 须为 `'static` (mlua UserData), 无法持有 `&dyn Context`,
+    /// 故指标 (atr_tf/ema_tf/close_tf) 改为由快照直接调 [`TfCache`] 的缓存 + 尾窗方法 —— 每根
+    /// 高周期 bar 只算一次, 且尾窗裁剪避免对全量可见前缀做 O(n²) 重算 (2026-09-25 修回测性能)。
+    /// 未预装 → None。默认无通道。
+    fn tf_cache_ref(&self, _pair: &str, _tf: &str) -> Option<Arc<TfCache>> {
+        None
+    }
+
     /// 预装高周期 K 线 (第二序列)。`tf` = 周期标签(如 `"1h"`); 装配层须先用
     /// [`crate::resample_complete`] 剔除不完整/缺口桶再装入。同一 `pair` 可装多套
     /// (如 4h ATR + 日线趋势判据), 键 = `pair|tf`。默认 no-op。
@@ -112,7 +122,7 @@ pub struct LiveContext {
     klines_cache: RwLock<HashMap<String, Vec<Kline>>>,
     /// 高周期序列缓存 (023 香农 ETF 指数增加策略; 2026-09-18 扩为多套): 键 = `pair|tf`。
     /// 由 `set_tf_klines` 预装(装配层已剔除不完整桶); `tf_klines` 按当前时刻取可见前缀。
-    tf_cache: RwLock<HashMap<String, TfCache>>,
+    tf_cache: RwLock<HashMap<String, Arc<TfCache>>>,
     /// 策略数据需求声明 (need_klines 写入, 引擎装配阶段读取)。
     declarations: Vec<Declaration>,
     rt: tokio::runtime::Handle,
@@ -555,6 +565,10 @@ impl Context for LiveContext {
         self.tf_cache.read().ok()?.get(&tf_key(pair, tf)).map(|c| c.visible(now_ms).to_vec())
     }
 
+    fn tf_cache_ref(&self, pair: &str, tf: &str) -> Option<Arc<TfCache>> {
+        self.tf_cache.read().ok()?.get(&tf_key(pair, tf)).cloned()
+    }
+
     /// 实盘/demo: 用最新价维护"当前未收盘"主时钟 K 线(周期 = 策略声明的 primary)。
     /// 这是实盘侧 `ctx:klines` 能从空到有的关键 —— 此前实盘上下文的 klines_cache 无人填充,
     /// 导致策略在第一个守卫(K 线)就 return, 永不动作(2026-09-24 demo 实测定位)。
@@ -634,7 +648,7 @@ impl Context for LiveContext {
             return;
         };
         if let Ok(mut c) = self.tf_cache.write() {
-            c.insert(tf_key(pair, tf), TfCache::new(tf_ms, bars));
+            c.insert(tf_key(pair, tf), Arc::new(TfCache::new(tf_ms, bars)));
         }
     }
 
@@ -668,7 +682,7 @@ pub struct DryRunContext {
     klines_cache: RwLock<HashMap<String, Vec<Kline>>>,
     /// 高周期序列缓存: 键 = `pair|tf`。由 `set_tf_klines` 预装(装配层已剔除不完整桶);
     /// 策略通过 `tf_klines(pair, tf)` 按声明读取, 可见前缀受当前时刻裁剪(无前视)。
-    tf_cache: RwLock<HashMap<String, TfCache>>,
+    tf_cache: RwLock<HashMap<String, Arc<TfCache>>>,
     /// 策略数据需求声明 (need_klines 写入, 引擎装配阶段读取)。
     declarations: Vec<Declaration>,
     pending_orders: Vec<(String, OrderRequest)>,
@@ -1114,6 +1128,10 @@ impl Context for DryRunContext {
         self.tf_cache.read().ok()?.get(&tf_key(pair, tf)).map(|c| c.visible(now_ms).to_vec())
     }
 
+    fn tf_cache_ref(&self, pair: &str, tf: &str) -> Option<Arc<TfCache>> {
+        self.tf_cache.read().ok()?.get(&tf_key(pair, tf)).cloned()
+    }
+
     /// 实盘/demo: 用最新价维护"当前未收盘"主时钟 K 线(周期 = 策略声明的 primary)。
     /// 这是实盘侧 `ctx:klines` 能从空到有的关键 —— 此前实盘上下文的 klines_cache 无人填充,
     /// 导致策略在第一个守卫(K 线)就 return, 永不动作(2026-09-24 demo 实测定位)。
@@ -1193,7 +1211,7 @@ impl Context for DryRunContext {
             return;
         };
         if let Ok(mut c) = self.tf_cache.write() {
-            c.insert(tf_key(pair, tf), TfCache::new(tf_ms, bars));
+            c.insert(tf_key(pair, tf), Arc::new(TfCache::new(tf_ms, bars)));
         }
     }
 
@@ -1399,7 +1417,7 @@ impl LiveContext {
                     continue;
                 };
                 let resampled = crate::multiframe::resample_complete(&bars, tf_ms);
-                tfc.insert(tf_key(pair, &tf), TfCache::new(tf_ms, resampled));
+                tfc.insert(tf_key(pair, &tf), Arc::new(TfCache::new(tf_ms, resampled)));
             }
         }
     }
@@ -1433,7 +1451,7 @@ impl DryRunContext {
                     continue;
                 };
                 let resampled = crate::multiframe::resample_complete(&bars, tf_ms);
-                tfc.insert(tf_key(pair, &tf), TfCache::new(tf_ms, resampled));
+                tfc.insert(tf_key(pair, &tf), Arc::new(TfCache::new(tf_ms, resampled)));
             }
         }
     }

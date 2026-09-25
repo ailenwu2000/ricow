@@ -3,8 +3,9 @@
 //! 用途(023 香农 ETF 指数增加策略): 策略在 1m 主序列上决策(金叉建仓 / 挂单撮合分辨率),
 //! 但间距用 **1h ATR** —— 引擎侧需要一条"第二序列"通道, 且必须无前视、可缓存(每桶只算一次)。
 
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use ricow_core::Kline;
@@ -155,9 +156,9 @@ pub fn resample_complete(bars: &[Kline], tf_ms: i64) -> Vec<Kline> {
 pub struct TfCache {
     tf_ms: i64,
     bars: Vec<Kline>,
-    memo: RefCell<HashMap<usize, (i64, f64)>>,
-    ema_memo: RefCell<HashMap<usize, (i64, f64)>>,
-    computes: Cell<usize>,
+    memo: Mutex<HashMap<usize, (i64, f64)>>,
+    ema_memo: Mutex<HashMap<usize, (i64, f64)>>,
+    computes: AtomicUsize,
 }
 
 /// 高周期缓存的键: `pair|tf` —— 同一 pair 可同时装多套序列(如 4h ATR + 日线趋势判据)。
@@ -171,9 +172,9 @@ impl TfCache {
         Self {
             tf_ms,
             bars,
-            memo: RefCell::new(HashMap::new()),
-            ema_memo: RefCell::new(HashMap::new()),
-            computes: Cell::new(0),
+            memo: Mutex::new(HashMap::new()),
+            ema_memo: Mutex::new(HashMap::new()),
+            computes: AtomicUsize::new(0),
         }
     }
 
@@ -197,14 +198,17 @@ impl TfCache {
             return None;
         }
         let last_ts = self.bars[n - 1].open_time.timestamp_millis();
-        if let Some((ts, v)) = self.memo.borrow().get(&period) {
+        if let Some((ts, v)) = self.memo.lock().unwrap().get(&period) {
             if *ts == last_ts {
                 return Some(*v);
             }
         }
-        let v = indicators_api::atr(&self.bars[..n], period)?;
-        self.computes.set(self.computes.get() + 1);
-        self.memo.borrow_mut().insert(period, (last_ts, v));
+        // 尾窗裁剪(2026-09-24): Wilder ATR 早期 TR 权重按 (period-1)/period 幂次衰减,
+        // 3×period 根后 <5% —— 传全部可见前缀 n 根在 1m 序列(n 可达 86400)上是 O(n²) 会卡死。
+        let start = n.saturating_sub(period * 3 + 1);
+        let v = indicators_api::atr(&self.bars[start..n], period)?;
+        self.computes.fetch_add(1, Ordering::SeqCst);
+        self.memo.lock().unwrap().insert(period, (last_ts, v));
         Some(v)
     }
 
@@ -231,20 +235,20 @@ impl TfCache {
             return None;
         }
         let last_ts = self.bars[n - 1].open_time.timestamp_millis();
-        if let Some((ts, v)) = self.ema_memo.borrow().get(&period) {
+        if let Some((ts, v)) = self.ema_memo.lock().unwrap().get(&period) {
             if *ts == last_ts {
                 return Some(*v);
             }
         }
         let v = indicators_api::ema(&self.bars[..n], period)?;
-        self.computes.set(self.computes.get() + 1);
-        self.ema_memo.borrow_mut().insert(period, (last_ts, v));
+        self.computes.fetch_add(1, Ordering::SeqCst);
+        self.ema_memo.lock().unwrap().insert(period, (last_ts, v));
         Some(v)
     }
 
     /// 实际计算次数(同桶内缓存命中不递增); 用于断言"每桶只算一次"(ATR 与 EMA 合并计数)。
     pub fn computes(&self) -> usize {
-        self.computes.get()
+        self.computes.load(Ordering::SeqCst)
     }
 }
 

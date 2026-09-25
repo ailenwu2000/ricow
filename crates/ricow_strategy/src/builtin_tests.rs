@@ -1,14 +1,12 @@
 //! 内置脚本 Lua 集成测试 (回测冒烟, 不依赖网络)。
 //!
-//! 脚本源: `strategies/builtin/`(策略样板)与 `strategies/builtin/executors/`(执行模式示例),
+//! 脚本源: `strategies/builtin/`(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格),
 //! include_str! 编译期嵌入。
-//! 断言每个内置脚本的关键行为 (建仓/间隔/分片/触发/挂单), 对齐 Rust 版已知向量。
-//! exec 执行组件 (levels/pullback_triggered/ticks_per/slice_due/detect_quote/side_order)
-//! 为引擎内置 Rust 实现, 单测见 exec.rs; 此处只验证注入路径 (test_exec_injected)。
+//! 断言每个内置脚本的关键行为 (建仓/激活/配对/挂单), 对齐 Rust 版已知向量。
 
 use std::collections::HashMap;
 
-use ricow_core::{Balance, Kline, OrderAction, OrderRequest, OrderSide, OrderType};
+use ricow_core::{Balance, Kline, OrderRequest, OrderSide, OrderType};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -19,13 +17,7 @@ use crate::lua::LuaStrategy;
 use crate::strategy::Strategy;
 use rust_decimal::prelude::ToPrimitive;
 
-const SHANNON_GRID: &str = include_str!("../../../strategies/builtin/shannon_rebalance.lua");
 const SHANNON_ETF_ACCUM: &str = include_str!("../../../strategies/builtin/shannon_spot_grid.lua");
-const DCA: &str = include_str!("../../../strategies/builtin/executors/dca.lua");
-const TWAP: &str = include_str!("../../../strategies/builtin/executors/twap.lua");
-const VWAP: &str = include_str!("../../../strategies/builtin/executors/vwap.lua");
-const PULLBACK: &str = include_str!("../../../strategies/builtin/executors/pullback.lua");
-const LADDER: &str = include_str!("../../../strategies/builtin/executors/ladder.lua");
 
 fn config(script: &str, params: &[(&str, ConfigValue)]) -> StrategyConfig {
     let mut map = HashMap::new();
@@ -47,365 +39,6 @@ fn config(script: &str, params: &[(&str, ConfigValue)]) -> StrategyConfig {
     }
 }
 
-fn kline(open: i64, high: i64, low: i64, close: i64) -> Kline {
-    Kline {
-        open_time: chrono::Utc::now(),
-        open: Decimal::from(open),
-        high: Decimal::from(high),
-        low: Decimal::from(low),
-        close: Decimal::from(close),
-        volume: Decimal::ONE,
-        close_time: chrono::Utc::now(),
-    }
-}
-
-/// 跑一段序列, 返回每根 bar 的策略订单。
-fn run_bars(cfg: StrategyConfig, bars: &[Kline]) -> Vec<Vec<OrderRequest>> {
-    let mut strategy = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
-        .expect("内置脚本应编译通过");
-    let mut ctx = BacktestContext::new(
-        cfg,
-        Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
-    );
-    strategy.on_init(&mut ctx);
-    let mut out = Vec::new();
-    for k in bars {
-        ctx.step_bar(k.clone());
-        let orders = strategy.on_tick(&mut ctx);
-        for req in &orders {
-            let _ = ctx.place_order(req.clone());
-        }
-        let fills = ctx.drain_fills();
-        for f in fills {
-            strategy.on_fill(&mut ctx, f);
-        }
-        out.push(orders);
-    }
-    out
-}
-
-#[test]
-fn test_shannon_rebalance_build_then_rebalance() {
-    // 首 tick 建仓 (市价买 ~50% 权益), 价涨后卖回 50:50。
-    let cfg = config(SHANNON_GRID, &[("pair", ConfigValue::String("ETH".into()))]);
-    let bars = vec![kline(100, 105, 95, 104), kline(110, 115, 105, 114)];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[0].len(), 1, "首 tick 应建仓");
-    assert_eq!(orders[0][0].side, OrderSide::Buy);
-    assert_eq!(orders[0][0].order_type, OrderType::Market);
-    // 100000 × 0.5 / 100 = 500。
-    assert!(
-        orders[0][0].size > dec!(400) && orders[0][0].size < dec!(600),
-        "建仓应约 50% 权益: {}",
-        orders[0][0].size
-    );
-    assert_eq!(orders[1].len(), 1, "价涨应再平衡卖出");
-    assert_eq!(orders[1][0].side, OrderSide::Sell);
-}
-
-#[test]
-fn test_dca_interval_ticks() {
-    // interval_secs=7200, bar_seconds=3600 → 每 2 tick 买入一次。
-    let cfg = config(
-        DCA,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("order_size", ConfigValue::Float(0.1)),
-            ("interval_secs", ConfigValue::Integer(7200)),
-            ("bar_seconds", ConfigValue::Integer(3600)),
-        ],
-    );
-    let bars = vec![
-        kline(100, 101, 99, 100),
-        kline(100, 101, 99, 100),
-        kline(100, 101, 99, 100),
-        kline(100, 101, 99, 100),
-    ];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[0].len(), 1, "首 tick 买入");
-    assert_eq!(orders[1].len(), 0, "间隔内不出");
-    assert_eq!(orders[2].len(), 1, "第 3 tick 再买");
-    assert_eq!(orders[3].len(), 0);
-}
-
-#[test]
-fn test_twap_slices() {
-    // num_slices=3, 每 1 tick 一片; 发完不再发。
-    let cfg = config(
-        TWAP,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("total_size", ConfigValue::Float(3.0)),
-            ("num_slices", ConfigValue::Integer(3)),
-            ("slice_interval_secs", ConfigValue::Integer(3600)),
-            ("bar_seconds", ConfigValue::Integer(3600)),
-        ],
-    );
-    let bars = vec![
-        kline(100, 101, 99, 100),
-        kline(100, 101, 99, 100),
-        kline(100, 101, 99, 100),
-        kline(100, 101, 99, 100),
-    ];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[0].len(), 1);
-    assert_eq!(orders[1].len(), 1);
-    assert_eq!(orders[2].len(), 1);
-    assert_eq!(orders[3].len(), 0, "3 片发完");
-    assert_eq!(orders[0][0].size, dec!(1), "每片 = total/num_slices");
-}
-
-#[test]
-fn test_pullback_triggers_on_pullback() {
-    // 100 → 105 (新高) → 101 (回撤 3.8% > 3%) → 触发买入。
-    let cfg = config(
-        PULLBACK,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("order_size", ConfigValue::Float(1.0)),
-            ("pullback_pct", ConfigValue::Float(0.03)),
-        ],
-    );
-    let bars = vec![kline(100, 101, 99, 100), kline(105, 106, 104, 105), kline(101, 102, 100, 101)];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[0].len(), 0);
-    assert_eq!(orders[1].len(), 0, "新高不触发");
-    assert_eq!(orders[2].len(), 1, "回撤触发");
-    assert_eq!(orders[2][0].side, OrderSide::Buy);
-}
-
-#[test]
-fn test_ladder_places_levels_equal() {
-    // equal 分档: lower 90 / upper 110 / n 3 → [90, 100, 110], 每档 total/n。
-    let cfg = config(
-        LADDER,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("total_size", ConfigValue::Float(3.0)),
-            ("num_levels", ConfigValue::Integer(3)),
-            ("lower_price", ConfigValue::Float(90.0)),
-            ("upper_price", ConfigValue::Float(110.0)),
-        ],
-    );
-    let bars = vec![kline(100, 101, 99, 100)];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[0].len(), 3, "一次性挂 3 档");
-    assert_eq!(orders[0][0].side, OrderSide::Buy);
-    assert_eq!(orders[0][0].size, dec!(1));
-    let prices: Vec<Decimal> = orders[0].iter().map(|o| o.price.unwrap()).collect();
-    assert_eq!(prices, vec![dec!(90), dec!(100), dec!(110)]);
-}
-
-#[test]
-fn test_ladder_geometric_levels() {
-    // geometric 分档: lower 100 / upper 400 / n 3 → [100, ~200, 400]。
-    let cfg = config(
-        LADDER,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("total_size", ConfigValue::Float(3.0)),
-            ("num_levels", ConfigValue::Integer(3)),
-            ("lower_price", ConfigValue::Float(100.0)),
-            ("upper_price", ConfigValue::Float(400.0)),
-            ("distribution", ConfigValue::String("geometric".into())),
-        ],
-    );
-    let bars = vec![kline(200, 201, 199, 200)];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[0].len(), 3);
-    let prices: Vec<f64> = orders[0].iter().map(|o| o.price.unwrap().to_f64().unwrap()).collect();
-    assert!((prices[0] - 100.0).abs() < 0.01, "首档 = {}", prices[0]);
-    assert!((prices[2] - 400.0).abs() < 0.01, "末档 = {}", prices[2]);
-    assert!((prices[1] - 200.0).abs() < 1.0, "等比中项 ≈ 200, got {}", prices[1]);
-}
-
-#[test]
-fn test_exec_injected() {
-    // from_source 统一注入 exec: 用户脚本不手动拼接即可直接调用 exec.* (注入路径)。
-    let script = r#"
-        function on_tick(ctx)
-            local orders = {}
-            local eq = exec.levels(90, 110, 3, false)
-            for _, p in ipairs(eq) do
-                orders[#orders + 1] = { pair = "ETH", side = "buy", size = 1, price = p, order_type = "limit" }
-            end
-            return orders
-        end
-    "#;
-    let cfg = config(script, &[("pair", ConfigValue::String("ETH".into()))]);
-    let bars = vec![kline(100, 101, 99, 100)];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[0].len(), 3, "注入的 exec.levels 应可用");
-    assert_eq!(orders[0][0].price, Some(dec!(90)));
-    assert_eq!(orders[0][1].price, Some(dec!(100)));
-    assert_eq!(orders[0][2].price, Some(dec!(110)));
-}
-
-/// 带成交量的 K 线构造 (kline 的 volume 固定为 1, 本函数可指定)。
-fn kline_v(open: i64, high: i64, low: i64, close: i64, volume: i64) -> Kline {
-    Kline {
-        open_time: chrono::Utc::now(),
-        open: Decimal::from(open),
-        high: Decimal::from(high),
-        low: Decimal::from(low),
-        close: Decimal::from(close),
-        volume: Decimal::from(volume),
-        close_time: chrono::Utc::now(),
-    }
-}
-
-#[test]
-fn test_vwap_slices() {
-    // num_slices=2, 每 2 tick 一片; 首片无历史 K 线 → 市价; 第 2 片有已收盘 K 线 → VWAP 限价。
-    let cfg = config(
-        VWAP,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("total_size", ConfigValue::Float(2.0)),
-            ("num_slices", ConfigValue::Integer(2)),
-            ("slice_interval_secs", ConfigValue::Integer(7200)),
-            ("bar_seconds", ConfigValue::Integer(3600)),
-        ],
-    );
-    let bars = vec![
-        kline_v(100, 101, 99, 100, 1),
-        kline_v(100, 101, 99, 100, 1),
-        kline_v(100, 101, 99, 100, 1),
-        kline_v(100, 101, 99, 100, 1),
-    ];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[0].len(), 1, "首片立即");
-    assert_eq!(orders[0][0].order_type, OrderType::Market, "首片无历史 K 线 → 市价");
-    assert_eq!(orders[0][0].size, dec!(1), "每片 = total/num_slices");
-    assert_eq!(orders[1].len(), 0, "间隔未到");
-    assert_eq!(orders[2].len(), 1, "第 2 片");
-    assert_eq!(orders[2][0].order_type, OrderType::Limit, "有已收盘 K 线 → VWAP 限价");
-    assert_eq!(orders[2][0].price, Some(dec!(100)), "VWAP = 平均 close = 100");
-    assert_eq!(orders[3].len(), 0, "2 片发完");
-}
-
-#[test]
-fn test_vwap_volume_weighted() {
-    // VWAP = Σ(close×volume)/Σ(volume): (100×1 + 200×3)/4 = 175。
-    let cfg = config(
-        VWAP,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("total_size", ConfigValue::Float(2.0)),
-            ("num_slices", ConfigValue::Integer(2)),
-            ("slice_interval_secs", ConfigValue::Integer(7200)),
-            ("bar_seconds", ConfigValue::Integer(3600)),
-        ],
-    );
-    let bars = vec![
-        kline_v(100, 101, 99, 100, 1),
-        kline_v(200, 201, 199, 200, 3),
-        kline_v(200, 201, 199, 200, 1),
-        kline_v(200, 201, 199, 200, 1),
-    ];
-    let orders = run_bars(cfg, &bars);
-    // 第 2 片 (tick3): 已收盘 = [bar1(100,vol1), bar2(200,vol3)] → VWAP = 175。
-    assert_eq!(orders[2].len(), 1);
-    assert_eq!(orders[2][0].price, Some(dec!(175)), "成交量加权均价应 = 175");
-}
-
-#[test]
-fn test_vwap_zero_volume_fallback() {
-    // 全部成交量 0 → 回退最新 close (bar2 的 close=200)。
-    let cfg = config(
-        VWAP,
-        &[
-            ("pair", ConfigValue::String("ETH".into())),
-            ("total_size", ConfigValue::Float(2.0)),
-            ("num_slices", ConfigValue::Integer(2)),
-            ("slice_interval_secs", ConfigValue::Integer(7200)),
-            ("bar_seconds", ConfigValue::Integer(3600)),
-        ],
-    );
-    let bars = vec![
-        kline_v(100, 101, 99, 100, 0),
-        kline_v(200, 201, 199, 200, 0),
-        kline_v(200, 201, 199, 200, 0),
-        kline_v(200, 201, 199, 200, 0),
-    ];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[2].len(), 1);
-    assert_eq!(orders[2][0].price, Some(dec!(200)), "成交量全 0 → 回退最新 close");
-}
-
-#[test]
-fn test_shannon_rebalance_target_ratio_070() {
-    // target_ratio=0.7 → 建仓 ≈ 70% 权益 (100000×0.7/100=700), 价涨后卖回 70:30。
-    let cfg = config(
-        SHANNON_GRID,
-        &[("pair", ConfigValue::String("ETH".into())), ("target_ratio", ConfigValue::Float(0.7))],
-    );
-    let bars = vec![kline(100, 105, 95, 104), kline(110, 115, 105, 114)];
-    let orders = run_bars(cfg, &bars);
-    assert_eq!(orders[0].len(), 1, "首 tick 应建仓");
-    assert_eq!(orders[0][0].side, OrderSide::Buy);
-    assert!(
-        orders[0][0].size > dec!(600) && orders[0][0].size < dec!(800),
-        "建仓应约 70% 权益 (≈700): {}",
-        orders[0][0].size
-    );
-    assert_eq!(orders[1].len(), 1, "价涨应再平衡卖出");
-    assert_eq!(orders[1][0].side, OrderSide::Sell);
-}
-
-#[test]
-fn test_shannon_rebalance_atr_widens_band() {
-    // ATR 开 (atr_period=3): 高波动 bars 建立大 ATR → band_eff 放大 → 涨 5% 不触发;
-    // 对照 atr_period=0 (禁用): band_eff = rebalance_band → 同序列涨 5% 触发卖出。
-    let params_on = [
-        ("pair", ConfigValue::String("ETH".into())),
-        ("atr_period", ConfigValue::Integer(3)),
-        ("atr_mult", ConfigValue::Float(1.0)),
-    ];
-    let cfg_on = config(SHANNON_GRID, &params_on);
-    let cfg_off = config(
-        SHANNON_GRID,
-        &[("pair", ConfigValue::String("ETH".into())), ("atr_period", ConfigValue::Integer(0))],
-    );
-    // bar0 建仓 @100; bar1-3 高波动 (high=110/low=90, close=100) 累计 TR≈20 → ATR/price≈0.2;
-    // bar4 涨到 105 (+5%): 币市值 500×105=52500 vs 目标 51250, 偏离 ~1.2% 权益。
-    let bars = vec![
-        kline(100, 100, 100, 100),
-        kline(100, 110, 90, 100),
-        kline(100, 110, 90, 100),
-        kline(100, 110, 90, 100),
-        kline(105, 110, 100, 105),
-    ];
-    let orders_on = run_bars(cfg_on, &bars);
-    assert_eq!(orders_on[0].len(), 1, "ATR 开: 首 tick 应建仓");
-    assert!(orders_on[4].is_empty(), "ATR 开: band 放大 (≈0.2) → 涨 5% 不应触发再平衡");
-    let orders_off = run_bars(cfg_off, &bars);
-    assert_eq!(orders_off[0].len(), 1, "ATR 关: 首 tick 应建仓");
-    assert_eq!(orders_off[4].len(), 1, "ATR 关: 固定 band 0.5% → 涨 5% 应触发卖出");
-    assert_eq!(orders_off[4][0].side, OrderSide::Sell);
-}
-
-#[test]
-fn test_shannon_rebalance_target_ratio_clamped() {
-    // target_ratio 超界 (0 与 2) → 回退默认 0.5, 建仓 ≈ 500, 不 panic。
-    for bad in [0.0f64, 2.0f64] {
-        let cfg = config(
-            SHANNON_GRID,
-            &[
-                ("pair", ConfigValue::String("ETH".into())),
-                ("target_ratio", ConfigValue::Float(bad)),
-            ],
-        );
-        let bars = vec![kline(100, 105, 95, 104), kline(110, 115, 105, 114)];
-        let orders = run_bars(cfg, &bars);
-        assert_eq!(orders[0].len(), 1, "target_ratio={bad}: 应建仓");
-        assert!(
-            orders[0][0].size > dec!(400) && orders[0][0].size < dec!(600),
-            "target_ratio={bad}: 应回退 0.5 (≈500): {}",
-            orders[0][0].size
-        );
-    }
-}
 
 // ============================================================================
 // 023 香农 ETF 指数增加策略 (shannon_spot_grid) 集成测试
@@ -523,16 +156,6 @@ fn flat_main(n: i64, px: i64) -> Vec<Kline> {
     (0..n).map(|h| bar_at_hour(h, px, px, px, px)).collect()
 }
 
-/// 030 测试用: 主序列 —— 前 `at` 根 @ `base`, 之后 @ `then`。
-fn step_main(n: i64, base: i64, at: i64, then: i64) -> Vec<Kline> {
-    (0..n)
-        .map(|h| {
-            let p = if h < at { base } else { then };
-            bar_at_hour(h, p, p, p, p)
-        })
-        .collect()
-}
-
 /// 030 测试用: 高周期(1h)序列 —— 前 `flat` 根横盘, 之后每根 +`step` → EMA3 上穿 EMA5。
 /// high−low = 2 且前收落在区间内 → ATR 恒为 2; 平盘段让 EMA3/EMA5 收敛到相等。
 fn tf_bars_up(flat: i64, n: i64, step: i64) -> Vec<Kline> {
@@ -541,30 +164,6 @@ fn tf_bars_up(flat: i64, n: i64, step: i64) -> Vec<Kline> {
             let px = if h < flat { 100 } else { 100 + (h - flat + 1) * step };
             bar_at_hour(h, px, px + 1, px - 1, px)
         })
-        .collect()
-}
-
-/// 030 测试用: 高周期序列 —— 横盘 → 上行(金叉) → 回落(死叉)。
-fn tf_bars_up_down(flat: i64, up: i64, down: i64, step: i64) -> Vec<Kline> {
-    let mut v = Vec::new();
-    let mut px = 100;
-    for h in 0..(flat + up + down) {
-        if h >= flat && h < flat + up {
-            px += step;
-        } else if h >= flat + up {
-            px -= step;
-        }
-        v.push(bar_at_hour(h, px, px + 1, px - 1, px));
-    }
-    v
-}
-
-fn market_orders(orders: &[Vec<OrderRequest>]) -> Vec<OrderRequest> {
-    orders
-        .iter()
-        .flatten()
-        .filter(|o| o.order_type == OrderType::Market)
-        .cloned()
         .collect()
 }
 
@@ -735,7 +334,7 @@ fn test_shannon_spot_grid_gate_off_still_sells_in_bull() {
     ]);
     // 1h: 横盘 10 根 -> 强势上行; 长度 910 > 判据 EMA200 预热(603 根), 末段 close 远高于 EMA200 = BULL
     let bull = tf_bars_up(10, 900, 1);
-    let (orders, _ctx, st) = run_accum_full(cfg, &bull.clone(), Some(bull));
+    let (orders, _ctx, _st) = run_accum_full(cfg, &bull.clone(), Some(bull));
     let buys = orders.iter().flatten().filter(|o| o.side == OrderSide::Buy).count();
     let sells = orders
         .iter()
@@ -803,3 +402,118 @@ fn test_shannon_spot_grid_records_entry_for_pnl_split() {
     assert!(st.global_f64("entry_size").unwrap_or(0.0) > 0.0, "初始建仓量应被记录");
     assert!(st.global_f64("invested0").unwrap_or(0.0) > 0.0, "投入本金应被记录");
 }
+
+// ============================================================================
+// paired_grid 现货动态非对称网格 集成测试 (2026-09-24)
+// ============================================================================
+
+const PAIRED_GRID: &str = include_str!("../../../strategies/builtin/paired_grid.lua");
+
+fn paired_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![
+        ("pair", ConfigValue::String("ETHUSDT".into())),
+        ("start_price", ConfigValue::Float(110.0)),
+        ("spacing_pct", ConfigValue::Float(0.04)), // 4% 固定间距
+        ("direction_offset", ConfigValue::Float(0.0)), // 关方向偏移, 间距恒 4%, 可精确预测买卖价
+        ("order_amount", ConfigValue::Float(10.0)),
+        // 放宽名义守卫, 聚焦机制(价格 100 × 0.1 ≈ 10 USDT 本已 > 默认 5, 仍显式设小防边界误伤)
+        ("min_notional", ConfigValue::Float(1.0)),
+    ];
+    params.extend_from_slice(extra);
+    config(PAIRED_GRID, &params)
+}
+
+#[test]
+fn test_paired_grid_activate_build_and_grid_structure() {
+    // start_price=110, 价格 100 激活; 建仓 30 USDT(不计 flag); 建仓后上下各挂一单(等比 4%)。
+    let cfg = paired_cfg(&[("initial_buy_amount", ConfigValue::Float(30.0))]);
+    let bars = flat_main(2, 100); // 2 根 @100: 首 tick 即激活建仓
+    let (orders, _ctx, st) = run_accum_full(cfg, &bars, None);
+
+    // 建仓市价单
+    let market: Vec<_> = orders
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Market)
+        .collect();
+    assert!(!market.is_empty(), "激活后应建仓市价买入, 实际无市价单");
+    assert_eq!(market[0].side, OrderSide::Buy);
+
+    // 等比 4%: 下方买单 @ 100/(1+0.04)=96.154; 上方卖单 @ 100×1.04=104
+    let buy_px: Vec<f64> = orders
+        .iter()
+        .flatten()
+        .filter(|o| o.side == OrderSide::Buy && o.order_type == OrderType::Limit)
+        .filter_map(|o| o.price.map(|p| p.to_f64().unwrap()))
+        .collect();
+    let sell_px: Vec<f64> = orders
+        .iter()
+        .flatten()
+        .filter(|o| o.side == OrderSide::Sell && o.order_type == OrderType::Limit)
+        .filter_map(|o| o.price.map(|p| p.to_f64().unwrap()))
+        .collect();
+    assert!(
+        buy_px.iter().any(|p| (p - 96.1538).abs() < 1e-3),
+        "应挂下方买单 @96.154, 实际买单: {buy_px:?}"
+    );
+    assert!(
+        sell_px.iter().any(|p| (p - 104.0).abs() < 1e-6),
+        "应挂上方配对卖单 @104, 实际卖单: {sell_px:?}"
+    );
+
+    // 建仓不计 flag; 本序列无网格成交 -> flag 恒 0
+    assert_eq!(
+        st.global_f64("flag"),
+        Some(0.0),
+        "建仓不计 flag, 无网格成交时 flag 应恒为 0"
+    );
+}
+
+#[test]
+fn test_paired_grid_pair_sell_above_buy() {
+    // 买单@96.154 成交(flag−1) → 反弹卖单@100 成交(flag+1): 配对卖价必须高于买价, flag 归 0。
+    let cfg = paired_cfg(&[]);
+    let mut bars = flat_main(1, 100); // 首 tick 激活(不建仓), ref=100
+    bars.push(bar_at_hour(1, 96, 96, 96, 96)); // 买单@96.154 成交(bar low 96 ≤ 96.154)
+    bars.push(bar_at_hour(2, 96, 96, 96, 96));
+    bars.push(bar_at_hour(3, 100, 100, 100, 100)); // 卖单@100 成交
+    bars.push(bar_at_hour(4, 100, 100, 100, 100));
+    bars.push(bar_at_hour(5, 100, 100, 100, 100));
+    let (orders, _ctx, st) = run_accum_full(cfg, &bars, None);
+
+    let sell_px: Vec<f64> = orders
+        .iter()
+        .flatten()
+        .filter(|o| o.side == OrderSide::Sell && o.order_type == OrderType::Limit)
+        .filter_map(|o| o.price.map(|p| p.to_f64().unwrap()))
+        .collect();
+    assert!(!sell_px.is_empty(), "买单成交后应挂配对卖单, 实际无卖单");
+    assert!(
+        sell_px.iter().all(|p| *p > 96.0),
+        "配对卖价必须高于买入价 96.154, 实际卖单: {sell_px:?}"
+    );
+
+    // 买单成交(flag−1) + 卖单成交(flag+1) -> 归 0
+    assert_eq!(
+        st.global_f64("flag"),
+        Some(0.0),
+        "一买一卖配对完成后 flag 应归 0"
+    );
+}
+
+#[test]
+fn test_paired_grid_flag_negative_on_downtrend() {
+    // 连续下跌只成交买单 -> flag 持续为负。
+    let cfg = paired_cfg(&[]);
+    let mut bars = flat_main(1, 100);
+    bars.push(bar_at_hour(1, 96, 96, 96, 96)); // 买单成交(flag=-1)
+    bars.push(bar_at_hour(2, 96, 96, 96, 96));
+    bars.push(bar_at_hour(3, 92, 92, 92, 92)); // 买单成交(flag=-2)
+    bars.push(bar_at_hour(4, 92, 92, 92, 92));
+    bars.push(bar_at_hour(5, 88, 88, 88, 88)); // 买单成交(flag=-3)
+    let (_orders, _ctx, st) = run_accum_full(cfg, &bars, None);
+
+    let flag = st.global_f64("flag").expect("flag 应可读");
+    assert!(flag < 0.0, "连续下跌只买不卖 → flag 应为负, 实际 {flag}");
+}
+

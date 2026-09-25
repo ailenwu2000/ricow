@@ -489,7 +489,7 @@ pub(crate) fn resolve_builtin_script(mut config: StrategyConfig) -> CoreResult<S
 ///
 /// lua 策略: `params.script_path` 存在则读文件内容填入 `script` (相对 dir 或绝对路径);
 /// 无 `script_path` 才用内嵌 `script` (旧 create_strategy 部署兼容); 两者皆无报错。
-/// 内置名 type (如 shannon_rebalance) 经 `resolve_builtin_script` Lua 化。
+/// 内置名 type (如 shannon_spot_grid) 经 `resolve_builtin_script` Lua 化。
 pub(crate) fn load_strategy_toml(dir: &std::path::Path, name: &str) -> CoreResult<StrategyConfig> {
     let path = dir.join(format!("{name}.toml"));
     let content = std::fs::read_to_string(&path)
@@ -646,7 +646,7 @@ mod tests {
         params.insert("pair".into(), ConfigValue::String("ETH".into()));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_rebalance".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params,

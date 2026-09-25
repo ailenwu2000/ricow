@@ -82,7 +82,7 @@ binance_secret=***
 
 | 档位 | 命令 | 资金 | 前置 |
 |---|---|---|---|
-| 回测 | `ricow backtest --strategy shannon_rebalance --pair ETHUSDT --days 30` | 无 | 零配置 |
+| 回测 | `ricow backtest --strategy shannon_spot_grid --pair ETHUSDT --days 30` | 无 | 零配置 |
 | Dry Run(本地虚拟撮合) | `ricow start <名字>` | 无 | 零配置 |
 | demo(币安测试网**真实下单**) | `ricow start <名字> --demo` | 模拟资金 | `[exchange].demo_*` |
 | 实盘(主网真实资金) | 策略 TOML 声明 `live_enabled = true` + `ricow start <名字> --live --accept-risk` | 真实 | `[exchange].binance_*` + 首次风险确认 + Dry Run 时长门禁 |
@@ -166,8 +166,8 @@ xattr -d com.apple.quarantine ./ricow
 
 - `specs/` — 唯一文档体系: constitution(项目宪法)/ product(产品方案)/ architecture(架构)/ lua-api(Lua API 规范)/ roadmap(里程碑进度)/ research(调研资料)/ changes(变更档案, SDD 流程产物)
 - `crates/` — 5 crate workspace: core / binance / strategy / engine / cli
-- `strategies/builtin/` — 内置参考实现(编译期嵌入二进制): shannon_rebalance.lua(**唯一策略样板**, 照它写你的策略)+ executors/{dca,twap,vwap,pullback,ladder}(执行模式示例, 非策略); exec 执行组件为引擎内置(Rust 实现, Lua 策略直接调用 exec.*)
-- 自建策略走 `create` 闭环:`ricow create --name <名字> --pair <交易对> --script <你的.lua>` → `ricow approve` → `ricow deploy <preview_id> --token <token>`(带编译门禁 + 真实 K 线沙箱回测, **确认前不落盘**;样板 = 内置 `strategies/builtin/shannon_rebalance.lua`,见 [specs/lua-api.md](specs/lua-api.md) 第九节)
+- `strategies/builtin/` — 内置参考实现(编译期嵌入二进制): shannon_spot_grid.lua(香农现货网格)+ paired_grid.lua(现货动态非对称网格); exec 执行组件为引擎内置(Rust 实现, Lua 策略直接调用 exec.*)
+- 自建策略走 `create` 闭环:`ricow create --name <名字> --pair <交易对> --script <你的.lua>` → `ricow approve` → `ricow deploy <preview_id> --token <token>`(带编译门禁 + 真实 K 线沙箱回测, **确认前不落盘**;样板 = 内置 `strategies/builtin/shannon_spot_grid.lua`,见 [specs/lua-api.md](specs/lua-api.md) 第九节)
 - `website/` — 官网落地页(<https://ricow.xyz>,纯静态 HTML/CSS,由 `.github/workflows/pages.yml` 部署到 GitHub Pages)
 - `crates/ricow/src/supervisor/` — 策略进程管理器(常驻 daemon + 本机控制通道 + 实例台账, 见 [specs/architecture.md §三](specs/architecture.md))
 

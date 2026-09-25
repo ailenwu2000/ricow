@@ -8,6 +8,7 @@
 //! 脚本只通过返回订单表数组影响策略行为; ctx 为只读快照 (LuaCtxData userdata)。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{Datelike, Timelike};
 use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
@@ -19,7 +20,7 @@ use crate::config::{ConfigValue, StrategyConfig};
 use crate::context::Context;
 use crate::indicators_api;
 use crate::lua_sandbox::create_lua_sandbox;
-use crate::multiframe::tf_key;
+use crate::multiframe::{tf_key, TfCache};
 use crate::strategy::Strategy;
 
 // ============================================================================
@@ -77,10 +78,11 @@ pub(crate) struct LuaCtxData {
     /// 当前 tick 时间 (UTC); None = 通道不可用 (单标的/实盘未接)。ctx:now() 用。
     now: Option<chrono::DateTime<chrono::Utc>>,
     klines_map: HashMap<String, Vec<Kline>>,
-    /// 高周期 (第二序列) 已收盘 K 线快照: 键 = `pair|tf`, 值 = 可见前缀(无前视)。
-    /// 由 `fill_snapshot` 按策略声明 (need_klines) 从 ctx.tf_klines 填充;
-    /// 指标 (ATR/EMA/close) 由策略侧显式 tf/period 现算(见 `atr_tf`/`ema_tf`/`close_tf` 绑定)。
-    tf_klines: HashMap<String, Vec<Kline>>,
+    /// 高周期 (第二序列) 序列缓存的共享引用: 键 = `pair|tf`。
+    /// 由 `fill_snapshot` 按策略声明 (need_klines) 从 ctx.tf_cache_ref 填充;
+    /// 指标 (ATR/EMA/close) 由绑定直接调 TfCache 的缓存 + 尾窗方法 —— 每根高周期 bar 只算一次,
+    /// 且尾窗裁剪, 避免每 tick 克隆全量可见前缀 + 全量重算的 O(n²) (2026-09-25 修回测性能)。
+    tf_cache: HashMap<String, Arc<TfCache>>,
     /// 组合信号模式标志 (bs_momentum Lua 化, T3): true → ctx:klines 返回全段
     /// (引擎已截断至执行日, ≥253 根供 IBD RS/EMA200 打分), 不套单标的 100 根 cap;
     /// false (默认) → 单标的路径维持 cap 100 (行为边界, 回归约束)。
@@ -106,7 +108,7 @@ impl LuaCtxData {
             config_bool_map: HashMap::new(),
             now: None,
             klines_map: HashMap::new(),
-            tf_klines: HashMap::new(),
+            tf_cache: HashMap::new(),
             full_klines: false,
         }
     }
@@ -155,10 +157,6 @@ impl LuaCtxData {
     /// 已收盘 K 线历史 (指标数据源, 无前视)。
     fn klines(&self, pair: &str) -> Option<Vec<Kline>> {
         self.klines_map.get(pair).cloned()
-    }
-    /// 高周期 (第二序列) 已收盘 K 线 (无前视): 键 = `pair|tf`。
-    fn tf_klines(&self, pair: &str, tf: &str) -> Option<Vec<Kline>> {
-        self.tf_klines.get(&tf_key(pair, tf)).cloned()
     }
 }
 
@@ -273,22 +271,33 @@ impl UserData for LuaCtxData {
             t.set(t.raw_len() + 1, row)?;
             Ok(())
         });
-        // 高周期 ATR: 在已预装的 `tf` 序列上现算(周期显式传入), 数据不足 → nil。
+        // 高周期 ATR: 直接调 TfCache 缓存 + 尾窗(周期显式传入), 数据不足 → nil。
+        // 每根高周期 bar 只算一次; 不克隆序列、不对全量可见前缀重算(修 O(n²))。
         methods.add_method("atr_tf", |_, data, (pair, tf, period): (String, String, usize)| {
-            let k = data.tf_klines(&pair, &tf).unwrap_or_default();
-            Ok(indicators_api::atr(&k, period))
+            let Some(now_ms) = data.now.map(|t| t.timestamp_millis()) else {
+                return Ok(None);
+            };
+            Ok(data.tf_cache.get(&tf_key(&pair, &tf)).and_then(|c| c.atr(period, now_ms)))
         });
-        // 高周期 EMA: 在已预装的 `tf` 序列上现算(周期显式传入), 数据不足 → nil。
+        // 高周期 EMA: 直接调 TfCache 缓存 + 尾窗(周期显式传入), 数据不足 → nil。
         methods.add_method("ema_tf", |_, data, (pair, tf, period): (String, String, usize)| {
-            let k = data.tf_klines(&pair, &tf).unwrap_or_default();
-            Ok(indicators_api::ema(&k, period))
+            let Some(now_ms) = data.now.map(|t| t.timestamp_millis()) else {
+                return Ok(None);
+            };
+            Ok(data.tf_cache.get(&tf_key(&pair, &tf)).and_then(|c| c.ema(period, now_ms)))
         });
         // 高周期 EMA 快慢线: `ctx:ema_cross(pair, tf, fast, slow)` → {fast=…, slow=…} 或 nil。
         methods.add_method(
             "ema_cross",
             |lua, data, (pair, tf, fast, slow): (String, String, usize, usize)| {
-                let k = data.tf_klines(&pair, &tf).unwrap_or_default();
-                match (indicators_api::ema(&k, fast), indicators_api::ema(&k, slow)) {
+                let Some(now_ms) = data.now.map(|t| t.timestamp_millis()) else {
+                    return Ok(Value::Nil);
+                };
+                let c = data.tf_cache.get(&tf_key(&pair, &tf));
+                match (
+                    c.and_then(|c| c.ema(fast, now_ms)),
+                    c.and_then(|c| c.ema(slow, now_ms)),
+                ) {
                     (Some(f), Some(s)) => {
                         let t = lua.create_table()?;
                         t.set("fast", f)?;
@@ -324,8 +333,10 @@ impl UserData for LuaCtxData {
         });
         // 高周期上一根已收盘 close: `ctx:close_tf(pair, tf)`。
         methods.add_method("close_tf", |_, data, (pair, tf): (String, String)| {
-            let k = data.tf_klines(&pair, &tf).unwrap_or_default();
-            Ok(k.last().and_then(|b| b.close.to_f64()))
+            let Some(now_ms) = data.now.map(|t| t.timestamp_millis()) else {
+                return Ok(None);
+            };
+            Ok(data.tf_cache.get(&tf_key(&pair, &tf)).and_then(|c| c.close(now_ms)))
         });
         methods.add_method("adx", |_, data, (pair, period): (String, usize)| {
             let k = data.klines(&pair).unwrap_or_default();
@@ -464,10 +475,11 @@ impl LuaStrategy {
             if let Some(k) = ctx.klines(&pair) {
                 data.klines_map.insert(pair.clone(), k);
             }
-            // 高周期 K 线: 按策略声明 (need_klines) 供给, 键 = `pair|tf`; 指标由策略侧现算。
+            // 高周期序列缓存: 按策略声明 (need_klines) 供给共享引用, 键 = `pair|tf`;
+            // 指标 (atr_tf/ema_tf/close_tf) 由绑定直接调 TfCache 缓存 + 尾窗 (2026-09-25 修 O(n²))。
             for d in ctx.declarations() {
-                if let Some(k) = ctx.tf_klines(&pair, &d.tf) {
-                    data.tf_klines.insert(tf_key(&pair, &d.tf), k);
+                if let Some(c) = ctx.tf_cache_ref(&pair, &d.tf) {
+                    data.tf_cache.insert(tf_key(&pair, &d.tf), c);
                 }
             }
         }

@@ -105,8 +105,7 @@ end
 | `ctx:equity()` | number | 总权益: 现货 = 报价现金 + 持仓市值; 合约 = 钱包现金 + 未实现盈亏 — 2026-09-15 新增 |
 
 > **盈亏政策属于策略** (2026-09-15, 020-platform-scope-trim): 平台**不再**提供亏损熔断/峰值回撤这类默认判断
-> (原"两级亏损熔断"已删除)。策略用 `ctx:net_pnl()` / `ctx:equity()` 自己实现回撤与止损 ——
-> 内置 `shannon_rebalance` 的 `dd_stop_pct` 参数即一条参考写法 (默认 0 = 关闭)。
+> (原"两级亏损熔断"已删除)。策略用 `ctx:net_pnl()` / `ctx:equity()` 自己实现回撤与止损。
 >
 > 持仓语义 (specs/backtest.md §五.6/§八 D9): 默认 `one-way` 模式同一交易对只有一个净仓, `position_*` 即全部信息;
 > `hedge` 模式下多空可并存, 净仓查询 (`position_*`) 合并多空后取净 (net = 0 时 side 为 `"none"`),
@@ -141,9 +140,11 @@ end
 
 指标输入为**已收盘**历史序列（当前未收盘 bar 不可见），数据不足返回 `nil`（用 `if v then` 判断）。
 
-> **指标输入长度契约（2026-09-17 固定）**: 单标的路径下 `ctx:klines` 与全部指标的输入 = 同一条
-> **尾窗序列，上限 100 根**（引擎按此裁剪，避免每 tick 克隆全量历史 —— 1m×79 天曾是 10^9 级拷贝）。
-> 需要更长窗口的指标（如 EMA200）不属于单标的路径能力，请用组合信号模式或高周期序列。
+> **指标输入长度契约（2026-09-25 收敛）**: 单标的路径下 `ctx:klines` 与主序列指标（`ctx:ema`/`ctx:atr` 等）的
+> 输入 = 同一条**按 primary 声明尾窗化**的序列：长度 = `need_klines("primary", tf, min_bars)` 的 `min_bars`（未声明
+> primary 的旧策略回落全量）。高周期指标（`ctx:atr_tf`/`ctx:ema_tf`/`ctx:close_tf`）走引擎 `TfCache` **缓存 + 尾窗**
+> （每根高周期 bar 只算一次），不再克隆序列全量重算。二者共同避免每 tick 克隆全量历史的 O(n²) —— 1m×60 天 =
+> 86400 根下曾把回测拖慢到 ~13 分钟（修复后 ~3 秒）。需要更长窗口的指标请用组合信号模式或高周期序列。
 
 | 函数 | 返回 | 说明 |
 |:-----|:-----|:-----|
@@ -183,7 +184,7 @@ end
 | 函数 | 返回 | 说明 |
 |:-----|:-----|:-----|
 | `ctx:log(msg)` | 无 | 写日志 |
-| `ctx:klines(pair)` | table? | 已收盘 K 线数组(无前视),每根 `{ts=, open=, close=, volume=}` (`ts` = bar open_time 的 epoch 秒, 2026-09-11 新增, 供盘中策略定位"当日会话起点")。单标的路径最多最近 100 根; 组合信号模式 (config 有 `universe` 键) 返回该 pair 美股信号线截至当前执行日的已收盘段, **尾窗封顶 400 根** (≥253 根可打分, 见 §四), 不套 100 cap |
+| `ctx:klines(pair)` | table? | 已收盘 K 线数组(无前视),每根 `{ts=, open=, close=, volume=}` (`ts` = bar open_time 的 epoch 秒, 2026-09-11 新增, 供盘中策略定位"当日会话起点")。单标的路径按 `need_klines("primary", ...)` 声明的 `min_bars` **尾窗化**(未声明 primary 回落全量); 组合信号模式 (config 有 `universe` 键) 返回该 pair 美股信号线截至当前执行日的已收盘段, **尾窗封顶 400 根** (≥253 根可打分, 见 §四), 不套 primary cap |
 
 ### exec 执行组件（引擎内置，全局表，点号调用）
 
@@ -199,7 +200,7 @@ end
 | `exec.slice_due(tick_count, start_tick, slices_sent, ticks_per_slice)` | boolean | TWAP 切片到期: 首片立即（slices_sent==0），之后每 ticks_per_slice 一片 |
 | `exec.side_order(ctx, pair, side, size)` | table | 对手价限价单（买 best_ask / 卖 best_bid），无盘口回退市价 |
 
-示例（内置 dca.lua 的间隔换算）:
+示例（间隔换算）:
 
 ```lua
 ticks_per_interval = exec.ticks_per(ctx:config_i64("interval_secs"), ctx:config_i64("bar_seconds"))
@@ -339,28 +340,25 @@ end
 4. 回测:`ricow backtest --strategy <name>`(TOML 已含 pair 时可省 `--pair`);
 5. 启动:`ricow run <name>`(Dry Run;TOML 里 `enabled = false` 会被拒绝启动)。
 
-**没有独立的"策略模板文件"**: 样板就是下节的 `strategies/builtin/shannon_rebalance.lua`, 直接读它照写。
+**没有独立的"策略模板文件"**: 样板就是下节的 `strategies/builtin/shannon_spot_grid.lua`, 直接读它照写。
 手工建策略(不走 create 闭环)同样支持: 自己写 `strategies/<name>.toml` + `strategies/scripts/<name>.lua`,
 TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝对路径);旧部署(TOML 内嵌 `script` 代码字符串)依然兼容。
 
 目录定位:默认取**当前工作目录**(在项目根运行 `ricow`);从其他目录运行可设
 `RICOW_ROOT=<项目根>`;数据库路径可单独用 `RICOW_DB=<path>` 覆盖。
 
-内置脚本(shannon_rebalance 策略样板 + executors/ 执行模式示例)均为 Lua 脚本,参考实现见
+内置脚本(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格)均为 Lua 脚本,参考实现见
 `strategies/builtin/`(git 跟踪,与用户策略同目录,复制即自定义):
 
-- `strategies/builtin/shannon_rebalance.lua` — 香农 50:50 中轴再平衡(**唯一策略样板**)
-- `strategies/builtin/executors/dca.lua` / `twap.lua` / `vwap.lua` — 定时定投 / 时间加权分批 / 成交量加权分批(间隔按 tick 计数,需 `bar_seconds` 参数,CLI 按 interval 自动注入; vwap 参考价 = 已收盘 K 线成交量加权均价, 无成交量回退市价)
-- `strategies/builtin/executors/pullback.lua` — 新高后回撤买入
-- `strategies/builtin/executors/ladder.lua` — 区间分档挂限价单
+- `strategies/builtin/shannon_spot_grid.lua` — 香农现货网格(虚拟账本权重再平衡 + ATR 间距, 详见 §九)
+- `strategies/builtin/paired_grid.lua` — 现货动态非对称网格(固定金额 + 配对卖价恒>买价 + 方向偏移, 详见 §九)
 
-> 执行模式示例(executors/)**不是策略**: 它们 = 最简信号(定时/回调/一次性挂单)+ 调 exec.* 执行;
-> 复制后改信号部分即成为你自己的策略。**builtin 脚本为编译期嵌入(include_str!), 直接改文件不重编译不生效**;
-> 自定义请复制到 `strategies/scripts/` 再改。
+**builtin 脚本为编译期嵌入(include_str!), 直接改文件不重编译不生效**;
+自定义请复制到 `strategies/scripts/` 再改。
 
-直接 `ricow backtest --strategy shannon_rebalance --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
+直接 `ricow backtest --strategy shannon_spot_grid --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
 **交易对必须带报价币**, 现货用 `ETHUSDT` 而非 `ETH`, 否则交易所返回 `Invalid symbol`);
-复制 `strategies/builtin/shannon_rebalance.lua` 或 `strategies/builtin/executors/*.lua` 到
+复制 `strategies/builtin/shannon_spot_grid.lua` 或 `strategies/builtin/paired_grid.lua` 到
 `strategies/scripts/` 修改即自定义(`strategies/` 下除 `builtin/` 外均被 git 忽略,
 用户策略默认私有;想入库自行调整 `.gitignore`)。
 

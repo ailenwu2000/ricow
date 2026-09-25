@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ricow_core::{
     parse_pair, Balance, CoreResult, Kline, OrderAck, OrderAction, OrderBook, OrderFill,
@@ -222,7 +223,7 @@ pub struct BacktestContext {
     /// 高周期序列 (第二序列, 023; 2026-09-18 扩为多套): 键 = `resolve_key(pair)|tf`,
     /// 装配层预装(已剔除不完整桶)。`atr_tf`/`ema_tf`/`close_tf` 按当前 tick 时间取可见前缀
     /// 计算, 每根高周期 bar 只算一次(TfCache 内部缓存)。
-    tf_caches: HashMap<String, TfCache>,
+    tf_caches: HashMap<String, Arc<TfCache>>,
     /// 策略数据需求声明 (need_klines 写入, 回测两阶段的声明入口读取)。
     declarations: Vec<Declaration>,
     default_exchange: String,
@@ -429,10 +430,22 @@ impl BacktestContext {
             );
         }
         if self.portfolio_klines.is_empty() {
-            // ctx:klines 返回全部已收盘序列(此前按 023 的 KLINES_TAIL 尾窗截断, 无设计依据,
-            // 2026-09-24 撤销): 策略需要多长历史由策略决定, 引擎不暗中截断。
-            let start = 0usize;
-            Some(self.closed_klines[start..].to_vec())
+            // ctx:klines 按 primary 声明尾窗截断: 策略经 need_klines 声明它需要多少根主时钟历史,
+            // 引擎按声明供给尾窗 —— 不再每 tick 全量克隆已收盘序列(2026-09-24 撤销尾窗后,
+            // 1m 主时钟 86400 根下每 tick 全量克隆是 O(n²), 回测从 ~13min 拖慢; 2026-09-25 修)。
+            // 未声明 primary(旧策略未声明) → 回落全量, 行为不变。
+            let tail = self
+                .declarations
+                .iter()
+                .find(|d| d.role == "primary")
+                .map(|d| d.min_bars as usize);
+            match tail {
+                Some(t) if t > 0 => {
+                    let start = self.closed_klines.len().saturating_sub(t);
+                    Some(self.closed_klines[start..].to_vec())
+                }
+                _ => Some(self.closed_klines.clone()),
+            }
         } else {
             self.portfolio_klines
                 .get(&self.resolve_key(pair))
@@ -1990,13 +2003,17 @@ impl Context for BacktestContext {
         Some(c.visible(now_ms).to_vec())
     }
 
+    fn tf_cache_ref(&self, pair: &str, tf: &str) -> Option<Arc<TfCache>> {
+        self.tf_caches.get(&tf_key(&self.resolve_key(pair), tf)).cloned()
+    }
+
     fn set_tf_klines(&mut self, pair: &str, tf: &str, bars: Vec<Kline>) {
         let Some(tf_ms) = crate::multiframe::tf_ms_of(tf) else {
             tracing::warn!(target: "multiframe", tf, "未知高周期标签, 忽略预装");
             return;
         };
         let key = tf_key(&self.resolve_key(pair), tf);
-        self.tf_caches.insert(key, TfCache::new(tf_ms, bars));
+        self.tf_caches.insert(key, Arc::new(TfCache::new(tf_ms, bars)));
     }
 }
 
@@ -2039,7 +2056,7 @@ mod tests {
     fn test_limit_buy_fills_when_low_crosses() {
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_rebalance".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
@@ -2066,7 +2083,7 @@ mod tests {
     fn test_limit_buy_rests_when_no_cross() {
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_rebalance".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
@@ -2092,7 +2109,7 @@ mod tests {
     fn test_balance_key_uses_base_asset_not_prefixed_pair() {
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_rebalance".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
@@ -2121,7 +2138,7 @@ mod tests {
         // 前视回归: on_tick 只能见当前 bar 的 open, 不能见未收盘的 close。
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_rebalance".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
@@ -2319,7 +2336,7 @@ mod tests {
         // 均价口径 (84 - 90 = -6) 在深跌反弹场景失真, LIFO 是网格真实口径。
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "shannon_rebalance".into(),
+            strategy_type: "shannon_spot_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params: Default::default(),
