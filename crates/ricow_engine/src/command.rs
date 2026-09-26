@@ -3,14 +3,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::Utc;
 use futures::{Stream, StreamExt};
 use ricow_core::{
-    Balance, CoreError, CoreResult, Exchange, Kline, Market, OrderAck, OrderFill, OrderSide,
-    OrderStatus, OrderUpdate, Position, UserEvent,
+    Balance, CoreError, CoreResult, Exchange, Kline, Market, OrderAck, OrderFill, OrderRequest,
+    OrderSide, OrderStatus, OrderUpdate, Position, UserEvent,
 };
 use ricow_strategy::{
     is_owned, ConfigValue, Context, Database, DryRunContext, LiveContext, OrderRecord,
@@ -481,6 +482,136 @@ async fn persist_position(
     }
 }
 
+/// 034 事件驱动决策 (dry-run): 下单出口 (on_tick 与 on_fill 返回的订单共用)。
+/// 只提交 + 拒单回传 + 落库, **不** drain 撮合成交 —— 调用方在合适时点 drain 并派发。
+async fn submit_orders_dry(
+    ctx: &mut DryRunContext,
+    strategy: &mut dyn Strategy,
+    orders: Vec<OrderRequest>,
+    outcome: &mut RunOutcome,
+    db: Option<&Database>,
+    strategy_name: &str,
+) {
+    for req in orders {
+        outcome.orders_submitted += 1;
+        match ctx.place_order(req) {
+            Ok(ack) if ack.status == OrderStatus::Rejected => {
+                // 风控/参数对齐拒单: 与"下单失败"区分计数 (策略循环不中断)
+                // 026 时点① 只记**已提交**的单 —— 拒单未到交易所, 不产生订单行
+                outcome.rejections += 1;
+                // 审计 #3: 拒单回传给策略。
+                strategy.on_order_update(ctx, ack.to_update(Utc::now()));
+            }
+            Ok(ack) => {
+                if ack.status == OrderStatus::Cancelled {
+                    strategy.on_order_update(ctx, ack.to_update(Utc::now()));
+                }
+                if let Some(db) = db {
+                    persist_order_ack(db, outcome, strategy_name, &ack, RunMode::DryRun).await;
+                }
+            }
+            Err(e) => {
+                // 下单失败如实记录并计数 (不再静默吞掉)
+                outcome.order_errors += 1;
+                let msg = e.to_string();
+                tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
+                outcome.last_error = Some(format!("下单失败: {msg}"));
+            }
+        }
+    }
+}
+
+/// 034 事件驱动决策 (dry-run): 单笔成交的完整处置 + on_fill 后续订单的有界递归。
+///
+/// 手工 Box 装箱以支持 async 递归: on_fill 返回的订单立即提交, 其即时成交在同一
+/// 事件内继续派发 (深度上限 [`crate::backtest_runner::MAX_FILL_DECISION_DEPTH`],
+/// 防"成交即市价反手"病态策略无限递归); on_fill 返回空 = 旧行为, 零递归。
+#[allow(clippy::too_many_arguments)]
+fn handle_dry_fill<'a>(
+    ctx: &'a mut DryRunContext,
+    strategy: &'a mut dyn Strategy,
+    fill: OrderFill,
+    depth: u32,
+    outcome: &'a mut RunOutcome,
+    db: Option<&'a Database>,
+    notifier: Option<&'a Notifier>,
+    strategy_name: &'a str,
+    pair: &'a str,
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > crate::backtest_runner::MAX_FILL_DECISION_DEPTH {
+            tracing::warn!(
+                target: "engine",
+                depth,
+                name = %strategy_name,
+                "on_fill 递归决策深度超限, 停止派发 (疑似'成交即反手'病态逻辑)"
+            );
+            return;
+        }
+        outcome.fills += 1;
+        if let Some(db) = db {
+            if let Err(e) = db.insert_fill(strategy_name, &fill).await {
+                outcome.persist_errors += 1;
+                let msg = e.to_string();
+                tracing::error!(target: "engine", name = %strategy_name, "成交落库失败: {msg}");
+                outcome.last_error = Some(format!("成交落库失败: {msg}"));
+            }
+            // 026 时点②: 订单状态 + PnL 快照 (与成交同批落库)
+            persist_fill_facts(db, outcome, strategy_name, &fill, ctx.pnl(), RunMode::DryRun).await;
+        }
+        if let Some(n) = notifier {
+            n.notify(NotifyEvent::Fill {
+                pair: fill.pair.clone(),
+                side: format!("{:?}", fill.side),
+                price: fill.fill_price,
+                size: fill.fill_size,
+                fee: fill.fee,
+            });
+        }
+        let follow_ups = strategy.on_fill(ctx, fill);
+        // 030 断点续接: 成交后立即持久化策略状态(关机/中止后重启可继续)。
+        if let Some(db) = db {
+            for (k, v) in strategy.state_snapshot() {
+                if let Err(e) = db.strategy_state_set(strategy_name, &k, &v).await {
+                    outcome.persist_errors += 1;
+                    tracing::error!(target: "engine", key = %k, "策略状态落库失败: {e}");
+                }
+            }
+        }
+        // 026 时点④: dry run 的持仓事实 = 虚拟持仓 (None = 已平 → 落 size 0)
+        if let Some(db) = db {
+            persist_position(
+                db,
+                outcome,
+                strategy_name,
+                pair,
+                ctx.position(pair).as_slice(),
+                RunMode::DryRun,
+            )
+            .await;
+        }
+        if follow_ups.is_empty() {
+            return;
+        }
+        submit_orders_dry(ctx, strategy, follow_ups, outcome, db, strategy_name).await;
+        let next_fills = ctx.drain_fills();
+        for f in next_fills {
+            handle_dry_fill(
+                ctx,
+                strategy,
+                f,
+                depth + 1,
+                outcome,
+                db,
+                notifier,
+                strategy_name,
+                pair,
+            )
+            .await;
+        }
+    })
+}
+
 /// 成交后刷新持仓: 合约走定向持仓覆盖; 现货走 base 可用余额包装 (空余额 = 清仓, 不留陈旧仓)。
 ///
 /// 返回**已写入上下文的持仓事实**: `Some(空切片)` = 确实无仓(已平), `None` = 查询失败
@@ -681,79 +812,31 @@ impl Engine {
             }
 
             let orders = strategy.on_tick(&mut ctx);
-            for req in orders {
-                outcome.orders_submitted += 1;
-                match ctx.place_order(req) {
-                    Ok(ack) if ack.status == OrderStatus::Rejected => {
-                        // 风控/参数对齐拒单: 与"下单失败"区分计数 (策略循环不中断)
-                        // 026 时点① 只记**已提交**的单 —— 拒单未到交易所, 不产生订单行
-                        outcome.rejections += 1;
-                        // 审计 #3: 拒单回传给策略。
-                        strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
-                    }
-                    Ok(ack) => {
-                        if ack.status == OrderStatus::Cancelled {
-                            strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
-                        }
-                        if let Some(db) = db {
-                            persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode).await;
-                        }
-                    }
-                    Err(e) => {
-                        // 下单失败如实记录并计数 (不再静默吞掉)
-                        outcome.order_errors += 1;
-                        let msg = e.to_string();
-                        tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
-                        outcome.last_error = Some(format!("下单失败: {msg}"));
-                    }
-                }
-            }
+            submit_orders_dry(
+                &mut ctx,
+                strategy.as_mut(),
+                orders,
+                &mut outcome,
+                db,
+                &strategy_name,
+            )
+            .await;
 
             let fills = ctx.drain_fills();
-            outcome.fills += fills.len() as u64;
             for fill in fills {
-                if let Some(db) = db {
-                    if let Err(e) = db.insert_fill(&strategy_name, &fill).await {
-                        outcome.persist_errors += 1;
-                        let msg = e.to_string();
-                        tracing::error!(target: "engine", name = %strategy_name, "成交落库失败: {msg}");
-                        outcome.last_error = Some(format!("成交落库失败: {msg}"));
-                    }
-                    // 026 时点②: 订单状态 + PnL 快照 (与成交同批落库)
-                    persist_fill_facts(db, &mut outcome, &strategy_name, &fill, ctx.pnl(), mode)
-                        .await;
-                }
-                if let Some(n) = &notifier {
-                    n.notify(NotifyEvent::Fill {
-                        pair: fill.pair.clone(),
-                        side: format!("{:?}", fill.side),
-                        price: fill.fill_price,
-                        size: fill.fill_size,
-                        fee: fill.fee,
-                    });
-                }
-                strategy.on_fill(&mut ctx, fill);
-                // 030 断点续接: 成交后立即持久化策略状态(关机/中止后重启可继续)。
-                if let Some(db) = db {
-                    for (k, v) in strategy.state_snapshot() {
-                        if let Err(e) = db.strategy_state_set(&strategy_name, &k, &v).await {
-                            outcome.persist_errors += 1;
-                            tracing::error!(target: "engine", key = %k, "策略状态落库失败: {e}");
-                        }
-                    }
-                }
-                // 026 时点④: dry run 的持仓事实 = 虚拟持仓 (None = 已平 → 落 size 0)
-                if let Some(db) = db {
-                    persist_position(
-                        db,
-                        &mut outcome,
-                        &strategy_name,
-                        &pair,
-                        ctx.position(&pair).as_slice(),
-                        mode,
-                    )
-                    .await;
-                }
+                // 034: 单笔成交完整处置 (含 on_fill 返回订单的立即提交与递归派发)。
+                handle_dry_fill(
+                    &mut ctx,
+                    strategy.as_mut(),
+                    fill,
+                    0,
+                    &mut outcome,
+                    db,
+                    notifier.as_ref(),
+                    &strategy_name,
+                    &pair,
+                )
+                .await;
             }
         }
 
@@ -1194,7 +1277,39 @@ impl Engine {
                             notifier.as_ref(),
                         )
                         .await;
-                        strategy.on_fill(&mut ctx, fill);
+                        // 034 事件驱动: on_fill 返回的订单立即提交 (实盘新成交经用户流
+                        // 再次触发 on_fill, 天然闭环, 无需本地递归)。
+                        for req in strategy.on_fill(&mut ctx, fill) {
+                            outcome.orders_submitted += 1;
+                            match ctx.place_order(req) {
+                                Ok(ack) if ack.status == OrderStatus::Rejected => {
+                                    outcome.rejections += 1;
+                                    strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
+                                }
+                                Ok(ack) => {
+                                    if ack.status == OrderStatus::Cancelled {
+                                        strategy
+                                            .on_order_update(&mut ctx, ack.to_update(Utc::now()));
+                                    }
+                                    if let Some(db) = db {
+                                        persist_order_ack(
+                                            db,
+                                            &mut outcome,
+                                            &strategy_name,
+                                            &ack,
+                                            mode,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Err(e) => {
+                                    outcome.order_errors += 1;
+                                    let msg = e.to_string();
+                                    tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
+                                    outcome.last_error = Some(format!("下单失败: {msg}"));
+                                }
+                            }
+                        }
                         // 030 断点续接: 成交后立即持久化策略状态(关机/中止后重启可继续)。
                         if let Some(db) = db {
                             for (k, v) in strategy.state_snapshot() {

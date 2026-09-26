@@ -757,11 +757,17 @@ impl Strategy for LuaStrategy {
         }
     }
 
-    fn on_fill(&mut self, ctx: &mut dyn Context, fill: OrderFill) {
+    /// 034 事件驱动: Lua `on_fill(ctx, fill)` 可像 on_tick 一样返回订单表数组;
+    /// 无返回/nil = 无订单。返回的订单由引擎立即下单(见 backtest_runner/command)。
+    fn on_fill(&mut self, ctx: &mut dyn Context, fill: OrderFill) -> Vec<OrderRequest> {
         let mut data = LuaCtxData::new();
         self.fill_snapshot(ctx, &mut data);
-        if let Ok(t) = self.fill_to_table(&fill) {
-            self.call("on_fill", data, vec![Value::Table(t)]);
+        let Ok(t) = self.fill_to_table(&fill) else {
+            return vec![];
+        };
+        match self.call("on_fill", data, vec![Value::Table(t)]) {
+            Some(Value::Table(orders)) => self.parse_orders(&orders),
+            _ => vec![],
         }
     }
 

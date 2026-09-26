@@ -14,7 +14,14 @@ pub trait Strategy: Send + Sync {
         vec![]
     }
 
-    fn on_fill(&mut self, _ctx: &mut dyn Context, _fill: OrderFill) {}
+    /// 成交回调 (034 事件驱动): 每笔成交入账后立即派发。
+    ///
+    /// 可返回订单 —— 引擎会立即下单, 且新成交会**再次**触发本回调(有界递归,
+    /// 深度上限见引擎 `MAX_FILL_DECISION_DEPTH`), 实现"成交→决策→挂单"零节流闭环。
+    /// 返回空(默认)则与旧语义一致: 决策等待下一次 `on_tick`。
+    fn on_fill(&mut self, _ctx: &mut dyn Context, _fill: OrderFill) -> Vec<OrderRequest> {
+        vec![]
+    }
 
     fn on_order_update(&mut self, _ctx: &mut dyn Context, _update: OrderUpdate) {}
 
