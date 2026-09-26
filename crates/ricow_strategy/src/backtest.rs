@@ -114,6 +114,42 @@ pub struct BacktestReport {
     pub turnover_ratio: f64,
     /// 组合持仓快照序列: 每收盘估值点的 (pair, size>0); 单标的路径为空。
     pub holdings_snapshots: Vec<Vec<(String, Decimal)>>,
+    // ---- 可观测性增强 (2026-09-26, 032+): 分侧盈亏 / 峰值敞口 / 期末强平标注 / 策略统计 ----
+    /// 分侧已实现盈亏 (hedge: "long"/"short" 两侧各赚多少; one-way/现货为 None)。
+    pub realized_long: Option<Decimal>,
+    pub realized_short: Option<Decimal>,
+    /// 分侧成交笔数 (position_side 维度): (long 笔数, short 笔数, 无侧笔数)。
+    pub fills_side_counts: Option<(u64, u64, u64)>,
+    /// 峰值名义敞口 (逐 bar 收盘估值的 Σ|size|×价 最大值; 现货 None)。
+    pub max_notional: Option<Decimal>,
+    /// 期末持仓盈亏 (未实现): 合约 = 总权益 − 现金 − Σ钱包; 现货 None (币本位口径不适用)。
+    pub unrealized_pnl: Option<Decimal>,
+    /// 本报告是否含期末强制平仓 (`--close-at-end`)。
+    pub close_at_end_applied: bool,
+    /// 策略级统计 (state_snapshot 透传, 引擎不解释键名含义; 空 = 策略未产出)。
+    pub strategy_stats: Vec<(String, String)>,
+    // ---- 回测规范 v1 概览 (A1-A7), 2026-09-26; 全部为展示字段, 不改变任何记账 ----
+    /// 回测区间: 首根 open_time / 末根 close_time (A1, UTC)。
+    pub start_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub end_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// 标的开始价格 = 首根 open (A4)。
+    pub first_open_price: Option<Decimal>,
+    /// 首次成交 (A3): (时间, 方向, 数量, 价格); 窗口内从未成交为 None。
+    pub first_entry: Option<(chrono::DateTime<chrono::Utc>, OrderSide, Decimal, Decimal)>,
+    /// 期末持仓均价 (A5); 期末无仓为 None。
+    pub final_pos_avg_price: Option<Decimal>,
+    /// 期末持仓方向 (A5, 合约: "long"/"short"; 现货/无仓为 None)。
+    pub final_pos_dir: Option<String>,
+    /// 期末强平落袋盈亏 (`--close-at-end` 强平 fills 的已实现盈亏合计, A5); 未启用为 None。
+    pub close_pnl_realized: Option<Decimal>,
+    // ---- 回测规范 v1 B 区: 成交统计补充 (引擎统一产出) ----
+    pub winning_trades: u64,
+    pub losing_trades: u64,
+    /// 最佳/最差单笔盈亏 (无盈利/亏损单为 None)。
+    pub best_trade: Option<Decimal>,
+    pub worst_trade: Option<Decimal>,
+    /// 总成交额 (quote, 单边累计)。
+    pub total_turnover: Decimal,
 }
 
 /// 组合信号模式 ctx:klines 返回段的最大长度 (007 v2, R1 十年回测性能前提)。
@@ -150,6 +186,29 @@ pub fn funding_settlements_in_bar(open_ms: i64, close_ms: i64) -> u32 {
     } else {
         ((close_ms - 1 - first) / STEP_MS + 1) as u32
     }
+}
+
+/// 逐仓爆仓价 (032 FR-006, 显示/告警口径): `liq = entry × (1 ∓ 1/L ± mmr)`
+/// (long 取 `−1/L +mmr`, short 取 `+1/L −mmr`; OctoBot/Jesse 同构式, 见 specs/research/backtest-engines-2026.md)。
+///
+/// 口径声明: 本公式是**开仓口径估算** —— 引擎实际强平用钱包线性穿越模型 (`check_liquidation_side`),
+/// 手续费/资金费侵蚀后实际爆仓价比本值更靠近开仓价。仅供 `ctx:pos_liq` 显示与告警。
+/// `lev < 1` 或 `entry ≤ 0` 返回 None (无定义)。
+pub fn isolated_liq_price(
+    entry: Decimal,
+    side: OrderSide,
+    lev: Decimal,
+    mmr: Decimal,
+) -> Option<Decimal> {
+    if entry <= Decimal::ZERO || lev < Decimal::ONE {
+        return None;
+    }
+    let inv = Decimal::ONE / lev;
+    let f = match side {
+        OrderSide::Buy => Decimal::ONE - inv + mmr,
+        OrderSide::Sell => Decimal::ONE + inv - mmr,
+    };
+    (f > Decimal::ZERO).then(|| entry * f)
 }
 
 /// 回测上下文: OHLC 合成撮合。
@@ -196,6 +255,13 @@ pub struct BacktestContext {
     closed_klines: Vec<Kline>,
     /// 尾 bar 补结算幂等标志 (013 FR-005, 修 L2)。
     finalized: bool,
+    /// 期末强制平仓进行中 (032+ 可观测性): force_close_all 置 true —— 平仓 fill 时间戳用
+    /// 期末 bar 的 close_time (与强平 fill 同口径), 而非撮合 bar open_time。
+    in_force_close: bool,
+    /// 峰值名义敞口 (逐 bar 收盘估值 Σ|size|×close 的最大值, 032+ 可观测性; 现货恒 0)。
+    max_notional: Decimal,
+    /// 期末强制平仓是否实际执行过 (032+ 可观测性, 报告标注用)。
+    close_at_end_applied: bool,
     /// 组合模式 (多标的轮动回测, M2): 当前 tick 各 pair 的 bar (键 = resolve_key(pair))。
     /// 单标的路径恒空; 撮合/估值按 pair 路由时回落 current_bar。
     portfolio_bars: HashMap<String, Kline>,
@@ -215,6 +281,11 @@ pub struct BacktestContext {
     /// **无条件记录**(首笔可能是卖出 —— 现货先有持仓时; 用 `if size>0` 之类的守卫会漏)。
     first_fill_price: Option<Decimal>,
     first_fill_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// 首笔成交方向/数量 (回测规范 v1 A3 概览; 与 first_fill_* 同点无条件记录)。
+    first_fill_side: Option<OrderSide>,
+    first_fill_size: Option<Decimal>,
+    /// 期末强平落袋盈亏 (--close-at-end 强平 fills 的已实现盈亏合计, 规范 A5)。
+    close_pnl_realized: Option<Decimal>,
     entry_equity: Option<Decimal>,
     /// 高周期序列 (第二序列, 023; 2026-09-18 扩为多套): 键 = `resolve_key(pair)|tf`,
     /// 装配层预装(已剔除不完整桶)。`atr_tf`/`ema_tf`/`close_tf` 按当前 tick 时间取可见前缀
@@ -306,6 +377,9 @@ impl BacktestContext {
             liquidation_count: 0,
             liquidation_long: 0,
             liquidation_short: 0,
+            in_force_close: false,
+            max_notional: Decimal::ZERO,
+            close_at_end_applied: false,
             leverage: Decimal::from_f64_retain(p.leverage).unwrap_or(Decimal::ONE),
             mmr: Decimal::from_f64_retain(p.mmr_pct).unwrap_or(Decimal::ZERO) / dec!(100),
             funding_rate_8h: Decimal::from_f64_retain(p.funding_rate_8h).unwrap_or(Decimal::ZERO),
@@ -325,6 +399,9 @@ impl BacktestContext {
             declarations: Vec::new(),
             first_fill_price: None,
             first_fill_time: None,
+            first_fill_side: None,
+            first_fill_size: None,
+            close_pnl_realized: None,
             entry_equity: None,
             default_exchange: "bn".to_string(),
             slippage_bps,
@@ -683,6 +760,19 @@ impl BacktestContext {
     /// (与 interval 无关: 1m~4h 恰好 1 次, 1d 恰好 3 次; 旧实现按 `hour() ∈ {0,8,16}` 会超结/欠结);
     /// ② 强平检查 —— one-way 按对整体, hedge 按侧独立 (FR-002)。
     fn settle_closed_bar(&mut self, bar: &Kline) {
+        // 逐 bar 刷新 mark_price = bar.close (032 FR-006): 否则 Position.mark_price 停留在
+        // 最后一次成交价, ctx:pos_mark 与 unrealized 陈旧 (强平模型不依赖 mark, 无行为副作用)。
+        // 同时采样峰值名义敞口 (032+ 可观测性)。
+        let mut notional = Decimal::ZERO;
+        for (_, p) in self.virtual_positions.iter_mut() {
+            if p.size > Decimal::ZERO {
+                p.mark_price = bar.close;
+                notional += p.size * bar.close;
+            }
+        }
+        if notional > self.max_notional {
+            self.max_notional = notional;
+        }
         if self.funding_rate_8h > Decimal::ZERO {
             let n = funding_settlements_in_bar(
                 bar.open_time.timestamp_millis(),
@@ -763,6 +853,12 @@ impl BacktestContext {
             Some(p) if p.size > Decimal::ZERO => (p.size, p.entry_price),
             _ => return,
         };
+        // 名义可忽略 (< 1e-6 USDT) 的残仓不可能触发强平; 且其强平价 `-a/b` 商会
+        // 溢出 Decimal 精度直接 panic —— 跳过判定 (防御层; 正常路径残差已在
+        // close_position 贴齐清零)。
+        if size * entry < dec!(1e-6) {
+            return;
+        }
         let w = self.wallet_of(pair_key, side);
         let (a, b) = match side {
             OrderSide::Buy => (w - entry * size, size * (Decimal::ONE - self.mmr)),
@@ -800,6 +896,8 @@ impl BacktestContext {
             fill_size: size,
             fee,
             timestamp: bar.close_time,
+            // hedge 按侧强平: 方向仓即该侧 (032)。
+            position_side: Some(if side == OrderSide::Buy { "long" } else { "short" }.into()),
         };
         self.pnl.record_fill(&fill);
         self.fill_queue.push(fill);
@@ -830,6 +928,11 @@ impl BacktestContext {
                 .map(|p| (p.size, p.entry_price))
                 .unwrap_or((Decimal::ZERO, Decimal::ZERO));
             if s_l <= Decimal::ZERO && s_s <= Decimal::ZERO {
+                break;
+            }
+            // 名义可忽略 (< 1e-6 USDT) 的残仓不可能触发强平, 且强平价除法会溢出
+            // Decimal 精度 panic —— 与 check_liquidation_side 同口径防御。
+            if s_l * e_l + s_s * e_s < dec!(1e-6) {
                 break;
             }
             // one-way 为 symbol 级单钱包 (两侧寻址同一键), 取任一方向等价
@@ -901,6 +1004,8 @@ impl BacktestContext {
                 fill_size: size,
                 fee,
                 timestamp: bar.close_time,
+                // one-way 组合强平: 按净仓方向, 非 hedge 方向仓 → None (032)。
+                position_side: None,
             };
             self.pnl.record_fill(&fill);
             self.fill_queue.push(fill);
@@ -1092,6 +1197,27 @@ impl BacktestContext {
             benchmark_return_pct: None,
             benchmark_max_drawdown: None,
             benchmark_annual_volatility: None,
+            // 可观测性增强字段: 组合路径不适用 (分侧/峰值敞口/期末强平/策略统计 = 单标的路径)。
+            realized_long: None,
+            realized_short: None,
+            fills_side_counts: None,
+            max_notional: None,
+            unrealized_pnl: None,
+            close_at_end_applied: false,
+            strategy_stats: Vec::new(),
+            // 回测规范 v1 概览: 组合路径暂不产出 (单标的路径专属展示字段)。
+            start_time: None,
+            end_time: None,
+            first_open_price: None,
+            first_entry: None,
+            final_pos_avg_price: None,
+            final_pos_dir: None,
+            close_pnl_realized: None,
+            winning_trades: self.pnl.winning_trades(),
+            losing_trades: self.pnl.losing_trades(),
+            best_trade: self.pnl.best_trade(),
+            worst_trade: self.pnl.worst_trade(),
+            total_turnover: self.turnover,
         }
     }
 
@@ -1099,24 +1225,53 @@ impl BacktestContext {
     pub fn report(&self) -> BacktestReport {
         let final_price = self.current_bar.as_ref().map(|k| k.close).unwrap_or(Decimal::ZERO);
         // 期末持仓: 净仓视图 (现货恒 Buy; 合约 one-way 单侧; hedge 合并后取净)。
-        let (final_pos_size, base_coin_size) = if self.is_futures() {
-            // 合约: 持仓币数语义不适用 (K8) —— 报告主仓 = 首对有仓 pair 的净仓 (供展示)。
-            let key = self
-                .virtual_positions
-                .iter()
-                .filter(|(_, p)| p.size > Decimal::ZERO)
-                .map(|((k, _), _)| k.clone())
-                .next();
-            match key {
-                Some(k) => (self.net_size_of(&k), self.first_pos_size.unwrap_or(Decimal::ZERO)),
-                None => (Decimal::ZERO, Decimal::ZERO),
-            }
-        } else {
-            match self.virtual_positions.values().next() {
-                Some(p) => (p.size, self.first_pos_size.unwrap_or(Decimal::ZERO)),
-                None => (Decimal::ZERO, Decimal::ZERO),
-            }
-        };
+        // 第 3 元 = 持仓均价 (回测规范 v1 A5): 取净仓方向侧的 entry_price; 第 4 元 = 方向。
+        let (final_pos_size, base_coin_size, final_pos_avg_price, final_pos_dir) =
+            if self.is_futures() {
+                // 合约: 持仓币数语义不适用 (K8) —— 报告主仓 = 首对有仓 pair 的净仓 (供展示)。
+                let key = self
+                    .virtual_positions
+                    .iter()
+                    .filter(|(_, p)| p.size > Decimal::ZERO)
+                    .map(|((k, _), _)| k.clone())
+                    .next();
+                match key {
+                    Some(k) => {
+                        let net = self.net_size_of(&k);
+                        let (avg, dir) = if net > Decimal::ZERO {
+                            (
+                                self.virtual_positions
+                                    .get(&(k.clone(), OrderSide::Buy))
+                                    .filter(|p| p.size > Decimal::ZERO)
+                                    .map(|p| p.entry_price),
+                                Some("long".to_string()),
+                            )
+                        } else if net < Decimal::ZERO {
+                            (
+                                self.virtual_positions
+                                    .get(&(k.clone(), OrderSide::Sell))
+                                    .filter(|p| p.size > Decimal::ZERO)
+                                    .map(|p| p.entry_price),
+                                Some("short".to_string()),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        (net, self.first_pos_size.unwrap_or(Decimal::ZERO), avg, dir)
+                    }
+                    None => (Decimal::ZERO, Decimal::ZERO, None, None),
+                }
+            } else {
+                match self.virtual_positions.values().next() {
+                    Some(p) => (
+                        p.size,
+                        self.first_pos_size.unwrap_or(Decimal::ZERO),
+                        if p.size > Decimal::ZERO { Some(p.entry_price) } else { None },
+                        None,
+                    ),
+                    None => (Decimal::ZERO, Decimal::ZERO, None, None),
+                }
+            };
         let final_cash = self.cash();
         // 期末总权益 (K8): 合约 = 现金 + Σ钱包 + Σ未实现 (mark_to_market 统一)。
         let final_equity = if self.is_futures() {
@@ -1240,6 +1395,27 @@ impl BacktestContext {
                 _ => (None, None, None, None, None),
             };
 
+        // ---- 回测规范 v1 概览 (A1-A7) ----
+        let start_time = self
+            .closed_klines
+            .first()
+            .map(|k| k.open_time)
+            .or_else(|| self.current_bar.as_ref().map(|b| b.open_time));
+        let end_time = self
+            .current_bar
+            .as_ref()
+            .map(|b| b.close_time)
+            .or_else(|| self.closed_klines.last().map(|k| k.close_time));
+        let first_entry = match (
+            self.first_fill_time,
+            self.first_fill_side,
+            self.first_fill_size,
+            self.first_fill_price,
+        ) {
+            (Some(t), Some(s), Some(sz), Some(p)) => Some((t, s, sz, p)),
+            _ => None,
+        };
+
         BacktestReport {
             total_bars: self.total_bars,
             total_trades: self.pnl.trade_count(),
@@ -1295,7 +1471,60 @@ impl BacktestContext {
             benchmark_return_pct: bm_ret,
             benchmark_max_drawdown: bm_dd,
             benchmark_annual_volatility: bm_vol,
+            // ---- 可观测性增强 (032+): 分侧盈亏 / 分侧笔数 / 峰值敞口 / 期末强平标注 ----
+            realized_long: if self.is_futures() {
+                self.pnl.realized_by_side().get("long").copied()
+            } else {
+                None
+            },
+            realized_short: if self.is_futures() {
+                self.pnl.realized_by_side().get("short").copied()
+            } else {
+                None
+            },
+            fills_side_counts: if self.is_futures() {
+                Some(Self::count_fills_by_side(self.pnl.fills()))
+            } else {
+                None
+            },
+            max_notional: if self.is_futures() { Some(self.max_notional) } else { None },
+            // 持仓盈亏 (未实现) = 总权益 − 现金 − Σ钱包 (合约口径; --close-at-end 后期末无仓 → 0)。
+            unrealized_pnl: if self.is_futures() {
+                let wallet_sum: Decimal = self.wallet.values().copied().sum();
+                Some(final_equity - final_cash - wallet_sum)
+            } else {
+                None
+            },
+            close_at_end_applied: self.close_at_end_applied,
+            // 策略统计由 runner 在 report() 后注入 (state_snapshot 透传)。
+            strategy_stats: Vec::new(),
+            // ---- 回测规范 v1: 概览 + 成交统计补充 ----
+            start_time,
+            end_time,
+            first_open_price: self.first_open,
+            first_entry,
+            final_pos_avg_price,
+            final_pos_dir,
+            close_pnl_realized: self.close_pnl_realized,
+            winning_trades: self.pnl.winning_trades(),
+            losing_trades: self.pnl.losing_trades(),
+            best_trade: self.pnl.best_trade(),
+            worst_trade: self.pnl.worst_trade(),
+            total_turnover: self.turnover,
         }
+    }
+
+    /// 按 position_side 聚合成交笔数 (032+ 可观测性): (long, short, 无侧)。
+    fn count_fills_by_side(fills: &[OrderFill]) -> (u64, u64, u64) {
+        let (mut l, mut s, mut n) = (0u64, 0u64, 0u64);
+        for f in fills {
+            match f.position_side.as_deref() {
+                Some("long") => l += 1,
+                Some("short") => s += 1,
+                _ => n += 1,
+            }
+        }
+        (l, s, n)
     }
 
     fn try_match_ohlc(&self, req: &OrderRequest, bar: &Kline) -> Option<Decimal> {
@@ -1316,11 +1545,18 @@ impl BacktestContext {
                     OrderSide::Buy => bar.low <= limit,
                     OrderSide::Sell => bar.high >= limit,
                 };
-                if crossed {
-                    Some(limit)
-                } else {
-                    None
+                if !crossed {
+                    return None;
                 }
+                // 成交价贴齐开盘价: 开盘就已穿越限价 (跳空 / 过期限价单, 如 ref 追踪留下
+                // 高于市价的陈旧买单) → 实盘该单立即以市价(开盘价)成交, 不能按限价记账,
+                // 否则深跌后陈旧买单按 20%+ 虚高价格成交产生幻影盈亏 (2026-09-26 180d
+                // 复跑实测: ref=98 的网格买单在市价 77.6 时按 97.28 成交)。开盘未穿越
+                // (价格在 bar 内摸到限价) 才按限价成交。
+                Some(match req.side {
+                    OrderSide::Buy => bar.open.min(limit),
+                    OrderSide::Sell => bar.open.max(limit),
+                })
             }
         }
     }
@@ -1496,7 +1732,12 @@ impl BacktestContext {
         fill_price: Decimal,
     ) -> Decimal {
         let key = self.pos_key(pair, side);
-        let close_size = size.min(self.side_size(pair, side));
+        let held = self.side_size(pair, side);
+        let close_size = size.min(held);
+        // 残差贴齐 (1e-9 币口径, 与现货策略层 cap_sell 一致): 批次 size 为 28 位 Decimal,
+        // 多笔开平的加减舍入会留下 ~1e-26 级残仓 —— 不清零则 sweep_wallet_if_flat 永不触发
+        // (钱包停摆), 且强平价除法 `-a/b` 商溢出 Decimal 精度直接 panic (2026-09-26 实测)。
+        let close_size = if held - close_size < dec!(1e-9) { held } else { close_size };
         if close_size <= Decimal::ZERO {
             return Decimal::ZERO;
         }
@@ -1525,6 +1766,10 @@ impl BacktestContext {
             if let Some(p) = self.virtual_positions.get(&key) {
                 realized += (fill_price - p.entry_price) * remaining * sgn;
             }
+            // 贴齐全平但批次合计与持仓有舍入差 (~1e-26) → 批次表清空, 不留死 lot。
+            if close_size == held {
+                self.position_lots.remove(&key);
+            }
         }
         // 剩余批次加权均价 (部分平仓后 entry 重算用; 不可变借用先算, 避免与下方 get_mut 冲突)。
         let new_entry =
@@ -1540,18 +1785,30 @@ impl BacktestContext {
                     None
                 }
             });
+        let fut = self.is_futures();
+        let (lev, mmr) = (self.leverage, self.mmr);
         if let Some(p) = self.virtual_positions.get_mut(&key) {
             p.size -= close_size;
             p.mark_price = fill_price;
             if p.size <= Decimal::ZERO {
                 p.size = Decimal::ZERO;
                 p.entry_price = Decimal::ZERO;
+                p.liquidation_price = None; // 归零 → 无爆仓价 (032)
             } else if let Some(avg) = new_entry {
                 p.entry_price = avg;
+                // 减仓重算 entry 后同步重算爆仓价 (032 FR-006, 显示口径)。
+                if fut {
+                    p.liquidation_price = isolated_liq_price(avg, side, lev, mmr);
+                }
             }
         }
         if realized != Decimal::ZERO {
-            self.pnl.record_pnl(realized);
+            // 分侧累加 (032+ 可观测性): 被平方向 Buy = 平多(long 侧), Sell = 平空(short 侧)。
+            let side_key = match side {
+                OrderSide::Buy => "long",
+                OrderSide::Sell => "short",
+            };
+            self.pnl.record_pnl_side(realized, side_key);
         }
         realized
     }
@@ -1563,7 +1820,8 @@ impl BacktestContext {
         }
         let key = self.pos_key(pair, side);
         self.position_lots.entry(key.clone()).or_default().push((fill_price, size));
-        let lev = if self.is_futures() { Some(self.leverage) } else { None };
+        let fut = self.is_futures();
+        let (lev, mmr) = (self.leverage, self.mmr);
         let e = self.virtual_positions.entry(key.clone()).or_insert_with(|| Position {
             pair: key.0.clone(),
             side,
@@ -1572,7 +1830,7 @@ impl BacktestContext {
             mark_price: fill_price,
             liquidation_price: None,
             unrealized_pnl: Decimal::ZERO,
-            leverage: lev,
+            leverage: if fut { Some(lev) } else { None },
         });
         let old_notional = e.entry_price * e.size;
         e.size += size;
@@ -1580,6 +1838,10 @@ impl BacktestContext {
             e.entry_price = (old_notional + fill_price * size) / e.size;
         }
         e.mark_price = fill_price;
+        // 爆仓价按公式填充 (032 FR-006, 显示口径; 现货不填)。
+        if fut {
+            e.liquidation_price = isolated_liq_price(e.entry_price, side, lev, mmr);
+        }
     }
 
     /// 该对两侧仓都清空时 → 各侧钱包余额转回现金 (K3; hedge 两侧各自回笼, one-way 两键相同)。
@@ -1606,6 +1868,8 @@ impl BacktestContext {
             let key = self.resolve_key(&req.pair);
             self.first_fill_price = Some(fill_price);
             self.first_fill_time = self.current_bar.as_ref().map(|b| b.open_time);
+            self.first_fill_side = Some(req.side);
+            self.first_fill_size = Some(req.size);
             self.entry_equity = Some(self.cash() + self.net_size_of(&key) * fill_price);
         }
         let (close, open) = self.split_fill(req);
@@ -1682,6 +1946,13 @@ impl BacktestContext {
             }
         }
 
+        // 成交时间戳 = 撮合参考 bar 的 open_time (无前视: 成交发生在该 bar 内)。
+        // 此前用 Utc::now() 墙钟, 导致逐笔导出/复盘时所有成交时间相同 (2026-09-26 修复)。
+        // 强平/期末强平 fill 用 bar.close_time (收盘判定), 口径差异 = 正常成交 bar 内即时 vs 收盘判定。
+        let fill_ts = self
+            .bar_for(&req.pair)
+            .map(|b| if self.in_force_close { b.close_time } else { b.open_time })
+            .unwrap_or_else(chrono::Utc::now);
         let fill = OrderFill {
             trade_id: Some(uuid::Uuid::new_v4().to_string()),
             exchange_order_id: order_id.to_string(),
@@ -1691,12 +1962,76 @@ impl BacktestContext {
             fill_price,
             fill_size: req.size,
             fee,
-            timestamp: chrono::Utc::now(),
+            timestamp: fill_ts,
+            // hedge: 透传请求方向仓 (on_fill 路由依据); one-way/现货为 None (032)。
+            position_side: req.position_side.clone(),
         };
         self.pnl.record_fill(&fill);
         self.fill_queue.push(fill);
         // 成交额累加 (手续费占比分母); 权益曲线不再在此采样 —— 由 step_bar/report 按 bar 收盘估值。
         self.turnover += fill_price * req.size;
+    }
+
+    /// 期末强制平仓 (032+ 可观测性, `--close-at-end`): 按期末价 (current_bar.close) 市价平掉
+    /// 所有方向仓 (hedge 两侧都平), 让报告的净盈亏/权益是"已实现、干净"的。
+    ///
+    /// - 平仓 fill 带 `position_side` (hedge 按侧路由) + `in_force_close` 标记 (时间戳用 close_time);
+    /// - 走与正常成交同一 `execute_fill` 记账路径 (钱包结算 / realized 入 pnl / sweep 回笼现金);
+    /// - 现货同样适用 (平 Buy 仓); 无仓 = 空操作。
+    /// - 幂等: 全部平净后二次调用无副作用。
+    pub fn force_close_all(&mut self) {
+        let price = match self.current_bar.as_ref() {
+            Some(b) => b.close,
+            None => return,
+        };
+        if price <= Decimal::ZERO {
+            return;
+        }
+        self.in_force_close = true;
+        // 规范 A5: 强平落袋盈亏 = 强平前后已实现盈亏差 (费/资金费不在 realized 内, 已分别单列)。
+        let realized_before_close = self.pnl.realized_pnl();
+        // 快照 (pair, 开仓方向, size); 按方向定平仓 side: Buy 仓 = Sell 平, Sell 仓 = Buy 平。
+        let mut targets: Vec<(String, OrderSide, Decimal)> = self
+            .virtual_positions
+            .iter()
+            .filter(|(_, p)| p.size > Decimal::ZERO)
+            .map(|((k, s), p)| (k.clone(), *s, p.size))
+            .collect();
+        // 稳定序 (one-way 同 pair 双键时先 Buy 后 Sell; 现货单键)。
+        targets.sort_by(|a, b| {
+            a.0.cmp(&b.0).then_with(|| match (a.1, b.1) {
+                (OrderSide::Buy, OrderSide::Sell) => std::cmp::Ordering::Less,
+                (OrderSide::Sell, OrderSide::Buy) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            })
+        });
+        for (pair_key, pos_side, size) in targets {
+            self.close_at_end_applied = true;
+            // 展示口径: 内部键 `bn:SOLUSDT` → `SOLUSDT` (与正常成交 fill.pair 一致;
+            // execute_fill 内 resolve_key 会再规范回内部键, 记账不受影响)。
+            let display_pair = match pair_key.split_once(':') {
+                Some((prefix, base)) if prefix == self.default_exchange => base.to_string(),
+                _ => pair_key.clone(),
+            };
+            let (close_side, position_side) = match pos_side {
+                OrderSide::Buy => (OrderSide::Sell, Some("long".to_string())),
+                OrderSide::Sell => (OrderSide::Buy, Some("short".to_string())),
+            };
+            let req = OrderRequest {
+                client_order_id: format!("CLOSE-{}", uuid::Uuid::new_v4()),
+                pair: display_pair,
+                side: close_side,
+                order_type: OrderType::Market,
+                price: None,
+                size,
+                reduce_only: true,
+                position_side,
+                action: OrderAction::Place,
+            };
+            self.execute_fill("CLOSE-ALL", &req, price);
+        }
+        self.close_pnl_realized = Some(self.pnl.realized_pnl() - realized_before_close);
+        self.in_force_close = false;
     }
 }
 
@@ -1710,6 +2045,12 @@ impl Context for BacktestContext {
 
     fn orderbook(&self, _pair: &str) -> Option<OrderBook> {
         None
+    }
+
+    /// 逐仓钱包合计 (032 复审): 合约权益口径 = 现金 + 钱包 + 未实现;
+    /// 漏加钱包把开仓锁定保证金当消失权益 → 权益/WARN 虚低。
+    fn wallets_total(&self) -> Decimal {
+        self.wallet.values().copied().sum()
     }
 
     fn position(&self, pair: &str) -> Option<Position> {
@@ -2087,6 +2428,69 @@ mod tests {
         let ack = ctx.place_order(req).unwrap();
         assert_eq!(ack.status, OrderStatus::Open);
         assert_eq!(ctx.report().total_trades, 0);
+    }
+
+    #[test]
+    fn test_limit_buy_gap_below_fills_at_open_not_limit() {
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_spot_grid".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params: Default::default(),
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let mut ctx = BacktestContext::new(
+            config,
+            Balance { asset: "USDC".into(), free: dec!(100000), locked: Decimal::ZERO },
+        );
+        // bar1: low=3005 > limit=3000 → 挂单; bar2 跳空深跌 (open=2900 < limit)。
+        // 实盘该单立即以市价成交 → 成交价必须是开盘价 2900, 不得按限价 3000 记账
+        // (2026-09-26 180d 复跑实测: 陈旧网格买单按 25% 虚高价成交的幻影盈亏)。
+        ctx.step_bar(kline(dec!(3010), dec!(3020), dec!(3005), dec!(3008)));
+        let req = OrderRequest::new_limit("ETH", OrderSide::Buy, dec!(3000), dec!(1));
+        let ack = ctx.place_order(req).unwrap();
+        assert_eq!(ack.status, OrderStatus::Open);
+        ctx.step_bar(kline(dec!(2900), dec!(2950), dec!(2800), dec!(2900)));
+        let fills = ctx.report().fills;
+        let filled = fills.last().expect("应已成交");
+        assert_eq!(filled.fill_price, dec!(2900));
+    }
+
+    #[test]
+    fn test_limit_sell_gap_above_fills_at_open_not_limit() {
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_spot_grid".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params: Default::default(),
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let mut ctx = BacktestContext::new(
+            config,
+            Balance { asset: "USDC".into(), free: dec!(100000), locked: Decimal::ZERO },
+        );
+        // 镜像: 陈旧限价卖 (limit 低于跳空高开后的市价) 按开盘价 3100 成交, 不得按 3000。
+        // 先市价建仓 (现货无仓卖单会被 L4/余额拦截), 手续费计 quote 不动 base 余额。
+        ctx.step_bar(kline(dec!(2990), dec!(2995), dec!(2980), dec!(2992)));
+        let open = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1));
+        assert_eq!(ctx.place_order(open).unwrap().status, OrderStatus::Filled);
+        let req = OrderRequest::new_limit("ETH", OrderSide::Sell, dec!(3000), dec!(1));
+        let ack = ctx.place_order(req).unwrap();
+        assert_eq!(ack.status, OrderStatus::Open);
+        ctx.step_bar(kline(dec!(3100), dec!(3150), dec!(3090), dec!(3105)));
+        let fills = ctx.report().fills;
+        let filled = fills.last().expect("应已成交");
+        assert_eq!(filled.fill_price, dec!(3100));
     }
 
     #[test]
@@ -3548,5 +3952,292 @@ mod tests {
         let ks = ctx.klines_for("TSLABUSDT").unwrap();
         assert_eq!(ks.len(), 1, "回落组合已收盘序列");
         assert_eq!(ks[0].close, dec!(105), "tick1 bar 收盘 105");
+    }
+
+    // ============ 032: 逐仓爆仓价填充与 mark 刷新 ============
+
+    #[test]
+    fn test_isolated_liq_price_known_vectors() {
+        // lev=2 / mmr=0.5%: long = entry×(1−1/2+0.005) = 0.505×entry; short = entry×(1+1/2−0.005) = 1.495×entry。
+        let lev = dec!(2);
+        let mmr = dec!(0.005);
+        assert_eq!(isolated_liq_price(dec!(100), OrderSide::Buy, lev, mmr), Some(dec!(50.5)));
+        assert_eq!(isolated_liq_price(dec!(100), OrderSide::Sell, lev, mmr), Some(dec!(149.5)));
+        // 边界: lev<1 或 entry≤0 无定义 → None; mmr 大到因子≤0 → None。
+        assert_eq!(isolated_liq_price(dec!(100), OrderSide::Buy, dec!(0.5), mmr), None);
+        assert_eq!(isolated_liq_price(Decimal::ZERO, OrderSide::Buy, lev, mmr), None);
+        assert_eq!(isolated_liq_price(dec!(100), OrderSide::Sell, lev, dec!(2)), None);
+    }
+
+    #[test]
+    fn test_futures_liq_fill_on_open_close() {
+        let bt = BacktestToml { leverage: Some(2.0), mmr_pct: Some(0.5), ..Default::default() };
+        let mut ctx = test_ctx_bt("futures", "hedge", 100000, bt);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut open_long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1));
+        open_long.position_side = Some("long".into());
+        ctx.place_order(open_long).unwrap();
+        // 开仓 → liq = 100×(1−0.5+0.005) = 50.5
+        assert_eq!(
+            ctx.position_directional("ETH", OrderSide::Buy).unwrap().liquidation_price,
+            Some(dec!(50.5))
+        );
+        // 加仓 1@120 → entry=110 → liq = 110×0.505 = 55.55
+        ctx.step_bar(kline(dec!(120), dec!(121), dec!(119), dec!(120)));
+        let mut add = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1));
+        add.position_side = Some("long".into());
+        ctx.place_order(add).unwrap();
+        let pos = ctx.position_directional("ETH", OrderSide::Buy).unwrap();
+        assert_eq!(pos.entry_price, dec!(110));
+        assert_eq!(pos.liquidation_price, Some(dec!(55.55)));
+        // 平半 (LIFO 平 120 批次) → 剩余 entry=100 → liq 重算回 50.5
+        ctx.step_bar(kline(dec!(110), dec!(111), dec!(109), dec!(110)));
+        let mut half = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(1));
+        half.position_side = Some("long".into());
+        ctx.place_order(half).unwrap();
+        let pos = ctx.position_directional("ETH", OrderSide::Buy).unwrap();
+        assert_eq!(pos.entry_price, dec!(100));
+        assert_eq!(pos.liquidation_price, Some(dec!(50.5)));
+        // 全平 → 无仓 (position_directional 归零即 None, liq 随仓消失)
+        let mut rest = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(1));
+        rest.position_side = Some("long".into());
+        ctx.place_order(rest).unwrap();
+        assert!(ctx.position_directional("ETH", OrderSide::Buy).is_none(), "全平后无多仓");
+    }
+
+    #[test]
+    fn test_spot_liq_not_filled() {
+        // 现货不填爆仓价 (回归约束)。
+        let bt = BacktestToml::default();
+        let mut ctx = test_ctx_bt("spot", "one-way", 100000, bt);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        ctx.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1))).unwrap();
+        assert_eq!(ctx.position("ETH").unwrap().liquidation_price, None);
+    }
+
+    #[test]
+    fn test_mark_price_refreshed_each_bar() {
+        // settle_closed_bar 逐 bar 刷新 mark_price = bar.close (032 FR-006)。
+        let bt = BacktestToml { leverage: Some(2.0), ..Default::default() };
+        let mut ctx = test_ctx_bt("futures", "hedge", 100000, bt);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut open_long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1));
+        open_long.position_side = Some("long".into());
+        ctx.place_order(open_long).unwrap();
+        // 成交后 mark=100; step(bar2) → bar1 收盘 settle 刷新 mark=bar1.close=100;
+        // 再 step(bar3) → bar2 收盘 → mark=130 (mark = 最近收盘 bar 的 close)。
+        assert_eq!(ctx.position_directional("ETH", OrderSide::Buy).unwrap().mark_price, dec!(100));
+        ctx.step_bar(kline(dec!(130), dec!(131), dec!(129), dec!(130)));
+        assert_eq!(ctx.position_directional("ETH", OrderSide::Buy).unwrap().mark_price, dec!(100));
+        ctx.step_bar(kline(dec!(140), dec!(141), dec!(139), dec!(140)));
+        assert_eq!(ctx.position_directional("ETH", OrderSide::Buy).unwrap().mark_price, dec!(130));
+    }
+
+    // ---- 032+ 可观测性 (2026-09-26): fill 时间戳 / 期末强平 / 分侧统计 ----
+
+    #[test]
+    fn test_fill_timestamp_uses_bar_time() {
+        // A: 正常成交 fill.timestamp = 撮合 bar 的 open_time (非墙钟);
+        //    强平 fill = 触发 bar 的 close_time (收盘判定口径)。
+        let bt = BacktestToml { leverage: Some(2.0), mmr_pct: Some(2.5), ..Default::default() };
+        let mut ctx = test_ctx_bt("futures", "one-way", 100000, bt);
+        ctx.step_bar(kline_at(3600, dec!(100), dec!(101), dec!(99), dec!(100)));
+        ctx.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(100))).unwrap();
+        let fills = ctx.drain_fills();
+        assert_eq!(fills.len(), 1, "市价单当前 bar 即时成交");
+        assert_eq!(
+            fills[0].timestamp,
+            chrono::DateTime::from_timestamp(3600, 0).unwrap(),
+            "正常成交时间戳 = 撮合 bar open_time"
+        );
+        // 深跌 bar (open 7200, close 10800) 穿越强平价 → 下一根 push 时结算触发强平。
+        ctx.step_bar(kline_at(7200, dec!(55), dec!(56), dec!(45), dec!(50)));
+        ctx.step_bar(kline_at(10800, dec!(52), dec!(54), dec!(51), dec!(53)));
+        let fills2 = ctx.drain_fills();
+        let liq = fills2.iter().find(|f| f.client_order_id.starts_with("LIQ")).expect("强平 fill");
+        assert_eq!(
+            liq.timestamp,
+            chrono::DateTime::from_timestamp(10800, 0).unwrap(),
+            "强平时间戳 = 触发 bar close_time"
+        );
+    }
+
+    #[test]
+    fn test_force_close_all_closes_both_sides_at_end() {
+        // B: hedge 双仓 → force_close_all 平掉两侧; 平仓 fill 带 position_side + 期末 close_time;
+        //    realized 含平仓盈亏; close_at_end_applied 标注; 分侧盈亏符号正确 (C)。
+        let bt = BacktestToml { leverage: Some(2.0), ..Default::default() };
+        let mut ctx = test_ctx_bt("futures", "hedge", 100000, bt);
+        ctx.step_bar(kline_at(3600, dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(10));
+        long.position_side = Some("long".into());
+        ctx.place_order(long).unwrap();
+        let mut short = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(10));
+        short.position_side = Some("short".into());
+        ctx.place_order(short).unwrap();
+        ctx.drain_fills();
+        // 期末 bar: close=110 (多赚 / 空亏)。
+        ctx.step_bar(kline_at(7200, dec!(110), dec!(111), dec!(109), dec!(110)));
+        ctx.finalize();
+        ctx.force_close_all();
+        assert_eq!(
+            ctx.position_side("ETH", OrderSide::Buy).map(|p| p.size).unwrap_or_default(),
+            Decimal::ZERO,
+            "期末强平后无多仓"
+        );
+        assert_eq!(
+            ctx.position_side("ETH", OrderSide::Sell).map(|p| p.size).unwrap_or_default(),
+            Decimal::ZERO,
+            "期末强平后无空仓"
+        );
+        let fills = ctx.drain_fills();
+        assert_eq!(fills.len(), 2, "两侧各一笔平仓 fill");
+        for f in &fills {
+            assert!(f.client_order_id.starts_with("CLOSE-"), "平仓 fill 带 CLOSE- 标识");
+            assert_eq!(
+                f.timestamp,
+                chrono::DateTime::from_timestamp(10800, 0).unwrap(),
+                "平仓 fill = 期末 bar close_time"
+            );
+        }
+        assert!(fills.iter().any(|f| f.position_side.as_deref() == Some("long")));
+        assert!(fills.iter().any(|f| f.position_side.as_deref() == Some("short")));
+        // C: 分侧盈亏符号 + 之和 == 总 realized; 分侧笔数 == 实际分布 (开+平各 2)。
+        let report = ctx.report();
+        assert!(report.close_at_end_applied, "close_at_end_applied 应标注");
+        let rl = report.realized_long.expect("多头侧有已实现");
+        let rs = report.realized_short.expect("空头侧有已实现");
+        assert!(rl > Decimal::ZERO, "多头侧期末平仓应盈利: {rl}");
+        assert!(rs < Decimal::ZERO, "空头侧期末平仓应亏损: {rs}");
+        assert!(close_enough(rl + rs, report.realized_pnl), "分侧之和 == 总 realized");
+        assert_eq!(report.fills_side_counts, Some((2, 2, 0)), "long/short 各 2 笔 (开+平)");
+        // 峰值名义敞口: finalize 采样期末 bar → 2 侧 × 10 × 110 = 2200。
+        assert!(close_enough(report.max_notional.expect("合约填峰值敞口"), dec!(2200)));
+        // 期末强平后无仓 → 持仓盈亏 (未实现) = 0。
+        assert_eq!(report.unrealized_pnl, Some(Decimal::ZERO), "close-at-end 后未实现 = 0");
+    }
+
+    #[test]
+    fn test_force_close_off_keeps_positions_and_flag_false() {
+        // B 回归: 不调用 force_close_all → 行为与历史一致 (持仓保留, 标注 false)。
+        let bt = BacktestToml { leverage: Some(2.0), ..Default::default() };
+        let mut ctx = test_ctx_bt("futures", "hedge", 100000, bt);
+        ctx.step_bar(kline_at(3600, dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(10));
+        long.position_side = Some("long".into());
+        ctx.place_order(long).unwrap();
+        ctx.step_bar(kline_at(7200, dec!(110), dec!(111), dec!(109), dec!(110)));
+        ctx.finalize();
+        let report = ctx.report();
+        assert!(!report.close_at_end_applied, "未开期末强平 → false");
+        assert_eq!(ctx.position_side("ETH", OrderSide::Buy).unwrap().size, dec!(10));
+        assert!(
+            report.realized_long.is_none() && report.realized_short.is_none(),
+            "无平仓 → 分侧 None"
+        );
+        // 持仓盈亏 (未实现) = (110 − 100) × 10 = 100 (开仓即全仓, realized 仅手续费前 0)。
+        assert_eq!(report.unrealized_pnl, Some(dec!(100)), "留仓时未实现 = 市值−成本");
+    }
+
+    #[test]
+    fn test_report_overview_fields_v1() {
+        // 回测规范 v1 概览 (A1-A5) + 成交统计 (B 区): 起止时间 / 首根 open / 首笔成交 /
+        // 期末持仓方向与均价 / 强平落袋盈亏 / 盈亏笔数 / 单笔极值 / 总成交额。
+        let bt = BacktestToml { leverage: Some(2.0), ..Default::default() };
+        let mut ctx = test_ctx_bt("futures", "hedge", 100000, bt);
+        ctx.step_bar(kline_at(3600, dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(10));
+        long.position_side = Some("long".into());
+        ctx.place_order(long).unwrap();
+        ctx.drain_fills();
+        // 部分平仓 4 @ 110 → 落袋一笔盈利 (record_pnl 极值来源)。
+        ctx.step_bar(kline_at(7200, dec!(110), dec!(111), dec!(109), dec!(110)));
+        let mut close = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(4));
+        close.position_side = Some("long".into());
+        ctx.place_order(close).unwrap();
+        ctx.drain_fills();
+        let t0 = chrono::DateTime::from_timestamp(3600, 0).unwrap();
+        let t1 = chrono::DateTime::from_timestamp(10800, 0).unwrap();
+        let report = ctx.report();
+        // A1: 起止 = 首根 open_time / 末根 close_time。
+        assert_eq!(report.start_time, Some(t0), "start_time = 首根 open_time");
+        assert_eq!(report.end_time, Some(t1), "end_time = 末根 close_time");
+        // A4: 标的开始价格 = 首根 open。
+        assert_eq!(report.first_open_price, Some(dec!(100)));
+        // A3: 首次成交 = 开仓市价单 (时间/方向/数量/价格)。
+        assert_eq!(report.first_entry, Some((t0, OrderSide::Buy, dec!(10), dec!(100))));
+        // A5: 期末持仓方向与均价 (引擎 entry_price, 不二次实现推导)。
+        assert_eq!(report.final_pos_dir.as_deref(), Some("long"));
+        assert_eq!(report.final_pos_avg_price, Some(dec!(100)));
+        // B 区: 已实现 4×(110−100)=40 (唯一一笔盈利); 总成交额 = 10×100 + 4×110。
+        assert_eq!(report.winning_trades, 1);
+        assert_eq!(report.losing_trades, 0);
+        assert_eq!(report.best_trade, Some(dec!(40)));
+        assert_eq!(report.worst_trade, Some(dec!(40)));
+        assert!(
+            close_enough(report.total_turnover, dec!(1440)),
+            "turnover = {}",
+            report.total_turnover
+        );
+        // 期末强平: 剩余 6 @ 110 → 落袋 60; 无仓后方向/均价清空。
+        ctx.finalize();
+        ctx.force_close_all();
+        let report = ctx.report();
+        assert_eq!(report.close_pnl_realized, Some(dec!(60)), "强平落袋 = 强平 fills 已实现合计");
+        assert_eq!(report.final_pos_dir, None);
+        assert_eq!(report.final_pos_avg_price, None);
+    }
+
+    /// 残仓贴齐回归 (2026-09-26 实测): 批次 size 为 28 位 Decimal, 多笔开平的加减舍入会留下
+    /// ~1e-26 级残仓 —— 曾使 sweep_wallet_if_flat 永不触发 (现金停摆, 032 根因 A 引擎侧),
+    /// 且强平价除法 `-a/b` 商溢出 Decimal 精度直接 panic。平仓贴齐 1e-9 后必须精确归零
+    /// + 批次表清空 + 钱包划回现金。
+    #[test]
+    fn test_close_position_rounding_residual_snapped_to_zero() {
+        let bt = BacktestToml { leverage: Some(2.0), ..Default::default() };
+        let mut ctx = test_ctx_bt("futures", "hedge", 100000, bt);
+        ctx.step_bar(kline_at(3600, dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut open = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(10));
+        open.position_side = Some("long".into());
+        ctx.place_order(open).unwrap();
+        // 模拟引擎侧持仓比批次合计多 1e-12 (多笔开平的路径差残差; < 1e-9 贴齐阈值)。
+        let key = ctx.pos_key("ETH", OrderSide::Buy);
+        ctx.virtual_positions.get_mut(&key).unwrap().size += dec!(0.000000000001);
+        // 卖出与批次合计同量 (10) → 贴齐 held, 持仓精确归零。
+        let mut close = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(10));
+        close.position_side = Some("long".into());
+        close.reduce_only = true;
+        ctx.place_order(close).unwrap();
+        assert_eq!(ctx.side_size("ETH", OrderSide::Buy), Decimal::ZERO, "残差贴齐后精确归零");
+        assert!(!ctx.position_lots.contains_key(&key), "全平贴齐后批次表清空 (不留死 lot)");
+        // 两侧无仓 → 钱包已划回现金 (sweep 触发, 不停摆)。
+        let cash = ctx.cash();
+        let wallet = ctx.wallet_of("ETH", OrderSide::Buy);
+        assert!(wallet == Decimal::ZERO, "钱包应被 sweep 划回, 实际 {wallet}");
+        assert!(cash > dec!(99990), "现金 ≈ 本金 − 手续费, 实际 {cash}");
+    }
+
+    /// 名义可忽略 (< 1e-6 USDT) 的残仓不得进入强平判定: 其强平价 `-a/b` 商会溢出
+    /// Decimal 精度直接 panic (2026-09-26 实测)。防御层: 跳过判定、持仓与钱包不动。
+    #[test]
+    fn test_liquidation_skips_dust_position() {
+        let bt = BacktestToml { leverage: Some(2.0), mmr_pct: Some(2.5), ..Default::default() };
+        let mut ctx = test_ctx_bt("futures", "hedge", 100000, bt);
+        ctx.step_bar(kline_at(3600, dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut open = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(10));
+        open.position_side = Some("long".into());
+        ctx.place_order(open).unwrap();
+        // 注入尘仓: 残差路径的直接形态 (size ~1e-26)。
+        let key = ctx.pos_key("ETH", OrderSide::Buy);
+        ctx.virtual_positions.get_mut(&key).unwrap().size = dec!(0.0000000000000000000000000001);
+        let bar = kline_at(7200, dec!(50), dec!(51), dec!(1), dec!(2)); // 深跌 bar
+        ctx.check_liquidation_side("ETH", OrderSide::Buy, &bar); // 不 panic 即通过
+        ctx.check_liquidation("ETH", &bar);
+        assert_eq!(
+            ctx.side_size("ETH", OrderSide::Buy),
+            dec!(0.0000000000000000000000000001),
+            "尘仓不触发强平, 持仓不动"
+        );
+        assert_eq!(ctx.liquidation_count, 0);
     }
 }

@@ -39,7 +39,7 @@ fn strategy_params() -> Vec<String> {
                 if let Some(rest) = line.strip_prefix("key = \"") {
                     if let Some(end) = rest.find('"') {
                         let k = &rest[..end];
-                        if k != "pair" && k != "script" && k != "interval" {
+                        if !is_engine_channel_key(k) {
                             keys.push(k.to_string());
                         }
                     }
@@ -50,6 +50,27 @@ fn strategy_params() -> Vec<String> {
     keys.sort();
     keys.dedup();
     keys
+}
+
+/// 引擎通道键: 通用配置(`pair`/`script`/`interval`) + `[backtest]` resolve 通道的引擎级参数
+/// (`leverage` 等)。它们由 CLI 按名写回 params 池(apply_backtest_cli)、引擎按名读取, 策略也可读
+/// (如展示引擎实际杠杆) —— 语义是**引擎/CLI 配置**, 不是策略参数, 故不进黑名单, 也不要求清单
+/// 声明(声明反而与 CLI flag 重复)。032 审核口径。
+fn is_engine_channel_key(k: &str) -> bool {
+    matches!(
+        k,
+        "pair"
+            | "script"
+            | "interval"
+            | "leverage"
+            | "max_leverage"
+            | "mmr_pct"
+            | "funding_rate_8h"
+            | "fee_maker_bps"
+            | "fee_taker_bps"
+            | "slippage_bps"
+            | "initial_cash"
+    )
 }
 
 /// 读配置的方法 (策略参数只能通过这些方法从配置池读出)。
@@ -208,14 +229,12 @@ fn manifest_keys_match_lua_read_keys() {
                     let rest = l.trim().strip_prefix("key = \"")?;
                     rest.find('"').map(|end| rest[..end].to_string())
                 })
-                .filter(|k| k != "pair" && k != "script" && k != "interval")
+                .filter(|k| !is_engine_channel_key(k))
                 .collect();
             manifest.sort();
             manifest.dedup();
-            let mut lua: Vec<String> = lua_read_keys(&src)
-                .into_iter()
-                .filter(|k| k != "pair" && k != "script" && k != "interval")
-                .collect();
+            let mut lua: Vec<String> =
+                lua_read_keys(&src).into_iter().filter(|k| !is_engine_channel_key(k)).collect();
             lua.sort();
             lua.dedup();
 

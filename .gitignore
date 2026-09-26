@@ -20,6 +20,8 @@ strategies/spot/*
 !strategies/futures/
 strategies/futures/*
 !strategies/futures/.gitkeep
+!strategies/futures/paired_grid_futures_long.lua
+!strategies/futures/paired_grid_futures_long.toml
 ricow.db
 ricow.db-shm
 ricow.db-wal

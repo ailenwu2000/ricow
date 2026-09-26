@@ -40,6 +40,11 @@ pub struct BacktestArgs {
     /// K 线间隔 (1m/5m/15m/1h/4h/1d, 默认 1h)
     #[arg(long)]
     pub interval: Option<String>,
+    /// K 线数据源市场 (spot|futures; 缺省跟随策略 market)。仅影响拉哪套 K 线,
+    /// 不改策略/引擎的 market 语义 —— 现货↔合约同 symbol 价格有 ~几 bps 基差,
+    /// 等价性对照 (现货策略 vs 期货只多头) 必须喂同一序列才能逐笔对齐 (032)。
+    #[arg(long = "klines-market")]
+    pub klines_market: Option<String>,
     /// lua 脚本路径 (strategy=lua 时必填)
     #[arg(long)]
     pub script: Option<String>,
@@ -80,6 +85,13 @@ pub struct BacktestArgs {
     /// 持仓模式 one-way|hedge (默认随策略 TOML / one-way)
     #[arg(long = "position-mode")]
     pub position_mode: Option<String>,
+    /// 期末强制平仓: 回测收尾按期末价平掉所有方向仓, 报告净盈亏为"已实现、干净"口径
+    /// (032+ 可观测性; 默认 false = 行为与历史逐位一致)。
+    #[arg(long = "close-at-end")]
+    pub close_at_end: bool,
+    /// 导出目录: 回测参数 / 逐笔成交 / 权益曲线 / 报告全文写入该目录 (032+ 可观测性)。
+    #[arg(long = "export-dir")]
+    pub export_dir: Option<String>,
 }
 
 /// 解析 `key=value` 参数: 值按 f64 优先, 否则字符串。
@@ -272,12 +284,26 @@ pub(crate) async fn run_backtest(
         }
         config.position_mode = p.clone();
     }
+    if let Some(m) = &args.klines_market {
+        if m != "spot" && m != "futures" {
+            return Err(CoreError::InvalidArgument(format!(
+                "--klines-market 仅支持 spot|futures, 收到 '{m}'"
+            )));
+        }
+    }
     // 三层回测参数 (内置默认 < 策略 TOML [backtest] < CLI): 解析出全量有效值 + 写回 params。
     let params = apply_backtest_cli(&args, &mut config)?;
     // --interval 是主时钟粒度(通用配置, 与 pair 同类): 写入 params 供策略 need_klines("primary", ...)
     // 声明使用。用户显式 --param interval 优先(不覆盖)。若不写, 策略 primary 声明会 fallback "1h",
     // 与 --interval 拉的 K 线粒度错位 → warmup 换算错 → 高周期指标永不就绪(实测 0 成交)。
-    config.params.entry("interval".into()).or_insert(ConfigValue::String(interval.clone()));
+    // 清单默认值注入 (032 B) 在 resolve_builtin_script 里先落了 interval 默认 → CLI **显式**给出的
+    // --interval 必须再覆盖它 (CLI 运行时配置 > 清单展示默认; 实测 2026-09-26: 不覆盖则
+    // `--interval 1m` 被清单 "1h" 压制, 回测按 1h 拉线)。
+    if args.interval.is_some() {
+        config.params.insert("interval".into(), ConfigValue::String(interval.clone()));
+    } else {
+        config.params.entry("interval".into()).or_insert(ConfigValue::String(interval.clone()));
+    }
     // 030 数据需求声明收集: 构造空 ctx 跑一次 on_init, 策略 need_klines 写入 declarations;
     // 据此推 warmup(预热根数)。引擎不再读 atr_interval/regime_interval 等策略参数名。
     // on_init 幂等约定: 声明阶段只依赖 config, 不依赖 balance/K 线(见 specs/architecture.md)。
@@ -319,11 +345,13 @@ pub(crate) async fn run_backtest(
     // 否则长窗口 (1m 数天 / 1h 数月) 会拿到错误响应: 表现为 "network error: error decoding
     // response body" (120 天 1m) 或长时间无输出 (3 天/1 天 1m 实测)。此处按 1000 根/批往前翻页。
     const KLINE_PAGE_MAX: u32 = 1000;
-    let fapi = if config.market == "futures" {
+    // 数据源市场: 默认跟随策略 market; --klines-market 仅解耦拉数 (策略/引擎语义不变)。
+    let kline_market = args.klines_market.as_deref().unwrap_or(&config.market);
+    let fapi = if kline_market == "futures" {
         let f = ricow_binance::FuturesDataClient::new()?;
         // MMR 元数据: 用户未显式 --mmr-pct 时, 按 symbol 查内置首档表 (exchangeInfo 公共值不可靠,
         // 见 specs/backtest.md §十一 T7); 表外回落 1.0%。
-        if args.mmr_pct.is_none() {
+        if args.mmr_pct.is_none() && config.market == "futures" {
             config
                 .params
                 .insert("mmr_pct".into(), ConfigValue::Float(ricow_binance::tier1_mmr_pct(&pair)));
@@ -399,7 +427,22 @@ pub(crate) async fn run_backtest(
     // 生效 MMR (报告显示用): 三层解析 + 可能的交易所首档拉取已写回 params; config move 前取出。
     // (D3: 此前打印恒 2.5, --mmr-pct/TOML 覆盖不反映。)
     let effective_mmr_pct = config.get_f64("mmr_pct").unwrap_or(1.0);
-    let report = Engine::new().backtest(config, initial_balance, &klines)?;
+    let report =
+        Engine::new().backtest(config.clone(), initial_balance, &klines, args.close_at_end)?;
+
+    // 测试参数区块 (032+ 可观测性): 生效配置全量通用 dump (剔除 script 源码, 太长)。
+    let mut test_params: Vec<(String, String)> = config
+        .params
+        .iter()
+        .filter(|(k, _)| k.as_str() != "script")
+        .map(|(k, v)| (k.clone(), config_value_repr(v)))
+        .collect();
+    test_params.push(("market".into(), config.market.clone()));
+    test_params.push(("position_mode".into(), config.position_mode.clone()));
+    // 回测窗口参数用 bt_ 前缀: 避免与策略自有参数同名撞键 (如网格策略的 interval 主时钟)。
+    test_params.push(("bt_days".into(), days.to_string()));
+    test_params.push(("bt_interval".into(), interval.clone()));
+    test_params.push(("bt_close_at_end".into(), args.close_at_end.to_string()));
 
     let text = format_backtest_report(
         &report,
@@ -419,9 +462,112 @@ pub(crate) async fn run_backtest(
         ),
         initial_cash,
         is_futures,
+        &test_params,
     );
 
+    // 导出 (032+ 可观测性, --export-dir): 参数 / 逐笔成交 / 权益曲线 / 报告全文。
+    if let Some(dir) = &args.export_dir {
+        export_backtest(dir, &args.strategy, &pair, &config, &klines, &report, &text)?;
+    }
+
     Ok((text, report))
+}
+
+/// `ConfigValue` → 展示字符串 (报告"测试参数"区块用)。
+fn config_value_repr(v: &ConfigValue) -> String {
+    match v {
+        ConfigValue::String(s) => s.clone(),
+        ConfigValue::Float(f) => f.to_string(),
+        ConfigValue::Integer(i) => i.to_string(),
+        ConfigValue::Boolean(b) => b.to_string(),
+    }
+}
+
+/// 把回测输入参数与输出明细导出到目录 (032+ 可观测性):
+/// - `params.json` —— 生效配置全量 (market/position_mode/params) + 窗口与 K 线根数;
+/// - `fills.csv` —— 逐笔成交 (时间戳 = bar 时间, 见 032+ 修复);
+/// - `equity.csv` —— 逐 bar 收盘权益曲线;
+/// - `report.txt` —— 报告全文。
+fn export_backtest(
+    dir: &str,
+    strategy: &str,
+    pair: &str,
+    config: &StrategyConfig,
+    klines: &[ricow_core::Kline],
+    report: &ricow_strategy::BacktestReport,
+    text: &str,
+) -> CoreResult<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| CoreError::InvalidArgument(format!("导出目录创建失败 {dir}: {e}")))?;
+    let stem = format!("{strategy}_{pair}");
+
+    // params.json
+    let mut params_map = serde_json::Map::new();
+    for (k, v) in &config.params {
+        let jv = match v {
+            ConfigValue::String(s) => serde_json::Value::String(s.clone()),
+            ConfigValue::Float(f) => serde_json::json!(f),
+            ConfigValue::Integer(i) => serde_json::json!(i),
+            ConfigValue::Boolean(b) => serde_json::Value::Bool(*b),
+        };
+        params_map.insert(k.clone(), jv);
+    }
+    let root = serde_json::json!({
+        "strategy": strategy,
+        "pair": pair,
+        "market": config.market,
+        "position_mode": config.position_mode,
+        "kline_bars": klines.len(),
+        "kline_first_open_time": klines.first().map(|k| k.open_time.to_rfc3339()),
+        "kline_last_close_time": klines.last().map(|k| k.close_time.to_rfc3339()),
+        "close_at_end_applied": report.close_at_end_applied,
+        "params": serde_json::Value::Object(params_map),
+    });
+    std::fs::write(
+        std::path::Path::new(dir).join(format!("{stem}_params.json")),
+        serde_json::to_string_pretty(&root).unwrap_or_default(),
+    )
+    .map_err(|e| CoreError::InvalidArgument(format!("导出 params.json 失败: {e}")))?;
+
+    // fills.csv
+    let mut csv = String::from(
+        "index,timestamp,pair,side,position_side,fill_price,fill_size,fee,client_order_id,exchange_order_id\n",
+    );
+    for (i, f) in report.fills.iter().enumerate() {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{}\n",
+            i,
+            f.timestamp.to_rfc3339(),
+            f.pair,
+            match f.side {
+                ricow_core::OrderSide::Buy => "buy",
+                ricow_core::OrderSide::Sell => "sell",
+            },
+            f.position_side.clone().unwrap_or_default(),
+            f.fill_price,
+            f.fill_size,
+            f.fee,
+            f.client_order_id,
+            f.exchange_order_id
+        ));
+    }
+    std::fs::write(std::path::Path::new(dir).join(format!("{stem}_fills.csv")), csv)
+        .map_err(|e| CoreError::InvalidArgument(format!("导出 fills.csv 失败: {e}")))?;
+
+    // equity.csv
+    let mut eq = String::from("bar_index,equity\n");
+    for (i, e) in report.equity_curve.iter().enumerate() {
+        eq.push_str(&format!("{i},{e}\n"));
+    }
+    std::fs::write(std::path::Path::new(dir).join(format!("{stem}_equity.csv")), eq)
+        .map_err(|e| CoreError::InvalidArgument(format!("导出 equity.csv 失败: {e}")))?;
+
+    // report.txt
+    std::fs::write(std::path::Path::new(dir).join(format!("{stem}_report.txt")), text)
+        .map_err(|e| CoreError::InvalidArgument(format!("导出 report.txt 失败: {e}")))?;
+
+    tracing::info!(target: "backtest", "回测导出完成: {dir}/{stem}_* (params.json / fills.csv / equity.csv / report.txt)");
+    Ok(())
 }
 
 /// CLI 入口: 跑回测并打印报告(与 AI 工具 `run_backtest` 共用同一主体与同一份格式化)。
@@ -498,6 +644,9 @@ order_size = 0.02
             funding_rate: None,
             market: None,
             position_mode: None,
+            close_at_end: false,
+            export_dir: None,
+            klines_market: None,
         };
         let cfg = resolve_config(&args).await.unwrap();
         assert_eq!(cfg.strategy_type, "lua", "内置名 TOML 应 Lua 化");
@@ -549,9 +698,80 @@ exchange = "binance"
             funding_rate: None,
             market: None,
             position_mode: None,
+            close_at_end: false,
+            export_dir: None,
+            klines_market: None,
         };
         let cfg = resolve_config(&args).await.unwrap();
         assert!(cfg.get_str("pair").is_none(), "TOML 无 pair 时 resolve 不注入");
         std::env::remove_var("RICOW_ROOT");
+    }
+
+    #[test]
+    fn test_export_backtest_writes_four_files() {
+        // 032+ 可观测性: export_backtest 落盘 params.json / fills.csv / equity.csv / report.txt。
+        use ricow_core::{Kline, OrderFill, OrderSide};
+        use rust_decimal_macros::dec;
+        let dir = "/tmp/ricow-export-test";
+        let _ = std::fs::remove_dir_all(dir);
+        let mut config = StrategyConfig {
+            name: "demo".into(),
+            strategy_type: "lua".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params: Default::default(),
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "futures".into(),
+            position_mode: "hedge".into(),
+            backtest: None,
+        };
+        config.params.insert("pair".into(), ConfigValue::String("SOLUSDT".into()));
+        config.params.insert("order_amount".into(), ConfigValue::Float(100.0));
+        let ts = chrono::DateTime::from_timestamp(3600, 0).unwrap();
+        let klines = vec![Kline {
+            open_time: ts,
+            open: Decimal::ONE,
+            high: Decimal::ONE,
+            low: Decimal::ONE,
+            close: Decimal::ONE,
+            volume: Decimal::ONE,
+            close_time: ts + chrono::Duration::hours(1),
+        }];
+        let mut report = ricow_strategy::BacktestReport::default();
+        report.fills.push(OrderFill {
+            trade_id: None,
+            exchange_order_id: "e1".into(),
+            client_order_id: "c1".into(),
+            pair: "SOLUSDT".into(),
+            side: OrderSide::Buy,
+            fill_price: dec!(100),
+            fill_size: dec!(1),
+            fee: dec!(0.05),
+            timestamp: ts,
+            position_side: Some("long".into()),
+        });
+        report.equity_curve = vec![dec!(1000), dec!(1001)];
+        let res = export_backtest(dir, "demo", "SOLUSDT", &config, &klines, &report, "报告全文");
+        assert!(res.is_ok(), "导出应成功: {:?}", res.err());
+        let params: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/demo_SOLUSDT_params.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(params["strategy"], "demo");
+        assert_eq!(params["pair"], "SOLUSDT");
+        assert_eq!(params["market"], "futures");
+        assert_eq!(params["kline_bars"], 1);
+        assert_eq!(params["params"]["order_amount"], 100.0);
+        let fills = std::fs::read_to_string(format!("{dir}/demo_SOLUSDT_fills.csv")).unwrap();
+        assert!(fills.starts_with("index,timestamp,pair,side,position_side"), "CSV 表头");
+        assert!(fills.contains(",100,1,0.05,c1,e1\n"), "逐笔行含价格/数量/费/id");
+        let eq = std::fs::read_to_string(format!("{dir}/demo_SOLUSDT_equity.csv")).unwrap();
+        assert_eq!(eq, "bar_index,equity\n0,1000\n1,1001\n");
+        assert_eq!(
+            std::fs::read_to_string(format!("{dir}/demo_SOLUSDT_report.txt")).unwrap(),
+            "报告全文"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1328,6 +1328,7 @@ mod tests {
             fill_size: dec!(1),
             fee: dec!(0.6),
             timestamp: Utc::now(),
+            position_side: None,
         };
         db.insert_fill("grid-1", &fill).await.unwrap();
         assert_eq!(db.fill_count().await.unwrap(), 1);
@@ -1388,6 +1389,7 @@ mod tests {
             fill_size: dec!(0.04),
             fee: dec!(0),
             timestamp: Utc::now(),
+            position_side: None,
         };
         db.insert_fill("s-zero-fee", &fill).await.unwrap();
         let (n2, fees2, last2) = db.fill_stats("s-zero-fee").await.unwrap();

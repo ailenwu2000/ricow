@@ -476,3 +476,228 @@ fn test_paired_grid_flag_negative_on_downtrend() {
     let flag = st.global_f64("flag").expect("flag 应可读");
     assert!(flag < 0.0, "连续下跌只买不卖 → flag 应为负, 实际 {flag}");
 }
+
+// ============================================================================
+// paired_grid_futures_long 合约配对做多网格 集成测试 (032 v2, 2026-09-26: 砍空头改纯配对做多;
+// 2026-09-26 改名: id paired_grid_futures → paired_grid_futures_long, 为将来的做空版
+// paired_grid_futures_short 让位)
+// ============================================================================
+
+const PAIRED_GRID_FUT: &str =
+    include_str!("../../../strategies/futures/paired_grid_futures_long.lua");
+
+/// 合约 hedge 配置: market/position_mode 走 config 顶层, 杠杆走 [backtest](引擎 resolve 口径)。
+fn futures_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![
+        ("pair", ConfigValue::String("ETHUSDT".into())),
+        ("spacing_pct", ConfigValue::Float(0.04)),
+        ("direction_offset", ConfigValue::Float(0.0)), // 关偏移, 间距恒 4%, 可精确预测
+        ("order_amount", ConfigValue::Float(10.0)),
+        ("min_notional", ConfigValue::Float(1.0)), // 放宽守卫, 聚焦机制
+    ];
+    params.extend_from_slice(extra);
+    let mut cfg = config(PAIRED_GRID_FUT, &params);
+    cfg.market = "futures".into();
+    cfg.position_mode = "hedge".into();
+    cfg.backtest = Some(crate::config::BacktestToml { leverage: Some(2.0), ..Default::default() });
+    cfg
+}
+
+/// 按 position_side 过滤挂单(hedge 路由断言用)。
+fn ps_orders<'a>(orders: &'a [Vec<OrderRequest>], ps: &str) -> Vec<&'a OrderRequest> {
+    orders.iter().flatten().filter(|o| o.position_side.as_deref() == Some(ps)).collect()
+}
+
+#[test]
+fn test_paired_grid_futures_long_activate_market_build() {
+    // 穿越激活(价 100 < start 110): 首 tick 市价建仓, 只下 LONG 侧单。
+    let cfg = futures_cfg(&[
+        ("start_price", ConfigValue::Float(110.0)),
+        ("initial_buy_amount", ConfigValue::Float(10.0)),
+    ]);
+    let bars = flat_main(3, 100);
+    let (orders, ctx, st) = run_accum_full(cfg, &bars, None);
+
+    // 建仓单: 市价 buy + position_side=long; 全程不得出现 short 侧挂单。
+    assert!(
+        ps_orders(&orders, "long")
+            .iter()
+            .any(|o| o.side == OrderSide::Buy && o.order_type == OrderType::Market),
+        "应穿越激活并市价建仓(position_side=long)"
+    );
+    assert!(
+        ps_orders(&orders, "short").is_empty(),
+        "只做多策略 -> 不得有任何 position_side=short 挂单"
+    );
+
+    // 建仓后多头仓 0.1 币(10 USDT @100), 建仓不计 flag。
+    let long_sz = ctx.position_directional("ETHUSDT", OrderSide::Buy).map(|p| p.size);
+    assert!(
+        long_sz.map(|s| (s.to_f64().unwrap() - 0.1).abs() < 1e-9).unwrap_or(false),
+        "建仓后应有 0.1 币多仓, 实际 {long_sz:?}"
+    );
+    assert_eq!(st.global_f64("flag"), Some(0.0), "建仓不计 flag");
+    assert!(st.global_f64("fill_count").unwrap_or(0.0) >= 1.0, "建仓应成交");
+}
+
+#[test]
+fn test_paired_grid_futures_long_grid_pair_cycle() {
+    // 网格配对闭环: 激活建仓 -> 下跌网格买成交(flag=-1) -> 反弹配对卖成交(flag=0)。
+    let cfg = futures_cfg(&[
+        ("start_price", ConfigValue::Float(110.0)),
+        ("initial_buy_amount", ConfigValue::Float(10.0)),
+    ]);
+    let bars = vec![
+        bar_at_hour(0, 100, 100, 100, 100), // 穿越激活: 市价买入 0.1 @100
+        bar_at_hour(1, 96, 96, 96, 96),     // 重挂: 网格买@96.15 并成交(flag=-1)
+        bar_at_hour(2, 96, 96, 96, 96),     // 重挂: 网格买@92.45 + 配对卖@100(保底 96×1.04)
+        bar_at_hour(3, 100, 100, 100, 100), // 配对卖@100 成交(flag=0)
+        bar_at_hour(4, 100, 100, 100, 100),
+    ];
+    let (orders, _ctx, st) = run_accum_full(cfg, &bars, None);
+
+    assert!(
+        ps_orders(&orders, "short").is_empty(),
+        "只做多策略 -> 不得有任何 position_side=short 挂单"
+    );
+    assert!(
+        ps_orders(&orders, "long")
+            .iter()
+            .any(|o| o.side == OrderSide::Buy && o.order_type == OrderType::Market),
+        "应穿越激活并市价建仓"
+    );
+    assert!(st.global_f64("fill_count").unwrap_or(0.0) >= 3.0, "建仓+网格一买一卖应有 >= 3 笔成交");
+    assert_eq!(st.global_f64("flag"), Some(0.0), "一买一卖配对完成后 flag 归 0");
+}
+
+#[test]
+fn test_paired_grid_futures_long_above_start_waits() {
+    // 价格高于 start_price: 不激活, 零挂单, 不报错(等待穿越)。
+    let cfg = futures_cfg(&[("start_price", ConfigValue::Float(100.0))]);
+    let bars = flat_main(4, 120);
+    let (orders, _ctx, st) = run_accum_full(cfg, &bars, None);
+    assert!(orders.iter().all(|o| o.is_empty()), "未激活 -> 不得下任何单");
+    assert_eq!(st.global_f64("fatal"), Some(0.0), "等待激活不是错误");
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "无成交");
+}
+
+#[test]
+fn test_paired_grid_futures_long_missing_start_price_halts() {
+    // 缺 start_price(≤0) -> 启动停机(同现货语义), 零挂单。
+    let cfg = futures_cfg(&[]);
+    let bars = flat_main(6, 100);
+    let (orders, _ctx, st) = run_accum_full(cfg, &bars, None);
+    assert!(orders.iter().all(|o| o.is_empty()), "缺必填参数 -> 不得下任何单");
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "应置停机标记");
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "无成交");
+}
+
+#[test]
+fn test_paired_grid_futures_long_cost_gate_halts() {
+    // 成本门槛: spacing_pct(0.05%) ≤ 2×fee_side(0.1%) -> 首次校验停机。
+    let cfg = futures_cfg(&[
+        ("spacing_pct", ConfigValue::Float(0.0005)),
+        ("start_price", ConfigValue::Float(100.0)),
+    ]);
+    let bars = flat_main(4, 100);
+    let (orders, _ctx, st) = run_accum_full(cfg, &bars, None);
+    assert!(orders.iter().all(|o| o.is_empty()), "成本门槛不满足必须停机且不下任何单");
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "应置停机标记");
+}
+
+// ============================================================================
+// 032 v2 验收: 合约配对做多 vs 现货 paired_grid 等价性
+// (用户核心诉求: 行为逻辑与现货完全一致 -> 同 K 线同参数逐笔成交轨迹一致)
+// ============================================================================
+
+/// f64 价格的平 bar(o=h=l=c=px; 引擎不校验周期)。
+fn bar_at_f(hour: i64, px: f64) -> Kline {
+    let ms = hour * 3_600_000;
+    let d = Decimal::from_f64_retain(px).unwrap();
+    Kline {
+        open_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap(),
+        open: d,
+        high: d,
+        low: d,
+        close: d,
+        volume: Decimal::ONE,
+        close_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms + 3_599_999).unwrap(),
+    }
+}
+
+/// 逐笔成交轨迹: (bar 序号, 方向, 数量, 价格)。
+type FillTrace = Vec<(usize, OrderSide, f64, f64)>;
+
+/// 跑完整序列并按 bar 收集逐笔成交, 供两条腿逐笔对照。
+fn run_collect_fills(cfg: StrategyConfig, bars: &[Kline]) -> FillTrace {
+    let mut strategy = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
+        .expect("内置脚本应编译通过");
+    let mut ctx = BacktestContext::new(
+        cfg,
+        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+    );
+    strategy.on_init(&mut ctx);
+    let mut out = Vec::new();
+    for (i, k) in bars.iter().enumerate() {
+        ctx.step_bar(k.clone());
+        let orders = strategy.on_tick(&mut ctx);
+        for req in &orders {
+            let _ = ctx.place_order(req.clone());
+        }
+        for f in ctx.drain_fills() {
+            out.push((i, f.side, f.fill_size.to_f64().unwrap(), f.fill_price.to_f64().unwrap()));
+            strategy.on_fill(&mut ctx, f);
+        }
+    }
+    out
+}
+
+#[test]
+fn test_paired_grid_futures_long_matches_spot_fill_by_fill() {
+    // 合约只多头 vs 现货 paired_grid, 同 K 线同参数: 网格机制逐笔一致 ——
+    // 现货成交轨迹必须是合约轨迹的**前缀**(bar 序号/方向/数量/价格逐笔一致)。
+    // 分叉点 = 现货第 10 条「无仓无单即结束」语义(v2 合约版不移植, 用户 2026-09-26 口径:
+    // "任何一单成交 → ref=成交价 → 全撤重挂"= 网格持续运行): 现货跑完首个完整配对循环后
+    // 不再交易, 合约版继续追踪+挂买。费用口径差异只允许落在净值, 不允许落在公共前缀轨迹。
+    // 路径(initial_buy_amount=0, 无建仓): 120 横盘 2 根(>110 不激活) → 100 穿越激活
+    // → 96 网格买成交(fill#1, ref=96.15) → 101 配对卖成交(fill#2, 栈清空+持仓=0
+    //   → 现货第 10 条 finished, 残留买单 92.455 在尾段 95 不会成交)
+    // → 95: 合约版(finished 不移植)重挂买 96.15 成交(fill#3, 网格持续运行)。
+    let path: Vec<Kline> = [120.0, 120.0, 100.0, 96.0, 96.0, 101.0, 95.0, 95.0]
+        .iter()
+        .enumerate()
+        .map(|(h, px)| bar_at_f(h as i64, *px))
+        .collect();
+
+    let spot_cfg = paired_cfg(&[
+        ("start_price", ConfigValue::Float(110.0)),
+        ("initial_buy_amount", ConfigValue::Float(0.0)),
+        ("fee_side", ConfigValue::Float(0.0005)),
+    ]);
+    let fut_cfg = futures_cfg(&[
+        ("start_price", ConfigValue::Float(110.0)),
+        ("initial_buy_amount", ConfigValue::Float(0.0)),
+        ("fee_side", ConfigValue::Float(0.0005)),
+    ]);
+
+    let spot_fills = run_collect_fills(spot_cfg, &path);
+    let fut_fills = run_collect_fills(fut_cfg, &path);
+
+    assert_eq!(spot_fills.len(), 2, "现货应 一买一卖后即结束: {:?}", spot_fills);
+    assert!(
+        fut_fills.len() > spot_fills.len(),
+        "现货结束后合约版应继续成交(网格持续运行): spot={} fut={}",
+        spot_fills.len(),
+        fut_fills.len()
+    );
+    for (i, sf) in spot_fills.iter().enumerate() {
+        let ff = &fut_fills[i];
+        assert_eq!(sf.0, ff.0, "第 {i} 笔成交 bar 不一致: spot={sf:?} fut={ff:?}");
+        assert_eq!(sf.1, ff.1, "第 {i} 笔成交方向不一致: spot={sf:?} fut={ff:?}");
+        assert_eq!(sf.3, ff.3, "第 {i} 笔成交价不一致: spot={sf:?} fut={ff:?}");
+        // 现货 cap_sell 有 1e-9 比例削裁(防超卖铁律), 合约版 cap_close 不自砍 → 数量差恰为相对 1e-9,
+        // 容差放宽到 1e-8 容纳这一已知的唯一数量口径差异。
+        let rel = (sf.2 - ff.2).abs() / sf.2.max(1e-12);
+        assert!(rel < 1e-8, "第 {i} 笔成交数量不一致: spot={sf:?} fut={ff:?}");
+    }
+}

@@ -71,6 +71,12 @@ pub struct StrategyManifest {
     /// 参数列表(声明顺序即表单顺序)。
     #[serde(default)]
     pub params: Vec<ManifestParam>,
+    /// 持仓模式 (032, 可选): "one-way" (缺省) | "hedge" —— 直跑路径回填 config 用。
+    #[serde(default)]
+    pub position_mode: Option<String>,
+    /// 默认杠杆 (032, 可选): 直跑路径无 `[backtest]` 段时回填 `leverage` (审核 S1)。
+    #[serde(default)]
+    pub default_leverage: Option<f64>,
 }
 
 impl StrategyManifest {
@@ -132,6 +138,11 @@ const BUILTIN: &[(&str, &str, &str)] = &[
         "paired_grid",
         include_str!("../../../../strategies/spot/paired_grid.toml"),
         include_str!("../../../../strategies/spot/paired_grid.lua"),
+    ),
+    (
+        "paired_grid_futures_long",
+        include_str!("../../../../strategies/futures/paired_grid_futures_long.toml"),
+        include_str!("../../../../strategies/futures/paired_grid_futures_long.lua"),
     ),
 ];
 
@@ -259,6 +270,8 @@ fn scan_user_with_problems() -> (Vec<CatalogEntry>, Vec<(String, String)>) {
                     suitable: None,
                     unsuitable: None,
                     params: Vec::new(),
+                    position_mode: None,
+                    default_leverage: None,
                 },
                 code,
                 source: Source::User,
@@ -338,6 +351,30 @@ options = ["u", "coin"]
         assert_eq!(mode.ty, ParamType::Enum);
         assert_eq!(mode.default.as_ref().and_then(|v| v.as_str()), Some("u"));
         assert_eq!(mode.options, Some(vec!["u".to_string(), "coin".to_string()]));
+    }
+
+    #[test]
+    fn manifest_optional_fields_default_none() {
+        // 032: 旧清单(无 position_mode / default_leverage)必须照常解析, 两字段缺省 None。
+        let m = StrategyManifest::parse(MANIFEST).unwrap();
+        assert_eq!(m.position_mode, None);
+        assert_eq!(m.default_leverage, None);
+    }
+
+    #[test]
+    fn parse_manifest_with_position_mode_and_leverage() {
+        // 032: futures 清单声明 position_mode + default_leverage → 正确解析。
+        let src = r#"
+id = "paired_grid_futures"
+name = "合约双向配对网格"
+market = "futures"
+summary = "多空双向网格"
+position_mode = "hedge"
+default_leverage = 2.0
+"#;
+        let m = StrategyManifest::parse(src).unwrap();
+        assert_eq!(m.position_mode.as_deref(), Some("hedge"));
+        assert_eq!(m.default_leverage, Some(2.0));
     }
 
     #[test]

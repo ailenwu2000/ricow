@@ -1,0 +1,107 @@
+# 合约配对做多网格 策略清单 (032 v2, 2026-09-26 用户指令: 砍空头改纯配对做多)
+#
+# 清单是表现层数据(参数键不进引擎代码); 引擎/CLI/绑定层零策略参数名 ——
+# 本文件 [[params]] 的 key 不得与引擎按名读取的参数同名(leverage/mmr_pct 等),
+# 杠杆走清单顶层 default_leverage 字段, 由 resolve_builtin_script 回填 [backtest].leverage。
+
+id = "paired_grid_futures_long"
+name = "合约配对做多网格"
+market = "futures"
+position_mode = "hedge"
+default_leverage = 2
+summary = "USDT-M 配对做多网格: 开多平多, 行为逻辑与现货 paired_grid 完全一致"
+description = """只做多和平多的配对网格(hedge 模式只下 LONG 侧单): 价格低于 start_price 激活,
+以最近成交价为参考价上下各挂一单(下方买单、上方平多卖单), 配对卖价恒 > 买价(保底 min_pair_profit);
+flag(买 −1 / 卖 +1)驱动间距不对称放大; 成交即全撤重挂; 栈空时追踪上移让买单跟随趋势。
+任何一单成交 → ref=成交价 → 全撤重挂, 网格持续运行(现货的"无仓无单即结束"语义不移植)。
+除结束语义外行为逻辑与现货 paired_grid 逐行一致, 合约化 5 点: position_side=LONG / 杠杆保证金兜底 /
+爆仓价监控 / 合约费率口径 / 期末强平损益单列。
+默认 2x 杠杆、建议 ≤5x(仅文案提示, 引擎默认上限 10x 不强制)。
+注意: DryRun 不模拟强平与资金费; 回测爆仓价为开仓口径估算。"""
+suitable = "震荡与缓慢单边行情吃网格价差(只做多, 不做空)"
+unsuitable = "单边下跌行情(只做多将套牢且逼近爆仓价); 低波动行情(间距覆盖不了往返手续费)"
+
+[[params]]
+key = "pair"
+name = "合约对"
+type = "string"
+desc = "如 SOLUSDT"
+required = true
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "价格低于它才激活(同现货); 缺失或 ≤0 启动停机"
+required = true
+
+[[params]]
+key = "initial_buy_amount"
+name = "初始建仓名义"
+type = "f64"
+desc = "USDT; 激活当刻市价买入该金额, 成交后拆成多笔 order_amount 配对仓(不计 flag); 0=不建仓"
+default = 0
+
+[[params]]
+key = "interval"
+name = "主时钟周期"
+type = "string"
+desc = "决策节流周期"
+default = "1h"
+
+[[params]]
+key = "spacing_pct"
+name = "网格间距"
+type = "f64"
+desc = "小数(0.01=1%); 必须 > 2×fee_side 否则停机"
+default = 0.01
+
+[[params]]
+key = "order_amount"
+name = "每格名义"
+type = "f64"
+desc = "USDT; 每笔开仓名义额"
+default = 10
+
+[[params]]
+key = "direction_offset"
+name = "方向偏移"
+type = "f64"
+desc = "flag 驱动的开/平方向间距不对称放大系数"
+default = 0.2
+
+[[params]]
+key = "accumulate_mode"
+name = "成交模式"
+type = "enum"
+desc = "u=积累计价币 / coin=积累币"
+default = "u"
+options = ["u", "coin"]
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "低于它跳过挂单(合约惯例 50)"
+default = 50
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "小数; 合约 taker 0.0005(5bps)"
+default = 0.0005
+
+[[params]]
+key = "min_pair_profit"
+name = "配对保底价差"
+type = "f64"
+desc = "0=自动取 2×fee_side"
+default = 0
+
+[[params]]
+key = "liq_warn_ratio"
+name = "爆仓价告警阈值"
+type = "f64"
+desc = "小数(0.1=10%); 距爆仓价 < 该比例打 WARN(只告警不动作)。与引擎 014 的 liq_warn_pct(百分点)是两条通道"
+default = 0.1

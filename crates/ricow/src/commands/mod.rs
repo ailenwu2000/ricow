@@ -470,8 +470,18 @@ pub(crate) fn ensure_strategies_dir_in(root: &std::path::Path) -> CoreResult<std
 /// 内置脚本 Lua 化: strategy_type 命中内置策略 id 且无 script 参数时, 注入
 /// 对应脚本内容 (编译期嵌入, 见 `strategies::catalog`), type 改 "lua"。
 /// 非内置 id / 已有 script(用户 lua 策略)原样返回。
+///
+/// 032 (审核 S1/M4): 命中内置时同时按清单回填策略级配置 —— `market`、
+/// `position_mode`(清单声明时)、`[backtest].leverage`(清单 `default_leverage`
+/// 且用户未显式给杠杆时)。回填必须发生在 `apply_backtest_cli` 的杠杆校验之前,
+/// 否则 futures 直跑会因缺 leverage 而报错。
+///
+/// 032 复审 (根因 B 参数可见性): 回填后遍历清单 `[[params]]`, 声明了 `default`
+/// 且用户未显式给的键 → 注入生效 params —— 报告"测试参数"/params.json 因此回显
+/// **全部生效值**(间距/偏移/费率等不再沉默走 Lua 兜底)。通用遍历清单数据,
+/// 不硬编码任何策略参数名(架构铁律: 参数键是数据不是代码)。
 pub(crate) fn resolve_builtin_script(mut config: StrategyConfig) -> CoreResult<StrategyConfig> {
-    let Some(code) = templates::code_of(&config.strategy_type) else {
+    let Some(entry) = crate::strategies::catalog::find(&config.strategy_type) else {
         // 命中不了 catalog: 若该 id 在扫描期有清单但被跳过(market 不一致 / 占用内置 id /
         // 缺同名 .lua), 如实报错而非静默放行 —— 否则用户只看到"unsupported strategy type"。
         if let Some(problem) = crate::strategies::catalog::problem_for(&config.strategy_type) {
@@ -485,8 +495,26 @@ pub(crate) fn resolve_builtin_script(mut config: StrategyConfig) -> CoreResult<S
     if config.get_str("script").is_some() {
         return Ok(config); // 已有 script(用户 lua 策略)
     }
-    config.params.insert("script".into(), ConfigValue::String(code));
+    config.params.insert("script".into(), ConfigValue::String(entry.code));
     config.strategy_type = "lua".into();
+    // ---- 清单回填 (032) ----
+    let manifest = entry.manifest;
+    config.market = manifest.market;
+    if let Some(pm) = manifest.position_mode {
+        config.position_mode = pm;
+    }
+    if let Some(lev) = manifest.default_leverage {
+        let bt = config.backtest.get_or_insert_with(Default::default);
+        if bt.leverage.is_none() {
+            bt.leverage = Some(lev);
+        }
+    }
+    // ---- 清单默认值注入 (032 复审 B) ----
+    for p in &manifest.params {
+        if let Some(dflt) = &p.default {
+            config.params.entry(p.key.clone()).or_insert_with(|| dflt.clone());
+        }
+    }
     Ok(config)
 }
 
@@ -664,6 +692,48 @@ mod tests {
         let resolved = resolve_builtin_script(config).unwrap();
         assert_eq!(resolved.strategy_type, "lua");
         assert!(resolved.get_str("script").unwrap().contains("on_tick"));
+    }
+
+    #[test]
+    fn test_resolve_builtin_script_injects_manifest_defaults() {
+        // 032 复审 B: 清单 [[params]] 声明 default 且用户未显式给的键 → 注入生效 params
+        // (报告"测试参数"/params.json 全量可见); 用户显式值不被覆盖; 必填无 default 不注入。
+        let mut params = HashMap::new();
+        params.insert("pair".into(), ConfigValue::String("ETHUSDT".into()));
+        params.insert("spacing_pct".into(), ConfigValue::Float(0.02));
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "paired_grid_futures_long".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let resolved = resolve_builtin_script(config).unwrap();
+        // 声明了 default 的键被注入(f64 / string 两类)
+        assert_eq!(
+            resolved.params.get("direction_offset").and_then(|v| v.as_f64()),
+            Some(0.2),
+            "清单默认值应注入生效 params"
+        );
+        assert_eq!(resolved.params.get("fee_side").and_then(|v| v.as_f64()), Some(0.0005));
+        assert_eq!(resolved.params.get("interval").and_then(|v| v.as_str()), Some("1h"));
+        // 用户显式值不被覆盖
+        assert_eq!(resolved.params.get("spacing_pct").and_then(|v| v.as_f64()), Some(0.02));
+        // 必填且无 default(pair)不注入
+        assert_eq!(resolved.params.get("pair").and_then(|v| v.as_str()), Some("ETHUSDT"));
+        // market/position_mode/杠杆回填不受注入影响
+        assert_eq!(resolved.market, "futures");
+        assert_eq!(resolved.position_mode, "hedge");
+        assert_eq!(
+            resolved.backtest.unwrap().leverage,
+            Some(2.0),
+            "default_leverage 应回填 [backtest].leverage"
+        );
     }
 
     #[test]
@@ -923,9 +993,182 @@ pub(crate) fn format_backtest_report(
     header: &str,
     initial_cash: rust_decimal::Decimal,
     is_futures: bool,
+    test_params: &[(String, String)],
 ) -> String {
     let mut out = String::new();
     line!(out, "{header}");
+    // 正负号助手 (Decimal 的 Display 不响应 `+` 格式符, 正数需手工补号)。
+    // 概览为"一眼看"区块: 金额统一 2 位小数 (既有区块保持原始精度不动)。
+    let signed = |d: Decimal| {
+        let r = d.round_dp(2);
+        if r >= Decimal::ZERO {
+            format!("+{r}")
+        } else {
+            format!("{r}")
+        }
+    };
+    // ---- 回测概览 (规范 v1 A1-A7): 置于报告最前, 用户核心诉求一眼可见 ----
+    // 纯展示区块, 不改变任何既有指标口径 (自审 6: 数值回归必须逐位不变)。
+    if let (Some(st), Some(et)) = (report.start_time, report.end_time) {
+        line!(out, "  --- 回测概览 ---");
+        // 天数 = 时长/24h 四舍五入 (179 天差 1 分钟不应显示 178)。
+        let days = ((et - st).num_hours() as f64 / 24.0).round() as i64;
+        // 周期由 区间/根数 推导 (报告结构不带 interval 元数据, 仅展示用途);
+        // 时长含端点误差, 按**相对误差最近**的候选周期归类。
+        let interval = if report.total_bars > 0 {
+            let secs = (et - st).num_milliseconds() as f64 / 1000.0 / report.total_bars as f64;
+            let cands = [60.0, 300.0, 900.0, 3600.0, 14400.0, 86400.0];
+            let names = ["1m", "5m", "15m", "1h", "4h", "1d"];
+            let (best, err): (&str, f64) = cands
+                .iter()
+                .zip(names)
+                .map(|(&c, n)| (n, (secs - c).abs() / c))
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(("?", 1.0));
+            if err < 0.2 {
+                best
+            } else {
+                "?"
+            }
+        } else {
+            "?"
+        };
+        line!(
+            out,
+            "  区间: {} ~ {} (UTC, {} 天, {} K 线, {} 根)",
+            st.format("%Y-%m-%d %H:%M"),
+            et.format("%Y-%m-%d %H:%M"),
+            days,
+            interval,
+            report.total_bars
+        );
+    }
+    line!(out, "  投入资金: {initial_cash} USDT");
+    match report.first_entry {
+        Some((t, side, sz, px)) => line!(
+            out,
+            "  首次成交: {} {} {} @ {} (≈{} USDT)",
+            t.format("%Y-%m-%d %H:%M"),
+            if side == ricow_core::OrderSide::Buy { "买" } else { "卖" },
+            sz.round_dp(8),
+            px,
+            (sz * px).round_dp(2)
+        ),
+        None => line!(out, "  首次成交: 无 (窗口内未成交)"),
+    }
+    if let Some(fp) = report.first_open_price {
+        line!(
+            out,
+            "  标的价格: {} → {} ({:+.2}%)",
+            fp,
+            report.final_price,
+            report.price_change_pct
+        );
+    }
+    // 期末持仓 (A5): 有仓给方向/均价/市值/浮动盈亏; 无仓必须说明原因 (规范禁止事项)。
+    if report.final_pos_size != Decimal::ZERO {
+        match (&report.final_pos_dir, report.final_pos_avg_price) {
+            (Some(dir), Some(avg)) => {
+                let dir_cn = if dir == "long" { "多头" } else { "空头" };
+                let mv = (report.final_pos_size * report.final_price).round_dp(2);
+                match report.unrealized_pnl {
+                    Some(u) => line!(
+                        out,
+                        "  期末持仓: {} {} @ 均价 {} (市值 {}, 浮动盈亏 {})",
+                        dir_cn,
+                        report.final_pos_size,
+                        avg,
+                        mv,
+                        signed(u)
+                    ),
+                    None => line!(
+                        out,
+                        "  期末持仓: {} {} @ 均价 {} (市值 {})",
+                        dir_cn,
+                        report.final_pos_size,
+                        avg,
+                        mv
+                    ),
+                }
+            }
+            _ => line!(
+                out,
+                "  期末持仓: {} (市值 {})",
+                report.final_pos_size,
+                (report.final_pos_size * report.final_price).round_dp(2)
+            ),
+        }
+    } else if let Some(cp) = report.close_pnl_realized {
+        line!(out, "  期末持仓: 无 (--close-at-end 强平落袋 {})", signed(cp));
+    } else if report.total_trades == 0 {
+        line!(out, "  期末持仓: 无 (窗口内未成交)");
+    } else {
+        line!(out, "  期末持仓: 无 (自然平完)");
+    }
+    // 净盈亏分解 (A6): 百分比必须带绝对值 (规范禁止事项), 资金费单列注明已含权益。
+    let net_pct = if initial_cash != Decimal::ZERO {
+        (report.net_pnl / initial_cash * Decimal::from(100)).to_f64().unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let fees = report.total_fees.round_dp(2);
+    match (report.unrealized_pnl, report.funding_net) {
+        (Some(u), Some(f)) => line!(
+            out,
+            "  净盈亏: {} ({:+.2}%) = 已实现 {} + 未实现 {} − 手续费 {fees} (资金费 {} 已含权益)",
+            signed(report.net_pnl),
+            net_pct,
+            signed(report.realized_pnl),
+            signed(u),
+            signed(f)
+        ),
+        (Some(u), None) => line!(
+            out,
+            "  净盈亏: {} ({:+.2}%) = 已实现 {} + 未实现 {} − 手续费 {fees}",
+            signed(report.net_pnl),
+            net_pct,
+            signed(report.realized_pnl),
+            signed(u)
+        ),
+        (None, Some(f)) => line!(
+            out,
+            "  净盈亏: {} ({:+.2}%) = 已实现 {} − 手续费 {fees} (资金费 {} 已含权益)",
+            signed(report.net_pnl),
+            net_pct,
+            signed(report.realized_pnl),
+            signed(f)
+        ),
+        (None, None) => line!(
+            out,
+            "  净盈亏: {} ({:+.2}%) = 已实现 {} − 手续费 {fees}",
+            signed(report.net_pnl),
+            net_pct,
+            signed(report.realized_pnl)
+        ),
+    }
+    // 基准对照一行 (A7); 底部「基准对照」区块保留不动 (自建仓口径等细节看那里)。
+    if let Some(ret) = report.benchmark_return_pct {
+        let dd = report
+            .benchmark_max_drawdown
+            .map(|v| format!("{:.2}%", v * Decimal::from(100)))
+            .unwrap_or_else(|| "n/a".into());
+        match report.strategy_return_since_entry_pct {
+            Some(s) => {
+                line!(out, "  基准对照: 满仓持有 {ret:+.2}% (最大回撤 {dd}) / 策略自建仓 {s:+.2}%")
+            }
+            None => line!(out, "  基准对照: 满仓持有 {ret:+.2}% (最大回撤 {dd})"),
+        }
+    }
+    // 测试参数区块 (032+ 可观测性): 生效配置全量通用 dump (调用方已剔除 script 源码)。
+    // 架构铁律: 只搬运 key-value, 不点名任何策略参数。
+    if !test_params.is_empty() {
+        line!(out, "  --- 测试参数 (生效配置全量) ---");
+        let mut tp = test_params.to_vec();
+        tp.sort();
+        for (k, v) in &tp {
+            line!(out, "  {k} = {v}");
+        }
+    }
     line!(out, "  K 线数: {}", report.total_bars);
     line!(out, "  成交笔数: {}", report.total_trades);
     line!(out, "  已实现盈亏: {}", report.realized_pnl);
@@ -964,8 +1207,28 @@ pub(crate) fn format_backtest_report(
         (Some(w), Some(l)) => line!(out, "  平均盈利/亏损: {w:.2} / {l:.2} USDT"),
         _ => line!(out, "  平均盈利/亏损: n/a"),
     }
+    // ---- 成交统计 (规范 v1 B 区): 盈亏笔数/单笔极值/成交额, 全由现有 pnl tracker 推导 ----
+    line!(out, "  --- 成交统计 ---");
+    line!(out, "  盈利/亏损笔数: {} / {}", report.winning_trades, report.losing_trades);
+    match (report.best_trade, report.worst_trade) {
+        (Some(b), Some(w)) => line!(out, "  最佳/最差单笔: {} / {}", signed(b), signed(w)),
+        _ => line!(out, "  最佳/最差单笔: n/a"),
+    }
+    line!(out, "  总成交额: {} USDT (单边累计)", report.total_turnover.round_dp(2));
+    if report.total_trades > 0 {
+        line!(
+            out,
+            "  单笔均名义: {} USDT",
+            (report.total_turnover / Decimal::from(report.total_trades)).round_dp(2)
+        );
+    }
     line!(out, "  --- 资产变化 (基准: 初始余额 {initial_cash} USDT) ---");
     line!(out, "  标的涨跌: {:+.2}% (首根open → {})", report.price_change_pct, report.final_price);
+    // 收益分解 (032+ 可观测性): 净盈亏 = 交易收益(已实现) + 持仓盈亏(未实现)。
+    // --close-at-end 已期末强平 → 持仓盈亏 = 0, 净盈亏全部来自交易。
+    if let Some(u) = report.unrealized_pnl {
+        line!(out, "  交易收益 (已实现): {} / 持仓盈亏 (期末未实现): {}", report.net_pnl, u);
+    }
     if is_futures {
         // 合约: 持仓币数无意义 (K8), 以名义敞口替代。
         match report.final_notional {
@@ -1009,6 +1272,34 @@ pub(crate) fn format_backtest_report(
             report.final_equity,
             report.equity_change_pct
         );
+    }
+    // ---- 可观测性增强 (032+): 分侧盈亏 / 分侧成交笔数 / 峰值名义敞口 ----
+    match (report.realized_long, report.realized_short) {
+        (Some(l), Some(s)) => {
+            line!(out, "  --- 分侧统计 (hedge) ---");
+            line!(out, "  已实现盈亏: 多头侧 {l} / 空头侧 {s}");
+            if let Some((lc, sc, nc)) = report.fills_side_counts {
+                line!(out, "  成交笔数: 多头侧 {lc} / 空头侧 {sc} / 无侧 {nc}");
+            }
+        }
+        (Some(l), None) => line!(out, "  已实现盈亏 (多头侧): {l}"),
+        (None, Some(s)) => line!(out, "  已实现盈亏 (空头侧): {s}"),
+        (None, None) => {}
+    }
+    if let Some(mn) = report.max_notional {
+        line!(out, "  峰值名义敞口: {mn} USDT");
+    }
+    if report.close_at_end_applied {
+        line!(out, "  [期末强制平仓: 已按期末价平掉全部方向仓 (--close-at-end)]");
+    }
+    // ---- 策略统计 (032+ state_snapshot 透传; 引擎不解释键名) ----
+    if !report.strategy_stats.is_empty() {
+        line!(out, "  --- 策略统计 ---");
+        let mut stats = report.strategy_stats.clone();
+        stats.sort();
+        for (k, v) in &stats {
+            line!(out, "  {k} = {v}");
+        }
     }
     // ---- 023 T8: 基准对照 (以首次成交价、同时点、同本金起算) ----
     match (report.benchmark_entry_price, report.benchmark_return_pct) {

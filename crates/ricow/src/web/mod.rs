@@ -1386,6 +1386,7 @@ mod tests {
                 fill_size: dec("2"),
                 fee: dec("0.1"),
                 timestamp: at,
+                position_side: None,
             },
         )
         .await

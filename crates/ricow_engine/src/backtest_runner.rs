@@ -13,12 +13,15 @@ use ricow_strategy::{BacktestContext, BacktestReport, Context, Strategy, Strateg
 
 /// 在历史 K 线上运行一次回测 (单标的)。
 ///
-/// 流程: on_init → 逐 bar step_bar + on_tick + place_order + drain_fills + on_fill → report。
+/// 流程: on_init → 逐 bar [step_bar + drain_fills/on_fill(撮合成交先入账) + on_tick +
+/// place_order + drain_fills/on_fill] → report。
+/// `close_at_end` = true 时收尾按期末价强制平掉所有方向仓 (032+ 可观测性, `--close-at-end`)。
 pub fn run_backtest(
     config: StrategyConfig,
     initial_balance: Balance,
     klines: &[Kline],
     strategy: &mut dyn Strategy,
+    close_at_end: bool,
 ) -> BacktestReport {
     let pair = config.get_str("pair").map(str::to_string);
     let mut ctx = BacktestContext::new(config, initial_balance);
@@ -67,6 +70,13 @@ pub fn run_backtest(
     let skip = if warmup > 0 && warmup < klines.len() { warmup } else { 0 };
     for k in &klines[skip..] {
         ctx.step_bar(k.clone());
+        // 时序保真 (032 复审根因 B): 撮合成交先于决策入账 —— step_bar 撮合出的成交
+        // 立即 drain + on_fill, 使 on_tick 看到含本 bar 成交的最新账本 (与实盘
+        // "WS 成交推送先于下一决策"语义对齐); 此前成交滞留到决策之后派发, 账本滞后
+        // 一根 bar, 策略按陈旧栈顶定单尺寸 → 账本/引擎残仓分叉。
+        for fill in ctx.drain_fills() {
+            strategy.on_fill(&mut ctx, fill);
+        }
         let orders = strategy.on_tick(&mut ctx);
         for req in orders {
             match ctx.place_order(req) {
@@ -85,19 +95,33 @@ pub fn run_backtest(
                 }
             }
         }
-        let fills = ctx.drain_fills();
-        for fill in fills {
+        // 本 tick 即时撮合的成交 (市价单/越线限价单) 仍在 place 后派发, 不跨 bar。
+        for fill in ctx.drain_fills() {
             strategy.on_fill(&mut ctx, fill);
         }
     }
 
     // 尾 bar 补结算 (013 FR-005): 最后一根 bar 的资金费/强平不由 push 路径触发
     ctx.finalize();
+    // 期末强制平仓 (032+ 可观测性, `--close-at-end`): 按期末价平掉所有方向仓,
+    // 让报告的净盈亏/权益是"已实现、干净"的。默认关闭 (行为零改动)。
+    if close_at_end {
+        ctx.force_close_all();
+        // 期末强平 fill 派发给策略 (032 复审): force_close_all 走同一 fill_queue,
+        // 不 drain 则策略账本残留幻影 lot、强平锁定损益不入策略统计(分侧归因缺失)。
+        for fill in ctx.drain_fills() {
+            strategy.on_fill(&mut ctx, fill);
+        }
+    }
     // 023: 回测收尾也跑一次 `on_stop` —— 策略的统计输出(跳过计数/重挂次数/末次方向)必须能在
     // 回测里看到, 否则"跳过占比"这类验收数字无处可取。语义是"收尾回调", 与实盘停机清理
     // 无关(回测没有交易所资源可清); 当前无内置策略在 on_stop 里下单。
     strategy.on_stop(&mut ctx);
-    ctx.report()
+    let mut report = ctx.report();
+    // 策略级统计透传 (032+ 可观测性): state_snapshot 原样进报告"策略统计"区块。
+    // 引擎只搬运 key-value 字符串, 不读键名、不解释含义 (架构铁律安全)。
+    report.strategy_stats = strategy.state_snapshot();
+    report
 }
 
 /// 主时钟周期推断: 策略未声明 primary 时(异常), 用相邻 bar 时间差兜底; 无法推断则 1h。
@@ -175,8 +199,9 @@ pub fn build_interval_ticks(
 /// 组合回测 (M2): 多标的统一时间轴驱动。
 ///
 /// 流程与 `run_backtest` 对齐: on_init → 逐 tick [step_portfolio(推进 + 撮合前 tick
-/// 残留限价单) → on_tick 产单 → place_order(市价即时按本 tick 各 pair bar open 成交;
-/// 资金不足拒单计数) → drain_fills → on_fill] → report_portfolio。
+/// 残留限价单) → drain_fills/on_fill(撮合成交先入账) → on_tick 产单 → place_order
+/// (市价即时按本 tick 各 pair bar open 成交; 资金不足拒单计数) → drain_fills/on_fill]
+/// → report_portfolio。
 ///
 /// `signal_klines` (bs_momentum Lua 化, 2026-09-09): 美股信号日线 (键 = 原始 pair 名,
 /// 装配层按窗口截取), 构造 ctx 后装载 — 组合信号模式下 ctx:klines(pair) 返回按全局
@@ -194,6 +219,10 @@ pub fn run_portfolio_backtest(
 
     for bars in ticks {
         ctx.step_portfolio(bars);
+        // 时序保真: 与 run_backtest 同步 —— 撮合成交先于决策入账 (032 复审根因 B)。
+        for fill in ctx.drain_fills() {
+            strategy.on_fill(&mut ctx, fill);
+        }
         let orders = strategy.on_tick(&mut ctx);
         for req in orders {
             match ctx.place_order(req) {
@@ -212,8 +241,7 @@ pub fn run_portfolio_backtest(
                 }
             }
         }
-        let fills = ctx.drain_fills();
-        for fill in fills {
+        for fill in ctx.drain_fills() {
             strategy.on_fill(&mut ctx, fill);
         }
     }
@@ -457,6 +485,35 @@ mod tests {
         let snap = s.state_snapshot();
         let seen = snap.iter().find(|(k, _)| k == "seen_status").map(|(_, v)| v.clone()).unwrap();
         assert_eq!(seen, "rejected", "拒单必须经 on_order_update 回传给 Lua");
+    }
+
+    #[test]
+    fn test_run_backtest_close_at_end_and_strategy_stats_passthrough() {
+        // 032+ 可观测性: run_backtest(close_at_end=true) 收尾强平 + on_stop 的 state_set
+        // 经 report.strategy_stats 透传 (引擎只搬运 key-value, 不解释键名)。
+        let script = r#"
+            function on_init(ctx) ctx:need_klines("primary", "1d", 1) end
+            function on_tick(ctx)
+                -- 首 tick 市价开多 1 手, 之后不再下单 (留持仓给期末强平)。
+                if ctx:pos_size("TSLABUSDT", "long") <= 0 then
+                    return { { pair = "TSLABUSDT", side = "buy", order_type = "market", size = 1 } }
+                end
+                return {}
+            end
+            function on_stop(ctx) ctx:state_set("stat_hello", "world") end
+        "#;
+        let mut cfg = strategy_config();
+        cfg.params.insert("script".into(), ConfigValue::String(script.into()));
+        cfg.params.insert("pair".into(), ConfigValue::String("TSLABUSDT".into()));
+        let mut s = LuaStrategy::from_source(script, cfg.clone()).expect("脚本应编译通过");
+        let klines = vec![kline(1, 100, 101), kline(2, 101, 102)];
+        let report = run_backtest(cfg, balance(100_000), &klines, &mut s, true);
+        // 期末强平: 开多 1 手后收尾平掉 → 报告标注 applied, 且末尾多一笔平仓 fill。
+        assert!(report.close_at_end_applied, "close_at_end=true 应触发期末强平标注");
+        // 策略统计透传: on_stop 的 state_set 应出现在 strategy_stats。
+        let hello =
+            report.strategy_stats.iter().find(|(k, _)| k == "stat_hello").map(|(_, v)| v.clone());
+        assert_eq!(hello.as_deref(), Some("world"), "strategy_stats 应透传 on_stop 写入的键");
     }
 
     #[test]

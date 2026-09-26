@@ -172,6 +172,7 @@ pub async fn create_preview(
         ),
         initial_cash,
         is_futures,
+        &[],
     );
     Ok(PreviewOutcome { report_text, preview_id })
 }

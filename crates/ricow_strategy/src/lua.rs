@@ -67,6 +67,10 @@ pub(crate) struct LuaCtxData {
     position_entries: HashMap<String, f64>,
     /// 方向仓快照 (D9/hedge): key = "{pair}|long|" / "{pair}|short", 值 = (size, entry_price)。
     directionals: HashMap<String, (f64, f64)>,
+    /// 方向仓逐侧爆仓价 (032): key 同上, 值 = Option (逐仓才有, 全仓/现货 None)。`ctx:pos_liq`。
+    directional_liq: HashMap<String, Option<f64>>,
+    /// 方向仓逐侧标记价 (032): key 同上。`ctx:pos_mark`。
+    directional_mark: HashMap<String, f64>,
     balances: HashMap<String, f64>,
     /// 已实现净盈亏 (报价币计, 已扣手续费): `ctx:net_pnl()`。020 新增 ——
     /// 平台不再代做亏损熔断, 回撤/止损规则由策略自己实现, 这是它的输入。
@@ -101,6 +105,8 @@ impl LuaCtxData {
             position_sizes: HashMap::new(),
             position_entries: HashMap::new(),
             directionals: HashMap::new(),
+            directional_liq: HashMap::new(),
+            directional_mark: HashMap::new(),
             balances: HashMap::new(),
             net_pnl: 0.0,
             equity: 0.0,
@@ -141,6 +147,14 @@ impl LuaCtxData {
     fn directional_entry(&self, pair: &str, side: &str) -> f64 {
         self.directionals.get(&format!("{pair}|{side}")).map(|(_, e)| *e).unwrap_or(0.0)
     }
+    /// 方向仓逐侧爆仓价 (032): 无仓 / 无值 (全仓/现货) → None (Lua nil)。
+    fn directional_liq(&self, pair: &str, side: &str) -> Option<f64> {
+        self.directional_liq.get(&format!("{pair}|{side}")).copied().flatten()
+    }
+    /// 方向仓逐侧标记价 (032): 无仓 → 0。
+    fn directional_mark(&self, pair: &str, side: &str) -> f64 {
+        self.directional_mark.get(&format!("{pair}|{side}")).copied().unwrap_or(0.0)
+    }
     fn balance(&self, asset: &str) -> f64 {
         self.balances.get(asset).copied().unwrap_or(0.0)
     }
@@ -178,6 +192,14 @@ impl UserData for LuaCtxData {
         });
         methods.add_method("pos_entry", |_, data, (pair, side): (String, String)| {
             Ok(data.directional_entry(&pair, &side))
+        });
+        // 方向仓逐侧爆仓价 / 标记价 (032): ctx:pos_liq(pair, "long") / ctx:pos_mark(pair, "short")。
+        // pos_liq 无仓或全仓/现货 (无逐仓爆仓价) → nil; pos_mark 无仓 → 0。
+        methods.add_method("pos_liq", |_, data, (pair, side): (String, String)| {
+            Ok(data.directional_liq(&pair, &side))
+        });
+        methods.add_method("pos_mark", |_, data, (pair, side): (String, String)| {
+            Ok(data.directional_mark(&pair, &side))
         });
         methods.add_method("balance", |_, data, asset: String| Ok(data.balance(&asset)));
         // 盈亏状态 (020): 平台不再代做亏损熔断/峰值回撤 —— 策略用这两个只读值自管风控。
@@ -437,6 +459,8 @@ impl LuaStrategy {
         let mut unrealized = 0.0f64;
 
         for pair in pairs {
+            // 净仓未实现盈亏回退值 (仅当 directionals 不可得时使用, 见循环末尾)。
+            let mut net_unrealized = 0.0f64;
             if let Some(price) = ctx.price(&pair) {
                 if let Some(f) = price.to_f64() {
                     data.prices.insert(pair.clone(), f);
@@ -459,18 +483,29 @@ impl LuaStrategy {
                 data.position_sides.insert(pair.clone(), side.to_string());
                 data.position_sizes.insert(pair.clone(), pos.size.to_f64().unwrap_or(0.0));
                 data.position_entries.insert(pair.clone(), pos.entry_price.to_f64().unwrap_or(0.0));
-                unrealized += pos.unrealized_pnl.to_f64().unwrap_or(0.0);
+                net_unrealized = pos.unrealized_pnl.to_f64().unwrap_or(0.0);
             }
             // 方向仓快照 (D9/hedge): 现货只填 long (= 净仓); 合约按 (pair, side) 各自方向仓。
+            // 逐侧爆仓价/标记价 (032): 回测端由 T002 填充; 实盘端透传交易所逐仓字段。
+            let mut dir_unrealized = 0.0f64;
+            let mut has_dir = false;
             for (side, label) in [(OrderSide::Buy, "long"), (OrderSide::Sell, "short")] {
                 if let Some(p) = ctx.position_directional(&pair, side) {
                     let key = format!("{pair}|{label}");
                     data.directionals.insert(
-                        key,
+                        key.clone(),
                         (p.size.to_f64().unwrap_or(0.0), p.entry_price.to_f64().unwrap_or(0.0)),
                     );
+                    data.directional_liq
+                        .insert(key.clone(), p.liquidation_price.as_ref().and_then(|d| d.to_f64()));
+                    data.directional_mark.insert(key, p.mark_price.to_f64().unwrap_or(0.0));
+                    dir_unrealized += p.unrealized_pnl.to_f64().unwrap_or(0.0);
+                    has_dir = true;
                 }
             }
+            // 未实现盈亏 (审核 M3): directionals 可得 → 逐侧累加 (hedge 两侧独立, 净仓口径会漏计);
+            // 不可得 (DryRun 合约旧路径) → 回退净仓口径。回测两侧 unrealized 恒 0 → 空操作。
+            unrealized += if has_dir { dir_unrealized } else { net_unrealized };
             if let Some(k) = ctx.klines(&pair) {
                 data.klines_map.insert(pair.clone(), k);
             }
@@ -494,8 +529,9 @@ impl LuaStrategy {
         data.net_pnl = ctx.pnl().net_pnl().to_f64().unwrap_or(0.0);
         let cash: f64 = data.balances.values().sum();
         data.equity = if ctx.config().market == "futures" {
-            // 合约: 持仓名义价值 ≠ 权益, 权益 = 钱包现金 + 未实现盈亏。
-            cash + unrealized
+            // 合约: 持仓名义价值 ≠ 权益, 权益 = 现金 + 逐仓钱包 + 未实现盈亏。
+            // (032 复审: 漏加钱包会把开仓锁定保证金当消失权益 → 权益/WARN 虚低。)
+            cash + ctx.wallets_total().to_f64().unwrap_or(0.0) + unrealized
         } else {
             // 现货: 现金 + 持仓市值 (数量 × 现价)。
             let holdings: f64 = data
@@ -678,6 +714,11 @@ impl LuaStrategy {
         };
         t.set("side", side)?;
         t.set("fee", fill.fee.to_f64().unwrap_or(0.0))?;
+        // hedge 方向仓 (032): "long"/"short"; 现货/one-way → nil。
+        t.set("position_side", fill.position_side.clone())?;
+        // 引擎生成的成交归属标识原样透传(如期末强平的 "CLOSE-" 前缀, backtest.rs force_close_all);
+        // 引擎不解释语义, 是否区分由策略自行判断(架构铁律: 引擎不含策略专有逻辑)。
+        t.set("client_order_id", fill.client_order_id.clone())?;
         Ok(t)
     }
 
@@ -1309,6 +1350,72 @@ mod tests {
         // tick3: 两侧都有仓 → 空订单。
         ctx.step_bar(sample_kline());
         assert!(strategy.on_tick(&mut ctx).is_empty());
+    }
+
+    /// 032 T005: Lua 绑定 pos_liq / pos_mark —— 回测读逐仓公式值、无仓 nil、hedge 两侧独立。
+    #[test]
+    fn test_pos_liq_and_pos_mark_bindings() {
+        let script = r#"
+            function on_tick(ctx)
+                if ctx:pos_size("ETH", "long") == 0 then
+                    -- 无仓: pos_liq 必须为 nil
+                    LIQ_NIL = 1
+                    if ctx:pos_liq("ETH", "long") ~= nil then LIQ_NIL = 0 end
+                    if ctx:pos_liq("ETH", "short") ~= nil then LIQ_NIL = 0 end
+                    return { { pair = "ETH", side = "buy", size = 1, order_type = "market",
+                               position_side = "long" } }
+                elseif ctx:pos_size("ETH", "short") == 0 then
+                    LQ = ctx:pos_liq("ETH", "long") or -1
+                    LM = ctx:pos_mark("ETH", "long")
+                    return { { pair = "ETH", side = "sell", size = 1, order_type = "market",
+                               position_side = "short" } }
+                end
+                SQ = ctx:pos_liq("ETH", "short") or -1
+                SM = ctx:pos_mark("ETH", "short")
+                LQ2 = ctx:pos_liq("ETH", "long") or -1
+                return {}
+            end
+        "#;
+        let mut config = test_config(script);
+        config.market = "futures".into();
+        config.position_mode = "hedge".into();
+        config.backtest = Some(crate::config::BacktestToml {
+            leverage: Some(2.0),
+            mmr_pct: Some(0.5),
+            funding_rate_8h: Some(0.0),
+            ..Default::default()
+        });
+        let mut strategy = LuaStrategy::from_source(script, config).expect("编译应通过");
+        let mut ctx = BacktestContext::new(
+            strategy.config.clone(),
+            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
+        );
+
+        // tick1: 无仓 → pos_liq 两侧均 nil。
+        ctx.step_bar(sample_kline());
+        let orders = strategy.on_tick(&mut ctx);
+        assert_eq!(strategy.global_f64("LIQ_NIL"), Some(1.0), "无仓时 pos_liq 应返回 nil");
+        for req in orders {
+            let _ = ctx.place_order(req);
+        }
+        ctx.drain_fills();
+
+        // tick2: long 已开 (entry=3000) → liq = 3000×(1−1/2+0.005) = 1515; mark = 上根 close 3005。
+        ctx.step_bar(sample_kline());
+        let orders = strategy.on_tick(&mut ctx);
+        assert_eq!(strategy.global_f64("LQ"), Some(1515.0), "多头逐仓爆仓价应为公式值");
+        assert_eq!(strategy.global_f64("LM"), Some(3005.0), "mark 应为已收盘 bar close");
+        for req in orders {
+            let _ = ctx.place_order(req);
+        }
+        ctx.drain_fills();
+
+        // tick3: 两侧独立 —— short liq = 3000×(1+1/2−0.005) = 4485, long 仍 1515。
+        ctx.step_bar(sample_kline());
+        assert!(strategy.on_tick(&mut ctx).is_empty());
+        assert_eq!(strategy.global_f64("SQ"), Some(4485.0), "空头逐仓爆仓价应为公式值");
+        assert_eq!(strategy.global_f64("SM"), Some(3005.0));
+        assert_eq!(strategy.global_f64("LQ2"), Some(1515.0), "hedge 两侧爆仓价互不污染");
     }
 
     /// T1 (bs_momentum Lua 化): BacktestContext::new resolve 后把最终撮合参数统一回写

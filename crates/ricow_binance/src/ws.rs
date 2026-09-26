@@ -449,6 +449,7 @@ fn parse_spot_execution(v: &Value) -> Option<UserEvent> {
             fill_size,
             fee,
             timestamp: DateTime::from_timestamp_millis(ts).unwrap_or_default(),
+            position_side: None, // 现货无方向仓概念 (032)
         }))
     } else {
         let avg_price = match (
@@ -515,6 +516,12 @@ fn parse_futures_order_update(v: &Value) -> Option<UserEvent> {
             fill_size,
             fee,
             timestamp: DateTime::from_timestamp_millis(ts).unwrap_or_default(),
+            // hedge 方向仓 (032): fapi `o.ps` = LONG/SHORT/BOTH; BOTH(one-way) → None。
+            position_side: match o.get("ps").and_then(|x| x.as_str()) {
+                Some("LONG") => Some("long".into()),
+                Some("SHORT") => Some("short".into()),
+                _ => None,
+            },
         }))
     } else {
         Some(UserEvent::Order(OrderUpdate {

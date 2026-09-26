@@ -63,8 +63,6 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
         )?;
     }
 
-    let exchange = crate::commands::bn_exchange()?;
-
     // 判定: name 命中已部署 TOML → TOML 加载; 未命中 → 策略类型直跑 (向后兼容)。
     let strategies_dir = crate::commands::ensure_strategies_dir()?;
     let config = if strategies_dir.join(format!("{}.toml", args.strategy)).exists() {
@@ -208,6 +206,15 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                 "启动策略 {} (Dry Run, 前台)。停机方式: stdin 输入 stop / 管道关闭 / Ctrl-C",
                 config.name
             );
+            // Dry Run 行情源按市场分支 (032 FR-008): 合约 = 公共 fapi 客户端 (免凭据,
+            // FuturesClient::new 不要求 key); 现货路径维持原 bn_exchange 不变。
+            let exchange = if config.market.eq_ignore_ascii_case("futures") {
+                Arc::new(
+                    ricow_binance::BnFuturesExchange::new(ricow_binance::FuturesClient::new()?),
+                ) as Arc<dyn ricow_core::Exchange>
+            } else {
+                crate::commands::bn_exchange()?
+            };
             let outcome = Engine::new()
                 .run_dry_run(config, exchange, initial_balance, Some(&db), Some(stop_rx))
                 .await?;

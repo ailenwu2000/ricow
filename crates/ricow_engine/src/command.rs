@@ -1440,6 +1440,7 @@ impl Engine {
         config: StrategyConfig,
         initial_balance: Balance,
         klines: &[Kline],
+        close_at_end: bool,
     ) -> CoreResult<ricow_strategy::BacktestReport> {
         // 杠杆校验 (方案 A): params 池为三层合并最终源 (CLI 写回; engine/AI 路径缺省 1x/上限 10)。
         // 纯 TOML [backtest] 不经 params 池的直调场景由 CLI 侧校验兜底。
@@ -1447,7 +1448,7 @@ impl Engine {
         let maxl = config.get_f64("max_leverage").unwrap_or(10.0);
         ricow_strategy::BacktestParams::validate_leverage(lev, maxl)?;
         let mut strategy = load_strategy(&config)?;
-        Ok(run_backtest(config, initial_balance, klines, strategy.as_mut()))
+        Ok(run_backtest(config, initial_balance, klines, strategy.as_mut(), close_at_end))
     }
 
     /// AI 建策略闭环 (三入口复用): 门禁 → 拉 K 线 → 回测 → 两步确认 preview。
@@ -1502,7 +1503,7 @@ impl Engine {
         // 计价资产: 全项目口径 USDT (bStocks 现货 quote 亦为 USDT, 见 specs/backtest.md §十一) ——
         // 原先硬编码 "USDC" 会让报告打错币种。
         let balance = Balance { asset: "USDT".into(), free: initial_cash, locked: Decimal::ZERO };
-        let report = self.backtest(config.clone(), balance, klines)?;
+        let report = self.backtest(config.clone(), balance, klines, false)?;
 
         let toml_str = config.to_toml().map_err(|e| CoreError::Parse(e.to_string()))?;
         let preview_id = create_preview(db, "strategy", &toml_str).await?;
@@ -1606,6 +1607,7 @@ mod tests {
             fill_size: dec!(2),
             fee: dec!(1.2),
             timestamp: Utc::now(),
+            position_side: None,
         }
     }
 

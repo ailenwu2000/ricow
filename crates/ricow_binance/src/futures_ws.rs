@@ -245,6 +245,12 @@ fn parse_order_trade_update(v: &Value) -> Option<UserEvent> {
             fill_size,
             fee,
             timestamp: DateTime::from_timestamp_millis(ts).unwrap_or_default(),
+            // hedge 方向仓 (032): fapi `o.ps` = LONG/SHORT/BOTH; BOTH(one-way) → None。
+            position_side: match o.get("ps").and_then(|x| x.as_str()) {
+                Some("LONG") => Some("long".into()),
+                Some("SHORT") => Some("short".into()),
+                _ => None,
+            },
         }))
     } else {
         Some(UserEvent::Order(OrderUpdate {

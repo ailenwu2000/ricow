@@ -9,8 +9,10 @@ use ricow_core::{
     OrderBook, OrderFill, OrderRequest, OrderSide, OrderStatus, OrderType, Position,
 };
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use crate::align::{ownership_prefix, prepare_live_order};
+use crate::backtest::isolated_liq_price;
 use crate::config::StrategyConfig;
 use crate::fee::FeeModel;
 use crate::multiframe::{tf_key, TfCache};
@@ -40,6 +42,14 @@ pub trait Context: Send {
     /// 默认实现 = 不支持 (None); BacktestContext 实现方向仓查询, 实盘后续接入。
     fn position_directional(&self, _pair: &str, _side: OrderSide) -> Option<Position> {
         None
+    }
+    /// 逐仓钱包余额合计 (合约; 无钱包概念端恒 0)。
+    ///
+    /// 合约权益口径必须含逐仓钱包: hedge 逐仓模式下开仓保证金从现金划入钱包,
+    /// 漏加钱包会把"锁定保证金"当成消失的权益 → 权益/WARN 虚低 (032 复审)。
+    /// 默认 0 = 该端无钱包概念 (现货/DryRun/Live); BacktestContext 覆写返回钱包合计。
+    fn wallets_total(&self) -> Decimal {
+        Decimal::ZERO
     }
     fn balance(&self, asset: &str) -> Option<Decimal>;
     fn place_order(&mut self, req: OrderRequest) -> CoreResult<OrderAck>;
@@ -125,6 +135,10 @@ pub struct LiveContext {
     tf_cache: RwLock<HashMap<String, Arc<TfCache>>>,
     /// 策略数据需求声明 (need_klines 写入, 引擎装配阶段读取)。
     declarations: Vec<Declaration>,
+    /// 实盘订单号单调计数器 (032): Lua 产出的下单请求 client_order_id 为空, 若原样注入归属前缀,
+    /// 则**同一 tick 批量挂单**(如网格重挂的买+卖两张)会拿到完全相同的 clientOrderId → 交易所拒
+    /// `ClientOrderId is duplicated`。下单前给空 cid 打 `{毫秒}{seq}` 唯一戳, 保证批量内/跨重启都不撞。
+    order_seq: u64,
     rt: tokio::runtime::Handle,
 }
 
@@ -160,6 +174,7 @@ impl LiveContext {
             klines_cache: RwLock::new(HashMap::new()),
             tf_cache: RwLock::new(HashMap::new()),
             declarations: Vec::new(),
+            order_seq: 0,
             rt,
         }
     }
@@ -472,6 +487,14 @@ impl Context for LiveContext {
         }
         let (prefix, base) = parse_pair(&req.pair);
         let (prefix, base) = (prefix.to_string(), base.to_string());
+        // 032: 空订单号打唯一戳 (毫秒 + 单调序号), 避免同 tick 批量挂单撞 clientOrderId。
+        // 归属前缀稍后由 prepare_live_order 注入, 故此处只保证"批量内互不相同"。
+        let mut req = req;
+        if req.client_order_id.is_empty() {
+            self.order_seq = self.order_seq.wrapping_add(1);
+            req.client_order_id =
+                format!("{}{}", chrono::Utc::now().timestamp_millis(), self.order_seq);
+        }
         // 拒单 ack 模板 (对齐失败时返回, 与风控拒单同形: 策略循环不中断)
         let rejected_ack = OrderAck {
             exchange_order_id: String::new(),
@@ -675,6 +698,15 @@ pub struct DryRunContext {
     orderbook_cache: RwLock<HashMap<String, OrderBook>>,
     virtual_positions: RwLock<HashMap<String, Position>>,
     virtual_balance: RwLock<HashMap<String, Balance>>,
+    /// 合约逐侧保证金钱包 (032 DryRun hedge): 键 = 方向仓键 (`{pair}|{side_tag}`), 值 = 冻结名义/杠杆。
+    /// 现货/one-way 不用 (净仓模型)。开仓冻结、平仓回笼、两侧全平转回现金。
+    wallets: HashMap<String, Decimal>,
+    /// 已 WARN 过爆仓价穿越的方向仓键 (防 update_orderbook 每次刷盘口都刷屏)。
+    liq_warned: std::collections::HashSet<String>,
+    /// 合约杠杆 (DryRun 显示/保证金口径; 来自 config.backtest.leverage → params.leverage → 1.0)。
+    leverage: Decimal,
+    /// 维持保证金率 (比率; 来自 params.mmr_pct/100, 装配层注入 tier1 查表值, 审核 M5)。
+    mmr: Decimal,
     klines_cache: RwLock<HashMap<String, Vec<Kline>>>,
     /// 高周期序列缓存: 键 = `pair|tf`。由 `set_tf_klines` 预装(装配层已剔除不完整桶);
     /// 策略通过 `tf_klines(pair, tf)` 按声明读取, 可见前缀受当前时刻裁剪(无前视)。
@@ -705,17 +737,46 @@ impl DryRunContext {
         let quote_asset = initial_balance.asset.clone();
         let mut balance_map = HashMap::new();
         balance_map.insert(initial_balance.asset.clone(), initial_balance);
+        let is_futures = config.market.eq_ignore_ascii_case("futures");
+        // 合约参数 (032): 杠杆 = params.leverage (装配层由 [backtest].leverage 回写, 缺省 1.0);
+        // MMR = params.mmr_pct/100 (装配层注入 tier1 查表值, 与回测同源, 审核 M5; 缺省 1.0% 保守)。
+        let leverage = config
+            .get_f64("leverage")
+            .and_then(Decimal::from_f64_retain)
+            .filter(|d| *d >= Decimal::ONE)
+            .unwrap_or(Decimal::ONE);
+        let mmr = config
+            .get_f64("mmr_pct")
+            .and_then(Decimal::from_f64_retain)
+            .map(|d| d / dec!(100))
+            .filter(|d| *d > Decimal::ZERO)
+            .unwrap_or(dec!(0.01));
+        // 合约费率 (USDT-M 默认 maker 2 / taker 5 bps; params 可覆盖)。
+        let fee_model = if is_futures {
+            let maker = config.get_f64("fee_maker_bps").unwrap_or(2.0);
+            let taker = config.get_f64("fee_taker_bps").unwrap_or(5.0);
+            FeeModel::new(
+                Decimal::from_f64_retain(maker).unwrap_or(dec!(2)),
+                Decimal::from_f64_retain(taker).unwrap_or(dec!(5)),
+            )
+        } else {
+            FeeModel::default()
+        };
         Self {
             exchanges,
             default_exchange: default_exchange.into(),
             guard: RefCell::new(OrderGuard::new()),
             config,
             pnl: PnlTracker::default(),
-            fee_model: FeeModel::default(),
+            fee_model,
             quote_asset,
             orderbook_cache: RwLock::new(HashMap::new()),
             virtual_positions: RwLock::new(HashMap::new()),
             virtual_balance: RwLock::new(balance_map),
+            wallets: HashMap::new(),
+            liq_warned: std::collections::HashSet::new(),
+            leverage,
+            mmr,
             klines_cache: RwLock::new(HashMap::new()),
             tf_cache: RwLock::new(HashMap::new()),
             declarations: Vec::new(),
@@ -756,6 +817,25 @@ impl DryRunContext {
         self.exchanges.get(key).cloned().ok_or_else(|| {
             CoreError::InvalidArgument(format!("exchange prefix '{key}' not configured"))
         })
+    }
+
+    /// 是否合约市场 (032 DryRun hedge)。
+    fn is_futures(&self) -> bool {
+        self.config.market.eq_ignore_ascii_case("futures")
+    }
+
+    /// 是否双向持仓模式 (hedge)。one-way 保持裸键 (单净仓, 与旧行为一致)。
+    fn is_hedge(&self) -> bool {
+        self.is_futures() && self.config.position_mode.eq_ignore_ascii_case("hedge")
+    }
+
+    /// 方向仓键 (hedge): `{pair}|{side_tag}`; 现货/one-way = 裸 pair 键。
+    fn pos_key(&self, pair: &str, side: OrderSide) -> String {
+        if self.is_hedge() {
+            format!("{}|{}", self.resolve_key(pair), side_tag(side))
+        } else {
+            self.resolve_key(pair)
+        }
     }
 
     /// 从交易所拉取历史 K 线。
@@ -818,7 +898,24 @@ impl DryRunContext {
     }
 
     /// reduce_only 订单的有效数量 (仅减少反向持仓)。
+    /// hedge (032): 按 `position_side` 指定的**该侧**封顶 (平多只减多仓); 无定向回落净仓语义。
     fn reduce_only_size(&self, req: &OrderRequest) -> Option<Decimal> {
+        if self.is_hedge() {
+            let target = match req.position_side.as_deref() {
+                Some("long") => Some(OrderSide::Buy),
+                Some("short") => Some(OrderSide::Sell),
+                // 无定向 reduce_only: 平反向侧 (buy 单平空 / sell 单平多)。
+                _ => Some(match req.side {
+                    OrderSide::Buy => OrderSide::Sell,
+                    OrderSide::Sell => OrderSide::Buy,
+                }),
+            };
+            let avail = self.side_size(&req.pair, target?);
+            if avail <= Decimal::ZERO {
+                return None;
+            }
+            return Some(req.size.min(avail));
+        }
         let pos = self.position(&req.pair)?;
         if pos.side == req.side || pos.size <= Decimal::ZERO {
             return None;
@@ -850,11 +947,16 @@ impl DryRunContext {
 
     /// 执行成交: 更新虚拟持仓 + 余额, 记录 fill 到 PnL。
     fn execute_fill(&mut self, order_id: &str, req: &OrderRequest, fill_price: Decimal) {
-        self.apply_position_change(req, fill_price);
-        self.apply_virtual_balance_change(req, fill_price);
-
         let is_maker = matches!(req.order_type, OrderType::Limit);
         let fee = self.fee_model.calc_fee(fill_price, req.size, is_maker);
+        if self.is_hedge() {
+            // 合约 hedge (032): quote 保证金 + 按侧仓, 与回测 K3 钱包模型同构。
+            self.apply_hedge_fill(req, fill_price, fee);
+        } else {
+            self.apply_position_change(req, fill_price);
+            self.apply_virtual_balance_change(req, fill_price);
+        }
+
         let fill = OrderFill {
             trade_id: Some(uuid::Uuid::new_v4().to_string()),
             exchange_order_id: order_id.to_string(),
@@ -865,6 +967,8 @@ impl DryRunContext {
             fill_size: req.size,
             fee,
             timestamp: chrono::Utc::now(),
+            // hedge: 透传请求方向仓 (on_fill 路由依据); 现货/one-way 为 None (032)。
+            position_side: req.position_side.clone(),
         };
         self.pnl.record_fill(&fill);
         self.fill_queue.push(fill);
@@ -938,6 +1042,217 @@ impl DryRunContext {
             }
         }
     }
+
+    // ============================ 032: DryRun 合约 hedge ============================
+
+    /// 单方向仓数量 (hedge 按侧键; 无仓 = 0)。
+    fn side_size(&self, pair: &str, side: OrderSide) -> Decimal {
+        let key = self.pos_key(pair, side);
+        self.virtual_positions
+            .read()
+            .ok()
+            .and_then(|c| c.get(&key).map(|p| p.size))
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    /// 成交效果拆分 (与回测 fill_effect 同语义): (平仓方向, 开仓方向)。
+    /// position_side=long/short 显式定向; 无定向 = one-way 净仓语义 (先平反向再开同向)。
+    fn hedge_effect(&self, req: &OrderRequest) -> (Option<OrderSide>, Option<OrderSide>) {
+        match (req.position_side.as_deref(), req.side) {
+            (Some("long"), OrderSide::Buy) => (None, Some(OrderSide::Buy)),
+            (Some("long"), OrderSide::Sell) => (Some(OrderSide::Buy), None),
+            (Some("short"), OrderSide::Sell) => (None, Some(OrderSide::Sell)),
+            (Some("short"), OrderSide::Buy) => (Some(OrderSide::Sell), None),
+            (_, OrderSide::Buy) => (Some(OrderSide::Sell), Some(OrderSide::Buy)),
+            (_, OrderSide::Sell) => (Some(OrderSide::Buy), Some(OrderSide::Sell)),
+        }
+    }
+
+    /// 刷新某方向仓的 unrealized (mark 口径) 与爆仓价穿越告警。
+    /// 自由函数: 只借用 `warned` 字段, 与 `virtual_positions` 写锁不冲突 (032)。
+    fn refresh_side_mark(
+        key: &str,
+        p: &mut Position,
+        warned: &mut std::collections::HashSet<String>,
+    ) {
+        p.unrealized_pnl = match p.side {
+            OrderSide::Buy => (p.mark_price - p.entry_price) * p.size,
+            OrderSide::Sell => (p.entry_price - p.mark_price) * p.size,
+        };
+        // 穿越爆仓价 (显示口径): 只 WARN 不平仓 (DryRun 不模拟强平, spec 范围外)。
+        if let Some(liq) = p.liquidation_price {
+            let crossed = match p.side {
+                OrderSide::Buy => p.mark_price <= liq,
+                OrderSide::Sell => p.mark_price >= liq,
+            };
+            if crossed && warned.insert(key.to_string()) {
+                tracing::warn!(
+                    target: "strategy.dryrun",
+                    position = %key,
+                    mark = %p.mark_price,
+                    liq = %liq,
+                    "标记价穿越爆仓价 (DryRun 不模拟强平, 仅告警)"
+                );
+            } else if !crossed {
+                warned.remove(key);
+            }
+        }
+    }
+
+    /// hedge 成交记账 (032): quote 保证金 + 按侧独立仓, 与回测 K3 钱包模型同构 (无 LIFO 批次, 加权均价)。
+    fn apply_hedge_fill(&mut self, req: &OrderRequest, fill_price: Decimal, fee: Decimal) {
+        let (close_side, open_side) = self.hedge_effect(req);
+        let total_notional = req.size * fill_price;
+        let mut remain = req.size;
+        let mut close_fee = Decimal::ZERO;
+        if let Some(cs) = close_side {
+            let avail = self.side_size(&req.pair, cs);
+            let sz = remain.min(avail);
+            if sz > Decimal::ZERO {
+                remain -= sz;
+                close_fee = fee * (sz * fill_price) / total_notional;
+                self.hedge_close(&req.pair, cs, sz, fill_price, close_fee);
+            }
+        }
+        if !req.reduce_only {
+            if let Some(os) = open_side {
+                if remain > Decimal::ZERO {
+                    let open_fee = fee - close_fee;
+                    self.hedge_open(&req.pair, os, remain, fill_price, open_fee);
+                }
+            }
+        }
+        // locked 汇总 = Σ wallets (balance(quote) 口径: free=可用现金, locked=冻结保证金)。
+        let total_wallet: Decimal = self.wallets.values().sum();
+        let quote = self.quote_asset.clone();
+        if let Ok(mut bal) = self.virtual_balance.write() {
+            if let Some(q) = bal.get_mut(&quote) {
+                q.locked = total_wallet;
+            }
+        }
+    }
+
+    /// hedge 开/加仓: 现金划入该侧钱包 (M = 名义/杠杆), 加权均价, 公式爆仓价。
+    fn hedge_open(
+        &mut self,
+        pair: &str,
+        side: OrderSide,
+        size: Decimal,
+        fill_price: Decimal,
+        fee: Decimal,
+    ) {
+        let margin = size * fill_price / self.leverage;
+        let quote = self.quote_asset.clone();
+        let sufficient =
+            self.virtual_balance.read().ok().and_then(|b| b.get(&quote).map(|q| q.free >= margin))
+                == Some(true);
+        if !sufficient {
+            tracing::warn!(
+                target: "strategy.dryrun",
+                pair = %pair, "保证金不足 (free < 名义/杠杆), 开仓跳过 (DryRun 资金校验)"
+            );
+            return;
+        }
+        {
+            let Ok(mut bal) = self.virtual_balance.write() else { return };
+            if let Some(q) = bal.get_mut(&quote) {
+                q.free -= margin;
+            }
+        }
+        let key = self.pos_key(pair, side);
+        let wallet = self.wallets.entry(key.clone()).or_insert(Decimal::ZERO);
+        *wallet += margin - fee;
+        let lev = self.leverage;
+        let mmr = self.mmr;
+        let mut guard = self.virtual_positions.write().ok();
+        if let Some(cache) = guard.as_mut() {
+            let e = cache.entry(key.clone()).or_insert_with(|| Position {
+                pair: pair.to_string(),
+                side,
+                size: Decimal::ZERO,
+                entry_price: Decimal::ZERO,
+                mark_price: fill_price,
+                liquidation_price: None,
+                unrealized_pnl: Decimal::ZERO,
+                leverage: Some(lev),
+            });
+            let old_notional = e.entry_price * e.size;
+            e.size += size;
+            e.entry_price = (old_notional + fill_price * size) / e.size;
+            e.mark_price = fill_price;
+            e.liquidation_price = isolated_liq_price(e.entry_price, side, lev, mmr);
+            Self::refresh_side_mark(&key, e, &mut self.liq_warned);
+        }
+    }
+
+    /// hedge 平仓: 已实现盈亏与平仓费走该侧钱包; 归零删键; 两侧全平 → 钱包转回现金。
+    fn hedge_close(
+        &mut self,
+        pair: &str,
+        side: OrderSide,
+        size: Decimal,
+        fill_price: Decimal,
+        fee: Decimal,
+    ) {
+        let key = self.pos_key(pair, side);
+        let realized = {
+            let Ok(cache) = self.virtual_positions.read() else { return };
+            match cache.get(&key) {
+                Some(p) => {
+                    let sz = size.min(p.size);
+                    match p.side {
+                        OrderSide::Buy => (fill_price - p.entry_price) * sz,
+                        OrderSide::Sell => (p.entry_price - fill_price) * sz,
+                    }
+                }
+                None => Decimal::ZERO,
+            }
+        };
+        if realized != Decimal::ZERO {
+            self.pnl.record_pnl(realized);
+        }
+        let wallet = self.wallets.entry(key.clone()).or_insert(Decimal::ZERO);
+        *wallet += realized - fee;
+        let lev = self.leverage;
+        let mmr = self.mmr;
+        let mut sweep_sides: Vec<OrderSide> = Vec::new();
+        {
+            let Ok(mut cache) = self.virtual_positions.write() else { return };
+            if let Some(p) = cache.get_mut(&key) {
+                p.size = (p.size - size).max(Decimal::ZERO);
+                p.mark_price = fill_price;
+                if p.size <= Decimal::ZERO {
+                    p.entry_price = Decimal::ZERO;
+                    p.unrealized_pnl = Decimal::ZERO;
+                    p.liquidation_price = None;
+                    cache.remove(&key);
+                    self.liq_warned.remove(&key);
+                    sweep_sides = vec![OrderSide::Buy, OrderSide::Sell];
+                } else {
+                    p.liquidation_price = isolated_liq_price(p.entry_price, side, lev, mmr);
+                    Self::refresh_side_mark(&key, p, &mut self.liq_warned);
+                }
+            }
+        }
+        // 该对两侧全平 → 各侧钱包余额转回现金 (K3 同构)。
+        if !sweep_sides.is_empty() {
+            let flat = self.side_size(pair, OrderSide::Buy).is_zero()
+                && self.side_size(pair, OrderSide::Sell).is_zero();
+            if flat {
+                let quote = self.quote_asset.clone();
+                for s in [OrderSide::Buy, OrderSide::Sell] {
+                    let k = self.pos_key(pair, s);
+                    if let Some(w) = self.wallets.remove(&k) {
+                        if let Ok(mut bal) = self.virtual_balance.write() {
+                            if let Some(q) = bal.get_mut(&quote) {
+                                q.free += w;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Context for DryRunContext {
@@ -952,8 +1267,26 @@ impl Context for DryRunContext {
     }
 
     fn position(&self, pair: &str) -> Option<Position> {
-        let key = self.resolve_key(pair);
-        self.virtual_positions.read().ok()?.get(&key).cloned()
+        // hedge (032): 两侧独立键 → 合并净仓 (net 0 → None); 现货/one-way = 裸键单仓。
+        let base = self.resolve_key(pair);
+        let cache = self.virtual_positions.read().ok()?;
+        if self.is_hedge() {
+            let long = cache.get(&format!("{base}|buy")).cloned();
+            let short = cache.get(&format!("{base}|sell")).cloned();
+            return net_position(long, short);
+        }
+        cache.get(&base).cloned()
+    }
+
+    fn position_directional(&self, pair: &str, side: OrderSide) -> Option<Position> {
+        // hedge: 按侧键返回该方向仓 (size>0); 现货/one-way 回落裸键 (仅 Buy = 净仓)。
+        let key = self.pos_key(pair, side);
+        let p = self.virtual_positions.read().ok()?.get(&key).cloned()?;
+        if p.size > Decimal::ZERO {
+            Some(p)
+        } else {
+            None
+        }
     }
 
     fn balance(&self, asset: &str) -> Option<Decimal> {
@@ -966,6 +1299,27 @@ impl Context for DryRunContext {
             cache.insert(key, ob);
         }
         self.match_pending(pair);
+        // 合约 (032): 盘口更新 → 刷该对方向仓 mark/unrealized + 穿越告警 (DryRun 无 bar 收盘)。
+        if self.is_futures() {
+            if let Some(px) = self.price(pair) {
+                let base = self.resolve_key(pair);
+                let sides: Vec<String> = if self.is_hedge() {
+                    vec![format!("{base}|buy"), format!("{base}|sell")]
+                } else {
+                    vec![base]
+                };
+                if let Ok(mut cache) = self.virtual_positions.write() {
+                    for k in sides {
+                        if let Some(p) = cache.get_mut(&k) {
+                            if p.size > Decimal::ZERO {
+                                p.mark_price = px;
+                                Self::refresh_side_mark(&k, p, &mut self.liq_warned);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn record_fill(&mut self, fill: &OrderFill) {
@@ -1446,5 +1800,186 @@ mod tests {
             assert_eq!(p.side, OrderSide::Buy);
             assert_eq!(p.size, dec!(0.27));
         }
+    }
+
+    // ==================== 032 T009: DryRun 合约 hedge ====================
+
+    use crate::config::ConfigValue;
+    use ricow_core::{OrderBookUpdate, OrderInfo, UserEvent};
+
+    /// 最小 mock 交易所 (DryRun 虚拟撮合不触网): 仅满足 trait, 交易方法一律报错。
+    struct NoopExchange;
+
+    #[async_trait::async_trait]
+    impl Exchange for NoopExchange {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        async fn get_markets(&self) -> CoreResult<Vec<Market>> {
+            Err(CoreError::InvalidArgument("noop".into()))
+        }
+        async fn get_klines(&self, _: &str, _: &str, _: u32) -> CoreResult<Vec<Kline>> {
+            Err(CoreError::InvalidArgument("noop".into()))
+        }
+        async fn get_orderbook(&self, _: &str, _: u32) -> CoreResult<OrderBook> {
+            Err(CoreError::InvalidArgument("noop".into()))
+        }
+        async fn place_order(&self, _: OrderRequest) -> CoreResult<OrderAck> {
+            Err(CoreError::InvalidArgument("noop".into()))
+        }
+        async fn cancel_order(&self, _: &str, _: &str) -> CoreResult<()> {
+            Err(CoreError::InvalidArgument("noop".into()))
+        }
+        async fn get_open_orders(&self, _: &str) -> CoreResult<Vec<OrderInfo>> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self, _: &str) -> CoreResult<Balance> {
+            Err(CoreError::InvalidArgument("noop".into()))
+        }
+        async fn get_position(&self, _: &str) -> CoreResult<Option<Position>> {
+            Ok(None)
+        }
+        async fn subscribe_orderbook(
+            &self,
+            _: &str,
+        ) -> CoreResult<std::pin::Pin<Box<dyn futures::Stream<Item = OrderBookUpdate> + Send>>>
+        {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        async fn subscribe_user_events(
+            &self,
+        ) -> CoreResult<std::pin::Pin<Box<dyn futures::Stream<Item = UserEvent> + Send>>> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn ob(bid: Decimal, ask: Decimal) -> OrderBook {
+        OrderBook::new_sorted(
+            vec![ricow_core::PriceLevel { price: bid, size: dec!(10) }],
+            vec![ricow_core::PriceLevel { price: ask, size: dec!(10) }],
+        )
+    }
+
+    fn dryrun_cfg(market: &str, mode: &str) -> StrategyConfig {
+        StrategyConfig {
+            name: "t".into(),
+            strategy_type: "lua".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params: HashMap::new(),
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: market.into(),
+            position_mode: mode.into(),
+            backtest: None,
+        }
+    }
+
+    fn dryrun_futures() -> DryRunContext {
+        let mut cfg = dryrun_cfg("futures", "hedge");
+        cfg.params.insert("leverage".into(), ConfigValue::Float(2.0));
+        cfg.params.insert("mmr_pct".into(), ConfigValue::Float(0.5));
+        DryRunContext::new(
+            Arc::new(NoopExchange),
+            cfg,
+            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
+        )
+    }
+
+    /// 开双仓并存: 按侧独立仓 + 公式爆仓价 + quote 保证金冻结 (free−=名义/杠杆, locked=Σ钱包)。
+    #[test]
+    fn test_dryrun_futures_hedge_open_both_sides() {
+        let mut ctx = dryrun_futures();
+        ctx.update_orderbook("ETHUSDT", ob(dec!(3000), dec!(3001)));
+
+        let mut buy = OrderRequest::new_market("ETHUSDT", OrderSide::Buy, dec!(1));
+        buy.position_side = Some("long".into());
+        assert_eq!(ctx.place_order(buy).unwrap().status, OrderStatus::Filled);
+        let mut sell = OrderRequest::new_market("ETHUSDT", OrderSide::Sell, dec!(1));
+        sell.position_side = Some("short".into());
+        assert_eq!(ctx.place_order(sell).unwrap().status, OrderStatus::Filled);
+
+        // 两侧独立可见。
+        let long = ctx.position_directional("ETHUSDT", OrderSide::Buy).expect("多头仓");
+        let short = ctx.position_directional("ETHUSDT", OrderSide::Sell).expect("空头仓");
+        assert_eq!(long.size, dec!(1));
+        assert_eq!(long.entry_price, dec!(3001), "市价买按 ask 成交");
+        assert_eq!(long.liquidation_price, Some(dec!(1515.505)), "3001×(1−1/2+0.005)");
+        assert_eq!(short.size, dec!(1));
+        assert_eq!(short.entry_price, dec!(3000));
+        assert_eq!(short.liquidation_price, Some(dec!(4485)), "3000×(1+1/2−0.005)");
+
+        // 净仓 = 0 → None; 保证金: free = 100000 − (3001+3000)/2; locked = Σ钱包 (扣 taker 5bps)。
+        assert!(ctx.position("ETHUSDT").is_none(), "hedge 等量对冲 → 净仓 None");
+        let bal = ctx.virtual_balance("USDT").expect("USDT 余额");
+        assert_eq!(bal.free, dec!(96999.5));
+        assert_eq!(bal.locked, dec!(2997.4995), "钱包 = Σ(名义/2 − 开仓费)");
+    }
+
+    /// reduce_only 按侧封顶: 平空单只减空仓, 多仓不动。
+    #[test]
+    fn test_dryrun_futures_hedge_reduce_only_per_side() {
+        let mut ctx = dryrun_futures();
+        ctx.update_orderbook("ETHUSDT", ob(dec!(3000), dec!(3001)));
+        let mut buy = OrderRequest::new_market("ETHUSDT", OrderSide::Buy, dec!(1));
+        buy.position_side = Some("long".into());
+        let _ = ctx.place_order(buy);
+        let mut sell = OrderRequest::new_market("ETHUSDT", OrderSide::Sell, dec!(1));
+        sell.position_side = Some("short".into());
+        let _ = ctx.place_order(sell);
+
+        // reduce_only 买 2 定向平空 → 封顶 1 (空仓只有 1), 多仓不动。
+        let mut close_short = OrderRequest::new_market("ETHUSDT", OrderSide::Buy, dec!(2));
+        close_short.position_side = Some("short".into());
+        close_short.reduce_only = true;
+        let ack = ctx.place_order(close_short).unwrap();
+        assert_eq!(ack.status, OrderStatus::Filled);
+        assert_eq!(ack.size, dec!(1), "按侧封顶");
+        assert!(ctx.position_directional("ETHUSDT", OrderSide::Sell).is_none(), "空仓已平");
+        assert_eq!(ctx.position_directional("ETHUSDT", OrderSide::Buy).unwrap().size, dec!(1));
+    }
+
+    /// 穿越爆仓价: 只 WARN 不平仓 (DryRun 不模拟强平), 标记价按盘口刷新。
+    #[test]
+    fn test_dryrun_futures_hedge_liq_cross_warns_only() {
+        let mut ctx = dryrun_futures();
+        ctx.update_orderbook("ETHUSDT", ob(dec!(3000), dec!(3001)));
+        let mut buy = OrderRequest::new_market("ETHUSDT", OrderSide::Buy, dec!(1));
+        buy.position_side = Some("long".into());
+        let _ = ctx.place_order(buy);
+
+        // 价格砸穿爆仓价 1515.505 → 只告警, 仓位保留。
+        ctx.update_orderbook("ETHUSDT", ob(dec!(1500), dec!(1501)));
+        let long = ctx.position_directional("ETHUSDT", OrderSide::Buy).expect("不强制平仓");
+        assert_eq!(long.size, dec!(1));
+        assert_eq!(long.mark_price, dec!(1500.5), "mark = 盘口中价");
+        assert_eq!(long.unrealized_pnl, dec!(-1500.5));
+        let key = ctx.pos_key("ETHUSDT", OrderSide::Buy);
+        assert!(ctx.liq_warned.contains(&key), "穿越应记入告警集");
+    }
+
+    /// 现货路径回归: 裸键净仓模型不变 (032 不影响现货)。
+    #[test]
+    fn test_dryrun_spot_path_unchanged() {
+        let mut cfg = dryrun_cfg("spot", "one-way");
+        cfg.params.insert("pair".into(), ConfigValue::String("ETHUSDT".into()));
+        let mut ctx = DryRunContext::new(
+            Arc::new(NoopExchange),
+            cfg,
+            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
+        );
+        ctx.update_orderbook("ETHUSDT", ob(dec!(3000), dec!(3001)));
+        let ack =
+            ctx.place_order(OrderRequest::new_market("ETHUSDT", OrderSide::Buy, dec!(1))).unwrap();
+        assert_eq!(ack.status, OrderStatus::Filled);
+        let p = ctx.position("ETHUSDT").expect("现货净仓");
+        assert_eq!(p.size, dec!(1));
+        assert_eq!(p.liquidation_price, None, "现货无爆仓价");
+        assert_eq!(
+            ctx.virtual_balance("ETHUSDT").unwrap().free,
+            dec!(1),
+            "base 资产键 = 完整 pair (parse_pair 仅拆 ':')"
+        );
+        assert_eq!(ctx.virtual_balance("USDT").unwrap().free, dec!(96999), "100000−3001");
     }
 }

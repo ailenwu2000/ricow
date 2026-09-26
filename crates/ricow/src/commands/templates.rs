@@ -1,14 +1,9 @@
 //! 策略模板目录 (019 G8 → 031 薄封装到 `crate::strategies::catalog`)。
 //!
 //! 031 起,"内置模板"与"用户自写策略"已统一由 [`crate::strategies::catalog`] 管理;
-//! 本模块保留 `code_of` / `find` / `list_text` / `render_read` 接口与文案生成, 数据来自 catalog。
+//! 本模块保留 `find` / `list_text` / `render_read` 接口与文案生成, 数据来自 catalog。
 
 use crate::strategies::catalog::{self, CatalogEntry};
-
-/// 策略 id → Lua 原文(供 `resolve_builtin_script` 把内置名 Lua 化)。
-pub(crate) fn code_of(name: &str) -> Option<String> {
-    catalog::find(name).map(|e| e.code)
-}
 
 /// 按 id 查策略。
 pub fn find(name: &str) -> Option<CatalogEntry> {
@@ -74,12 +69,11 @@ mod tests {
     }
 
     #[test]
-    fn find_and_code_of_work() {
+    fn find_works() {
         assert!(find("shannon_spot_grid").is_some());
         assert!(find("paired_grid").is_some());
         assert!(find("no-such-template").is_none());
-        assert!(code_of("shannon_spot_grid").is_some_and(|c| c.contains("on_tick")));
-        assert!(code_of("no-such-template").is_none());
+        assert!(find("shannon_spot_grid").is_some_and(|e| e.code.contains("on_tick")));
     }
 
     #[test]

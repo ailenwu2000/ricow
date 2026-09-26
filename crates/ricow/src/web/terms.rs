@@ -18,6 +18,31 @@ pub struct Term {
 /// 回测报告指标名(顺序即报告里的出现顺序), 与 `format_backtest_report` 一一对应。
 pub const REPORT_TERMS: &[Term] = &[
     Term {
+        key: "区间",
+        zh: "回测覆盖的时间范围(起止时刻为 UTC), 以及使用的 K 线周期与根数。",
+        en: "The time span covered by the backtest (start/end in UTC), with the candle interval and count.",
+    },
+    Term {
+        key: "投入资金",
+        zh: "回测开始时给策略的初始资金(计价币, 通常是 USDT)。",
+        en: "The starting capital given to the strategy at the beginning of the backtest (quote currency, usually USDT).",
+    },
+    Term {
+        key: "首次成交",
+        zh: "回测窗口内第一笔成交的时间、方向、数量与价格; 之前策略一直空仓。",
+        en: "The first fill in the window: time, side, size and price; before it the strategy held nothing.",
+    },
+    Term {
+        key: "标的价格",
+        zh: "标的首根 K 线开盘价 → 期末收盘价, 以及整体涨跌幅; 与策略收益对照着看。",
+        en: "The instrument's first-open to final-close price with its overall change; compare with the strategy's return.",
+    },
+    Term {
+        key: "期末持仓",
+        zh: "回测结束时还持有的仓位: 方向、数量、均价、市值与浮动盈亏; 无持仓会说明原因(强平落袋/自然平完/未成交)。",
+        en: "Position still held at the end: direction, size, average price, market value and unrealized P&L; if flat, the reason is stated (closed at end / naturally flat / never filled).",
+    },
+    Term {
         key: "K 线数",
         zh: "本次回测一共走过多少根 K 线(每根代表一个时间周期, 如 1 小时)。",
         en: "How many candles the backtest walked through; one candle is one time interval, e.g. 1 hour.",
@@ -113,6 +138,26 @@ pub const REPORT_TERMS: &[Term] = &[
         en: "Average profit per winning trade / average loss per losing trade, in quote currency.",
     },
     Term {
+        key: "盈利/亏损笔数",
+        zh: "已平仓交易中赚钱和亏钱的笔数; 与胜率同一口径。",
+        en: "How many closed trades made money vs lost money; same basis as the win rate.",
+    },
+    Term {
+        key: "最佳/最差单笔",
+        zh: "单笔已平仓交易的最好与最差盈亏; 看收益是否靠个别几笔撑起来。",
+        en: "The best and worst single closed-trade P&L; shows whether returns hinge on a few trades.",
+    },
+    Term {
+        key: "总成交额",
+        zh: "回测期间单向累计的成交金额(买入与卖出各自累计), 手续费按它计算。",
+        en: "Cumulative one-way turnover during the backtest (buys and sells counted separately); fees are charged on it.",
+    },
+    Term {
+        key: "单笔均名义",
+        zh: "总成交额 ÷ 成交笔数, 反映平均每笔订单下多大。",
+        en: "Turnover ÷ number of fills; how big each order is on average.",
+    },
+    Term {
         key: "标的涨跌",
         zh: "标的自身从首根开盘价到期末价的涨跌幅; 用来对照策略有没有跑赢单纯持有。",
         en: "The instrument's own move from the first open to the final price; compare with it to see whether the strategy beat buy and hold.",
@@ -180,6 +225,7 @@ pub fn all() -> Vec<&'static Term> {
 mod tests {
     use super::*;
     use crate::commands::format_backtest_report;
+    use chrono::TimeZone;
     use ricow_strategy::{BacktestReport, HedgeSides};
     use rust_decimal::Decimal;
 
@@ -218,6 +264,17 @@ mod tests {
             avg_loss: Some(5.0),
             ..Default::default()
         };
+        // 回测规范 v1 概览/成交统计字段: 全给非零值, 保证新标签真的被打印(SC-009 反向核对)。
+        // 区间 24h / 24 根 → 周期推导恰为 1h。
+        let st = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        report.start_time = Some(st);
+        report.end_time = Some(chrono::Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap());
+        report.first_open_price = Some(Decimal::from(98));
+        report.first_entry =
+            Some((st, ricow_core::OrderSide::Buy, Decimal::from(1), Decimal::from(99)));
+        report.best_trade = Some(Decimal::from(10));
+        report.worst_trade = Some(Decimal::from(-5));
+        report.total_turnover = Decimal::from(300);
         if is_futures {
             report.funding_net = Some(Decimal::from(3));
             report.liquidation_count = Some(1);
@@ -231,7 +288,13 @@ mod tests {
     }
 
     fn printed_report(is_futures: bool) -> String {
-        format_backtest_report(&sample(is_futures), "回测报告", Decimal::from(10_000), is_futures)
+        format_backtest_report(
+            &sample(is_futures),
+            "回测报告",
+            Decimal::from(10_000),
+            is_futures,
+            &[],
+        )
     }
 
     /// 抠出报告正文里的指标名: 只认 `指标名: 值` 这种正文行 —— 表头无冒号、段标题以 `---` 开头,
