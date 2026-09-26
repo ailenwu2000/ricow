@@ -1,6 +1,7 @@
 //! 内置脚本 Lua 集成测试 (回测冒烟, 不依赖网络)。
 //!
-//! 脚本源: `strategies/spot/`(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格),
+//! 脚本源: `strategies/spot/`(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格 +
+//! uniswap_v2_grid 现货 Uniswap V2 网格),
 //! include_str! 编译期嵌入。
 //! 断言每个内置脚本的关键行为 (建仓/激活/配对/挂单), 对齐 Rust 版已知向量。
 
@@ -700,4 +701,310 @@ fn test_paired_grid_futures_long_matches_spot_fill_by_fill() {
         let rel = (sf.2 - ff.2).abs() / sf.2.max(1e-12);
         assert!(rel < 1e-8, "第 {i} 笔成交数量不一致: spot={sf:?} fut={ff:?}");
     }
+}
+
+// ============================================================================
+// 033 现货 Uniswap V2 网格 (uniswap_v2_grid) 集成测试
+// ============================================================================
+
+const UNISWAP_V2_GRID: &str = include_str!("../../../strategies/spot/uniswap_v2_grid.lua");
+
+fn univ2_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![
+        ("pair", ConfigValue::String("ETHUSDT".into())),
+        ("atr_interval", ConfigValue::String("1h".into())),
+        ("atr_period", ConfigValue::Integer(14)),
+        ("atr_mult", ConfigValue::Float(1.0)),
+        ("min_notional", ConfigValue::Float(5.0)),
+        ("fee_side", ConfigValue::Float(0.001)),
+        ("invest_cash", ConfigValue::Float(10000.0)),
+    ];
+    params.extend_from_slice(extra);
+    config(UNISWAP_V2_GRID, &params)
+}
+
+/// 033: 主序列 —— h<at 为 base, 之后为 then(触发 start_price 激活门槛), 每根带 ±1 振幅
+/// (振幅只为让重采样后的 1h ATR 非零, 平段 ATR=0 会被"ATR 未就绪"拦下)。
+fn univ2_main(n: i64, base: i64, then: i64, at: i64) -> Vec<Kline> {
+    (0..n)
+        .map(|h| {
+            let p = if h < at { base } else { then };
+            bar_at_hour(h, p, p + 1, p - 1, p)
+        })
+        .collect()
+}
+
+/// 033: 把第 `idx` 根替换为自定义 OHLC(制造一次穿越成交)。
+fn with_bar(mut bars: Vec<Kline>, idx: i64, o: i64, h: i64, l: i64, c: i64) -> Vec<Kline> {
+    bars[idx as usize] = bar_at_hour(idx, o, h, l, c);
+    bars
+}
+
+/// 033: runner 同款时序(step_bar → 撮合成交先入账 → on_tick → 下单 → 即时成交入账),
+/// 与 `backtest_runner::run_backtest` 逐 bar 循环一致(成交先于决策, 同 bar 重挂生效)。
+fn run_univ2(
+    cfg: StrategyConfig,
+    bars: &[Kline],
+    tf: Option<Vec<Kline>>,
+) -> (Vec<Vec<OrderRequest>>, BacktestContext, LuaStrategy) {
+    let mut strategy = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
+        .expect("内置脚本应编译通过");
+    let mut ctx = BacktestContext::new(
+        cfg,
+        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+    );
+    if let Some(bars) = tf {
+        ctx.set_tf_klines("ETHUSDT", "1h", bars);
+    }
+    strategy.on_init(&mut ctx);
+    let mut out = Vec::new();
+    for k in bars {
+        ctx.step_bar(k.clone());
+        for f in ctx.drain_fills() {
+            strategy.on_fill(&mut ctx, f);
+        }
+        let orders = strategy.on_tick(&mut ctx);
+        for req in &orders {
+            let _ = ctx.place_order(req.clone());
+        }
+        for f in ctx.drain_fills() {
+            strategy.on_fill(&mut ctx, f);
+        }
+        out.push(orders);
+    }
+    (out, ctx, strategy)
+}
+
+#[test]
+fn test_uniswap_v2_grid_requires_tf_atr_channel() {
+    // 高周期 ATR 通道未预装 → 一笔都不下(不猜 ATR 值, 不激活不建仓)。
+    let (orders, _ctx, st) = run_univ2(
+        univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]),
+        &univ2_main(60, 200, 100, 10),
+        None,
+    );
+    assert!(orders.iter().all(|o| o.is_empty()), "ATR 通道未就绪时必须完全不动");
+    assert_eq!(st.global_f64("balance_price"), None, "不得激活");
+}
+
+#[test]
+fn test_uniswap_v2_grid_requires_start_price() {
+    let (orders, _ctx, st) =
+        run_univ2(univ2_cfg(&[]), &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    assert!(orders.iter().all(|o| o.is_empty()), "缺必填 start_price 时不得下任何单");
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "缺参数 -> 无成交");
+    assert!(
+        st.state_snapshot().iter().any(|(k, v)| k == "halted" && v == "1"),
+        "缺必填参数应 FATAL 停机"
+    );
+}
+
+#[test]
+fn test_uniswap_v2_grid_thin_spacing_halts() {
+    // 成本门槛: 生效间距/价格 < 4×fee_side → [FATAL] 停机, 不建仓不挂单。
+    // min_spacing_pct=-1 禁用下限(否则默认 0.4% 下限会托起间距绕过门槛)。
+    let (orders, _ctx, st) = run_univ2(
+        univ2_cfg(&[
+            ("start_price", ConfigValue::Float(150.0)),
+            ("atr_mult", ConfigValue::Float(0.0001)),
+            ("min_spacing_pct", ConfigValue::Float(-1.0)),
+        ]),
+        &univ2_main(60, 200, 100, 10),
+        Some(tf_bars(60)),
+    );
+    assert!(orders.iter().all(|o| o.is_empty()), "成本门槛不满足时必须停机且不下任何单");
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "不得建仓");
+    assert!(st.state_snapshot().iter().any(|(k, v)| k == "halted" && v == "1"));
+}
+
+#[test]
+fn test_uniswap_v2_grid_min_spacing_floor() {
+    // 最小间距下限: atr_mult×ATR = 0.0002 远小于下限 0.01×价格 = 1.0
+    // → 生效间距 = 1.0, 挂单 99/101(而非 99.9998/100.0002)。
+    let cfg = univ2_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("atr_mult", ConfigValue::Float(0.0001)),
+        ("min_spacing_pct", ConfigValue::Float(0.01)),
+    ]);
+    // h≥11 改纯平段(100,100,100,100): 间距 1.0 的挂单 99/101 不会被平段 high/low 触发,
+    // 便于只断言挂单价格(ATR 来自 aux 序列, 主序列振幅此处无关)。
+    let bars: Vec<Kline> = univ2_main(40, 200, 100, 10)
+        .into_iter()
+        .enumerate()
+        .map(|(i, k)| if i >= 11 { bar_at_hour(i as i64, 100, 100, 100, 100) } else { k })
+        .collect();
+    let (orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "建仓价 100 = 第一平衡价");
+    let limits: Vec<_> = orders[16]
+        .iter()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    assert_eq!(buy.price, Some(dec!(99)), "买价 = 平衡价 − 生效间距(下限 1.0)");
+    assert_eq!(sell.price, Some(dec!(101)), "卖价 = 平衡价 + 生效间距(下限 1.0)");
+}
+
+#[test]
+fn test_uniswap_v2_grid_activate_half_build_and_grid() {
+    // 激活: 市价买 invest_cash/2 = 5000 名义; 成交价 100 = 第一平衡价;
+    // 重挂: 平衡价 ± 1×ATR(=2) = 98 / 102, 量按"成交后 1:1 恢复"(含费修正)。
+    let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    let market: Vec<_> =
+        orders.iter().flatten().filter(|o| o.order_type == OrderType::Market).collect();
+    assert_eq!(market.len(), 1, "激活时应恰有一笔市价建仓");
+    assert_eq!(market[0].side, OrderSide::Buy);
+    let notional = market[0].size * market[0].price.unwrap_or(dec!(100));
+    assert!((notional - dec!(5000)).abs() < dec!(1), "建仓名义应为投入一半 5000: {notional}");
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "建仓成交价应成为第一平衡价");
+    assert_eq!(st.global_f64("invested0"), Some(10000.0));
+
+    // 建仓成交后的重挂(建仓市价单在 h=15 成交, h=16 重挂): 买 98 / 卖 102
+    let limits: Vec<_> = orders[16]
+        .iter()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    assert_eq!(limits.len(), 2, "两侧都应挂单: {:?}", limits);
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    assert_eq!(buy.price, Some(dec!(98)), "买价 = 平衡价 − 1×ATR");
+    assert_eq!(sell.price, Some(dec!(102)), "卖价 = 平衡价 + 1×ATR");
+    // 量: C=10000−5000−5(费)=4995, Q=50 → 买 q=(4995−50×98)/(98×2.001); 卖 q=(50×102−4995)/(102×1.999)
+    let q_buy_exp = (4995.0 - 50.0 * 98.0) / (98.0 * 2.001);
+    let q_sell_exp = (50.0 * 102.0 - 4995.0) / (102.0 * 1.999);
+    let q_buy = buy.size.to_f64().expect("size 应可转 f64");
+    let q_sell = sell.size.to_f64().expect("size 应可转 f64");
+    assert!((q_buy - q_buy_exp).abs() < 1e-6, "买量应为 1:1 恢复量: {q_buy} vs {q_buy_exp}");
+    assert!((q_sell - q_sell_exp).abs() < 1e-6, "卖量应为 1:1 恢复量: {q_sell} vs {q_sell_exp}");
+}
+
+#[test]
+fn test_uniswap_v2_grid_buy_fill_restores_one_to_one() {
+    // 买 98 成交后: 平衡价 := 98 并同 tick 重挂 96/100; 引擎当根撮合: bar18 high=100 ≥ 卖 100
+    // → 卖 100 亦当根成交, 期末在 100 处恢复 1:1(|C′ − Q′×100| < 0.01, 平衡价 := 最后一笔成交价)。
+    let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 100, 100, 97, 99);
+    let (orders, ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    assert_eq!(st.global_f64("fill_count"), Some(3.0), "建仓 + 买 98 + 重挂卖 100 各成交一次");
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "平衡价 := 最后一笔成交价");
+    let c = ctx.balance("USDT").expect("应有 USDT 余额");
+    let q = ctx.position("ETHUSDT").expect("应有持仓").size;
+    let diff = c - q * dec!(100);
+    assert!(diff.abs() < dec!(0.01), "成交后应恢复 1:1: C={c} Q={q} |C−Q×100|={diff}");
+    // 同 tick 重挂: 买 96 / 卖 100(挂单先于撮合可见)
+    let limits: Vec<_> = orders[18]
+        .iter()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    assert_eq!(buy.price, Some(dec!(96)));
+    assert_eq!(sell.price, Some(dec!(100)));
+}
+
+#[test]
+fn test_uniswap_v2_grid_sell_fill_restores_one_to_one() {
+    // 卖 102 成交后: 平衡价 := 102 并同 tick 重挂 100/104; 引擎当根撮合: bar18 low=100 ≤ 买 100
+    // → 买 100 亦当根成交, 期末在 100 处恢复 1:1(平衡价 := 最后一笔成交价)。
+    let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 100, 103, 100, 102);
+    let (orders, ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    assert_eq!(st.global_f64("fill_count"), Some(3.0), "建仓 + 卖 102 + 重挂买 100 各成交一次");
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "平衡价 := 最后一笔成交价");
+    let c = ctx.balance("USDT").expect("应有 USDT 余额");
+    let q = ctx.position("ETHUSDT").expect("应有持仓").size;
+    let diff = c - q * dec!(100);
+    assert!(diff.abs() < dec!(0.01), "成交后应恢复 1:1: C={c} Q={q} |C−Q×100|={diff}");
+    // 同 tick 重挂: 买 100 / 卖 104(挂单先于撮合可见)
+    let limits: Vec<_> = orders[18]
+        .iter()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    assert_eq!(buy.price, Some(dec!(100)));
+    assert_eq!(sell.price, Some(dec!(104)));
+}
+
+#[test]
+fn test_uniswap_v2_grid_no_position_activation_only_buy() {
+    // invest_cash=4 → 建仓名义 2 < min_notional 5 → 按无建仓激活: 平衡价=现价, 只挂买单不挂卖单。
+    let cfg = univ2_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("invest_cash", ConfigValue::Float(4.0)),
+    ]);
+    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "无建仓 -> 无成交");
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "平衡价 := 激活时现价");
+    let limits: Vec<_> = orders[16]
+        .iter()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let sells: Vec<_> = limits.iter().filter(|o| o.side == OrderSide::Sell).collect();
+    let buys: Vec<_> = limits.iter().filter(|o| o.side == OrderSide::Buy).collect();
+    assert!(sells.is_empty(), "无持仓不得挂卖单");
+    assert_eq!(buys.len(), 1, "应只挂买单");
+    assert_eq!(buys[0].price, Some(dec!(98)));
+}
+
+#[test]
+fn test_uniswap_v2_grid_state_snapshot() {
+    // 状态快照(断点续接最小必需项): balance_price / built / pending_entry / invested0。
+    let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let (_orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    let snap = st.state_snapshot();
+    let get = |k: &str| snap.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    assert_eq!(get("balance_price").as_deref(), Some("100.0000000000"));
+    assert_eq!(get("built").as_deref(), Some("1"));
+    assert_eq!(get("pending_entry").as_deref(), Some("0"));
+    assert_eq!(get("invested0").as_deref(), Some("10000.00"));
+}
+
+#[test]
+fn test_uniswap_v2_grid_ledger_cross_check() {
+    // runner 时序(含预热跳过): 激活建仓 → 买 98 → 卖 100; 停机时策略模型账本 vs 引擎误差 < 0.01。
+    let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let mut bars = univ2_main(60, 200, 100, 24);
+    bars[40] = bar_at_hour(40, 100, 101, 97, 99); // low=97 触发买 98; 同 bar 重挂卖 100 且 high=101 → 当根也成交
+    let mut strategy = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
+        .expect("内置脚本应编译通过");
+    let mut ctx = BacktestContext::new(
+        cfg,
+        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+    );
+    ctx.set_tf_klines("ETHUSDT", "1h", tf_bars(60));
+    strategy.on_init(&mut ctx);
+    // 预热跳过 24 根(aux 1h×24 根 / 主时钟 1h), 与装配层一致。
+    for k in &bars[24..] {
+        ctx.step_bar(k.clone());
+        for f in ctx.drain_fills() {
+            strategy.on_fill(&mut ctx, f);
+        }
+        let orders = strategy.on_tick(&mut ctx);
+        for req in orders {
+            let _ = ctx.place_order(req);
+        }
+        for f in ctx.drain_fills() {
+            strategy.on_fill(&mut ctx, f);
+        }
+    }
+    strategy.on_stop(&mut ctx);
+    let snap: HashMap<String, String> = strategy.state_snapshot().into_iter().collect();
+    let stat = |k: &str| snap.get(k).cloned().unwrap_or_default();
+    assert_eq!(
+        stat("stat_fill_count"),
+        "3",
+        "应恰有 建仓+买+卖 3 笔成交: {}",
+        stat("stat_fill_count")
+    );
+    let d_cash: f64 = stat("stat_ledger_diff_cash").parse().expect("stat_ledger_diff_cash");
+    let d_pos: f64 = stat("stat_ledger_diff_pos").parse().expect("stat_ledger_diff_pos");
+    assert!(d_cash.abs() < 0.01, "账本现金差应 < 0.01: {d_cash}");
+    assert!(d_pos.abs() < 0.01, "账本持仓差应 < 0.01: {d_pos}");
+    // 期末 1:1: 现金 ≈ 持仓 × 平衡价(100)
+    let c = ctx.balance("USDT").expect("应有 USDT 余额");
+    let q = ctx.position("ETHUSDT").expect("应有持仓").size;
+    let diff = c - q * dec!(100);
+    assert!(diff.abs() < dec!(0.01), "期末应恢复 1:1: C={c} Q={q} |C−Q×100|={diff}");
 }

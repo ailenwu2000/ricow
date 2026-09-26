@@ -17,6 +17,8 @@ strategies/spot/*
 !strategies/spot/shannon_spot_grid.toml
 !strategies/spot/paired_grid.lua
 !strategies/spot/paired_grid.toml
+!strategies/spot/uniswap_v2_grid.lua
+!strategies/spot/uniswap_v2_grid.toml
 !strategies/futures/
 strategies/futures/*
 !strategies/futures/.gitkeep

@@ -1,0 +1,80 @@
+# 策略清单(manifest): 展示元数据 + 参数 schema。仅供 UI/CLI/AI, 引擎不读(架构铁律)。
+id = "uniswap_v2_grid"
+name = "现货 Uniswap V2 网格"
+market = "spot"
+summary = "模拟 uniswap v2 池: 真实现金与持仓价值恒 1:1, 平衡价 ± atr_mult×ATR 挂单, 成交价即新平衡价并按 1:1 恢复的量重挂两侧; 动态 ATR 间距"
+description = """
+模拟 Uniswap V2 池的再平衡网格: 价格低于 start_price 激活, 用投入资金一半市价建仓(成交价 = 第一平衡价格); 平衡价 + atr_mult×ATR 挂卖单、平衡价 − atr_mult×ATR 挂买单, 每笔挂单量按"成交后资金与仓位价值恰好恢复 1:1"(含手续费修正)计算; 任一成交后成交价成为新平衡价格并全撤重挂两侧。ATR 周期与 K 线周期可配(默认 1h K 线、14 周期、乘数 1), 间距随行情波动动态伸缩。无结束语义(池自平衡, 仓位不清零)。
+"""
+suitable = "震荡市(双向再平衡收割)、宽幅波动"
+unsuitable = "单边急涨(池持续卖出跑输持有, LP 固有特性)、极低波动(间距低于成本门槛自动停机)"
+
+[[params]]
+key = "pair"
+name = "交易对"
+type = "string"
+desc = "现货交易对(如 SOLUSDT)"
+required = true
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "价格低于它才激活(必填; 回测请设为窗口起点价, 勿前视)"
+required = true
+
+[[params]]
+key = "invest_cash"
+name = "投入资金"
+type = "f64"
+desc = "投入资金(计价币); 激活时用其一半市价建仓。0 = 激活时 quote 余额全额"
+default = 0
+
+[[params]]
+key = "interval"
+name = "主时钟"
+type = "string"
+desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
+default = "1h"
+
+[[params]]
+key = "atr_interval"
+name = "ATR K 线周期"
+type = "string"
+desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
+default = "1h"
+
+[[params]]
+key = "atr_period"
+name = "ATR 周期"
+type = "i64"
+desc = "ATR 回看根数"
+default = 14
+
+[[params]]
+key = "atr_mult"
+name = "ATR 乘数"
+type = "f64"
+desc = "网格间距 = atr_mult × ATR"
+default = 1
+
+[[params]]
+key = "min_spacing_pct"
+name = "最小间距(价格占比)"
+type = "f64"
+desc = "间距下限(占价格比例, 0.004 = 0.4%, 0/缺省 = 默认 0.4%); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损; 负数 = 禁用下限(纯 ATR 间距)"
+default = 0.004
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额"
+default = 5
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "单边手续费率(0.001 = 现货 0.1%/边)"
+default = 0.001
