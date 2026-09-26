@@ -1,0 +1,41 @@
+首次调用 API
+DeepSeek API 使用与 OpenAI/Anthropic 兼容的 API 格式，通过修改配置，您可以使用 OpenAI/Anthropic SDK 来访问 DeepSeek API，或使用与 OpenAI/Anthropic API 兼容的软件。
+
+PARAM	VALUE
+base_url (OpenAI)	https://api.deepseek.com
+base_url (Anthropic)	https://api.deepseek.com/anthropic
+api_key	申请一个 API key
+model	deepseek-flash(1)
+deepseek-v4-pro(2)
+(1) 模型名请使用 deepseek-flash。旧模型名 deepseek-v4-flash、deepseek-v4-flash-vision-exp 仍可调用，但对应模型已下线，请求将由 DeepSeek-V4.1-Flash 模型提供服务，并按 Flash 价格计费。
+
+(2) 为响应广大用户的需求，我们决定在 2026 年 9 月 14 日之后继续提供 DeepSeek V4 Pro 的 API 调用服务，计费方式保持不变；如有变动，我们将另行通知。感谢您的理解与支持！
+
+接入 Agent 工具
+DeepSeek Harness 开发者预览版面向全球 Harness 开发者开放测试。详见 DeepSeek Harness 入门。
+
+DeepSeek API 已接入多种主流 AI Agent 与编程助手工具。如果你使用 Claude Code、GitHub Copilot、OpenCode 等工具，可以直接将 DeepSeek 作为后端模型，无需编写代码即可开始使用。
+
+详见 Agent 工具接入指南。
+
+调用对话 API
+在创建 API key 之后，你可以使用以下样例脚本，通过 OpenAI API 格式来访问 DeepSeek 模型。样例为非流式输出，您可以将 stream 设置为 true 来使用流式输出。
+
+Anthropic API 格式的访问样例，请参考Anthropic API。
+
+curl
+python
+nodejs
+curl https://api.deepseek.com/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
+  -d '{
+        "model": "deepseek-flash",
+        "messages": [
+          {"role": "system", "content": "You are a helpful assistant."},
+          {"role": "user", "content": "Hello!"}
+        ],
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+        "stream": false
+      }'
