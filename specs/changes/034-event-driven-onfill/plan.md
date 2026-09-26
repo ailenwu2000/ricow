@@ -104,7 +104,7 @@ place_orders(ctx, strategy, reqs):
 | 7 | **策略自报版本 + 可视化标注**(`version()` / `plot_annotations()`) | Freqtrade | 无 | 低成本小功能(竞品研究 §五已记录, 维持"暂不做") |
 | 8 | **同一 kernel 跑回测/仿真/实盘**(代码路径全同) | Nautilus | 三路径相似但三份循环(dry-run/live/回测各自实现) | R2 抽 place_orders 辅助是朝此方向的第一步; 全量统一成本高 |
 | 9 | **MessageBus pub/sub 解耦**(组件间发布订阅, 策略可订阅任意数据通道) | Nautilus | 固定回调接口(need_klines/on_tick/on_fill) | 符合 ricow "少而精", 现有声明式接口更简单, 不建议引入 |
-| 10 | **实盘行情静默期兜底**: quote 无更新时也有周期性决策心跳 | Hummingbot(轮询+事件混合) | 实盘 on_tick 仅由 quote 驱动, 行情断流=无决策(断流直接停机, 有保护) | 低成本: 实盘加一个 N 秒兜底 tick; 可与 #3 同期做 |
+| 10 | **实盘行情静默期兜底**: quote 无更新时也有周期性决策心跳 | Hummingbot(轮询+事件混合) | 实盘 on_tick 仅由 quote 驱动, 行情断流=无决策(断流直接停机, 有保护) | 低成本: 实盘加一个 N 秒兜底 tick; 可与 #3 同期做 **→ 已落实(035, 2026-09-26, 30s 心跳走共用决策出口, 见 `specs/changes/035-live-heartbeat-tick/`)** |
 
 **建议的后续优先级**(供未来计划排期, 本期不动): #3 对账 > #1 滑点/部分成交 > #10 心跳 > 其余 YAGNI。
 

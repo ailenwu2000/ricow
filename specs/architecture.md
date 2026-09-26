@@ -66,6 +66,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 策略统一 Lua 5.4(mlua 嵌入式沙箱): 5 回调 `on_init/on_tick/on_fill/on_order_update/on_stop`, `on_tick` / `on_fill` 返回订单数组; ctx 为只读快照
 - **事件驱动决策(034, 2026-09-26)**: 成交**立即入账**后派发 `on_fill`(不受主时钟节流); `on_fill` 可返回订单, 引擎"下单 → 撮合 → on_fill"有界递归闭环(深度上限 8 + WARN, 防"成交即市价反手"病态逻辑)。三路径同语义: 回测单标的/组合走统一 `settle_orders` 辅助(成交先于决策入账的 032 时序保持不变), dry-run 走 `handle_dry_fill`(逐笔落库/通知/状态持久化后递归), 实盘 Fill 分支 on_fill 返回订单立即提交、新成交经用户流天然闭环。不返回订单的 on_fill = 旧行为, 决策等下一次 on_tick。
+- **实盘静默期兜底心跳(035, 2026-09-26)**: 实盘 `on_tick` 原本仅由 quote 事件驱动, 流**未断但静默**时(低流动性/交易所节流)策略零决策、重挂无限推迟 —— 流断开已有保护(Quote(None) → StreamEnded 停机), 静默无兜底。035 在实盘主循环加固定 30s 心跳(`QUOTE_HEARTBEAT_SECS` 常量): 用**最后一次** orderbook 调 `on_tick` 并走与 Quote 分支**同一条**决策出口(`live_decision_tick`); 启动后从未收到 quote(orderbook 为空)时跳过, 不虚构行情事实(不 `tick_kline`、不计 ticks)。参照 Hummingbot 事件+轮询混合模式; 回测/dry-run 语义不变(034 D3 口径)。
 - **ctx.\*** API(冒号调用): 行情 / 持仓余额 / 配置参数(config_f64 等)/ 指标(基于已收盘 K 线, 无前视)/ 时间 `now()`(2026-09-11 新增, 供"每日固定时刻动作"的盘中策略)
 - **数据供给与分层纪律(030, 2026-09-24 策略/引擎分层收敛)**:
   - **分层铁律(最高约束)**: 引擎(`ricow_engine`)/ CLI(`ricow/src/commands`)/ 绑定层(`ricow_strategy` 的 `context.rs`/`lua.rs`)**零策略参数名** —— 策略参数(如 `atr_interval`/`regime_ema_period`/`atr_mult`)只能由 Lua 策略自己读; 上述各层不得出现策略参数名字面量, 由 `crates/ricow_strategy/tests/architecture_guard.rs` 机械锁死(注入即红, 反向验证通过)。

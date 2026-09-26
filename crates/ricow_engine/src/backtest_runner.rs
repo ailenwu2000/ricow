@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::{NaiveDate, Utc};
-use ricow_core::{Balance, Kline, OrderSide, OrderStatus};
+use ricow_core::{Balance, Kline, OrderStatus};
 use ricow_strategy::{BacktestContext, BacktestReport, Context, Strategy, StrategyConfig};
 
 /// 034 事件驱动决策: "下单 → 撮合 → 成交派发 on_fill" 的有界递归闭环。
@@ -259,6 +259,7 @@ pub fn run_portfolio_backtest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ricow_core::OrderSide;
     use ricow_strategy::{ConfigValue, LuaStrategy};
     use rust_decimal::prelude::ToPrimitive;
     use rust_decimal::Decimal;

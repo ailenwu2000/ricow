@@ -106,13 +106,19 @@ const FUNDING_LOOKBACK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// 资金费增量拉取间隔 (014 D4): 30 分钟 —— 资金费 8h 结算一次, 该粒度足够且无变现频压力。
 const FUNDING_POLL_SECS: u64 = 1800;
 
-/// 实盘双流事件 (行情 / 用户数据流 / 停机信号 / 资金费对账)。
+/// 实盘行情静默期兜底心跳间隔 (035, 竞品优势 #10): quote 流**未断但静默**时也周期性决策,
+/// 防网格挂单空窗/重挂被无限期推迟。行情正常时心跳空转冗余 (策略自身幂等), 语义无损。
+const QUOTE_HEARTBEAT_SECS: u64 = 30;
+
+/// 实盘事件 (行情 / 用户数据流 / 停机信号 / 资金费对账 / 静默心跳)。
 enum LiveEvent {
     Stop(Option<StopRequest>),
     Quote(Option<ricow_core::OrderBookUpdate>),
     User(Option<UserEvent>),
     /// 资金费增量拉取 (014 FR-003): 不驱动策略 tick, 只对账落库。
     Funding,
+    /// 035 行情静默兜底心跳: 用最后一次 orderbook 调 on_tick, 不虚构行情事实。
+    Heartbeat,
 }
 
 /// 拉取资金费流水并落库 (014 FR-003): 水位 = db `MAX(funding_time)`(无记录则回溯 `FUNDING_LOOKBACK_MS`)。
@@ -612,6 +618,73 @@ fn handle_dry_fill<'a>(
     })
 }
 
+/// 035 实盘决策 tick 的共用出口 (Quote 与 Heartbeat 共用, FR-002):
+/// on_tick 产单 → 提交 (计数/落库/拒单回传) → 下单即成交则立刻对齐本地快照 (016 FR-B)。
+#[allow(clippy::too_many_arguments)] // 与 refresh_positions 同口径, 参数聚合另行立项
+async fn live_decision_tick(
+    ctx: &mut LiveContext,
+    strategy: &mut dyn Strategy,
+    outcome: &mut RunOutcome,
+    db: Option<&Database>,
+    strategy_name: &str,
+    mode: RunMode,
+    exchange: &Arc<dyn Exchange>,
+    market: &Market,
+    pair: &str,
+    is_futures: bool,
+    liq_warn_threshold: f64,
+    notifier: Option<&Notifier>,
+) {
+    let orders = strategy.on_tick(ctx);
+    let mut any_filled = false;
+    for req in orders {
+        outcome.orders_submitted += 1;
+        match ctx.place_order(req) {
+            Ok(ack) if ack.status == OrderStatus::Rejected => {
+                outcome.rejections += 1;
+                strategy.on_order_update(ctx, ack.to_update(Utc::now()));
+            }
+            Ok(ack) => {
+                // 026 时点①: 委托价/委托量在提交时落库
+                if ack.status == OrderStatus::Cancelled {
+                    strategy.on_order_update(ctx, ack.to_update(Utc::now()));
+                }
+                if let Some(db) = db {
+                    persist_order_ack(db, outcome, strategy_name, &ack, mode).await;
+                }
+                if ack.filled_size > Decimal::ZERO {
+                    any_filled = true;
+                }
+            }
+            Err(e) => {
+                outcome.order_errors += 1;
+                let msg = e.to_string();
+                tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
+                outcome.last_error = Some(format!("下单失败: {msg}"));
+            }
+        }
+    }
+    // 下单即有成交 → 立刻对齐本地快照 (016 FR-B): 成交回写走用户流有延迟, 期间策略会按陈旧
+    // 持仓/现金重复下单 (demo 实测: 1.4s 内同价同量 3 次 → 2 成交 + 1 次资金不足报错)。
+    if any_filled {
+        let refreshed = refresh_positions(
+            exchange,
+            market,
+            pair,
+            ctx,
+            is_futures,
+            strategy_name,
+            liq_warn_threshold,
+            notifier,
+        )
+        .await;
+        // 026 时点④: 只落**查到的事实**; None = 查询失败 → 不落库 (不拿陈旧快照冒充现状)
+        if let (Some(db), Some(positions)) = (db, refreshed) {
+            persist_position(db, outcome, strategy_name, pair, &positions, mode).await;
+        }
+    }
+}
+
 /// 成交后刷新持仓: 合约走定向持仓覆盖; 现货走 base 可用余额包装 (空余额 = 清仓, 不留陈旧仓)。
 ///
 /// 返回**已写入上下文的持仓事实**: `Some(空切片)` = 确实无仓(已平), `None` = 查询失败
@@ -1096,6 +1169,9 @@ impl Engine {
         }
         let mut funding_tick = tokio::time::interval(Duration::from_secs(FUNDING_POLL_SECS));
         funding_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 035: 行情静默期兜底心跳 (首拍即触发, 由 orderbook 为空守卫拦下, 见 Heartbeat 分支)
+        let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(QUOTE_HEARTBEAT_SECS));
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tracing::info!(target: "engine", name = %strategy_name, pair = %pair, mode = %mode.label(), "live run started");
 
         let mut stop_rx = stop;
@@ -1117,11 +1193,13 @@ impl Engine {
                     upd = quote_stream.next() => LiveEvent::Quote(upd),
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
+                    _ = heartbeat_tick.tick() => LiveEvent::Heartbeat,
                 },
                 None => tokio::select! {
                     upd = quote_stream.next() => LiveEvent::Quote(upd),
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
+                    _ = heartbeat_tick.tick() => LiveEvent::Heartbeat,
                 },
             };
 
@@ -1160,63 +1238,45 @@ impl Engine {
                         ctx.tick_kline(&pair, px, chrono::Utc::now().timestamp_millis());
                     }
 
-                    let orders = strategy.on_tick(&mut ctx);
-                    let mut any_filled = false;
-                    for req in orders {
-                        outcome.orders_submitted += 1;
-                        match ctx.place_order(req) {
-                            Ok(ack) if ack.status == OrderStatus::Rejected => {
-                                outcome.rejections += 1;
-                                strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
-                            }
-                            Ok(ack) => {
-                                // 026 时点①: 委托价/委托量在提交时落库
-                                if ack.status == OrderStatus::Cancelled {
-                                    strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
-                                }
-                                if let Some(db) = db {
-                                    persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode)
-                                        .await;
-                                }
-                                if ack.filled_size > Decimal::ZERO {
-                                    any_filled = true;
-                                }
-                            }
-                            Err(e) => {
-                                outcome.order_errors += 1;
-                                let msg = e.to_string();
-                                tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
-                                outcome.last_error = Some(format!("下单失败: {msg}"));
-                            }
-                        }
+                    // 035: 决策出口与心跳共用 (FR-002)
+                    live_decision_tick(
+                        &mut ctx,
+                        &mut *strategy,
+                        &mut outcome,
+                        db,
+                        &strategy_name,
+                        mode,
+                        &exchange,
+                        &market,
+                        &pair,
+                        is_futures,
+                        liq_warn_threshold,
+                        notifier.as_ref(),
+                    )
+                    .await;
+                }
+                LiveEvent::Heartbeat => {
+                    // 035 FR-003: 静默期兜底 —— 用最后一次 orderbook 决策, 不虚构行情事实。
+                    // 启动后从未收到 quote (orderbook 为空) 时跳过; 不 tick_kline、不计 ticks。
+                    if ctx.price(&pair).is_none() {
+                        continue;
                     }
-                    // 下单即有成交 → 立刻对齐本地快照 (016 FR-B): 成交回写走用户流有延迟, 期间策略会按陈旧
-                    // 持仓/现金重复下单 (demo 实测: 1.4s 内同价同量 3 次 → 2 成交 + 1 次资金不足报错)。
-                    if any_filled {
-                        let refreshed = refresh_positions(
-                            &exchange,
-                            &market,
-                            &pair,
-                            &ctx,
-                            is_futures,
-                            &strategy_name,
-                            liq_warn_threshold,
-                            notifier.as_ref(),
-                        )
-                        .await;
-                        // 026 时点④: 只落**查到的事实**; None = 查询失败 → 不落库 (不拿陈旧快照冒充现状)
-                        if let (Some(db), Some(positions)) = (db, refreshed) {
-                            persist_position(
-                                db,
-                                &mut outcome,
-                                &strategy_name,
-                                &pair,
-                                &positions,
-                                mode,
-                            )
-                            .await;
-                        }
-                    }
+                    tracing::debug!(target: "engine", name = %strategy_name, "行情静默心跳触发决策");
+                    live_decision_tick(
+                        &mut ctx,
+                        &mut *strategy,
+                        &mut outcome,
+                        db,
+                        &strategy_name,
+                        mode,
+                        &exchange,
+                        &market,
+                        &pair,
+                        is_futures,
+                        liq_warn_threshold,
+                        notifier.as_ref(),
+                    )
+                    .await;
                 }
                 LiveEvent::User(None) => {
                     // 用户数据流断线: 成交无法回灌 → 异常停机 (plan P1), 不静默继续
@@ -1889,5 +1949,137 @@ mod tests {
         );
         assert_eq!(outcome.fills, 3, "写库失败不改变交易台账");
         assert_eq!(outcome.order_errors, 0, "落库失败不计入下单失败");
+    }
+
+    // ---- 035 T004: 实盘静默期兜底心跳 (共用决策出口 live_decision_tick) ----
+
+    /// 最小测试交易所 (单元测试专用, 不触网): 记录提交的订单并返回 Open ack; 其余不可用。
+    struct RecordingExchange(std::sync::Mutex<Vec<OrderRequest>>);
+
+    #[async_trait::async_trait]
+    impl Exchange for RecordingExchange {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        async fn get_markets(&self) -> CoreResult<Vec<Market>> {
+            Err(CoreError::InvalidArgument("recording".into()))
+        }
+        async fn get_klines(&self, _: &str, _: &str, _: u32) -> CoreResult<Vec<Kline>> {
+            Err(CoreError::InvalidArgument("recording".into()))
+        }
+        async fn get_orderbook(&self, _: &str, _: u32) -> CoreResult<ricow_core::OrderBook> {
+            Err(CoreError::InvalidArgument("recording".into()))
+        }
+        async fn place_order(&self, req: OrderRequest) -> CoreResult<OrderAck> {
+            self.0.lock().unwrap().push(req);
+            Ok(OrderAck {
+                exchange_order_id: "EX-HB".into(),
+                client_order_id: "hb-cid".into(),
+                pair: "ETHUSDT".into(),
+                side: OrderSide::Buy,
+                price: dec!(2999),
+                size: dec!(0.01),
+                filled_size: Decimal::ZERO,
+                status: OrderStatus::Open,
+            })
+        }
+        async fn cancel_order(&self, _: &str, _: &str) -> CoreResult<()> {
+            Err(CoreError::InvalidArgument("recording".into()))
+        }
+        async fn get_open_orders(&self, _: &str) -> CoreResult<Vec<ricow_core::OrderInfo>> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self, _: &str) -> CoreResult<Balance> {
+            Err(CoreError::InvalidArgument("recording".into()))
+        }
+        async fn get_position(&self, _: &str) -> CoreResult<Option<Position>> {
+            Ok(None)
+        }
+        async fn subscribe_orderbook(
+            &self,
+            _: &str,
+        ) -> CoreResult<Pin<Box<dyn Stream<Item = ricow_core::OrderBookUpdate> + Send>>> {
+            // 恒静默: 模拟"流活着但无行情更新" (035 待验证的场景)
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn subscribe_user_events(
+            &self,
+        ) -> CoreResult<Pin<Box<dyn Stream<Item = UserEvent> + Send>>> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    /// 035 FR-002: 心跳与 Quote 共用决策出口 —— on_tick 产单被真实提交 (计数 + 交易所收到)。
+    /// multi_thread: LiveContext.place_order 走 block_in_place 桥接 async。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_live_decision_tick_calls_on_tick_and_submits() {
+        let config = crate::create_strategy(
+            "t-hb",
+            r#"
+            count = 0
+            function on_tick(ctx)
+                if count == 0 then
+                    count = 1
+                    return { { pair = "ETHUSDT", side = "buy", size = 0.01, order_type = "limit", price = 2999 } }
+                end
+                return {}
+            end
+        "#,
+            "ETHUSDT",
+            HashMap::new(),
+        )
+        .unwrap();
+        let ex = Arc::new(RecordingExchange(std::sync::Mutex::default()));
+        let market = Market {
+            symbol: "ETHUSDT".into(),
+            base_asset: "ETH".into(),
+            quote_asset: "USDT".into(),
+            is_perpetual: false,
+            min_size: dec!(0.001),
+            tick_size: dec!(0.01),
+            step_size: None,
+            min_notional: None,
+            max_leverage: None,
+            margin_mode: None,
+            is_delisted: false,
+        };
+        let mut ctx =
+            LiveContext::new(ex.clone(), config.clone(), tokio::runtime::Handle::current());
+        ctx.set_markets(std::slice::from_ref(&market));
+        // 035 FR-003 前置: 已有行情 (心跳只在收到过 quote 后才决策)
+        ctx.update_orderbook(
+            "ETHUSDT",
+            ricow_core::OrderBook::new_sorted(
+                vec![ricow_core::PriceLevel { price: dec!(2999.5), size: dec!(10) }],
+                vec![ricow_core::PriceLevel { price: dec!(3000.5), size: dec!(10) }],
+            ),
+        );
+        let mut strategy = load_strategy(&config).unwrap();
+        let mut outcome = RunOutcome::default();
+
+        live_decision_tick(
+            &mut ctx,
+            &mut *strategy,
+            &mut outcome,
+            None,
+            "t-hb",
+            RunMode::Demo,
+            &(ex.clone() as Arc<dyn Exchange>),
+            &market,
+            "ETHUSDT",
+            false,
+            0.15,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome.orders_submitted, 1, "on_tick 产单经共用出口提交");
+        assert_eq!(outcome.rejections, 0);
+        assert_eq!(
+            ex.0.lock().unwrap().len(),
+            1,
+            "交易所必须真实收到订单 (RecordingExchange 记录)"
+        );
+        assert_eq!(outcome.ticks, 0, "共用出口不制造行情事实 (FR-003)");
     }
 }
