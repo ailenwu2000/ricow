@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use ricow_core::{Balance, Kline, OrderRequest, OrderSide, OrderType};
+use ricow_core::{Balance, Kline, OrderAction, OrderRequest, OrderSide, OrderType};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -541,34 +541,252 @@ fn test_paired_grid_futures_long_activate_market_build() {
     assert!(st.global_f64("fill_count").unwrap_or(0.0) >= 1.0, "建仓应成交");
 }
 
+/// 036 事件模型: 复刻引擎 settle_orders(034)——下单 → drain → on_fill(返回订单递归 place)。
+/// 同时记录 on_fill 返回批次、全部下单批次与逐笔成交。
+fn settle_orders_test(
+    ctx: &mut BacktestContext,
+    strategy: &mut LuaStrategy,
+    orders: Vec<OrderRequest>,
+    i: usize,
+    fill_batches: &mut Vec<(usize, Vec<OrderRequest>)>,
+    placed: &mut Vec<(usize, Vec<OrderRequest>)>,
+    fills: &mut FillTrace,
+) {
+    if !orders.is_empty() {
+        placed.push((i, orders.clone()));
+    }
+    for req in orders {
+        let _ = ctx.place_order(req);
+    }
+    for f in ctx.drain_fills() {
+        fills.push((i, f.side, f.fill_size.to_f64().unwrap(), f.fill_price.to_f64().unwrap()));
+        let follow = strategy.on_fill(ctx, f);
+        fill_batches.push((i, follow.clone()));
+        settle_orders_test(ctx, strategy, follow, i, fill_batches, placed, fills);
+    }
+}
+
+/// 036 事件模型: 复刻引擎回测主循环 (step_bar → 成交先入账/on_fill 闭环 → on_tick → place),
+/// 收集 on_fill 每次返回的订单批次 (bar 序号, 批次)。
+fn run_event_loop(cfg: StrategyConfig, bars: &[Kline]) -> Vec<(usize, Vec<OrderRequest>)> {
+    let (batches, _, _) = run_event_full(cfg, bars);
+    batches
+}
+
+/// 同 [`run_event_loop`], 另返回全部下单批次与逐笔成交轨迹。
+/// 036 事件模型跑批产物: (on_fill 返回批次, 全部下单批次, 逐笔成交), 每项带 bar 序号。
+type EventRun = (Vec<(usize, Vec<OrderRequest>)>, Vec<(usize, Vec<OrderRequest>)>, FillTrace);
+
+fn run_event_full(cfg: StrategyConfig, bars: &[Kline]) -> EventRun {
+    let mut strategy = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
+        .expect("内置脚本应编译通过");
+    let mut ctx = BacktestContext::new(
+        cfg,
+        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+    );
+    strategy.on_init(&mut ctx);
+    let (mut batches, mut placed, mut fills) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, k) in bars.iter().enumerate() {
+        ctx.step_bar(k.clone());
+        settle_orders_test(
+            &mut ctx,
+            &mut strategy,
+            Vec::new(),
+            i,
+            &mut batches,
+            &mut placed,
+            &mut fills,
+        );
+        let tick = strategy.on_tick(&mut ctx);
+        settle_orders_test(&mut ctx, &mut strategy, tick, i, &mut batches, &mut placed, &mut fills);
+    }
+    (batches, placed, fills)
+}
+
+#[test]
+fn test_paired_grid_futures_long_on_fill_rehangs_immediately() {
+    // 036 核心行为: 网格买成交后 on_fill **立即**返回全撤重挂订单(不等下一根 bar),
+    // 卖价锚定栈顶成本×(1+up), 买价=新 ref÷(1+down), 重挂限价单不本 bar 再成交(深度安全)。
+    // 路径: 100 激活(无建仓) → 100 重挂买@96.1538 → 96 买成交 → on_fill 同 bar 返回
+    // cancel + 买@92.4556 + 卖@100(=96.1538×1.04)。
+    let cfg = futures_cfg(&[("start_price", ConfigValue::Float(110.0))]);
+    let bars: Vec<Kline> = [100.0, 100.0, 96.0, 96.0]
+        .iter()
+        .enumerate()
+        .map(|(h, px)| bar_at_f(h as i64, *px))
+        .collect();
+    let (batches, _placed, _fills) = run_event_full(cfg, &bars);
+
+    // 买成交发生在 bar2, on_fill 返回的批次只能有一个(重挂限价单不本 bar 再成交 → 无递归)。
+    let b2: Vec<&Vec<OrderRequest>> =
+        batches.iter().filter(|(i, _)| *i == 2).map(|(_, o)| o).collect();
+    assert_eq!(b2.len(), 1, "bar2 应恰有 1 批 on_fill 返回(深度安全): {batches:?}");
+    let re: Vec<&OrderRequest> = b2[0].iter().filter(|o| o.action == OrderAction::Place).collect();
+    assert_eq!(re.len(), 2, "应返回买 + 卖 两条实单(另有 1 条全撤指令): {re:?}");
+    let buy = re
+        .iter()
+        .copied()
+        .find(|o| o.side == OrderSide::Buy && o.order_type == OrderType::Limit)
+        .expect("应有网格买限价单");
+    let sell = re
+        .iter()
+        .copied()
+        .find(|o| o.side == OrderSide::Sell && o.order_type == OrderType::Limit)
+        .expect("应有平多卖限价单");
+    let buy_px = buy.price.unwrap().to_f64().unwrap();
+    let sell_px = sell.price.unwrap().to_f64().unwrap();
+    // 成交@96 -> ref=96, flag=-1: 下间距 = 0.04×(1+1×0.2)(num() 将 offset=0 回退默认 0.2)
+    // = 4.8% -> 买 = 96÷1.048; 上间距 4% -> 卖 = 栈顶成本 96×1.04。
+    assert!((buy_px - 96.0 / 1.048).abs() < 1e-3, "买价=新 ref÷1.048: {buy_px}");
+    assert!((sell_px - 96.0 * 1.04).abs() < 1e-3, "卖价锚定栈顶成本×1.04: {sell_px}");
+    assert!(sell_px > buy_px, "配对卖价必须 > 买价");
+    assert_eq!(buy.position_side.as_deref(), Some("long"));
+    assert_eq!(sell.position_side.as_deref(), Some("long"));
+    // 卖量=栈顶 lot(fill 全量), 买量=order_amount/价。
+    let fill_sz = 10.0 / (100.0 / 1.04);
+    assert!(
+        (sell.size.to_f64().unwrap() - fill_sz).abs() < 1e-9,
+        "卖量应=栈顶买入量 {}",
+        sell.size
+    );
+    assert!(
+        (buy.size.to_f64().unwrap() * buy_px - 10.0).abs() < 1e-6,
+        "买名义=order_amount: {}",
+        buy.size
+    );
+}
+
+#[test]
+fn test_paired_grid_futures_long_on_fill_build_splits_immediately() {
+    // 036: 建仓市价单成交后 on_fill **同 bar** 拆格重挂(ref=建仓成交价), 不等下一根 bar。
+    let cfg = futures_cfg(&[
+        ("start_price", ConfigValue::Float(110.0)),
+        ("initial_buy_amount", ConfigValue::Float(10.0)),
+    ]);
+    let bars: Vec<Kline> =
+        [100.0].iter().enumerate().map(|(h, px)| bar_at_f(h as i64, *px)).collect();
+    let batches = run_event_loop(cfg, &bars);
+
+    assert!(!batches.is_empty(), "建仓成交应触发 on_fill 重挂");
+    let (i, re) = &batches[0];
+    assert_eq!(*i, 0, "建仓成交发生在 bar0, 重挂应同 bar 返回");
+    let sell = re
+        .iter()
+        .find(|o| o.action == OrderAction::Place && o.side == OrderSide::Sell)
+        .expect("应含配对卖单");
+    let sell_px = sell.price.unwrap().to_f64().unwrap();
+    assert!((sell_px - 104.0).abs() < 1e-6, "ref=建仓价100, 卖=100×1.04=104: {sell_px}");
+    let buy = re
+        .iter()
+        .find(|o| o.action == OrderAction::Place && o.side == OrderSide::Buy)
+        .expect("应含网格买单");
+    let buy_px = buy.price.unwrap().to_f64().unwrap();
+    assert!((buy_px - 100.0 / 1.04).abs() < 1e-6, "买=100÷1.04: {buy_px}");
+}
+
+#[test]
+fn test_paired_grid_futures_long_on_fill_no_order_keeps_rehang() {
+    // 036: 资金/名义不足时 on_fill 返回空表, need_rehang 保持(下一 bar on_tick 继续重试)。
+    // min_notional=10.3: 网格买名义恒=order_amount=10 < 10.3 跳过; 建仓 lot 卖名义
+    // 10×1.04=10.4 ≥ 10.3 能挂出 -> 卖出后栈空, 两手皆空。
+    let cfg = futures_cfg(&[
+        ("start_price", ConfigValue::Float(110.0)),
+        ("initial_buy_amount", ConfigValue::Float(20.0)),
+        ("order_amount", ConfigValue::Float(10.0)),
+        ("min_notional", ConfigValue::Float(10.3)),
+    ]);
+    let bars: Vec<Kline> =
+        [100.0, 105.0, 99.0].iter().enumerate().map(|(h, px)| bar_at_f(h as i64, *px)).collect();
+    let batches = run_event_loop(cfg, &bars);
+
+    // bar0: 建仓成交 -> on_fill 重挂: 买 10<10.3 跳过, 仅卖出建仓 lot(@104)。
+    let b0: Vec<&Vec<OrderRequest>> =
+        batches.iter().filter(|(i, _)| *i == 0).map(|(_, o)| o).collect();
+    assert_eq!(b0.len(), 1, "bar0 建仓成交应恰触发 1 批 on_fill: {batches:?}");
+    assert!(
+        b0[0].iter().any(|o| o.side == OrderSide::Sell),
+        "bar0 应挂出建仓 lot 的配对卖单: {:?}",
+        b0[0]
+    );
+    // bar1: 卖出建仓 lot(104)成交 -> on_fill 重挂下一 lot 卖@104 -> **同 bar 链式再成交**
+    // -> 第二次 on_fill 栈空, 两手皆空 -> 空表(保持 need_rehang)。
+    let b1: Vec<&Vec<OrderRequest>> =
+        batches.iter().filter(|(i, _)| *i == 1).map(|(_, o)| o).collect();
+    assert_eq!(b1.len(), 2, "bar1 应有链式两批 on_fill: {batches:?}");
+    assert!(b1[0].iter().any(|o| o.side == OrderSide::Sell), "第一批应重挂栈顶卖单: {:?}", b1[0]);
+    assert!(b1[1].is_empty(), "栈空后无单可挂应返回空表(保持 need_rehang): {:?}", b1[1]);
+    // bar2: 无新成交(重试发生在 on_tick, 不产单不成交)。
+    let b2: Vec<&Vec<OrderRequest>> =
+        batches.iter().filter(|(i, _)| *i == 2).map(|(_, o)| o).collect();
+    assert!(b2.is_empty(), "bar2 不应有新成交");
+}
+
+#[test]
+fn test_paired_grid_futures_long_on_fill_min_pair_profit_floor() {
+    // 036: min_pair_profit 保底在 on_fill 重挂中仍生效 —— 卖价 = max(栈顶×(1+up), 栈顶×(1+mpp))。
+    let cfg = futures_cfg(&[
+        ("start_price", ConfigValue::Float(110.0)),
+        ("min_pair_profit", ConfigValue::Float(0.10)), // 10% > up 4% -> 保底接管
+    ]);
+    let bars: Vec<Kline> =
+        [100.0, 100.0, 96.0].iter().enumerate().map(|(h, px)| bar_at_f(h as i64, *px)).collect();
+    let batches = run_event_loop(cfg, &bars);
+    let (i, re) = batches.last().expect("买成交应触发 on_fill 重挂");
+    assert_eq!(*i, 2);
+    let sell = re
+        .iter()
+        .find(|o| o.action == OrderAction::Place && o.side == OrderSide::Sell)
+        .expect("应有卖单");
+    let sell_px = sell.price.unwrap().to_f64().unwrap();
+    // 成交@96 -> 栈顶成本 96: max(96×1.04, 96×1.10) = 96×1.10。
+    assert!(
+        (sell_px - 96.0 * 1.10).abs() < 1e-3,
+        "卖价应被 min_pair_profit 抬到栈顶成本×1.10: {sell_px}"
+    );
+}
+
 #[test]
 fn test_paired_grid_futures_long_grid_pair_cycle() {
     // 网格配对闭环: 激活建仓 -> 下跌网格买成交(flag=-1) -> 反弹配对卖成交(flag=0)。
+    // 036: 走事件模型主循环(on_fill 重挂订单同 bar place)。
     let cfg = futures_cfg(&[
         ("start_price", ConfigValue::Float(110.0)),
         ("initial_buy_amount", ConfigValue::Float(10.0)),
     ]);
     let bars = vec![
-        bar_at_hour(0, 100, 100, 100, 100), // 穿越激活: 市价买入 0.1 @100
-        bar_at_hour(1, 96, 96, 96, 96),     // 重挂: 网格买@96.15 并成交(flag=-1)
-        bar_at_hour(2, 96, 96, 96, 96),     // 重挂: 网格买@92.45 + 配对卖@100(保底 96×1.04)
-        bar_at_hour(3, 100, 100, 100, 100), // 配对卖@100 成交(flag=0)
-        bar_at_hour(4, 100, 100, 100, 100),
+        bar_at_f(0, 100.0), // 穿越激活: 市价买入 0.1 @100; on_fill 同 bar 重挂买@96.15
+        bar_at_f(1, 96.0), // 网格买@96.15 成交@96(flag=-1); on_fill 重挂: 买@91.60 + 配对卖@99.84(锚成本96×1.04)
+        bar_at_f(2, 96.0), // 静默
+        bar_at_f(3, 104.0), // 配对卖@99.84 成交(建仓 lot 平仓不计 flag)
+        bar_at_f(4, 104.0),
     ];
-    let (orders, _ctx, st) = run_accum_full(cfg, &bars, None);
-
+    let (batches, placed, fills) = run_event_full(cfg, &bars);
+    let all_placed: Vec<Vec<OrderRequest>> = placed.iter().map(|(_, o)| o.clone()).collect();
     assert!(
-        ps_orders(&orders, "short").is_empty(),
+        ps_orders(&all_placed, "short").is_empty(),
         "只做多策略 -> 不得有任何 position_side=short 挂单"
     );
     assert!(
-        ps_orders(&orders, "long")
+        ps_orders(&all_placed, "long")
             .iter()
             .any(|o| o.side == OrderSide::Buy && o.order_type == OrderType::Market),
         "应穿越激活并市价建仓"
     );
-    assert!(st.global_f64("fill_count").unwrap_or(0.0) >= 3.0, "建仓+网格一买一卖应有 >= 3 笔成交");
-    assert_eq!(st.global_f64("flag"), Some(0.0), "一买一卖配对完成后 flag 归 0");
+    // 逐笔轨迹: 建仓(买市价@100) + 网格买(@96) + bar3 链式两笔卖出 ——
+    // 卖@99.84 成交 -> on_fill 同 bar 重挂栈顶(建仓 lot)卖@104 -> 本 bar 立即再成交
+    // (036 事件模型同 bar 链式成交, 栈清空; 建仓 lot 平仓不计 flag)。
+    assert_eq!(fills.len(), 4, "建仓+网格买+同 bar 链式双卖应恰 4 笔成交: {fills:?}");
+    assert_eq!(fills[0], (0, OrderSide::Buy, 0.1, 100.0));
+    assert_eq!(fills[1].0, 1, "网格买应在 bar1 成交");
+    assert_eq!(fills[1].1, OrderSide::Buy);
+    assert_eq!(fills[2].0, 3, "配对卖应在 bar3 成交");
+    assert_eq!(fills[2].1, OrderSide::Sell);
+    assert_eq!(fills[3].0, 3, "链式卖应同 bar(bar3)成交");
+    assert_eq!(fills[3].1, OrderSide::Sell);
+    // 每笔成交都伴随 on_fill 重挂批次(事件模型核心行为)。
+    for f in &fills {
+        assert!(batches.iter().any(|(i, _)| i == &f.0), "bar{} 成交后应有 on_fill 重挂批次", f.0);
+    }
 }
 
 #[test]
@@ -630,27 +848,9 @@ fn bar_at_f(hour: i64, px: f64) -> Kline {
 type FillTrace = Vec<(usize, OrderSide, f64, f64)>;
 
 /// 跑完整序列并按 bar 收集逐笔成交, 供两条腿逐笔对照。
+/// 036: 复刻引擎事件驱动主循环(step_bar → fill 先入账/on_fill 闭环 → on_tick → place)。
 fn run_collect_fills(cfg: StrategyConfig, bars: &[Kline]) -> FillTrace {
-    let mut strategy = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
-        .expect("内置脚本应编译通过");
-    let mut ctx = BacktestContext::new(
-        cfg,
-        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
-    );
-    strategy.on_init(&mut ctx);
-    let mut out = Vec::new();
-    for (i, k) in bars.iter().enumerate() {
-        ctx.step_bar(k.clone());
-        let orders = strategy.on_tick(&mut ctx);
-        for req in &orders {
-            let _ = ctx.place_order(req.clone());
-        }
-        for f in ctx.drain_fills() {
-            out.push((i, f.side, f.fill_size.to_f64().unwrap(), f.fill_price.to_f64().unwrap()));
-            strategy.on_fill(&mut ctx, f);
-        }
-    }
-    out
+    run_event_full(cfg, bars).2
 }
 
 #[test]
