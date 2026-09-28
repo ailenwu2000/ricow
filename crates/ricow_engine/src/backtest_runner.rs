@@ -16,7 +16,10 @@ use ricow_strategy::{BacktestContext, BacktestReport, Context, Strategy, Strateg
 /// - 下单后拒单/撤单/过期回传 `on_order_update` (审计 #3);
 /// - 撮合出的成交**立即**入账并派发 `on_fill`; on_fill 返回的订单再次下单、
 ///   新成交再次派发 —— 成交→决策→挂单零节流 (对齐 NautilusTrader 事件驱动语义);
-/// - 深度上限 [`MAX_FILL_DECISION_DEPTH`] 防病态策略 ("成交即市价反手") 无限递归;
+/// - 深度上限 [`MAX_FILL_DECISION_DEPTH`] 防病态策略 ("成交即市价反手") 无限递归,
+///   超限时不再静默丢批 —— 每笔被丢弃的订单回传 `on_order_update(Cancelled)` (038 R2);
+/// - 038 R1 撮合保真: on_fill 链内 (depth ≥ 1) 返回的**限价单**次 bar 生效 (defer 开关),
+///   市价单仍即时撮合; depth 0 (on_tick) 下单语义零改动。
 /// - on_fill 返回空(现有全部策略)时行为与旧逐 bar 循环逐分一致。
 pub(crate) const MAX_FILL_DECISION_DEPTH: u32 = 8;
 
@@ -32,9 +35,28 @@ pub(crate) fn settle_orders(
             depth,
             "on_fill 递归决策深度超限, 停止派发 (疑似'成交即反手'病态逻辑)"
         );
+        // 038 R2: 丢批不静默 —— 每笔被丢弃订单回传 Cancelled, 策略可感知并重挂。
+        for req in orders {
+            let ack = ricow_core::OrderAck {
+                exchange_order_id: String::new(),
+                client_order_id: req.client_order_id.clone(),
+                pair: req.pair,
+                side: req.side,
+                price: req.price.unwrap_or_default(),
+                size: req.size,
+                filled_size: rust_decimal::Decimal::ZERO,
+                status: OrderStatus::Cancelled,
+            };
+            strategy.on_order_update(ctx, ack.to_update(Utc::now()));
+        }
         return;
     }
     for req in orders {
+        // 038 R1: 链内限价单次 bar 生效 (defer 开关); 市价单/撤单指令照旧即时处理。
+        let defer = depth > 0 && req.order_type == ricow_core::OrderType::Limit;
+        if defer {
+            ctx.set_defer_new_limits(true);
+        }
         match ctx.place_order(req) {
             Ok(ack)
                 if matches!(
@@ -49,6 +71,9 @@ pub(crate) fn settle_orders(
             Err(e) => {
                 tracing::warn!(target: "backtest", "下单失败: {e}");
             }
+        }
+        if defer {
+            ctx.set_defer_new_limits(false);
         }
     }
     for fill in ctx.drain_fills() {

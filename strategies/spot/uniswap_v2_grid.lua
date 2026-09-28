@@ -1,4 +1,11 @@
--- 现货 Uniswap V2 网格 (uniswap_v2_grid) -- v1 (2026-09-26, 033)
+-- 现货 Uniswap V2 网格 (uniswap_v2_grid) -- v3 (2026-09-28, 038 撮合保真 + 事件模型)
+--
+-- 037+038 最终口径: 全撤重挂逻辑抽至共享 do_rehang(ctx); on_fill(建仓/网格成交)记账后立即
+--   do_rehang 并**返回重挂订单**(事件模型)。此前 037 实测的"同 bar 双向 ping-pong 链"根因
+--   在引擎撮合(新挂单按整根 bar 重匹配), 已由 038 R1 修复: on_fill 链内返回的限价单**次 bar
+--   生效**(市价单/撤单指令仍即时), 无乒乓链、无深度封顶丢批 —— 语义 = "成交后立即重挂,
+--   新单最早下根 bar 可成交"(保守近似, 对齐 backtrader/backtesting.py/NautilusTrader)。
+--   1:1 恢复公式、min_spacing_pct 下限、成本门槛、停摆可观测性等语义零改动。
 --
 -- ═══ 一句话 ═══
 --   模拟 uniswap v2 池: 真实现金 C 与真实持仓 Q 价值恒 1:1; 以平衡价 ± atr_mult×ATR 挂买卖单,
@@ -198,6 +205,109 @@ function on_init(ctx)
         num(ctx, "start_price", 0)))
 end
 
+-- 全撤重挂(共享决策出口, 037 事件模型): on_fill 成交后与 on_tick 重挂共用。
+-- 逐行搬移自原 on_tick 重挂块, 语义零改动。返回订单表(含 cancel_pending)或 {}(无单可挂)。
+-- ATR/间距在此独立重算(on_fill 派发点行情只读上下文已就绪, 034 验证)。
+function do_rehang(ctx)
+    local pair = ctx:config_str("pair")
+    local price = ctx:price(pair)
+    if not price or price <= 0 then
+        return {}
+    end
+    local atr_mult = num(ctx, "atr_mult", 1)
+    local min_notional = num(ctx, "min_notional", 5)
+    local fee_side = num(ctx, "fee_side", 0.001)
+    local fee_bps = fee_side * 10000
+    local f = fee_side
+
+    local atr_intv = ctx:config_str("atr_interval")
+    if atr_intv == nil or atr_intv == "" then
+        atr_intv = "1h"
+    end
+    local atr_period = math.floor(num(ctx, "atr_period", 14))
+    if atr_period <= 0 then
+        atr_period = 14
+    end
+    local atr = ctx:atr_tf(pair, atr_intv, atr_period)
+    if not atr or atr <= 0 then
+        skip_no_atr = skip_no_atr + 1
+        stall_bars = stall_bars + 1
+        if stall_since == nil then
+            stall_since = (ctx:now() or {}).ts
+        end
+        return {}
+    end
+    -- 生效间距 = max(atr_mult×ATR, 最小间距下限×价格)(同 on_tick 口径)
+    local spacing = atr_mult * atr
+    local min_spacing = num(ctx, "min_spacing_pct", 0.004) * price
+    if spacing < min_spacing then
+        spacing = min_spacing
+    end
+
+    local C = ctx:balance(quote_asset) or 0
+    local Q = ctx:position_size(pair) or 0
+    local buy_px = balance_price - spacing
+    local sell_px = balance_price + spacing
+    local orders = { { pair = pair, action = "cancel_pending" } }
+
+    if buy_px > 0 then
+        local q = (C - Q * buy_px) / (buy_px * (2 + f))
+        if q > 0 then
+            q = cap_buy(ctx, q, buy_px, fee_bps)
+            if q * buy_px >= min_notional then
+                orders[#orders + 1] = {
+                    pair = pair, side = "buy", size = q, order_type = "limit", price = buy_px,
+                }
+            end
+        end
+    else
+        skip_zero_buy_px = skip_zero_buy_px + 1
+    end
+
+    if Q > 0 then
+        local q = (Q * sell_px - C) / (sell_px * (2 - f))
+        if q > 0 then
+            q = cap_sell(ctx, pair, q)
+            if q * sell_px >= min_notional then
+                orders[#orders + 1] = {
+                    pair = pair, side = "sell", size = q, order_type = "limit", price = sell_px,
+                }
+            end
+        end
+    end
+
+    if #orders <= 1 then
+        -- 两侧都没挂出(量太小/名义不足/单侧资金耗尽): 保持 need_rehang 下一 tick 再试(防永久停摆)
+        skip_notional = skip_notional + 1
+        stall_bars = stall_bars + 1
+        if stall_since == nil then
+            stall_since = (ctx:now() or {}).ts
+        end
+        if stall_since ~= nil and (ctx:now() or {}).ts ~= nil
+            and (ctx:now()).ts - stall_since >= 86400000
+            and (stall_warned_at == nil or (ctx:now()).ts - stall_warned_at >= 86400000) then
+            stall_warned_at = (ctx:now()).ts
+            ctx:log(string.format(
+                "[uniswap_v2_grid] [WARN] 停摆 ≥1 天: 平衡价 %.4f 间距 %.4f 下两侧均无法挂单 " ..
+                "(现金 %.2f 持仓 %.6f, 小名义跳过 %d 次)",
+                balance_price, spacing, C, Q, skip_notional))
+        end
+        return {}
+    end
+
+    need_rehang = false
+    rehang_count = rehang_count + 1
+    save_state(ctx)
+    ctx:log(string.format(
+        "[uniswap_v2_grid] 网格重挂 #%d: 平衡价 %.4f 间距 %.4f (ATR %.4f×%.2f) -> 买 %s / 卖 %s | " ..
+        "现金 %.2f 持仓 %.6f",
+        rehang_count, balance_price, spacing, atr, atr_mult,
+        buy_px > 0 and string.format("%.4f", buy_px) or "跳过(买价≤0)",
+        Q > 0 and string.format("%.4f", sell_px) or "无(无持仓)",
+        C, Q))
+    return orders
+end
+
 function on_tick(ctx)
     if halted then
         return {}
@@ -335,70 +445,15 @@ function on_tick(ctx)
         return {} -- 两侧单未成交 → 平衡价不变, 不重挂
     end
 
-    -- 重挂(全撤重挂): C/Q 取真实账本, 量按"成交后 1:1 恢复"(含费修正)
-    local C = ctx:balance(quote_asset) or 0
-    local Q = ctx:position_size(pair) or 0
-    local buy_px = balance_price - spacing
-    local sell_px = balance_price + spacing
-    local orders = { { pair = pair, action = "cancel_pending" } }
-
-    if buy_px > 0 then
-        local q = (C - Q * buy_px) / (buy_px * (2 + f))
-        if q > 0 then
-            q = cap_buy(ctx, q, buy_px, fee_bps)
-            if q * buy_px >= min_notional then
-                orders[#orders + 1] = {
-                    pair = pair, side = "buy", size = q, order_type = "limit", price = buy_px,
-                }
-            end
-        end
-    else
-        skip_zero_buy_px = skip_zero_buy_px + 1
-    end
-
-    if Q > 0 then
-        local q = (Q * sell_px - C) / (sell_px * (2 - f))
-        if q > 0 then
-            q = cap_sell(ctx, pair, q)
-            if q * sell_px >= min_notional then
-                orders[#orders + 1] = {
-                    pair = pair, side = "sell", size = q, order_type = "limit", price = sell_px,
-                }
-            end
-        end
-    end
-
-    if #orders <= 1 then
-        -- 两侧都没挂出(量太小/名义不足/单侧资金耗尽): 保持 need_rehang 下一 tick 再试(防永久停摆)
-        skip_notional = skip_notional + 1
-        stall_bars = stall_bars + 1
-        if stall_since == nil then
-            stall_since = t.ts
-        end
-        if t.ts - stall_since >= 86400000 and (stall_warned_at == nil or t.ts - stall_warned_at >= 86400000) then
-            stall_warned_at = t.ts
-            ctx:log(string.format(
-                "[uniswap_v2_grid] [WARN] 停摆 ≥1 天: 平衡价 %.4f 间距 %.4f 下两侧均无法挂单 " ..
-                "(现金 %.2f 持仓 %.6f, 小名义跳过 %d 次)",
-                balance_price, spacing, C, Q, skip_notional))
-        end
-        return {}
-    end
-
-    need_rehang = false
-    rehang_count = rehang_count + 1
-    save_state(ctx)
-    ctx:log(string.format(
-        "[uniswap_v2_grid] 网格重挂 #%d: 平衡价 %.4f 间距 %.4f (ATR %.4f×%.2f) -> 买 %s / 卖 %s | " ..
-        "现金 %.2f 持仓 %.6f",
-        rehang_count, balance_price, spacing, atr, atr_mult,
-        buy_px > 0 and string.format("%.4f", buy_px) or "跳过(买价≤0)",
-        Q > 0 and string.format("%.4f", sell_px) or "无(无持仓)",
-        C, Q))
-    return orders
+    -- 重挂出口(共享决策出口, 037 事件模型): 全撤重挂逻辑已抽至 do_rehang, 语义不变
+    return do_rehang(ctx)
 end
 
 function on_fill(ctx, fill)
+    -- 停机防御(037 事件模型): halted 后不再产出任何订单
+    if halted then
+        return {}
+    end
     local px = fill.fill_price or balance_price or 0
     local size = fill.fill_size or 0
 
@@ -425,7 +480,9 @@ function on_fill(ctx, fill)
             "[uniswap_v2_grid] 建仓成交 %.6f @ %.4f (费 %.4f) -> 平衡价 := %.4f | 现金 %.2f 持仓 %.6f " ..
             "仓位市值 %.2f (投入 %.2f)",
             size, px, fill.fee or 0, balance_price, m_cash, m_pos, m_pos * px, invested0))
-        return
+        -- 038 事件模型: 建仓成交立即全撤重挂(do_rehang)。链内限价单由引擎 038 R1 次 bar 生效,
+        -- 无同 bar 乒乓链; 撤单指令即时生效。
+        return do_rehang(ctx)
     end
 
     -- 网格成交: 平衡价 := 成交价; 模型账本按真实成交推进; 全撤重挂
@@ -445,6 +502,9 @@ function on_fill(ctx, fill)
         fill_count, fill.side, size, px, size * px, fill.fee or 0,
         m_cash or 0, m_pos or 0, balance_price,
         (m_pos and m_pos > 0 and m_pos * px > 0) and (m_cash or 0) / (m_pos * px) or 0))
+    -- 038 事件模型: 网格成交立即全撤重挂(平衡价 := 本笔成交价)。链内限价单由引擎 038 R1
+    -- 次 bar 生效, 无同 bar 乒乓链; 撤单指令即时生效。
+    return do_rehang(ctx)
 end
 
 -- 拒单回传: 重挂防停摆。

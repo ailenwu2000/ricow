@@ -250,6 +250,13 @@ pub struct BacktestContext {
     /// 下单工程护栏 (019-R5): 固定 100 单/秒, 与 Dry Run / 实盘同一实现; 平台不做投资风控。
     guard: RefCell<OrderGuard>,
     pending_orders: Vec<(String, OrderRequest)>,
+    /// 038 R1 撮合保真: on_fill 链内新限价单次 bar 生效开关。settle_orders 派发 depth≥1 的
+    /// 限价单时置 true —— place_order 对限价单跳过"按整根当前 bar 重匹配"的即时撮合, 直接
+    /// 入 pending_orders, 从下一根 bar 的 match_pending 起正常撮合 (含开盘跳空按 open 成交)。
+    /// 对齐行业默认 (backtrader/backtesting.py/NautilusTrader: 本 bar 新挂单绝不按本 bar
+    /// [low,high] 回溯成交), 从机制上消灭"买→卖→买"同 bar 乒乓链。市价单与 on_tick (depth 0)
+    /// 下单不受影响, 语义零改动。
+    defer_new_limits: bool,
     fill_queue: Vec<OrderFill>,
     current_bar: Option<Kline>,
     closed_klines: Vec<Kline>,
@@ -386,6 +393,7 @@ impl BacktestContext {
             rejected_count: 0,
             guard,
             pending_orders: Vec::new(),
+            defer_new_limits: false,
             fill_queue: Vec::new(),
             current_bar: None,
             closed_klines: Vec::new(),
@@ -621,6 +629,11 @@ impl BacktestContext {
                 p
             })
         }
+    }
+
+    /// 038 R1: 切换"on_fill 链内新限价单次 bar 生效"开关 (settle_orders 派发 depth≥1 限价单时用)。
+    pub fn set_defer_new_limits(&mut self, on: bool) {
+        self.defer_new_limits = on;
     }
 
     /// 推送一根 K 线: 更新当前 bar (前一根移入已收盘序列), 撮合 pending 订单。
@@ -2168,6 +2181,23 @@ impl Context for BacktestContext {
                 return Ok(ack);
             }
         };
+        // 038 R1 撮合保真: on_fill 链内 (defer 开关打开) 的新限价单**不按当前 bar 重匹配**,
+        // 直接入簿, 从下一根 bar 的 match_pending 起正常撮合 (含开盘跳空按 open 成交)。
+        // 对齐行业默认 (backtrader/backtesting.py/NautilusTrader), 消灭同 bar 乒乓链。
+        // 注: guard_reject/风控/可平量校验已在上文完成, 与即时撮合路径同一门槛。
+        if self.defer_new_limits && req.order_type == OrderType::Limit {
+            self.pending_orders.push((exchange_order_id.clone(), req.clone()));
+            return Ok(OrderAck {
+                exchange_order_id,
+                client_order_id: req.client_order_id,
+                pair: req.pair,
+                side: req.side,
+                price: req.price.unwrap_or(Decimal::ZERO),
+                size: req.size,
+                filled_size: Decimal::ZERO,
+                status: OrderStatus::Open,
+            });
+        }
         let ack = match self.try_match_ohlc(&req, &bar) {
             Some(fill_price) => {
                 if self.is_noop_fill(&req) {

@@ -543,11 +543,13 @@ fn test_paired_grid_futures_long_activate_market_build() {
 
 /// 036 事件模型: 复刻引擎 settle_orders(034)——下单 → drain → on_fill(返回订单递归 place)。
 /// 同时记录 on_fill 返回批次、全部下单批次与逐笔成交。
+/// 038 R1: 链内 (depth≥1) 限价单次 bar 生效 (defer 开关, 与引擎同款)。
 fn settle_orders_test(
     ctx: &mut BacktestContext,
     strategy: &mut LuaStrategy,
     orders: Vec<OrderRequest>,
     i: usize,
+    depth: u32,
     fill_batches: &mut Vec<(usize, Vec<OrderRequest>)>,
     placed: &mut Vec<(usize, Vec<OrderRequest>)>,
     fills: &mut FillTrace,
@@ -556,13 +558,20 @@ fn settle_orders_test(
         placed.push((i, orders.clone()));
     }
     for req in orders {
+        let defer = depth > 0 && req.order_type == OrderType::Limit;
+        if defer {
+            ctx.set_defer_new_limits(true);
+        }
         let _ = ctx.place_order(req);
+        if defer {
+            ctx.set_defer_new_limits(false);
+        }
     }
     for f in ctx.drain_fills() {
         fills.push((i, f.side, f.fill_size.to_f64().unwrap(), f.fill_price.to_f64().unwrap()));
         let follow = strategy.on_fill(ctx, f);
         fill_batches.push((i, follow.clone()));
-        settle_orders_test(ctx, strategy, follow, i, fill_batches, placed, fills);
+        settle_orders_test(ctx, strategy, follow, i, depth + 1, fill_batches, placed, fills);
     }
 }
 
@@ -593,12 +602,22 @@ fn run_event_full(cfg: StrategyConfig, bars: &[Kline]) -> EventRun {
             &mut strategy,
             Vec::new(),
             i,
+            0,
             &mut batches,
             &mut placed,
             &mut fills,
         );
         let tick = strategy.on_tick(&mut ctx);
-        settle_orders_test(&mut ctx, &mut strategy, tick, i, &mut batches, &mut placed, &mut fills);
+        settle_orders_test(
+            &mut ctx,
+            &mut strategy,
+            tick,
+            i,
+            0,
+            &mut batches,
+            &mut placed,
+            &mut fills,
+        );
     }
     (batches, placed, fills)
 }
@@ -696,7 +715,7 @@ fn test_paired_grid_futures_long_on_fill_no_order_keeps_rehang() {
         ("min_notional", ConfigValue::Float(10.3)),
     ]);
     let bars: Vec<Kline> =
-        [100.0, 105.0, 99.0].iter().enumerate().map(|(h, px)| bar_at_f(h as i64, *px)).collect();
+        [100.0, 105.0, 105.0].iter().enumerate().map(|(h, px)| bar_at_f(h as i64, *px)).collect();
     let batches = run_event_loop(cfg, &bars);
 
     // bar0: 建仓成交 -> on_fill 重挂: 买 10<10.3 跳过, 仅卖出建仓 lot(@104)。
@@ -708,17 +727,17 @@ fn test_paired_grid_futures_long_on_fill_no_order_keeps_rehang() {
         "bar0 应挂出建仓 lot 的配对卖单: {:?}",
         b0[0]
     );
-    // bar1: 卖出建仓 lot(104)成交 -> on_fill 重挂下一 lot 卖@104 -> **同 bar 链式再成交**
-    // -> 第二次 on_fill 栈空, 两手皆空 -> 空表(保持 need_rehang)。
+    // bar1: 卖出建仓 lot(104)成交 -> on_fill 重挂下一 lot 卖@104 (038 R1: 链内限价单
+    // 次 bar 生效, **不再同 bar 链式再成交**) -> 恰 1 批。
     let b1: Vec<&Vec<OrderRequest>> =
         batches.iter().filter(|(i, _)| *i == 1).map(|(_, o)| o).collect();
-    assert_eq!(b1.len(), 2, "bar1 应有链式两批 on_fill: {batches:?}");
-    assert!(b1[0].iter().any(|o| o.side == OrderSide::Sell), "第一批应重挂栈顶卖单: {:?}", b1[0]);
-    assert!(b1[1].is_empty(), "栈空后无单可挂应返回空表(保持 need_rehang): {:?}", b1[1]);
-    // bar2: 无新成交(重试发生在 on_tick, 不产单不成交)。
+    assert_eq!(b1.len(), 1, "bar1 应恰 1 批 on_fill(链内限价次 bar 生效): {batches:?}");
+    assert!(b1[0].iter().any(|o| o.side == OrderSide::Sell), "应重挂栈顶卖单: {:?}", b1[0]);
+    // bar2: 次 bar 入簿的卖@104 成交 -> 第二次 on_fill 栈空, 两手皆空 -> 空表(保持 need_rehang)。
     let b2: Vec<&Vec<OrderRequest>> =
         batches.iter().filter(|(i, _)| *i == 2).map(|(_, o)| o).collect();
-    assert!(b2.is_empty(), "bar2 不应有新成交");
+    assert_eq!(b2.len(), 1, "bar2 应有 1 批 on_fill: {batches:?}");
+    assert!(b2[0].is_empty(), "栈空后无单可挂应返回空表(保持 need_rehang): {:?}", b2[0]);
 }
 
 #[test]
@@ -772,16 +791,16 @@ fn test_paired_grid_futures_long_grid_pair_cycle() {
             .any(|o| o.side == OrderSide::Buy && o.order_type == OrderType::Market),
         "应穿越激活并市价建仓"
     );
-    // 逐笔轨迹: 建仓(买市价@100) + 网格买(@96) + bar3 链式两笔卖出 ——
-    // 卖@99.84 成交 -> on_fill 同 bar 重挂栈顶(建仓 lot)卖@104 -> 本 bar 立即再成交
-    // (036 事件模型同 bar 链式成交, 栈清空; 建仓 lot 平仓不计 flag)。
-    assert_eq!(fills.len(), 4, "建仓+网格买+同 bar 链式双卖应恰 4 笔成交: {fills:?}");
+    // 逐笔轨迹: 建仓(买市价@100) + 网格买(@96) + 配对卖@99.84(bar3) + 链式卖@104(bar4) ——
+    // 卖@99.84 成交 -> on_fill 同 bar 重挂栈顶(建仓 lot)卖@104, 但 038 R1 链内限价单
+    // **次 bar 生效** -> 在 bar4 成交(栈清空; 建仓 lot 平仓不计 flag)。
+    assert_eq!(fills.len(), 4, "建仓+网格买+配对卖+次 bar 链式卖应恰 4 笔成交: {fills:?}");
     assert_eq!(fills[0], (0, OrderSide::Buy, 0.1, 100.0));
     assert_eq!(fills[1].0, 1, "网格买应在 bar1 成交");
     assert_eq!(fills[1].1, OrderSide::Buy);
     assert_eq!(fills[2].0, 3, "配对卖应在 bar3 成交");
     assert_eq!(fills[2].1, OrderSide::Sell);
-    assert_eq!(fills[3].0, 3, "链式卖应同 bar(bar3)成交");
+    assert_eq!(fills[3].0, 4, "链式卖应次 bar(bar4)成交(038 R1 保守化)");
     assert_eq!(fills[3].1, OrderSide::Sell);
     // 每笔成交都伴随 on_fill 重挂批次(事件模型核心行为)。
     for f in &fills {
@@ -940,13 +959,50 @@ fn with_bar(mut bars: Vec<Kline>, idx: i64, o: i64, h: i64, l: i64, c: i64) -> V
     bars
 }
 
-/// 033: runner 同款时序(step_bar → 撮合成交先入账 → on_tick → 下单 → 即时成交入账),
-/// 与 `backtest_runner::run_backtest` 逐 bar 循环一致(成交先于决策, 同 bar 重挂生效)。
+/// 037 事件模型: on_fill 返回的订单即下单 → drain → 递归(复刻引擎 settle_orders, 034,
+/// 含 [`MAX_FILL_DECISION_DEPTH`] 同款深度上限 8); 下单批次按 bar 收集进 `out`。
+const MAX_FILL_DECISION_DEPTH: u32 = 8;
+
+fn settle_univ2(
+    ctx: &mut BacktestContext,
+    strategy: &mut LuaStrategy,
+    orders: Vec<OrderRequest>,
+    out: &mut Vec<Vec<Vec<OrderRequest>>>,
+    depth: u32,
+) {
+    if depth > MAX_FILL_DECISION_DEPTH {
+        return;
+    }
+    if !orders.is_empty() {
+        out.last_mut().expect("out 应已按 bar 预留").push(orders.clone());
+    }
+    for req in orders {
+        // 038 R1: 链内 (depth≥1) 限价单次 bar 生效 —— 与引擎 settle_orders 同款 defer 开关;
+        // 市价单/撤单指令即时处理。
+        let defer = depth > 0 && req.order_type == OrderType::Limit;
+        if defer {
+            ctx.set_defer_new_limits(true);
+        }
+        let _ = ctx.place_order(req);
+        if defer {
+            ctx.set_defer_new_limits(false);
+        }
+    }
+    for f in ctx.drain_fills() {
+        let follow = strategy.on_fill(ctx, f);
+        settle_univ2(ctx, strategy, follow, out, depth + 1);
+    }
+}
+
+/// 033/037: runner 同款时序(step_bar → 撮合成交先入账 → on_tick → 下单 → 即时成交入账),
+/// 与 `backtest_runner::run_backtest` 逐 bar 循环一致(成交先于决策, 同 bar 重挂生效);
+/// 037 起含事件模型递归(on_fill 返回订单即下单)。返回逐 bar 全部下单批次
+/// (on_fill 返回 + on_tick, 每项为该 bar 的批次列表)。
 fn run_univ2(
     cfg: StrategyConfig,
     bars: &[Kline],
     tf: Option<Vec<Kline>>,
-) -> (Vec<Vec<OrderRequest>>, BacktestContext, LuaStrategy) {
+) -> (Vec<Vec<Vec<OrderRequest>>>, BacktestContext, LuaStrategy) {
     let mut strategy = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
         .expect("内置脚本应编译通过");
     let mut ctx = BacktestContext::new(
@@ -957,20 +1013,18 @@ fn run_univ2(
         ctx.set_tf_klines("ETHUSDT", "1h", bars);
     }
     strategy.on_init(&mut ctx);
-    let mut out = Vec::new();
+    let mut out: Vec<Vec<Vec<OrderRequest>>> = Vec::new();
     for k in bars {
         ctx.step_bar(k.clone());
+        out.push(Vec::new());
         for f in ctx.drain_fills() {
-            strategy.on_fill(&mut ctx, f);
+            // 引擎口径: step_bar 撮合出的成交在 settle_orders(d=0) 首轮派发,
+            // on_fill 的 follow 从 depth+1 起(深度上限 8)。
+            let follow = strategy.on_fill(&mut ctx, f);
+            settle_univ2(&mut ctx, &mut strategy, follow, &mut out, 1);
         }
         let orders = strategy.on_tick(&mut ctx);
-        for req in &orders {
-            let _ = ctx.place_order(req.clone());
-        }
-        for f in ctx.drain_fills() {
-            strategy.on_fill(&mut ctx, f);
-        }
-        out.push(orders);
+        settle_univ2(&mut ctx, &mut strategy, orders, &mut out, 0);
     }
     (out, ctx, strategy)
 }
@@ -1035,8 +1089,11 @@ fn test_uniswap_v2_grid_min_spacing_floor() {
         .collect();
     let (orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
     assert_eq!(st.global_f64("balance_price"), Some(100.0), "建仓价 100 = 第一平衡价");
-    let limits: Vec<_> = orders[16]
+    // 038 R3: 建仓成交 on_fill 同 bar 立即重挂(batch 记录在 fill bar 15; 链内限价单由
+    // 引擎 defer 次 bar 生效, 不参与本 bar 撮合)。
+    let limits: Vec<_> = orders[15]
         .iter()
+        .flatten()
         .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
         .collect();
     let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
@@ -1052,7 +1109,7 @@ fn test_uniswap_v2_grid_activate_half_build_and_grid() {
     let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
     let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
     let market: Vec<_> =
-        orders.iter().flatten().filter(|o| o.order_type == OrderType::Market).collect();
+        orders.iter().flatten().flatten().filter(|o| o.order_type == OrderType::Market).collect();
     assert_eq!(market.len(), 1, "激活时应恰有一笔市价建仓");
     assert_eq!(market[0].side, OrderSide::Buy);
     let notional = market[0].size * market[0].price.unwrap_or(dec!(100));
@@ -1060,9 +1117,10 @@ fn test_uniswap_v2_grid_activate_half_build_and_grid() {
     assert_eq!(st.global_f64("balance_price"), Some(100.0), "建仓成交价应成为第一平衡价");
     assert_eq!(st.global_f64("invested0"), Some(10000.0));
 
-    // 建仓成交后的重挂(建仓市价单在 h=15 成交, h=16 重挂): 买 98 / 卖 102
-    let limits: Vec<_> = orders[16]
+    // 建仓成交后的重挂(038 R3: on_fill 同 bar 返回, 记录在 fill bar 15): 买 98 / 卖 102
+    let limits: Vec<_> = orders[15]
         .iter()
+        .flatten()
         .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
         .collect();
     assert_eq!(limits.len(), 2, "两侧都应挂单: {:?}", limits);
@@ -1081,20 +1139,21 @@ fn test_uniswap_v2_grid_activate_half_build_and_grid() {
 
 #[test]
 fn test_uniswap_v2_grid_buy_fill_restores_one_to_one() {
-    // 买 98 成交后: 平衡价 := 98 并同 tick 重挂 96/100; 引擎当根撮合: bar18 high=100 ≥ 卖 100
-    // → 卖 100 亦当根成交, 期末在 100 处恢复 1:1(|C′ − Q′×100| < 0.01, 平衡价 := 最后一笔成交价)。
+    // 买 98 成交后: 重挂 96/100(fill 先于 on_tick 派发 → 同 bar on_tick 重挂)。
+    // bar18 收窄为 [97,99](high < 卖 100), 只触发买侧 —— 宽 bar 双侧场景由下方测试专测。
     let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
-    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 100, 100, 97, 99);
+    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 99, 99, 97, 98);
     let (orders, ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
-    assert_eq!(st.global_f64("fill_count"), Some(3.0), "建仓 + 买 98 + 重挂卖 100 各成交一次");
-    assert_eq!(st.global_f64("balance_price"), Some(100.0), "平衡价 := 最后一笔成交价");
+    assert_eq!(st.global_f64("fill_count"), Some(2.0), "建仓 + 买 98 各成交一次");
+    assert_eq!(st.global_f64("balance_price"), Some(98.0), "平衡价 := 买成交价");
     let c = ctx.balance("USDT").expect("应有 USDT 余额");
     let q = ctx.position("ETHUSDT").expect("应有持仓").size;
-    let diff = c - q * dec!(100);
-    assert!(diff.abs() < dec!(0.01), "成交后应恢复 1:1: C={c} Q={q} |C−Q×100|={diff}");
-    // 同 tick 重挂: 买 96 / 卖 100(挂单先于撮合可见)
+    let diff = c - q * dec!(98);
+    assert!(diff.abs() < dec!(0.01), "成交后应恢复 1:1: C={c} Q={q} |C−Q×98|={diff}");
+    // 同 bar on_tick 重挂: 买 96 / 卖 100(不成交, bar high=99)
     let limits: Vec<_> = orders[18]
         .iter()
+        .flatten()
         .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
         .collect();
     let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
@@ -1105,26 +1164,58 @@ fn test_uniswap_v2_grid_buy_fill_restores_one_to_one() {
 
 #[test]
 fn test_uniswap_v2_grid_sell_fill_restores_one_to_one() {
-    // 卖 102 成交后: 平衡价 := 102 并同 tick 重挂 100/104; 引擎当根撮合: bar18 low=100 ≤ 买 100
-    // → 买 100 亦当根成交, 期末在 100 处恢复 1:1(平衡价 := 最后一笔成交价)。
+    // 卖 102 成交后: 重挂 100/104(fill 先于 on_tick 派发 → 同 bar on_tick 重挂)。
+    // bar18 收窄为 [101,103](low > 买 100), 只触发卖侧。
     let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
-    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 100, 103, 100, 102);
+    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 102, 103, 101, 102);
     let (orders, ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
-    assert_eq!(st.global_f64("fill_count"), Some(3.0), "建仓 + 卖 102 + 重挂买 100 各成交一次");
-    assert_eq!(st.global_f64("balance_price"), Some(100.0), "平衡价 := 最后一笔成交价");
+    assert_eq!(st.global_f64("fill_count"), Some(2.0), "建仓 + 卖 102 各成交一次");
+    assert_eq!(st.global_f64("balance_price"), Some(102.0), "平衡价 := 卖成交价");
     let c = ctx.balance("USDT").expect("应有 USDT 余额");
     let q = ctx.position("ETHUSDT").expect("应有持仓").size;
-    let diff = c - q * dec!(100);
-    assert!(diff.abs() < dec!(0.01), "成交后应恢复 1:1: C={c} Q={q} |C−Q×100|={diff}");
-    // 同 tick 重挂: 买 100 / 卖 104(挂单先于撮合可见)
+    let diff = c - q * dec!(102);
+    assert!(diff.abs() < dec!(0.01), "成交后应恢复 1:1: C={c} Q={q} |C−Q×102|={diff}");
+    // 同 bar on_tick 重挂: 买 100 / 卖 104(均不成交, bar 范围 [101,103])
     let limits: Vec<_> = orders[18]
         .iter()
+        .flatten()
         .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
         .collect();
     let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
     let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
     assert_eq!(buy.price, Some(dec!(100)));
     assert_eq!(sell.price, Some(dec!(104)));
+}
+
+#[test]
+fn test_uniswap_v2_grid_on_fill_chain_capped_at_engine_depth() {
+    // 038 R1+R3: on_fill 立即重挂已恢复, 但链内限价单**次 bar 生效**(引擎 defer 开关) ——
+    // 宽 bar [97,100] 触发买 98 成交后, 重挂的 买 96/卖 100 不再被同 bar 回溯匹配,
+    // 乒乓链从机制上消失(037 病理修复的直接锁形测试)。
+    let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 100, 100, 97, 99);
+    let (orders, ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    assert_eq!(
+        st.global_f64("fill_count"),
+        Some(2.0),
+        "建仓 1 + 宽 bar 买 98 各 1; 重挂单次 bar 生效, 本 bar 不再成交"
+    );
+    assert_eq!(st.global_f64("balance_price"), Some(98.0), "平衡价 := 买成交价");
+    // 重挂批次记录在 fill bar 18(本 bar 未撮合)
+    let limits: Vec<_> = orders[18]
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    assert_eq!(buy.price, Some(dec!(96)));
+    assert_eq!(sell.price, Some(dec!(100)));
+    // 1:1 恢复仍在成交价成立
+    let c = ctx.balance("USDT").expect("应有 USDT 余额");
+    let q = ctx.position("ETHUSDT").expect("应有持仓").size;
+    let diff = c - q * dec!(98);
+    assert!(diff.abs() < dec!(0.05), "成交后 1:1 仍近似成立: C={c} Q={q} diff={diff}");
 }
 
 #[test]
@@ -1139,6 +1230,7 @@ fn test_uniswap_v2_grid_no_position_activation_only_buy() {
     assert_eq!(st.global_f64("balance_price"), Some(100.0), "平衡价 := 激活时现价");
     let limits: Vec<_> = orders[16]
         .iter()
+        .flatten()
         .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
         .collect();
     let sells: Vec<_> = limits.iter().filter(|o| o.side == OrderSide::Sell).collect();
@@ -1166,7 +1258,9 @@ fn test_uniswap_v2_grid_ledger_cross_check() {
     // runner 时序(含预热跳过): 激活建仓 → 买 98 → 卖 100; 停机时策略模型账本 vs 引擎误差 < 0.01。
     let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
     let mut bars = univ2_main(60, 200, 100, 24);
-    bars[40] = bar_at_hour(40, 100, 101, 97, 99); // low=97 触发买 98; 同 bar 重挂卖 100 且 high=101 → 当根也成交
+    // low=97 触发买 98; 重挂卖 100 在下一根振幅 bar(h=101)成交 —— 事件模型下
+    // 重挂单持久挂出, 与旧 bar 节流口径的成交集合一致(时点后移一根 bar)。
+    bars[40] = bar_at_hour(40, 99, 99, 97, 98);
     let mut strategy = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
         .expect("内置脚本应编译通过");
     let mut ctx = BacktestContext::new(
@@ -1175,19 +1269,16 @@ fn test_uniswap_v2_grid_ledger_cross_check() {
     );
     ctx.set_tf_klines("ETHUSDT", "1h", tf_bars(60));
     strategy.on_init(&mut ctx);
-    // 预热跳过 24 根(aux 1h×24 根 / 主时钟 1h), 与装配层一致。
+    // 预热跳过 24 根(aux 1h×24 根 / 主时钟 1h), 与装配层一致; 037 事件模型递归。
     for k in &bars[24..] {
         ctx.step_bar(k.clone());
+        let mut sink: Vec<Vec<Vec<OrderRequest>>> = vec![Vec::new()];
         for f in ctx.drain_fills() {
-            strategy.on_fill(&mut ctx, f);
+            let follow = strategy.on_fill(&mut ctx, f);
+            settle_univ2(&mut ctx, &mut strategy, follow, &mut sink, 1);
         }
         let orders = strategy.on_tick(&mut ctx);
-        for req in orders {
-            let _ = ctx.place_order(req);
-        }
-        for f in ctx.drain_fills() {
-            strategy.on_fill(&mut ctx, f);
-        }
+        settle_univ2(&mut ctx, &mut strategy, orders, &mut sink, 0);
     }
     strategy.on_stop(&mut ctx);
     let snap: HashMap<String, String> = strategy.state_snapshot().into_iter().collect();
@@ -1195,14 +1286,14 @@ fn test_uniswap_v2_grid_ledger_cross_check() {
     assert_eq!(
         stat("stat_fill_count"),
         "3",
-        "应恰有 建仓+买+卖 3 笔成交: {}",
+        "应恰有 建仓+买98+卖100 3 笔成交: {}",
         stat("stat_fill_count")
     );
     let d_cash: f64 = stat("stat_ledger_diff_cash").parse().expect("stat_ledger_diff_cash");
     let d_pos: f64 = stat("stat_ledger_diff_pos").parse().expect("stat_ledger_diff_pos");
     assert!(d_cash.abs() < 0.01, "账本现金差应 < 0.01: {d_cash}");
     assert!(d_pos.abs() < 0.01, "账本持仓差应 < 0.01: {d_pos}");
-    // 期末 1:1: 现金 ≈ 持仓 × 平衡价(100)
+    // 期末 1:1: 现金 ≈ 持仓 × 平衡价(100, 最后一笔 = 卖 100)
     let c = ctx.balance("USDT").expect("应有 USDT 余额");
     let q = ctx.position("ETHUSDT").expect("应有持仓").size;
     let diff = c - q * dec!(100);
