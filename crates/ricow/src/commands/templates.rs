@@ -62,30 +62,28 @@ mod tests {
     #[test]
     fn list_text_lists_builtin_strategies() {
         let text = list_text();
-        for must in ["shannon_spot_grid", "paired_grid", "香农现货网格", "现货动态非对称网格"]
-        {
+        for must in ["paired_grid", "paired_grid_futures_long", "现货动态非对称网格"] {
             assert!(text.contains(must), "清单缺少: {must}");
         }
     }
 
     #[test]
     fn find_works() {
-        assert!(find("shannon_spot_grid").is_some());
         assert!(find("paired_grid").is_some());
         assert!(find("no-such-template").is_none());
-        assert!(find("shannon_spot_grid").is_some_and(|e| e.code.contains("on_tick")));
+        assert!(find("paired_grid").is_some_and(|e| e.code.contains("on_tick")));
     }
 
     #[test]
     fn names_contains_builtin() {
         let names = names();
-        assert!(names.iter().any(|n| n == "shannon_spot_grid"));
         assert!(names.iter().any(|n| n == "paired_grid"));
+        assert!(names.iter().any(|n| n == "paired_grid_futures_long"));
     }
 
     #[test]
     fn render_read_includes_code() {
-        let grid = find("shannon_spot_grid").unwrap();
+        let grid = find("paired_grid").unwrap();
         let rendered = render_read(&grid);
         assert!(rendered.contains("on_tick"), "详情须带原文代码");
     }

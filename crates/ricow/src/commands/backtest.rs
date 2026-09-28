@@ -613,7 +613,7 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "shannon_spot_grid"
+type = "paired_grid"
 enabled = true
 exchange = "binance"
 
@@ -671,7 +671,7 @@ order_size = 0.02
             r#"
 [strategy]
 name = "nopair"
-type = "shannon_spot_grid"
+type = "paired_grid"
 enabled = true
 exchange = "binance"
 "#,

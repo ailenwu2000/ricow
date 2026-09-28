@@ -130,11 +130,6 @@ pub struct CatalogEntry {
 /// 内置示例(编译期嵌入): (策略 id, 清单 TOML, Lua 源码)。
 const BUILTIN: &[(&str, &str, &str)] = &[
     (
-        "shannon_spot_grid",
-        include_str!("../../../../strategies/spot/shannon_spot_grid.toml"),
-        include_str!("../../../../strategies/spot/shannon_spot_grid.lua"),
-    ),
-    (
         "paired_grid",
         include_str!("../../../../strategies/spot/paired_grid.toml"),
         include_str!("../../../../strategies/spot/paired_grid.lua"),
@@ -418,18 +413,14 @@ default_leverage = 2.0
         let entries = all();
         assert!(entries
             .iter()
-            .any(|e| e.manifest.id == "shannon_spot_grid" && e.source == Source::Builtin));
-        assert!(entries
-            .iter()
             .any(|e| e.manifest.id == "paired_grid" && e.source == Source::Builtin));
         assert!(entries
             .iter()
-            .any(|e| e.manifest.id == "shannon_spot_grid" && e.code.contains("on_tick")));
+            .any(|e| e.manifest.id == "paired_grid" && e.code.contains("on_tick")));
     }
 
     #[test]
     fn find_works() {
-        assert!(find("shannon_spot_grid").is_some());
         assert!(find("paired_grid").is_some());
         assert!(find("no-such-strategy").is_none());
     }

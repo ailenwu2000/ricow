@@ -130,7 +130,7 @@ pub struct LiveContext {
     position_cache: RwLock<HashMap<String, Position>>,
     balance_cache: RwLock<HashMap<String, Balance>>,
     klines_cache: RwLock<HashMap<String, Vec<Kline>>>,
-    /// 高周期序列缓存 (023 香农 ETF 指数增加策略; 2026-09-18 扩为多套): 键 = `pair|tf`。
+    /// 高周期序列缓存 (023 引入; 2026-09-18 扩为多套): 键 = `pair|tf`。
     /// 由 `set_tf_klines` 预装(装配层已剔除不完整桶); `tf_klines` 按当前时刻取可见前缀。
     tf_cache: RwLock<HashMap<String, Arc<TfCache>>>,
     /// 策略数据需求声明 (need_klines 写入, 引擎装配阶段读取)。

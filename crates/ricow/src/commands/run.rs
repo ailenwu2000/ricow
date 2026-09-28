@@ -416,7 +416,7 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "shannon_spot_grid"
+type = "paired_grid"
 enabled = {enabled}
 exchange = "binance"
 
