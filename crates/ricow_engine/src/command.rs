@@ -119,6 +119,8 @@ enum LiveEvent {
     Funding,
     /// 035 行情静默兜底心跳: 用最后一次 orderbook 调 on_tick, 不虚构行情事实。
     Heartbeat,
+    /// 042 通知摘要心跳: 周期向用户推送运行摘要 (IM 心跳/日报)。
+    SummaryTick,
 }
 
 /// 拉取资金费流水并落库 (014 FR-003): 水位 = db `MAX(funding_time)`(无记录则回溯 `FUNDING_LOOKBACK_MS`)。
@@ -634,8 +636,21 @@ async fn live_decision_tick(
     is_futures: bool,
     liq_warn_threshold: f64,
     notifier: Option<&Notifier>,
+    // 042: 停摆通知阈值 (`notify_stall_bars`); 策略 `stat_stall_bars` ≥ 阈值时派发一次 stall 通知
+    notify_stall_bars: u64,
 ) {
     let orders = strategy.on_tick(ctx);
+    // 042: 策略停机/停摆状态量通知 (notify_once 去重, 每 tick 重复调用安全)
+    if let Some(n) = notifier {
+        if strategy.halted() {
+            n.notify(NotifyEvent::Halted { detail: "策略运行期置停机标记".into() });
+        }
+        if let Some(bars) = strategy.stall_bars() {
+            if bars >= notify_stall_bars {
+                n.notify(NotifyEvent::Stall { bars, threshold: notify_stall_bars });
+            }
+        }
+    }
     let mut any_filled = false;
     for req in orders {
         outcome.orders_submitted += 1;
@@ -1172,7 +1187,22 @@ impl Engine {
         // 035: 行情静默期兜底心跳 (首拍即触发, 由 orderbook 为空守卫拦下, 见 Heartbeat 分支)
         let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(QUOTE_HEARTBEAT_SECS));
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 042: 通知摘要心跳 (IM 心跳/日报); `notify_heartbeat_secs` 0 = 关闭
+        let notify_heartbeat_secs =
+            config.get_f64("notify_heartbeat_secs").unwrap_or(86_400.0).max(0.0) as u64;
+        let notify_heartbeat_on = notify_heartbeat_secs > 0;
+        let mut summary_tick =
+            tokio::time::interval(Duration::from_secs(notify_heartbeat_secs.max(1)));
+        summary_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 042: 停摆通知阈值 (`notify_stall_bars`, 默认 1440 bars); live_decision_tick 内消费
+        let notify_stall_bars =
+            config.get_f64("notify_stall_bars").unwrap_or(1440.0).max(0.0) as u64;
+        let started_at = std::time::Instant::now();
         tracing::info!(target: "engine", name = %strategy_name, pair = %pair, mode = %mode.label(), "live run started");
+        // 042: 启动通知 (未配 webhook 时 no-op)
+        if let Some(n) = &notifier {
+            n.notify(NotifyEvent::Started { mode: mode.label().to_string(), pair: pair.clone() });
+        }
 
         let mut stop_rx = stop;
         // 停机时是否平仓: 启动参数与停机指令二者取或 (`start --live` 后 `stop --close-all` 也生效)
@@ -1190,12 +1220,16 @@ impl Engine {
                             close_all: false,
                         }),
                     }),
+                    // 042: 摘要心跳优先于行情 —— biased 下行情流 (100ms) 恒就绪会饿死排后的分支
+                    _ = summary_tick.tick(), if notify_heartbeat_on => LiveEvent::SummaryTick,
                     upd = quote_stream.next() => LiveEvent::Quote(upd),
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
                     _ = heartbeat_tick.tick() => LiveEvent::Heartbeat,
                 },
                 None => tokio::select! {
+                    biased;
+                    _ = summary_tick.tick(), if notify_heartbeat_on => LiveEvent::SummaryTick,
                     upd = quote_stream.next() => LiveEvent::Quote(upd),
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
@@ -1252,6 +1286,7 @@ impl Engine {
                         is_futures,
                         liq_warn_threshold,
                         notifier.as_ref(),
+                        notify_stall_bars,
                     )
                     .await;
                 }
@@ -1275,8 +1310,22 @@ impl Engine {
                         is_futures,
                         liq_warn_threshold,
                         notifier.as_ref(),
+                        notify_stall_bars,
                     )
                     .await;
+                }
+                LiveEvent::SummaryTick => {
+                    // 042: 通知摘要心跳 —— interval 首拍即触发, 跳过 (刚启动无需心跳)
+                    if started_at.elapsed() < Duration::from_secs(notify_heartbeat_secs.max(1)) {
+                        continue;
+                    }
+                    if let Some(n) = &notifier {
+                        n.notify(NotifyEvent::Heartbeat {
+                            uptime_secs: started_at.elapsed().as_secs(),
+                            fills: outcome.fills,
+                            ticks: outcome.ticks,
+                        });
+                    }
                 }
                 LiveEvent::User(None) => {
                     // 用户数据流断线: 成交无法回灌 → 异常停机 (plan P1), 不静默继续
@@ -1552,10 +1601,12 @@ impl Engine {
             if let Some(n) = &notifier {
                 let residual_pos = cleanup.residual_position.unwrap_or(Decimal::ZERO);
                 if !cleanup.residual.is_empty() || residual_pos != Decimal::ZERO {
-                    n.notify(NotifyEvent::Residual {
+                    // 042: 同步投递 —— 残留告警发生在停机尾部, 后台任务会被进程退出掐断
+                    n.notify_stopping(NotifyEvent::Residual {
                         orders: cleanup.residual.len(),
                         position: residual_pos,
-                    });
+                    })
+                    .await;
                 }
             }
             outcome.cleanup = Some(cleanup);
@@ -1606,6 +1657,17 @@ impl Engine {
             residual_orders = residual, residual_position = %residual_pos,
             "live run stopped"
         );
+        // 042: 停机通知 —— 原因如实 (含异常路径), 带本次运行累计成交数;
+        // 同步投递 (进程即将退出, 后台任务会被掐断)
+        if let Some(n) = &notifier {
+            let reason = match (&outcome.last_error, outcome.stop_reason) {
+                (Some(err), Some(sr)) => format!("{sr}: {err}"),
+                (Some(err), None) => err.clone(),
+                (None, Some(sr)) => sr.to_string(),
+                (None, None) => "未知".to_string(),
+            };
+            n.notify_stopping(NotifyEvent::Stopped { reason, fills: outcome.fills }).await;
+        }
         Ok(outcome)
     }
 
@@ -2070,6 +2132,7 @@ mod tests {
             false,
             0.15,
             None,
+            1440,
         )
         .await;
 

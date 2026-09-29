@@ -813,6 +813,35 @@ impl Strategy for LuaStrategy {
         let globals = self.lua.globals();
         globals.get::<Function>("on_stop").is_ok()
     }
+
+    /// 042: 策略停机标记 —— Lua 全局 `fatal`/`halted` ≥ 1, 或 `_RICOW_STATE` 同名键 = "1"。
+    fn halted(&self) -> bool {
+        let g = self.lua.globals();
+        let num_set = |name: &str| -> bool {
+            matches!(g.get::<Option<f64>>(name).ok().flatten(), Some(v) if v >= 1.0)
+        };
+        if num_set("fatal") || num_set("halted") {
+            return true;
+        }
+        ["fatal", "halted"]
+            .iter()
+            .any(|k| matches!(state_get(&g, k).as_deref(), Some("1") | Some("1.0") | Some("true")))
+    }
+
+    /// 042: 策略停摆计数 —— `_RICOW_STATE["stat_stall_bars"]` (字符串), 回退 Lua 全局。
+    fn stall_bars(&self) -> Option<u64> {
+        let g = self.lua.globals();
+        if let Some(v) = state_get(&g, "stat_stall_bars") {
+            return v.parse::<f64>().ok().map(|f| f as u64);
+        }
+        g.get::<Option<f64>>("stat_stall_bars").ok().flatten().map(|f| f as u64)
+    }
+}
+
+/// 读 `_RICOW_STATE[key]` (字符串值, 030 状态快照表)。
+fn state_get(g: &mlua::Table, key: &str) -> Option<String> {
+    let t = g.get::<Option<mlua::Table>>("_RICOW_STATE").ok().flatten()?;
+    t.get::<Option<String>>(key).ok().flatten()
 }
 
 // ============================================================================

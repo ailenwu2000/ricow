@@ -42,4 +42,19 @@ pub trait Strategy: Send + Sync {
     fn has_on_stop(&self) -> bool {
         false
     }
+
+    /// 策略是否已置停机标记 (042): 引擎据此派发 `halted` 通知。
+    ///
+    /// Lua 策略约定: 全局 `fatal = 1` / `halted = 1` (或 `_RICOW_STATE` 同名键 "1")。
+    /// 默认 false —— 非 Lua 策略 / 未置标记。
+    fn halted(&self) -> bool {
+        false
+    }
+
+    /// 策略停摆计数 (042): 引擎据此派发 `stall` 通知。
+    ///
+    /// Lua 策略约定: `_RICOW_STATE["stat_stall_bars"]` (字符串)。默认 None —— 不监控停摆。
+    fn stall_bars(&self) -> Option<u64> {
+        None
+    }
 }

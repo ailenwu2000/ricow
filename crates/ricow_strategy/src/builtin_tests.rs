@@ -1113,8 +1113,7 @@ fn test_shannon_grid_ledger_cross_check() {
 // 合约化 = futures_cfg 同款 hedge + [backtest].leverage。
 // ============================================================================
 
-const SHANNON_GRID_FUT: &str =
-    include_str!("../../../strategies/futures/shannon_grid_futures.lua");
+const SHANNON_GRID_FUT: &str = include_str!("../../../strategies/futures/shannon_grid_futures.lua");
 
 /// 合约 hedge 配置(默认: invest_cash=10000, 杠杆 2 → 总资金 20000, 建仓名义 10000)。
 fn shannon_fut_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
@@ -1142,8 +1141,7 @@ fn test_shannon_grid_futures_leverage_bounds_halts() {
             ("start_price", ConfigValue::Float(150.0)),
             ("leverage", ConfigValue::Float(lev)),
         ]);
-        let (orders, _ctx, st) =
-            run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+        let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
         assert!(orders.iter().all(|o| o.is_empty()), "杠杆 {lev} 越界必须停机且不下任何单");
         assert_eq!(st.global_f64("fatal"), Some(1.0), "杠杆 {lev} 应置停机标记");
         assert_eq!(st.global_f64("fill_count"), Some(0.0), "杠杆 {lev} 不得建仓");
@@ -1175,8 +1173,10 @@ fn test_shannon_grid_futures_activate_builds_half_of_total() {
     assert!((v_cash - 9995.0).abs() < 0.01, "虚拟现金应=总资金−名义−费=9995: {v_cash}");
     // 引擎实际多头仓位与虚拟仓位一致
     let long_sz = ctx.position_directional("ETHUSDT", OrderSide::Buy).map(|p| p.size);
-    assert!(long_sz.map(|s| (s.to_f64().unwrap() - v_pos).abs() < 1e-6).unwrap_or(false),
-        "引擎多头仓位 {long_sz:?} 应与虚拟仓位一致");
+    assert!(
+        long_sz.map(|s| (s.to_f64().unwrap() - v_pos).abs() < 1e-6).unwrap_or(false),
+        "引擎多头仓位 {long_sz:?} 应与虚拟仓位一致"
+    );
 }
 
 #[test]
@@ -1208,16 +1208,17 @@ fn test_shannon_grid_futures_build_rehangs_atr_spacing() {
     let q_buy = buy.size.to_f64().expect("size 应可转 f64");
     let q_sell = sell.size.to_f64().expect("size 应可转 f64");
     assert!((q_buy - q_buy_exp).abs() < 1e-6, "买量应为虚拟 1:1 恢复量: {q_buy} vs {q_buy_exp}");
-    assert!((q_sell - q_sell_exp).abs() < 1e-6, "卖量应为虚拟 1:1 恢复量: {q_sell} vs {q_sell_exp}");
+    assert!(
+        (q_sell - q_sell_exp).abs() < 1e-6,
+        "卖量应为虚拟 1:1 恢复量: {q_sell} vs {q_sell_exp}"
+    );
 }
 
 /// 5x 杠杆配置(041 降杠杆测试): invest 10000 × 5 = 总资金 50000, 建仓名义 25000(250@100),
 /// V0 = 建仓价值 = 25000。
 fn shannon_fut_cfg_lev5(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
-    let mut params = vec![
-        ("start_price", ConfigValue::Float(150.0)),
-        ("leverage", ConfigValue::Float(5.0)),
-    ];
+    let mut params =
+        vec![("start_price", ConfigValue::Float(150.0)), ("leverage", ConfigValue::Float(5.0))];
     params.extend_from_slice(extra);
     let mut cfg = shannon_fut_cfg(&params);
     if let Some(b) = cfg.backtest.as_mut() {
@@ -1246,10 +1247,7 @@ fn test_shannon_grid_futures_delev_sell_caps_to_initial_value() {
     let q_delev = (250.0 * 103.0 - 25000.0) / (103.0 * (1.0 - 0.0005));
     assert!(q_delev > q_1to1, "用例前提: 降杠杆量应大于 1:1 量");
     assert!((q_sell - q_delev).abs() < 1e-3, "卖量应为降杠杆量: {q_sell} vs {q_delev}");
-    assert!(
-        st.global_f64("delev_count").unwrap_or(0.0) >= 1.0,
-        "应记录降杠杆卖单次数"
-    );
+    assert!(st.global_f64("delev_count").unwrap_or(0.0) >= 1.0, "应记录降杠杆卖单次数");
     let extra = st.global_f64("delev_extra_notional").unwrap_or(0.0);
     let extra_exp = (q_delev - q_1to1) * 103.0;
     assert!((extra - extra_exp).abs() < 0.01, "超额名义应=增量卖量×卖价: {extra} vs {extra_exp}");
@@ -1279,7 +1277,10 @@ fn test_shannon_grid_futures_delev_fill_trims_cash_back_to_one_to_one() {
     let q_delev = (250.0 * 103.0 - 25000.0) / (103.0 * (1.0 - 0.0005));
     let trimmed_exp = 24987.5 + q_delev * 103.0 - 25000.0; // 超额回笼 − 成交费(费率口径差 <1)
     let trimmed = st.global_f64("delev_trimmed").unwrap_or(0.0);
-    assert!((trimmed - trimmed_exp).abs() < 1.0, "削减现金应=超额回笼−费: {trimmed} vs {trimmed_exp}");
+    assert!(
+        (trimmed - trimmed_exp).abs() < 1.0,
+        "削减现金应=超额回笼−费: {trimmed} vs {trimmed_exp}"
+    );
     assert!(trimmed > 0.0, "削减量必须 > 0");
 }
 
@@ -1302,11 +1303,7 @@ fn test_shannon_grid_futures_delev_drawdown_no_trim() {
     let q_1to1 = (250.0 * 103.0 - 24987.5) / (103.0 * (2.0 - 0.0005));
     let q_delev = (250.0 * 103.0 - 25000.0) / (103.0 * (1.0 - 0.0005));
     let extra_exp = (q_delev - q_1to1) * 103.0;
-    assert_eq!(
-        st.global_f64("delev_count"),
-        Some(1.0),
-        "回撤中不得新增消减, 仅剩建仓首格那一次"
-    );
+    assert_eq!(st.global_f64("delev_count"), Some(1.0), "回撤中不得新增消减, 仅剩建仓首格那一次");
     let extra = st.global_f64("delev_extra_notional").unwrap_or(0.0);
     assert!((extra - extra_exp).abs() < 0.01, "超额名义应定格在首格消减量: {extra} vs {extra_exp}");
 }
@@ -1326,11 +1323,7 @@ fn test_shannon_grid_futures_delev_disabled_keeps_one_to_one() {
     let q_sell = limits[0].size.to_f64().expect("size 应可转 f64");
     let q_1to1 = (250.0 * 103.0 - 24987.5) / (103.0 * (2.0 - 0.0005));
     assert!((q_sell - q_1to1).abs() < 1e-3, "禁用时卖量应为 1:1 量: {q_sell} vs {q_1to1}");
-    assert_eq!(
-        st.global_f64("delev_count"),
-        Some(0.0),
-        "禁用时不记录降杠杆计数"
-    );
+    assert_eq!(st.global_f64("delev_count"), Some(0.0), "禁用时不记录降杠杆计数");
 }
 
 #[test]
@@ -1368,7 +1361,10 @@ fn test_shannon_grid_futures_buy_fill_restores_one_to_one() {
     let diff = v_cash - v_pos * 97.0;
     // 容差 0.1: 1:1 公式假设费 = fee_side×名义, 但引擎对限价单收 maker 费 0.02% (< 0.05%),
     // 虚拟账本按真实 fill.fee 记账 -> 少扣费产生小额合法富余(方向恒正)。
-    assert!(diff.abs() < 0.1, "成交后虚拟账本应近似 1:1: v_cash={v_cash} v_pos={v_pos} diff={diff}");
+    assert!(
+        diff.abs() < 0.1,
+        "成交后虚拟账本应近似 1:1: v_cash={v_cash} v_pos={v_pos} diff={diff}"
+    );
     // 重挂: 买 94 / 卖 100(均不成交, bar 范围 [97,99])
     let limits: Vec<_> = orders[18]
         .iter()
@@ -1398,7 +1394,10 @@ fn test_shannon_grid_futures_sell_fill_restores_one_to_one() {
     let v_cash = st.global_f64("v_cash").expect("v_cash");
     let diff = v_cash - v_pos * 103.0;
     // 容差 0.1: 同上, 引擎限价 maker 费 0.02% < fee_side 假设 0.05%, 少扣费产生小额合法富余。
-    assert!(diff.abs() < 0.1, "成交后虚拟账本应近似 1:1: v_cash={v_cash} v_pos={v_pos} diff={diff}");
+    assert!(
+        diff.abs() < 0.1,
+        "成交后虚拟账本应近似 1:1: v_cash={v_cash} v_pos={v_pos} diff={diff}"
+    );
     // 重挂: 买 100 / 卖 106(均不成交, bar 范围 [101,103])
     let limits: Vec<_> = orders[18]
         .iter()
@@ -1475,7 +1474,10 @@ fn test_shannon_grid_futures_liquidation_halts_and_tracks_min_dist() {
         .map(|p| p.size.to_f64().unwrap())
         .unwrap_or(0.0);
     let v_pos = st.global_f64("v_pos").expect("v_pos");
-    assert!((v_pos - eng_pos).abs() < 1e-6, "爆仓后虚拟持仓应与引擎一致: v_pos={v_pos} eng={eng_pos}");
+    assert!(
+        (v_pos - eng_pos).abs() < 1e-6,
+        "爆仓后虚拟持仓应与引擎一致: v_pos={v_pos} eng={eng_pos}"
+    );
     // 爆仓 bar 之后不再产生任何订单(全撤指令除外)
     let after: usize = orders[(n - 2) as usize..].iter().flatten().flatten().count();
     assert_eq!(after, 0, "爆仓停机后不得再挂单");
@@ -1491,4 +1493,23 @@ fn test_shannon_grid_futures_liquidation_halts_and_tracks_min_dist() {
     assert!(get("stat_liq_dist_min_ts").is_some(), "stat_liq_dist_min_ts 应导出");
     assert!(get("stat_liq_count").is_some(), "stat_liq_count 应导出");
     assert!(get("stat_liq_pnl").is_some(), "stat_liq_pnl 应导出");
+}
+
+#[test]
+fn test_notify_halt_and_stall_flags() {
+    // 042: 引擎 halted/stall 通知的取值口径 —— Lua 全局 fatal 与 _RICOW_STATE 键
+    let src = "fatal = 0\n";
+    let mut st = LuaStrategy::from_source(src, config(src, &[])).expect("编译");
+    assert!(!st.halted(), "未置标记 → false");
+    assert_eq!(st.stall_bars(), None, "未暴露停摆计数 → None");
+
+    // state 表路径 (ctx:state_set 持久化键; 重启后经 state_restore 注回也应识别)
+    st.state_restore(vec![("halted".into(), "1".into()), ("stat_stall_bars".into(), "7".into())]);
+    assert!(st.halted(), "_RICOW_STATE['halted']='1' → true");
+    assert_eq!(st.stall_bars(), Some(7));
+
+    // 全局路径 (策略运行期置 fatal = 1)
+    let src2 = "fatal = 1\n";
+    let st2 = LuaStrategy::from_source(src2, config(src2, &[])).expect("编译");
+    assert!(st2.halted(), "全局 fatal=1 → true");
 }

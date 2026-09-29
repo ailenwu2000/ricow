@@ -386,6 +386,18 @@ async fn monitor_loop(state: Arc<Mutex<State>>) {
         }
         for (name, code, view, root) in exited {
             write_exit_record(&root, &name, &view, code, "进程自行退出");
+            // 042: 崩溃通知 —— 子进程自行退出 (非 stop/daemon 退出路径), 按 strategy TOML 的
+            // notify_* 参数投递; 未配置 webhook 时 no-op。失败只 warn, 不影响监控循环。
+            let cfg_dir = root.join("strategies");
+            let notifier = crate::commands::load_strategy_toml(&cfg_dir, &name)
+                .ok()
+                .and_then(|cfg| ricow_engine::Notifier::from_config(&cfg));
+            if let Some(n) = notifier {
+                n.notify(ricow_engine::NotifyEvent::Crashed {
+                    exit_code: code,
+                    mode: view.mode.clone().unwrap_or_else(|| "unknown".into()),
+                });
+            }
         }
     }
 }

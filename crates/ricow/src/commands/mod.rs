@@ -22,6 +22,7 @@ pub mod instances;
 pub mod logs;
 pub mod market;
 pub mod onboard;
+pub mod optimize;
 pub mod pairs;
 pub mod run;
 pub mod templates;
