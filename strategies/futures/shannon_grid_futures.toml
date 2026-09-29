@@ -1,0 +1,101 @@
+# 合约香农网格 策略清单 (040, 2026-09-28)
+#
+# 清单是表现层数据(参数键不进引擎代码); 引擎/CLI/绑定层零策略参数名 ——
+# 本文件 [[params]] 的 key 不得与引擎按名读取的参数同名(leverage/mmr_pct 等),
+# 杠杆走清单顶层 default_leverage 字段, 由 resolve_builtin_script 回填 [backtest].leverage。
+
+id = "shannon_grid_futures"
+name = "合约香农网格"
+market = "futures"
+position_mode = "hedge"
+default_leverage = 2
+summary = "USDT-M 合约香农网格: 总资金=投入×杠杆, 总资金一半开多建仓, 虚拟账本恒 1:1 再平衡, 平衡价 ± atr_mult×ATR 挂开多/平多单; 爆仓价实时监控"
+description = """合约版香农恒定权重再平衡网格(hedge 模式只下 LONG 侧): 杠杆 1~5 倍(默认 2),
+总资金 = 投入资金 × 杠杆。价格低于 start_price 激活, 用总资金一半市价开多建仓(成交价 = 第一平衡价格);
+以虚拟账本(虚拟现金 + 虚拟仓位, 仓位与实际一致)计算, 平衡价 + atr_mult×ATR 挂开多单、平衡价 − atr_mult×ATR
+挂平多单, 每笔挂单量按"成交后虚拟现金与虚拟仓位价值恰好恢复 1:1"(含手续费修正)计算; 任一成交后成交价成为
+新平衡价格并全撤重挂两侧。虚拟现金隔离可用保证金随价格/浮盈亏的频繁波动; 虚拟买单超真实可用保证金时
+告警记录(挂单照常挂出)。爆仓价实时监控(距爆仓价 < 阈值告警, 只提示不动作), 运行期记录距爆仓最近的
+时刻(stat_liq_dist_min/ts/price); 真发生爆仓(引擎 LIQ- 强平成交)即停机不再交易, 损失单列 stat_liq_pnl。ATR 周期与 K 线周期可配
+(默认 1h K 线、14 周期、乘数 1.5), 间距随行情波动动态伸缩。无结束语义(公式自平衡)。
+⚠ 合约有杠杆: 单边下跌将逼近爆仓价(2x 半仓初始爆仓距离约 49%), 请关注告警与 stat_liq_price_final。
+注意: 回测爆仓价为开仓口径估算, 费率/资金费侵蚀后实际更近。"""
+suitable = "震荡市(双向再平衡收割)、宽幅波动; 愿意承担杠杆爆仓风险的网格交易者"
+unsuitable = "单边急跌(只做多将套牢且逼近爆仓价)、极低波动(间距低于成本门槛自动停机)"
+
+[[params]]
+key = "pair"
+name = "合约对"
+type = "string"
+desc = "USDT-M 合约交易对(如 SOLUSDT)"
+required = true
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "价格低于它才激活(必填; 回测请设为窗口起点价, 勿前视)"
+required = true
+
+[[params]]
+key = "invest_cash"
+name = "投入资金"
+type = "f64"
+desc = "投入资金(保证金, USDT); 总资金 = 投入 × 杠杆, 激活时用总资金一半市价开多。0 = 激活时 quote 余额全额"
+default = 0
+
+[[params]]
+key = "interval"
+name = "主时钟"
+type = "string"
+desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
+default = "1h"
+
+[[params]]
+key = "atr_interval"
+name = "ATR K 线周期"
+type = "string"
+desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
+default = "1h"
+
+[[params]]
+key = "atr_period"
+name = "ATR 周期"
+type = "i64"
+desc = "ATR 回看根数"
+default = 14
+
+[[params]]
+key = "atr_mult"
+name = "ATR 乘数"
+type = "f64"
+desc = "网格间距 = atr_mult × ATR"
+default = 1.5
+
+[[params]]
+key = "min_spacing_pct"
+name = "最小间距(价格占比)"
+type = "f64"
+desc = "间距下限(占价格比例, 0.002 = 0.2% = 4×合约费率; 负数 = 禁用下限); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损"
+default = 0.002
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额(合约 SOLUSDT fapi 最小名义 5)"
+default = 5
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "单边手续费率(0.0005 = 合约 taker 0.05%/边)"
+default = 0.0005
+
+[[params]]
+key = "liq_warn_ratio"
+name = "爆仓价告警阈值"
+type = "f64"
+desc = "小数(0.1=10%); 多头距爆仓价 < 该比例打 WARN(只告警不动作)。与引擎 014 的 liq_warn_pct(百分点)是两条通道"
+default = 0.1

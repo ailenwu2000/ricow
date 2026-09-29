@@ -1,4 +1,4 @@
--- 现货 Uniswap V2 网格 (uniswap_v2_grid) -- v3 (2026-09-28, 038 撮合保真 + 事件模型)
+-- 现货香农网格策略 (shannon_grid) -- v3 (2026-09-28, 038 撮合保真 + 事件模型)
 --
 -- 037+038 最终口径: 全撤重挂逻辑抽至共享 do_rehang(ctx); on_fill(建仓/网格成交)记账后立即
 --   do_rehang 并**返回重挂订单**(事件模型)。此前 037 实测的"同 bar 双向 ping-pong 链"根因
@@ -8,8 +8,8 @@
 --   1:1 恢复公式、min_spacing_pct 下限、成本门槛、停摆可观测性等语义零改动。
 --
 -- ═══ 一句话 ═══
---   模拟 uniswap v2 池: 真实现金 C 与真实持仓 Q 价值恒 1:1; 以平衡价 ± atr_mult×ATR 挂买卖单,
---   任一成交都把成交价当作新平衡价、按"成交后 1:1 恢复"的量全撤重挂两侧 —— 离散化的恒定乘积再平衡。
+--   真实账本香农网格: 真实现金 C 与真实持仓 Q 价值恒 1:1(等权再平衡); 以平衡价 ± atr_mult×ATR 挂买卖单,
+--   任一成交都把成交价当作新平衡价、按"成交后 1:1 恢复"的量全撤重挂两侧 —— 离散化的恒定权重再平衡。
 --
 -- ═══ 策略含义(用户 2026-09-26 口径, 逐条) ═══
 --   1) 激活建仓: 给 start_price(开始价格); 价格**低于**它才激活。激活后市价买入 invest_cash 的一半
@@ -21,8 +21,8 @@
 --        卖 q = (Q·p_s − C) / (p_s·(2−f))   [收 q·p_s·(1−f) 后 C′ = (Q−q)·p_s]
 --      f = fee_side。C/Q 为**真实**余额与持仓(与 shannon 的虚拟账本不同, 无杠杆无目标权重)。
 --   4) 成交: 平衡价 := 该笔成交价; 虚拟仓位不存在 —— 直接按真实成交更新策略账本模型; 全撤重挂两侧。
---   5) 结束语义: **无**。回平衡卖量 ≤ 持仓一半, 仓位永不清零、资金永不耗尽(公式自平衡), 全程运行,
---      与 uniswap 池语义一致。停机**不清仓**。
+--   5) 结束语义: **无**。回平衡卖量 ≤ 持仓一半, 仓位永不清零、资金永不耗尽(公式自平衡),
+--      全程运行。停机**不清仓**。
 --
 -- ═══ 与 shannon_spot_grid / paired_grid 的显式语义差异 ═══
 --   - 账本 = 真实 C + 真实 Q(无 v_coin/v_cash 虚拟账本、无 leverage_mult、无 target_ratio、无趋势门控)。
@@ -50,9 +50,9 @@
 --   在停机时与引擎余额/持仓交叉核对(误差 > 0.01 → WARN + stat_ledger_diff_* 留档)。
 --
 -- ═══ 用法 ═══
---   ricow backtest --strategy uniswap_v2_grid --pair SOLUSDT --interval 1m --days 180 --cash 10000 \
+--   ricow backtest --strategy shannon_grid --pair SOLUSDT --interval 1m --days 180 --cash 10000 \
 --     --param start_price=<窗口起点价> --param invest_cash=10000 --param atr_interval=1h
---   TOML: type = "uniswap_v2_grid" + [strategy.params] 填上面参数表。
+--   TOML: type = "shannon_grid" + [strategy.params] 填上面参数表。
 --
 quote_asset = ""  -- 计价资产, on_init 里 detect_quote(pair) 动态检测
 -- 状态
@@ -182,15 +182,15 @@ function on_init(ctx)
         pending_entry = (ctx:state_get("pending_entry") == "1")
         halted = (ctx:state_get("halted") == "1")
         if halted then
-            ctx:log("[uniswap_v2_grid] 续接: 上次已停机(halted=true) -> 本次不再交易")
+            ctx:log("[shannon_grid] 续接: 上次已停机(halted=true) -> 本次不再交易")
         end
         ctx:log(string.format(
-            "[uniswap_v2_grid] 续接上次状态: 平衡价 %.4f, 投入 %.2f, 建仓 %.6f@%.4f",
+            "[shannon_grid] 续接上次状态: 平衡价 %.4f, 投入 %.2f, 建仓 %.6f@%.4f",
             balance_price, invested0, entry_size, entry_price))
     end
 
     ctx:log(string.format(
-        "[uniswap_v2_grid] init pair=%s quote=%s 投入=%s 建仓=投入一半 主时钟=%s ATR=%s×%d mult=%.2f " ..
+        "[shannon_grid] init pair=%s quote=%s 投入=%s 建仓=投入一半 主时钟=%s ATR=%s×%d mult=%.2f " ..
         "min_notional=%.2f fee_side=%.4f",
         pair, quote_asset,
         (ctx:config_f64("invest_cash") or 0) > 0 and string.format("%.2f", ctx:config_f64("invest_cash"))
@@ -200,7 +200,7 @@ function on_init(ctx)
         atr_intv, num(ctx, "atr_period", 14), num(ctx, "atr_mult", 1),
         num(ctx, "min_notional", 5), num(ctx, "fee_side", 0.001)))
     ctx:log(string.format(
-        "[uniswap_v2_grid] 激活: 价格低于 start_price=%.4f 才激活, 用投入一半市价建仓, " ..
+        "[shannon_grid] 激活: 价格低于 start_price=%.4f 才激活, 用投入一半市价建仓, " ..
         "成交价 = 第一平衡价格; 平衡价 ± ATR 挂单, 成交后 1:1 恢复并重挂",
         num(ctx, "start_price", 0)))
 end
@@ -288,7 +288,7 @@ function do_rehang(ctx)
             and (stall_warned_at == nil or (ctx:now()).ts - stall_warned_at >= 86400000) then
             stall_warned_at = (ctx:now()).ts
             ctx:log(string.format(
-                "[uniswap_v2_grid] [WARN] 停摆 ≥1 天: 平衡价 %.4f 间距 %.4f 下两侧均无法挂单 " ..
+                "[shannon_grid] [WARN] 停摆 ≥1 天: 平衡价 %.4f 间距 %.4f 下两侧均无法挂单 " ..
                 "(现金 %.2f 持仓 %.6f, 小名义跳过 %d 次)",
                 balance_price, spacing, C, Q, skip_notional))
         end
@@ -299,7 +299,7 @@ function do_rehang(ctx)
     rehang_count = rehang_count + 1
     save_state(ctx)
     ctx:log(string.format(
-        "[uniswap_v2_grid] 网格重挂 #%d: 平衡价 %.4f 间距 %.4f (ATR %.4f×%.2f) -> 买 %s / 卖 %s | " ..
+        "[shannon_grid] 网格重挂 #%d: 平衡价 %.4f 间距 %.4f (ATR %.4f×%.2f) -> 买 %s / 卖 %s | " ..
         "现金 %.2f 持仓 %.6f",
         rehang_count, balance_price, spacing, atr, atr_mult,
         buy_px > 0 and string.format("%.4f", buy_px) or "跳过(买价≤0)",
@@ -355,7 +355,7 @@ function on_tick(ctx)
         if t.ts - stall_since >= 86400000 and (stall_warned_at == nil or t.ts - stall_warned_at >= 86400000) then
             stall_warned_at = t.ts
             ctx:log(string.format(
-                "[uniswap_v2_grid] [WARN] 停摆 ≥1 天: ATR 未就绪已连续跳过 %d 根 bar, 不挂单",
+                "[shannon_grid] [WARN] 停摆 ≥1 天: ATR 未就绪已连续跳过 %d 根 bar, 不挂单",
                 skip_no_atr))
         end
         return {}
@@ -376,13 +376,13 @@ function on_tick(ctx)
             halted = true
             save_state(ctx)
             ctx:log(string.format(
-                "[uniswap_v2_grid] [FATAL] 成本门槛不满足 -> 停机: 生效间距=%.6f (=%.4f%% 价格) " ..
+                "[shannon_grid] [FATAL] 成本门槛不满足 -> 停机: 生效间距=%.6f (=%.4f%% 价格) " ..
                 "必须 ≥ 4×fee_side×价格=%.6f (=%.4f%%); atr_mult=%.2f ATR=%.6f 价格=%.4f",
                 spacing, spacing / price * 100, need, need / price * 100, atr_mult, atr, price))
             return {}
         end
         ctx:log(string.format(
-            "[uniswap_v2_grid] 成本门槛通过(首次校验): 生效间距=%.6f (%.4f%% 价格) ≥ %.4f%%",
+            "[shannon_grid] 成本门槛通过(首次校验): 生效间距=%.6f (%.4f%% 价格) ≥ %.4f%%",
             spacing, spacing / price * 100, 4 * fee_side * 100))
     end
 
@@ -395,7 +395,7 @@ function on_tick(ctx)
         if start_px <= 0 then
             halted = true
             save_state(ctx)
-            ctx:log("[uniswap_v2_grid] [FATAL] 缺少必填参数 start_price(开始价格) -> 停机: " ..
+            ctx:log("[shannon_grid] [FATAL] 缺少必填参数 start_price(开始价格) -> 停机: " ..
                 "策略只在价格低于 start_price 时激活。")
             return {}
         end
@@ -413,7 +413,7 @@ function on_tick(ctx)
         if size > 0 and size * price >= min_notional then
             pending_entry = true
             ctx:log(string.format(
-                "[uniswap_v2_grid] 激活(价 %.4f < 开始价 %.4f) -> 市价买入 %.6f (≈%.2f %s, 投入 %.2f 的一半), " ..
+                "[shannon_grid] 激活(价 %.4f < 开始价 %.4f) -> 市价买入 %.6f (≈%.2f %s, 投入 %.2f 的一半), " ..
                 "成交价将成为第一平衡价格",
                 price, start_px, size, size * price, quote_asset, inv))
             return {
@@ -421,7 +421,7 @@ function on_tick(ctx)
             }
         end
         ctx:log(string.format(
-            "[uniswap_v2_grid] 激活但建仓名义 %.2f < min_notional %.2f -> 按无建仓处理(平衡价 := 现价)",
+            "[shannon_grid] 激活但建仓名义 %.2f < min_notional %.2f -> 按无建仓处理(平衡价 := 现价)",
             size * price, min_notional))
         built = true
         balance_price = price
@@ -477,7 +477,7 @@ function on_fill(ctx, fill)
         need_rehang = true
         save_state(ctx)
         ctx:log(string.format(
-            "[uniswap_v2_grid] 建仓成交 %.6f @ %.4f (费 %.4f) -> 平衡价 := %.4f | 现金 %.2f 持仓 %.6f " ..
+            "[shannon_grid] 建仓成交 %.6f @ %.4f (费 %.4f) -> 平衡价 := %.4f | 现金 %.2f 持仓 %.6f " ..
             "仓位市值 %.2f (投入 %.2f)",
             size, px, fill.fee or 0, balance_price, m_cash, m_pos, m_pos * px, invested0))
         -- 038 事件模型: 建仓成交立即全撤重挂(do_rehang)。链内限价单由引擎 038 R1 次 bar 生效,
@@ -517,7 +517,7 @@ function on_order_update(ctx, upd)
         end
         need_rehang = true
         ctx:log(string.format(
-            "[uniswap_v2_grid] 挂单被拒: pair=%s filled=%.6f remaining=%.6f → 重挂",
+            "[shannon_grid] 挂单被拒: pair=%s filled=%.6f remaining=%.6f → 重挂",
             upd.pair, upd.filled_size or 0, upd.remaining_size or 0))
     end
 end
@@ -533,14 +533,14 @@ function on_stop(ctx)
     local d_pos = (m_pos or pos) - pos
     if math.abs(d_cash) > 0.01 or math.abs(d_pos) > 0.01 then
         ctx:log(string.format(
-            "[uniswap_v2_grid] [WARN] 账本分叉: 模型现金 %.6f vs 引擎 %.6f (差 %.6f), " ..
+            "[shannon_grid] [WARN] 账本分叉: 模型现金 %.6f vs 引擎 %.6f (差 %.6f), " ..
             "模型持仓 %.8f vs 引擎 %.8f (差 %.8f)",
             m_cash or 0, cash, d_cash, m_pos or 0, pos, d_pos))
     end
 
     -- 收益分解: 合计 = 期末权益 − 投入 = 持仓收益(期末持仓×(末价−建仓价)) + 交易收益(再平衡净贡献)
     local out = string.format(
-        "[uniswap_v2_grid] 停机(**不清仓**): 成交 %d(买 %d 卖 %d) / 跳过(ATR未就绪 %d, 小名义 %d, 买价≤0 %d) / " ..
+        "[shannon_grid] 停机(**不清仓**): 成交 %d(买 %d 卖 %d) / 跳过(ATR未就绪 %d, 小名义 %d, 买价≤0 %d) / " ..
         "重挂 %d / %s / 平衡价 %s / 期末现金 %.2f 持仓 %.6f(市值 %.2f) 权益 %.2f / 模型费 %.4f / 账本差(现金 %.6f 持仓 %.8f)",
         fill_count, buy_count, sell_count, skip_no_atr, skip_notional, skip_zero_buy_px,
         rehang_count,

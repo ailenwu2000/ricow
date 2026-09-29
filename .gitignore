@@ -17,13 +17,15 @@ strategies/spot/*
 !strategies/spot/shannon_spot_grid.toml
 !strategies/spot/paired_grid.lua
 !strategies/spot/paired_grid.toml
-!strategies/spot/uniswap_v2_grid.lua
-!strategies/spot/uniswap_v2_grid.toml
+!strategies/spot/shannon_grid.lua
+!strategies/spot/shannon_grid.toml
 !strategies/futures/
 strategies/futures/*
 !strategies/futures/.gitkeep
 !strategies/futures/paired_grid_futures_long.lua
 !strategies/futures/paired_grid_futures_long.toml
+!strategies/futures/shannon_grid_futures.lua
+!strategies/futures/shannon_grid_futures.toml
 ricow.db
 ricow.db-shm
 ricow.db-wal

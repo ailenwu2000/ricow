@@ -140,9 +140,14 @@ const BUILTIN: &[(&str, &str, &str)] = &[
         include_str!("../../../../strategies/futures/paired_grid_futures_long.lua"),
     ),
     (
-        "uniswap_v2_grid",
-        include_str!("../../../../strategies/spot/uniswap_v2_grid.toml"),
-        include_str!("../../../../strategies/spot/uniswap_v2_grid.lua"),
+        "shannon_grid",
+        include_str!("../../../../strategies/spot/shannon_grid.toml"),
+        include_str!("../../../../strategies/spot/shannon_grid.lua"),
+    ),
+    (
+        "shannon_grid_futures",
+        include_str!("../../../../strategies/futures/shannon_grid_futures.toml"),
+        include_str!("../../../../strategies/futures/shannon_grid_futures.lua"),
     ),
 ];
 

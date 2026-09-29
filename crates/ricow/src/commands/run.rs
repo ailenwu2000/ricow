@@ -238,7 +238,14 @@ async fn build_exchange(
     let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();
     if config.market.eq_ignore_ascii_case("futures") {
         let ex = crate::commands::bn_futures_signed_mode(mode)?;
-        let leverage = config.get_f64("leverage").unwrap_or(1.0).max(1.0) as u32;
+        // 杠杆来源: 显式 params.leverage > [backtest].leverage(清单 default_leverage 回填) > 1x。
+        // 040-L demo 实跑发现: 只读 params 会漏掉清单回填的杠杆, 交易所侧 1x 与策略口径脱节
+        // (cap_open/爆仓距离估算全按清单杠杆算), 必须对齐。
+        let leverage = config
+            .get_f64("leverage")
+            .or_else(|| config.backtest.as_ref().and_then(|b| b.leverage))
+            .unwrap_or(1.0)
+            .max(1.0) as u32;
         let isolated =
             config.get_str("margin_type").map(|s| !s.eq_ignore_ascii_case("cross")).unwrap_or(true);
         let hedge = config.position_mode.eq_ignore_ascii_case("hedge");

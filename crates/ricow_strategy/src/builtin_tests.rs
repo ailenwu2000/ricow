@@ -1,7 +1,7 @@
 //! 内置脚本 Lua 集成测试 (回测冒烟, 不依赖网络)。
 //!
 //! 脚本源: `strategies/spot/`(paired_grid 现货动态非对称网格 +
-//! uniswap_v2_grid 现货 Uniswap V2 网格)与 `strategies/futures/`(paired_grid_futures_long),
+//! shannon_grid 现货 香农网格)与 `strategies/futures/`(paired_grid_futures_long),
 //! include_str! 编译期嵌入。
 //! 断言每个内置脚本的关键行为 (建仓/激活/配对/挂单), 对齐 Rust 版已知向量。
 
@@ -730,10 +730,10 @@ fn test_paired_grid_futures_long_matches_spot_fill_by_fill() {
 }
 
 // ============================================================================
-// 033 现货 Uniswap V2 网格 (uniswap_v2_grid) 集成测试
+// 033 现货 香农网格 (shannon_grid) 集成测试
 // ============================================================================
 
-const UNISWAP_V2_GRID: &str = include_str!("../../../strategies/spot/uniswap_v2_grid.lua");
+const SHANNON_GRID: &str = include_str!("../../../strategies/spot/shannon_grid.lua");
 
 fn univ2_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
     let mut params = vec![
@@ -746,7 +746,7 @@ fn univ2_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
         ("invest_cash", ConfigValue::Float(10000.0)),
     ];
     params.extend_from_slice(extra);
-    config(UNISWAP_V2_GRID, &params)
+    config(SHANNON_GRID, &params)
 }
 
 /// 033: 主序列 —— h<at 为 base, 之后为 then(触发 start_price 激活门槛), 每根带 ±1 振幅
@@ -837,7 +837,7 @@ fn run_univ2(
 }
 
 #[test]
-fn test_uniswap_v2_grid_requires_tf_atr_channel() {
+fn test_shannon_grid_requires_tf_atr_channel() {
     // 高周期 ATR 通道未预装 → 一笔都不下(不猜 ATR 值, 不激活不建仓)。
     let (orders, _ctx, st) = run_univ2(
         univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]),
@@ -849,7 +849,7 @@ fn test_uniswap_v2_grid_requires_tf_atr_channel() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_requires_start_price() {
+fn test_shannon_grid_requires_start_price() {
     let (orders, _ctx, st) =
         run_univ2(univ2_cfg(&[]), &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
     assert!(orders.iter().all(|o| o.is_empty()), "缺必填 start_price 时不得下任何单");
@@ -861,7 +861,7 @@ fn test_uniswap_v2_grid_requires_start_price() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_thin_spacing_halts() {
+fn test_shannon_grid_thin_spacing_halts() {
     // 成本门槛: 生效间距/价格 < 4×fee_side → [FATAL] 停机, 不建仓不挂单。
     // min_spacing_pct=-1 禁用下限(否则默认 0.4% 下限会托起间距绕过门槛)。
     let (orders, _ctx, st) = run_univ2(
@@ -879,7 +879,7 @@ fn test_uniswap_v2_grid_thin_spacing_halts() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_min_spacing_floor() {
+fn test_shannon_grid_min_spacing_floor() {
     // 最小间距下限: atr_mult×ATR = 0.0002 远小于下限 0.01×价格 = 1.0
     // → 生效间距 = 1.0, 挂单 99/101(而非 99.9998/100.0002)。
     let cfg = univ2_cfg(&[
@@ -910,7 +910,7 @@ fn test_uniswap_v2_grid_min_spacing_floor() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_activate_half_build_and_grid() {
+fn test_shannon_grid_activate_half_build_and_grid() {
     // 激活: 市价买 invest_cash/2 = 5000 名义; 成交价 100 = 第一平衡价;
     // 重挂: 平衡价 ± 1×ATR(=2) = 98 / 102, 量按"成交后 1:1 恢复"(含费修正)。
     let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
@@ -945,7 +945,7 @@ fn test_uniswap_v2_grid_activate_half_build_and_grid() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_buy_fill_restores_one_to_one() {
+fn test_shannon_grid_buy_fill_restores_one_to_one() {
     // 买 98 成交后: 重挂 96/100(fill 先于 on_tick 派发 → 同 bar on_tick 重挂)。
     // bar18 收窄为 [97,99](high < 卖 100), 只触发买侧 —— 宽 bar 双侧场景由下方测试专测。
     let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
@@ -970,7 +970,7 @@ fn test_uniswap_v2_grid_buy_fill_restores_one_to_one() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_sell_fill_restores_one_to_one() {
+fn test_shannon_grid_sell_fill_restores_one_to_one() {
     // 卖 102 成交后: 重挂 100/104(fill 先于 on_tick 派发 → 同 bar on_tick 重挂)。
     // bar18 收窄为 [101,103](low > 买 100), 只触发卖侧。
     let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
@@ -995,7 +995,7 @@ fn test_uniswap_v2_grid_sell_fill_restores_one_to_one() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_on_fill_chain_capped_at_engine_depth() {
+fn test_shannon_grid_on_fill_chain_capped_at_engine_depth() {
     // 038 R1+R3: on_fill 立即重挂已恢复, 但链内限价单**次 bar 生效**(引擎 defer 开关) ——
     // 宽 bar [97,100] 触发买 98 成交后, 重挂的 买 96/卖 100 不再被同 bar 回溯匹配,
     // 乒乓链从机制上消失(037 病理修复的直接锁形测试)。
@@ -1026,7 +1026,7 @@ fn test_uniswap_v2_grid_on_fill_chain_capped_at_engine_depth() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_no_position_activation_only_buy() {
+fn test_shannon_grid_no_position_activation_only_buy() {
     // invest_cash=4 → 建仓名义 2 < min_notional 5 → 按无建仓激活: 平衡价=现价, 只挂买单不挂卖单。
     let cfg = univ2_cfg(&[
         ("start_price", ConfigValue::Float(150.0)),
@@ -1048,7 +1048,7 @@ fn test_uniswap_v2_grid_no_position_activation_only_buy() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_state_snapshot() {
+fn test_shannon_grid_state_snapshot() {
     // 状态快照(断点续接最小必需项): balance_price / built / pending_entry / invested0。
     let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
     let (_orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
@@ -1061,7 +1061,7 @@ fn test_uniswap_v2_grid_state_snapshot() {
 }
 
 #[test]
-fn test_uniswap_v2_grid_ledger_cross_check() {
+fn test_shannon_grid_ledger_cross_check() {
     // runner 时序(含预热跳过): 激活建仓 → 买 98 → 卖 100; 停机时策略模型账本 vs 引擎误差 < 0.01。
     let cfg = univ2_cfg(&[("start_price", ConfigValue::Float(150.0))]);
     let mut bars = univ2_main(60, 200, 100, 24);
@@ -1105,4 +1105,239 @@ fn test_uniswap_v2_grid_ledger_cross_check() {
     let q = ctx.position("ETHUSDT").expect("应有持仓").size;
     let diff = c - q * dec!(100);
     assert!(diff.abs() < dec!(0.01), "期末应恢复 1:1: C={c} Q={q} |C−Q×100|={diff}");
+}
+
+// ============================================================================
+// 040 合约香农网格 (shannon_grid_futures) 集成测试
+// 母本 = 现货 shannon_grid(复用 univ2_main/with_bar/settle_univ2/run_univ2 时序),
+// 合约化 = futures_cfg 同款 hedge + [backtest].leverage。
+// ============================================================================
+
+const SHANNON_GRID_FUT: &str =
+    include_str!("../../../strategies/futures/shannon_grid_futures.lua");
+
+/// 合约 hedge 配置(默认: invest_cash=10000, 杠杆 2 → 总资金 20000, 建仓名义 10000)。
+fn shannon_fut_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![
+        ("pair", ConfigValue::String("ETHUSDT".into())),
+        ("atr_interval", ConfigValue::String("1h".into())),
+        ("atr_period", ConfigValue::Integer(14)),
+        ("min_notional", ConfigValue::Float(50.0)),
+        ("fee_side", ConfigValue::Float(0.0005)),
+        ("invest_cash", ConfigValue::Float(10000.0)),
+    ];
+    params.extend_from_slice(extra);
+    let mut cfg = config(SHANNON_GRID_FUT, &params);
+    cfg.market = "futures".into();
+    cfg.position_mode = "hedge".into();
+    cfg.backtest = Some(crate::config::BacktestToml { leverage: Some(2.0), ..Default::default() });
+    cfg
+}
+
+#[test]
+fn test_shannon_grid_futures_leverage_bounds_halts() {
+    // 杠杆越界(<1 或 >5)→ FATAL 停机, 不建仓不挂单。
+    for lev in [0.5f64, 8.0f64] {
+        let cfg = shannon_fut_cfg(&[
+            ("start_price", ConfigValue::Float(150.0)),
+            ("leverage", ConfigValue::Float(lev)),
+        ]);
+        let (orders, _ctx, st) =
+            run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+        assert!(orders.iter().all(|o| o.is_empty()), "杠杆 {lev} 越界必须停机且不下任何单");
+        assert_eq!(st.global_f64("fatal"), Some(1.0), "杠杆 {lev} 应置停机标记");
+        assert_eq!(st.global_f64("fill_count"), Some(0.0), "杠杆 {lev} 不得建仓");
+    }
+}
+
+#[test]
+fn test_shannon_grid_futures_activate_builds_half_of_total() {
+    // 激活: 市价开多 v_total/2 = 10000×2/2 = 10000 名义(position_side=long, 无 short 侧);
+    // 虚拟账本初始化: v_pos=100, v_cash = 20000 − 10000 − 费(5) = 9995。
+    let cfg = shannon_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let (orders, ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    let all: Vec<_> = orders.iter().flatten().flatten().collect();
+    assert!(
+        all.iter().all(|o| o.position_side.as_deref() != Some("short")),
+        "只做多策略 -> 不得有任何 position_side=short 挂单"
+    );
+    let market: Vec<_> = all.iter().filter(|o| o.order_type == OrderType::Market).collect();
+    assert_eq!(market.len(), 1, "激活时应恰有一笔市价开多建仓");
+    assert_eq!(market[0].side, OrderSide::Buy);
+    assert_eq!(market[0].position_side.as_deref(), Some("long"), "建仓单必须带 position_side=long");
+    let notional = market[0].size * market[0].price.unwrap_or(dec!(100));
+    assert!((notional - dec!(10000)).abs() < dec!(1), "建仓名义应为总资金一半 10000: {notional}");
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "建仓成交价应成为第一平衡价");
+    assert_eq!(st.global_f64("invested0"), Some(10000.0));
+    let v_pos = st.global_f64("v_pos").expect("应有虚拟仓位");
+    let v_cash = st.global_f64("v_cash").expect("应有虚拟现金");
+    assert!((v_pos - 100.0).abs() < 1e-6, "虚拟仓位应=建仓量 100: {v_pos}");
+    assert!((v_cash - 9995.0).abs() < 0.01, "虚拟现金应=总资金−名义−费=9995: {v_cash}");
+    // 引擎实际多头仓位与虚拟仓位一致
+    let long_sz = ctx.position_directional("ETHUSDT", OrderSide::Buy).map(|p| p.size);
+    assert!(long_sz.map(|s| (s.to_f64().unwrap() - v_pos).abs() < 1e-6).unwrap_or(false),
+        "引擎多头仓位 {long_sz:?} 应与虚拟仓位一致");
+}
+
+#[test]
+fn test_shannon_grid_futures_build_rehangs_atr_spacing() {
+    // 建仓成交后立即重挂: 间距 = atr_mult(1.5)×ATR(2) = 3 → 买 97 / 卖 103;
+    // 量按虚拟账本 1:1 恢复公式(v_cash=9995, v_pos=100)。
+    let cfg = shannon_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    assert_eq!(st.global_f64("balance_price"), Some(100.0));
+    // 建仓成交 on_fill 同 bar 立即重挂(038 事件模型; 链内限价单引擎 defer 次 bar 生效)
+    let limits: Vec<_> = orders[15]
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    assert_eq!(limits.len(), 2, "两侧都应挂单: {:?}", limits);
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有开多买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有平多卖单");
+    assert_eq!(buy.price, Some(dec!(97)), "买价 = 平衡价 − 1.5×ATR");
+    assert_eq!(sell.price, Some(dec!(103)), "卖价 = 平衡价 + 1.5×ATR");
+    assert_eq!(buy.position_side.as_deref(), Some("long"));
+    assert_eq!(sell.position_side.as_deref(), Some("long"));
+    let q_buy_exp = (9995.0 - 100.0 * 97.0) / (97.0 * (2.0 + 0.0005));
+    let q_sell_exp = (100.0 * 103.0 - 9995.0) / (103.0 * (2.0 - 0.0005));
+    let q_buy = buy.size.to_f64().expect("size 应可转 f64");
+    let q_sell = sell.size.to_f64().expect("size 应可转 f64");
+    assert!((q_buy - q_buy_exp).abs() < 1e-6, "买量应为虚拟 1:1 恢复量: {q_buy} vs {q_buy_exp}");
+    assert!((q_sell - q_sell_exp).abs() < 1e-6, "卖量应为虚拟 1:1 恢复量: {q_sell} vs {q_sell_exp}");
+}
+
+#[test]
+fn test_shannon_grid_futures_buy_fill_restores_one_to_one() {
+    // 买 97 成交后: 虚拟账本恢复 1:1(v_cash ≈ v_pos×97), 平衡价 := 97, 重挂 94/100。
+    // bar18 收窄为 [97,99](high < 卖 103), 只触发买侧。
+    let cfg = shannon_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 99, 99, 97, 98);
+    let (orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    assert_eq!(st.global_f64("fill_count"), Some(2.0), "建仓 + 买 97 各成交一次");
+    assert_eq!(st.global_f64("balance_price"), Some(97.0), "平衡价 := 买成交价");
+    let v_pos = st.global_f64("v_pos").expect("v_pos");
+    let v_cash = st.global_f64("v_cash").expect("v_cash");
+    let diff = v_cash - v_pos * 97.0;
+    // 容差 0.1: 1:1 公式假设费 = fee_side×名义, 但引擎对限价单收 maker 费 0.02% (< 0.05%),
+    // 虚拟账本按真实 fill.fee 记账 -> 少扣费产生小额合法富余(方向恒正)。
+    assert!(diff.abs() < 0.1, "成交后虚拟账本应近似 1:1: v_cash={v_cash} v_pos={v_pos} diff={diff}");
+    // 重挂: 买 94 / 卖 100(均不成交, bar 范围 [97,99])
+    let limits: Vec<_> = orders[18]
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    assert_eq!(buy.price, Some(dec!(94)));
+    assert_eq!(sell.price, Some(dec!(100)));
+}
+
+#[test]
+fn test_shannon_grid_futures_sell_fill_restores_one_to_one() {
+    // 卖 103 成交后: 虚拟账本恢复 1:1(v_cash ≈ v_pos×103), 平衡价 := 103, 重挂 100/106。
+    // bar18 收窄为 [101,103](low > 买 97), 只触发卖侧。
+    let cfg = shannon_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 102, 103, 101, 102);
+    let (orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    assert_eq!(st.global_f64("fill_count"), Some(2.0), "建仓 + 卖 103 各成交一次");
+    assert_eq!(st.global_f64("balance_price"), Some(103.0), "平衡价 := 卖成交价");
+    let v_pos = st.global_f64("v_pos").expect("v_pos");
+    let v_cash = st.global_f64("v_cash").expect("v_cash");
+    let diff = v_cash - v_pos * 103.0;
+    // 容差 0.1: 同上, 引擎限价 maker 费 0.02% < fee_side 假设 0.05%, 少扣费产生小额合法富余。
+    assert!(diff.abs() < 0.1, "成交后虚拟账本应近似 1:1: v_cash={v_cash} v_pos={v_pos} diff={diff}");
+    // 重挂: 买 100 / 卖 106(均不成交, bar 范围 [101,103])
+    let limits: Vec<_> = orders[18]
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    assert_eq!(buy.price, Some(dec!(100)));
+    assert_eq!(sell.price, Some(dec!(106)));
+}
+
+#[test]
+fn test_shannon_grid_futures_underfunded_buys_recorded() {
+    // 虚拟资金不足可观测: invest_cash=90000 远超实际余额 10000 → 建仓被 cap_open 砍到真实可用,
+    // 虚拟账本仍按 v_total=180000 记账 → 首次重挂买量巨大, 估算保证金超真实可用 →
+    // underfunded_buys ≥ 1(挂单照常挂出, 不砍量)。
+    let cfg = shannon_fut_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("invest_cash", ConfigValue::Float(90000.0)),
+    ]);
+    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "建仓应完成");
+    let uf = st.global_f64("underfunded_buys").expect("underfunded_buys");
+    assert!(uf >= 1.0, "应有虚拟资金不足记录: {uf}");
+    let notional = st.global_f64("underfunded_notional").expect("underfunded_notional");
+    assert!(notional > 0.0, "资金不足名义应 > 0: {notional}");
+}
+
+#[test]
+fn test_shannon_grid_futures_state_snapshot() {
+    // 状态快照(断点续接最小必需项): balance_price / built / pending_entry / invested0 / v_cash。
+    let cfg = shannon_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let (_orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    let snap = st.state_snapshot();
+    let get = |k: &str| snap.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    assert_eq!(get("balance_price").as_deref(), Some("100.0000000000"));
+    assert_eq!(get("built").as_deref(), Some("1"));
+    assert_eq!(get("pending_entry").as_deref(), Some("0"));
+    assert_eq!(get("invested0").as_deref(), Some("10000.00"));
+    assert!(get("v_cash").is_some(), "虚拟现金应持久化(续接重建虚拟账本)");
+}
+
+#[test]
+fn test_shannon_grid_futures_liquidation_halts_and_tracks_min_dist() {
+    // 040-L: 深跌使钱包权益穿越维持保证金 → 引擎 LIQ- 强平 fill → 策略停机不再交易;
+    // 运行期最近爆仓距离 stat_liq_dist_min 应被记录且 > 0。
+    // 2x 半仓(名义 10000, 保证金 5000, 仓 100@100)线性穿越模型爆仓价 ≈ 50.5;
+    // 价格 100 → 30 必然触发。
+    let cfg = shannon_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    // 前 10 根 base=100(激活建仓), 之后每根跌 5 直到 30, 再放 3 根 30 的 bar 让强平结算完成
+    let mut bars = univ2_main(10, 100, 100, 10);
+    let mut h = 10i64;
+    let mut p = 95i64;
+    while p >= 30 {
+        bars.push(bar_at_hour(h, p, p + 1, p - 1, p));
+        h += 1;
+        p -= 5;
+    }
+    for i in 0..3 {
+        bars.push(bar_at_hour(h + i, 30, 31, 29, 30));
+    }
+    let n = bars.len() as i64;
+    let (orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+
+    // 爆仓被识别: LIQ fill 计数 ≥ 1, 停机标记置位
+    assert!(st.global_f64("liq_count").unwrap_or(0.0) >= 1.0, "应识别引擎 LIQ- 强平 fill");
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "爆仓应置停机标记");
+    let dmin = st.global_f64("liq_dist_min").expect("最近爆仓距离应被记录");
+    assert!(dmin <= 0.1, "应逼近甚至穿越估算爆仓价(负值=现价已低于估算爆仓价): {dmin}");
+    // 爆仓后虚拟账本仍逐分同步引擎(爆仓同 bar 在途买单会回测工件性成交, 实盘撤单即时无此问题)
+    let eng_pos = _ctx
+        .position_directional("ETHUSDT", OrderSide::Buy)
+        .map(|p| p.size.to_f64().unwrap())
+        .unwrap_or(0.0);
+    let v_pos = st.global_f64("v_pos").expect("v_pos");
+    assert!((v_pos - eng_pos).abs() < 1e-6, "爆仓后虚拟持仓应与引擎一致: v_pos={v_pos} eng={eng_pos}");
+    // 爆仓 bar 之后不再产生任何订单(全撤指令除外)
+    let after: usize = orders[(n - 2) as usize..].iter().flatten().flatten().count();
+    assert_eq!(after, 0, "爆仓停机后不得再挂单");
+    // state 快照持久化 halted(重启不复活); 显式触发 on_stop 校验 stat 导出
+    let (mut st, mut ctx2) = (st, _ctx);
+    st.on_stop(&mut ctx2);
+    let snap = st.state_snapshot();
+    let halted = snap.iter().find(|(k, _)| k == "halted").map(|(_, v)| v.clone());
+    assert_eq!(halted.as_deref(), Some("1"), "halted 应持久化(重启不复活)");
+    // stat 导出齐备
+    let get = |k: &str| snap.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    assert!(get("stat_liq_dist_min").is_some(), "stat_liq_dist_min 应导出");
+    assert!(get("stat_liq_dist_min_ts").is_some(), "stat_liq_dist_min_ts 应导出");
+    assert!(get("stat_liq_count").is_some(), "stat_liq_count 应导出");
+    assert!(get("stat_liq_pnl").is_some(), "stat_liq_pnl 应导出");
 }
