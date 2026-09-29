@@ -26,6 +26,16 @@
 --      分叉**(卖平多真实回笼 = 释放保证金 q·p/L + 已实现盈亏, 虚拟记 +q·p; 资金费引擎 8h 计收、
 --      虚拟账本不计), 只留档不告警。--close-at-end 的 CLOSE- 强平 fill 按普通卖出推进虚拟账本,
 --      盈亏单列 stat_close_pnl(均值成本口径)。
+--   7) 卖出侧降杠杆(041 v3, 2026-09-29 用户口径: 锚定建仓价值+削减虚拟现金): V0 = entry_size ×
+--      entry_price(建仓定格, state 已持久化, 零新增状态)。挂卖单时**仅现价 ≥ 建仓价(非浮亏闸门)**
+--      且卖单价下可实现仓位名义 Q·sell_px > V0×delev_cap_mult(默认 1.0; 0/缺失=默认, 负数禁用;
+--      哨兵约定同 num()) 时, 消减卖量 q_delev = (Q·sell_px − V0×mult)/(sell_px·(1−f)),
+--      最终卖量 = max(正常 1:1 量, q_delev); 下跌/回撤(现价 < 建仓价)完全不消减; 买侧公式不动。
+--      **成交后账本强制回到 1:1**: model_apply 卖出推进后若 v_cash > v_pos×成交价(只可能由消减卖
+--      造成), 把超出部分从 v_cash 削掉(delev_trimmed 累计) —— 削掉的现金退出虚拟网格(真实权益
+--      里仍存在, 只是网格不再用它下注), 虚拟总资金缩小 = 有效杠杆棘轮式下行。若不削减, 账本现金
+--      偏重会被下一格买单按 1:1 公式买回, 降杠杆被抵消(v2 教训)。计数/累计导出 stat_delev_count /
+--      stat_delev_extra_notional / stat_delev_cash_trimmed。
 --   ⚠ 再平衡固有语义(同现货): 下跌后反弹的首笔平多单相对高位历史开多是保本/微亏 —— 恒定权重
 --   再平衡特性, 非配对违约; 不引入 min_pair_profit/栈顶锚定(那是 paired 系语义, 香农无栈)。
 --
@@ -97,7 +107,10 @@ skip_zero_buy_px = 0
 rehang_count = 0
 underfunded_buys = 0      -- 虚拟买单量超真实可用保证金的次数(合约差异 #5)
 underfunded_notional = 0  -- 上述买单的累计名义
+delev_count = 0           -- 卖出侧降杠杆卖单次数(041, 含并入正常卖单的降杠杆量)
+delev_extra_notional = 0  -- 降杠杆超额卖出的累计名义(相对正常 1:1 卖量的增量部分)
 close_pnl = 0             -- CLOSE- 强平锁定损益(均值成本口径)
+delev_trimmed = 0         -- 消减卖后从 v_cash 削掉的现金累计(账本强制回 1:1, 退出虚拟网格)
 m_fee = 0                 -- 虚拟账本累计手续费(Σ fill.fee)
 buy_notional = 0          -- 虚拟账本累计买入名义(账本重建核对用)
 sell_notional = 0         -- 虚拟账本累计卖出名义
@@ -141,7 +154,7 @@ end
 
 -- 虚拟账本按真实成交推进(合约差异 #2): 与现货 model_apply 同构, 只是账本是"虚拟"的 ——
 -- v_pos 与引擎逐分同步, v_cash 的引擎对应物(可用保证金)随浮盈亏波动, 故对账口径见 on_stop。
-local function model_apply(fill, px, size)
+local function model_apply(ctx, fill, px, size)
     if v_cash == nil then
         return -- 首笔(建仓)成交在 on_fill 里同步初始值, 不会走到这里
     end
@@ -154,6 +167,20 @@ local function model_apply(fill, px, size)
         v_cash = v_cash + size * px - (fill.fee or 0)
         v_pos = v_pos - size
         sell_notional = sell_notional + size * px
+        -- 降杠杆收口(041 v3): 卖出后若 v_cash > v_pos×成交价(现金偏重, 只可能由消减卖造成),
+        -- 削掉超出部分强制回 1:1 —— 削掉的现金退出虚拟网格, 虚拟总资金缩小 = 降杠杆生效。
+        -- 正常 1:1 卖恰好 C=Q·px, 削减量为 0, 不影响普通网格。
+        -- ⚠ 排除 LIQ- 真爆仓强平: 爆仓损失属 stat_liq_pnl 口径, 不得计入 delev_trimmed。
+        if v_cash > v_pos * px
+            and (fill.client_order_id or ""):sub(1, 4) ~= "LIQ-" then
+            local cut = v_cash - v_pos * px
+            v_cash = v_pos * px
+            delev_trimmed = delev_trimmed + cut
+            ctx:log(string.format(
+                "[shannon_grid_futures] 消减收口: 卖后现金偏重 %.2f -> 削减虚拟现金 %.2f, " ..
+                "账本回 1:1 (现金 %.2f = 仓位 %.6f×%.4f), 累计已削减 %.2f",
+                cut, cut, v_cash, v_pos, px, delev_trimmed))
+        end
     end
     m_fee = m_fee + (fill.fee or 0)
 end
@@ -171,10 +198,11 @@ function save_state(ctx)
     end
     ctx:state_set("avg_entry", string.format("%.10f", avg_entry))
     -- 虚拟账本重建核对恒等式的累计项(续接后 on_stop 核对仍成立):
-    --   v_cash = v_total − m_fee − buy_notional + sell_notional
+    --   v_cash = v_total − m_fee − buy_notional + sell_notional − delev_trimmed
     ctx:state_set("m_fee", string.format("%.10f", m_fee))
     ctx:state_set("buy_notional", string.format("%.10f", buy_notional))
     ctx:state_set("sell_notional", string.format("%.10f", sell_notional))
+    ctx:state_set("delev_trimmed", string.format("%.10f", delev_trimmed))
     -- 终态持久化(防重启复活, 同 shannon 审计教训)
     ctx:state_set("halted", halted and "1" or "0")
     -- 建仓单在途标记(防重启重复建仓)
@@ -215,6 +243,9 @@ function on_init(ctx)
     liq_dist_min_price = 0
     liq_count = 0
     liq_pnl = 0
+    delev_count = 0
+    delev_extra_notional = 0
+    delev_trimmed = 0
 
     -- 杠杆校验(合约差异 #1): 1~5 倍, 越界 FATAL 停机。杠杆唯一权威 = 清单 default_leverage
     -- (回填 [backtest].leverage), 此处防御性读取; num() 将 0 折为默认, 下界用 <1 捕获。
@@ -243,6 +274,7 @@ function on_init(ctx)
         m_fee = tonumber(ctx:state_get("m_fee")) or 0
         buy_notional = tonumber(ctx:state_get("buy_notional")) or 0
         sell_notional = tonumber(ctx:state_get("sell_notional")) or 0
+        delev_trimmed = tonumber(ctx:state_get("delev_trimmed")) or 0
         v_pos = ctx:pos_size(pair, "long") or 0
         -- 账本完整性防御: 已建仓但虚拟现金缺失(状态损坏/旧版本状态) → 记账链断裂,
         -- do_rehang 卖量公式会以 C=0 退化出 ≈Q/2 的半仓平多单 → 必须 FATAL 停机。
@@ -268,7 +300,7 @@ function on_init(ctx)
 
     ctx:log(string.format(
         "[shannon_grid_futures] init pair=%s quote=%s 投入=%s 杠杆=%.1f(总资金=投入×杠杆) 建仓=总资金一半 " ..
-        "主时钟=%s ATR=%s×%d mult=%.2f min_notional=%.2f fee_side=%.4f liq_warn=%.2f",
+        "主时钟=%s ATR=%s×%d mult=%.2f min_notional=%.2f fee_side=%.4f delev_cap=%.2f liq_warn=%.2f",
         pair, quote_asset,
         (ctx:config_f64("invest_cash") or 0) > 0 and string.format("%.2f", ctx:config_f64("invest_cash"))
             or "激活时余额全额",
@@ -277,6 +309,8 @@ function on_init(ctx)
             and ctx:config_str("interval") or "1h",
         atr_intv, num(ctx, "atr_period", 14), num(ctx, "atr_mult", 1.5),
         num(ctx, "min_notional", 5), num(ctx, "fee_side", 0.0005),
+        (ctx:config_f64("delev_cap_mult") == nil or ctx:config_f64("delev_cap_mult") == 0) and 1
+            or ctx:config_f64("delev_cap_mult"),
         num(ctx, "liq_warn_ratio", 0.1)))
     ctx:log(string.format(
         "[shannon_grid_futures] 激活: 价格低于 start_price=%.4f 才激活, 用总资金一半市价开多, " ..
@@ -364,6 +398,34 @@ function do_rehang(ctx)
 
     if Q > 0 then
         local q = (Q * sell_px - C) / (sell_px * (2 - f))
+        -- 卖出侧降杠杆(041 v3 锚定建仓价值): 仅当现价 ≥ 建仓价(非浮亏)时启用 —— 下跌/回撤中
+        -- 完全不消减(不提前锁亏); 启用时若卖单价下可实现仓位名义 Q·sell_px 超过
+        -- V0×delev_cap_mult(V0 = entry_size×entry_price), 把超额随卖单一并卖掉,
+        -- 最终卖量 = max(1:1 量, 降杠杆量); 买侧不动。成交后由 model_apply 收口把账本
+        -- 强制回 1:1(超额现金削出虚拟网格), 见头注释第 7 点。
+        -- ⚠ delev_cap_mult 哨兵同 num(): 0/缺失 = 默认 1, 负数禁用(config_f64 对缺失/CLI 浮点
+        -- 参数可能返回 0, 不能用 0 做禁用哨兵)。
+        local delev_cap = ctx:config_f64("delev_cap_mult")
+        if delev_cap == nil or delev_cap == 0 then
+            delev_cap = 1
+        end
+        if delev_cap > 0 and entry_size > 0 and entry_price > 0
+            and price >= entry_price then
+            local pos_notional = Q * sell_px
+            local cap_notional = entry_size * entry_price * delev_cap
+            if pos_notional > cap_notional then
+                local q_delev = (pos_notional - cap_notional) / (sell_px * (1 - f))
+                if q_delev > q then
+                    delev_extra_notional = delev_extra_notional + (q_delev - q) * sell_px
+                    delev_count = delev_count + 1
+                    ctx:log(string.format(
+                        "[shannon_grid_futures] 降杠杆卖出: 仓位名义 %.2f > 建仓价值上限 %.2f -> " ..
+                        "卖量 %.6f -> %.6f (超额名义 %.2f, 仓位名义压回建仓价值)",
+                        pos_notional, cap_notional, q, q_delev, (q_delev - q) * sell_px))
+                    q = q_delev
+                end
+            end
+        end
         if q > 0 then
             q = cap_close(ctx, pair, q)
             if q > 0 and q * sell_px >= min_notional then
@@ -667,7 +729,7 @@ function on_fill(ctx, fill)
         close_pnl = close_pnl + size * (px - avg_entry)
     end
     balance_price = px
-    model_apply(fill, px, size)
+    model_apply(ctx, fill, px, size)
     if fill.side == "buy" then
         buy_count = buy_count + 1
     else
@@ -722,10 +784,10 @@ function on_stop(ctx)
             v_pos or 0, pos, d_pos))
     end
 
-    -- 虚拟账本重建核对: v_cash 应恒等于 总资金 − Σ费 − Σ买名义 + Σ卖名义
+    -- 虚拟账本重建核对: v_cash 应恒等于 总资金 − Σ费 − Σ买名义 + Σ卖名义 − 消减削减现金
     -- (逐 fill 递推的封闭恒等式; Shannon 再平衡浮盈合法进入 v_cash, 故不能用
     --  "v_cash+v_pos×价 vs 总资金" 这类不含盈亏项的伪恒等式)。差 > 0.01 → WARN。
-    local v_recon = v_total - m_fee - buy_notional + sell_notional
+    local v_recon = v_total - m_fee - buy_notional + sell_notional - delev_trimmed
     local v_recon_diff = (v_cash or 0) - v_recon
     if v_total > 0 and math.abs(v_recon_diff) > 0.01 then
         ctx:log(string.format(
@@ -736,10 +798,12 @@ function on_stop(ctx)
     -- 收益分解: 合计 = 期末权益 − 投入 = 持仓收益(期末持仓×(末价−建仓价)) + 交易收益(再平衡净贡献)
     local out = string.format(
         "[shannon_grid_futures] 停机(**不清仓**): 成交 %d(买 %d 卖 %d) / 跳过(ATR未就绪 %d, 小名义 %d, 买价≤0 %d) / " ..
-        "重挂 %d / 资金不足买 %d 次(累计名义 %.2f) / %s / 平衡价 %s / 期末虚拟现金 %.2f 持仓 %.6f(市值 %.2f) " ..
+        "重挂 %d / 资金不足买 %d 次(累计名义 %.2f) / 降杠杆卖 %d 次(超额名义 %.2f) / %s / 平衡价 %s / " ..
+        "期末虚拟现金 %.2f 持仓 %.6f(市值 %.2f) " ..
         "权益 %.2f / 虚拟费 %.4f / 强平锁定 %.2f / 爆仓 %d 次(损失 %.2f, 最近距离 %s) / 持仓差 %.8f",
         fill_count, buy_count, sell_count, skip_no_atr, skip_notional, skip_zero_buy_px,
         rehang_count, underfunded_buys, underfunded_notional,
+        delev_count, delev_extra_notional,
         halted and "已停机(成本门槛/参数/爆仓)" or "正常运行",
         balance_price and string.format("%.4f", balance_price) or "nil",
         v_cash or 0, pos, pos * (last_price or 0), eq, m_fee, close_pnl,
@@ -779,6 +843,10 @@ function on_stop(ctx)
     ctx:state_set("stat_skip_notional", string.format("%d", skip_notional))
     ctx:state_set("stat_underfunded_buys", string.format("%d", underfunded_buys))
     ctx:state_set("stat_underfunded_notional", string.format("%.2f", underfunded_notional))
+    -- 041 卖出侧降杠杆可观测
+    ctx:state_set("stat_delev_count", string.format("%d", delev_count))
+    ctx:state_set("stat_delev_extra_notional", string.format("%.2f", delev_extra_notional))
+    ctx:state_set("stat_delev_cash_trimmed", string.format("%.2f", delev_trimmed))
     ctx:state_set("stat_stall_bars", string.format("%d", stall_bars))
     ctx:state_set("stat_cash_final", string.format("%.2f", ctx:balance(quote_asset) or 0))
     ctx:state_set("stat_v_cash_final", string.format("%.2f", v_cash or 0))
