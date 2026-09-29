@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Ricow</title>
     <!--
-      两个静态资源的 URL 里带 `__RICOW_TOKEN__`: 服务端只在 `/` 处替换它(见 `web/mod.rs`)。
+      静态资源的 URL 里带 `__RICOW_TOKEN__`: 服务端只在 `/` 处替换它(见 `web/mod.rs`)。
       浏览器取 `<link>` / `<script>` 无法自定请求头, 只能把 token 挂在查询串上 —— 与
       `EventSource` 走同一条取值路径(`token_of`)。
     -->
@@ -13,7 +13,7 @@
   </head>
   <body>
     <div id="app">
-      <!-- 左: 竖长会话列表 (FR-006 / FR-007) -->
+      <!-- 左: 主导航 + 竖长会话列表 (032 导航 / FR-006 / FR-007) -->
       <aside id="sidebar">
         <div class="side-head">
           <span class="brand">Ricow</span>
@@ -21,85 +21,123 @@
             + 新建
           </button>
         </div>
+        <!-- 032: 五项 hash 导航(对话/市场/策略/运行/设置); 高亮由 router.js 同步。 -->
+        <nav id="nav">
+          <a href="#chat" data-zh="对话" data-en="Chat">对话</a>
+          <a href="#markets" data-zh="市场" data-en="Markets">市场</a>
+          <a href="#strategies" data-zh="策略" data-en="Strategies">策略</a>
+          <a href="#runs" data-zh="运行" data-en="Runs">运行</a>
+          <a href="#settings" data-zh="设置" data-en="Settings">设置</a>
+        </nav>
+        <!-- 会话列表始终显示(切到别的视图也保留在左栏)。 -->
         <ul id="session-list"></ul>
       </aside>
 
       <main id="main">
+        <!-- 全视图共享的顶栏: 语言切换钮在任何视图都可见可用(FR-029)。 -->
         <header id="topbar">
           <span id="session-title" class="muted"></span>
           <span id="status" class="status"></span>
           <button id="lang-toggle" class="ghost-btn" type="button" title="中 / EN">EN</button>
         </header>
 
-        <!-- 右上: 对话流 (用户与 AI 输出; 按级别着色 FR-013 / FR-023) -->
-        <section id="stream" aria-live="polite"></section>
+        <!-- 032: 视图容器, 同一时间只有一个 .view.active(router.js 切换)。 -->
 
-        <!-- 右下: 输入区 (FR-009 / FR-010) -->
-        <form id="composer" autocomplete="off">
-          <div
-            class="hint"
-            data-zh="Enter 发送 · Shift+Enter 换行"
-            data-en="Enter to send · Shift+Enter for newline"
-          >
-            Enter 发送 · Shift+Enter 换行
+        <!-- 对话视图: 中栏(对话流 + 输入区)与右栏三面板整体迁入, DOM 结构与 id 不变。 -->
+        <section id="view-chat" class="view active">
+          <div class="chat-col">
+            <!-- 右上: 对话流 (用户与 AI 输出; 按级别着色 FR-013 / FR-023) -->
+            <section id="stream" aria-live="polite"></section>
+
+            <!-- 右下: 输入区 (FR-009 / FR-010) -->
+            <form id="composer" autocomplete="off">
+              <div
+                class="hint"
+                data-zh="Enter 发送 · Shift+Enter 换行"
+                data-en="Enter to send · Shift+Enter for newline"
+              >
+                Enter 发送 · Shift+Enter 换行
+              </div>
+              <div class="composer-row">
+                <textarea
+                  id="input"
+                  rows="1"
+                  spellcheck="false"
+                  data-zh-placeholder="说点什么…(也可以用 /help /history /lang /keys 这类命令)"
+                  data-en-placeholder="Say something… (slash commands like /help /history /lang /keys work too)"
+                ></textarea>
+                <button id="send" type="submit" data-zh="发送" data-en="Send">发送</button>
+              </div>
+            </form>
           </div>
-          <div class="composer-row">
-            <textarea
-              id="input"
-              rows="1"
-              spellcheck="false"
-              data-zh-placeholder="说点什么…(也可以用 /help /history /lang /keys 这类命令)"
-              data-en-placeholder="Say something… (slash commands like /help /history /lang /keys work too)"
-            ></textarea>
-            <button id="send" type="submit" data-zh="发送" data-en="Send">发送</button>
-          </div>
-        </form>
+
+          <!--
+            右: 交易面板 + 日志面板 (026 FR-012 / FR-016)。两块都**只读** —— 页面上没有任何直连交易所的
+            按钮; 撤单 / 平仓 / 停机仍然只能走上面的对话确认流程(D17 / FR-013)。
+          -->
+          <aside id="panels">
+            <section class="panel" id="strategy-panel">
+              <div class="panel-head">
+                <span data-zh="策略" data-en="Strategies">策略</span>
+              </div>
+              <!-- 031: 策略目录(内置示例 + 用户自写), 按现货/合约分组; 只读, 配置走对话确认。 -->
+              <div id="strategy-list" class="rows"></div>
+              <div id="strategy-detail" class="strategy-detail" hidden></div>
+            </section>
+
+            <section class="panel" id="trade-panel">
+              <div class="panel-head">
+                <span data-zh="交易" data-en="Trades">交易</span>
+                <span id="trade-asof" class="muted small"></span>
+              </div>
+              <!-- 三态如实呈现(FR-014): "确实没有" / "daemon 未运行, 此刻状态不可知" / "读不到(原因)"。 -->
+              <div id="trade-source" class="source"></div>
+              <div class="block">
+                <div class="block-title" data-zh="当前持仓" data-en="Positions">当前持仓</div>
+                <div id="positions" class="rows"></div>
+              </div>
+              <div class="block">
+                <div class="block-title" data-zh="挂单" data-en="Open orders">挂单</div>
+                <div id="orders" class="rows"></div>
+              </div>
+              <div class="block">
+                <div class="block-title" data-zh="最近成交" data-en="Recent fills">最近成交</div>
+                <div id="fills" class="rows"></div>
+              </div>
+            </section>
+
+            <section class="panel" id="log-panel">
+              <div class="panel-head">
+                <span data-zh="策略日志" data-en="Strategy log">策略日志</span>
+                <select id="log-name" class="mini-select"></select>
+              </div>
+              <div id="log-lines" class="log-lines"></div>
+            </section>
+          </aside>
+        </section>
+
+        <!-- 032 阶段 1: 其余四个视图只有占位, 业务逻辑后续阶段接入。 -->
+        <section id="view-markets" class="view" hidden>
+          <h2 class="placeholder-title" data-zh="市场" data-en="Markets">市场</h2>
+        </section>
+        <!-- 策略管理(032 US3): 容器由 strategies.js 渲染(列表/详情/弹窗全部 JS 生成)。 -->
+        <section id="view-strategies" class="view" hidden></section>
+        <!-- 运行管理(032 US4): 容器由 runs.js 渲染(实例表/弹窗/日志面板全部 JS 生成)。 -->
+        <section id="view-runs" class="view" hidden></section>
+        <section id="view-settings" class="view" hidden>
+          <h2 class="placeholder-title" data-zh="设置" data-en="Settings">设置</h2>
+        </section>
       </main>
-
-      <!--
-        右: 交易面板 + 日志面板 (026 FR-012 / FR-016)。两块都**只读** —— 页面上没有任何直连交易所的
-        按钮; 撤单 / 平仓 / 停机仍然只能走上面的对话确认流程(D17 / FR-013)。
-      -->
-      <aside id="panels">
-        <section class="panel" id="strategy-panel">
-          <div class="panel-head">
-            <span data-zh="策略" data-en="Strategies">策略</span>
-          </div>
-          <!-- 031: 策略目录(内置示例 + 用户自写), 按现货/合约分组; 只读, 配置走对话确认。 -->
-          <div id="strategy-list" class="rows"></div>
-          <div id="strategy-detail" class="strategy-detail" hidden></div>
-        </section>
-
-        <section class="panel" id="trade-panel">
-          <div class="panel-head">
-            <span data-zh="交易" data-en="Trades">交易</span>
-            <span id="trade-asof" class="muted small"></span>
-          </div>
-          <!-- 三态如实呈现(FR-014): "确实没有" / "daemon 未运行, 此刻状态不可知" / "读不到(原因)"。 -->
-          <div id="trade-source" class="source"></div>
-          <div class="block">
-            <div class="block-title" data-zh="当前持仓" data-en="Positions">当前持仓</div>
-            <div id="positions" class="rows"></div>
-          </div>
-          <div class="block">
-            <div class="block-title" data-zh="挂单" data-en="Open orders">挂单</div>
-            <div id="orders" class="rows"></div>
-          </div>
-          <div class="block">
-            <div class="block-title" data-zh="最近成交" data-en="Recent fills">最近成交</div>
-            <div id="fills" class="rows"></div>
-          </div>
-        </section>
-
-        <section class="panel" id="log-panel">
-          <div class="panel-head">
-            <span data-zh="策略日志" data-en="Strategy log">策略日志</span>
-            <select id="log-name" class="mini-select"></select>
-          </div>
-          <div id="log-lines" class="log-lines"></div>
-        </section>
-      </aside>
     </div>
+    <!-- 032: 脚本按依赖顺序加载, 全部走 token 查询串鉴权; common.js 必须先于视图文件。 -->
+    <script src="/lightweight-charts.js?token=__RICOW_TOKEN__"></script>
+    <script src="/common.js?token=__RICOW_TOKEN__"></script>
+    <script src="/router.js?token=__RICOW_TOKEN__"></script>
+    <script src="/chat.js?token=__RICOW_TOKEN__"></script>
+    <script src="/settings.js?token=__RICOW_TOKEN__"></script>
+    <script src="/markets.js?token=__RICOW_TOKEN__"></script>
+    <script src="/strategies.js?token=__RICOW_TOKEN__"></script>
+    <script src="/runs.js?token=__RICOW_TOKEN__"></script>
     <script src="/app.js?token=__RICOW_TOKEN__"></script>
   </body>
 </html>

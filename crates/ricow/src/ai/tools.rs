@@ -420,7 +420,7 @@ fn tool_run_backtest(_ctx: ToolCtx) -> DynamicTool {
                 if let Some(m) = args.get("market").and_then(|v| v.as_str()) {
                     a.market = Some(m.to_string());
                 }
-                let (text, _report) = commands::backtest::run_backtest(a)
+                let text = commands::backtest::run_backtest(a)
                     .await
                     .map_err(|e| ToolExecutionError::other(format!("回测失败: {e}")))?;
                 Ok(ToolOutput::text(clamp_output(redact(&text))))

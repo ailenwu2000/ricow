@@ -45,32 +45,39 @@ fn io_err(context: &str, e: impl std::fmt::Display) -> CoreError {
     CoreError::InvalidArgument(format!("{context}: {e}"))
 }
 
+/// 自举就绪产物: daemon 元信息 + 子进程 pid + 日志路径。
+struct DaemonReady {
+    info: ledger::DaemonInfo,
+    child_pid: u32,
+    log: std::path::PathBuf,
+}
+
 /// 若存在可达的 daemon, 返回其元信息 (连不上则清理陈旧文件并返回 None)。
-async fn live_daemon(root: &std::path::Path) -> Option<ledger::DaemonInfo> {
+///
+/// `announce`: CLI 路径为 true (打印清理提示); Web 自举路径为 false (无终端输出, FR-034)。
+async fn live_daemon_inner(root: &std::path::Path, announce: bool) -> Option<ledger::DaemonInfo> {
     let info = ledger::read_daemon_info(root)?;
     match Client::connect(root).await {
         Ok(_) => Some(info),
         Err(_) => {
-            println!("提示: 清理陈旧 run/daemon.json (pid={} 未在监听)", info.pid);
+            if announce {
+                println!("提示: 清理陈旧 run/daemon.json (pid={} 未在监听)", info.pid);
+            }
             ledger::remove_daemon_info(root);
             None
         }
     }
 }
 
-async fn start() -> CoreResult<()> {
-    let root = crate::commands::project_root();
-    ledger::ensure_dirs(&root).map_err(|e| io_err("创建 run/ logs/ 目录失败", e))?;
+/// CLI 入口: 保留清理提示打印 (终端输出逐字不变, FR-034)。
+async fn live_daemon(root: &std::path::Path) -> Option<ledger::DaemonInfo> {
+    live_daemon_inner(root, true).await
+}
 
-    if let Some(info) = live_daemon(&root).await {
-        return Err(CoreError::InvalidArgument(format!(
-            "daemon 已在运行 (pid={}, 端口={}); 如需重启请先 ricow daemon stop",
-            info.pid, info.port
-        )));
-    }
-
+/// 后台拉起 `daemon run` 子进程并轮询 daemon.json 直到就绪 (无任何 println, 提示走返回错误)。
+async fn spawn_and_wait(root: &std::path::Path) -> CoreResult<DaemonReady> {
     let exe = std::env::current_exe().map_err(|e| io_err("定位 ricow 可执行文件失败", e))?;
-    let log = ledger::logs_dir(&root).join("daemon.log");
+    let log = ledger::logs_dir(root).join("daemon.log");
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -85,20 +92,12 @@ async fn start() -> CoreResult<()> {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
     detach(&mut cmd);
-    let child = cmd.spawn().map_err(|e| io_err("启动 daemon 进程失败", e))?;
-    let child_pid = child.id();
+    let child_pid = cmd.spawn().map_err(|e| io_err("启动 daemon 进程失败", e))?.id();
 
     // 等待 daemon 写入 daemon.json (就绪信号)
     for _ in 0..50 {
-        if let Some(info) = ledger::read_daemon_info(&root) {
-            println!(
-                "daemon 已启动: pid={} (子进程 pid={}) 端口={} 日志={}",
-                info.pid,
-                child_pid,
-                info.port,
-                log.display()
-            );
-            return Ok(());
+        if let Some(info) = ledger::read_daemon_info(root) {
+            return Ok(DaemonReady { info, child_pid, log });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -106,6 +105,47 @@ async fn start() -> CoreResult<()> {
         "daemon 启动超时 (5s 未就绪); 请查看日志 {}",
         log.display()
     )))
+}
+
+/// 确保 daemon 就绪 (幂等): 已在运行则直接返回其元信息, 否则后台拉起并等待。
+async fn ensure_daemon_ready(root: &std::path::Path) -> CoreResult<DaemonReady> {
+    ledger::ensure_dirs(root).map_err(|e| io_err("创建 run/ logs/ 目录失败", e))?;
+
+    if let Some(info) = live_daemon_inner(root, false).await {
+        return Ok(DaemonReady {
+            child_pid: info.pid,
+            log: ledger::logs_dir(root).join("daemon.log"),
+            info,
+        });
+    }
+    spawn_and_wait(root).await
+}
+
+/// Web 自举入口 (027/T030): 确保 daemon 存活, 幂等; 无任何 println (FR-034)。
+pub(crate) async fn ensure_daemon(root: &std::path::Path) -> CoreResult<()> {
+    ensure_daemon_ready(root).await.map(|_| ())
+}
+
+async fn start() -> CoreResult<()> {
+    let root = crate::commands::project_root();
+    ledger::ensure_dirs(&root).map_err(|e| io_err("创建 run/ logs/ 目录失败", e))?;
+
+    if let Some(info) = live_daemon(&root).await {
+        return Err(CoreError::InvalidArgument(format!(
+            "daemon 已在运行 (pid={}, 端口={}); 如需重启请先 ricow daemon stop",
+            info.pid, info.port
+        )));
+    }
+
+    let ready = spawn_and_wait(&root).await?;
+    println!(
+        "daemon 已启动: pid={} (子进程 pid={}) 端口={} 日志={}",
+        ready.info.pid,
+        ready.child_pid,
+        ready.info.port,
+        ready.log.display()
+    );
+    Ok(())
 }
 
 async fn stop() -> CoreResult<()> {

@@ -48,7 +48,10 @@ pub fn bstock_spot_pool(markets: &[Market], equity_bases: &[String]) -> Vec<Stri
 }
 
 /// 交易对视野: 现货 / 合约两组符号 + 是否为"仅股票类"过滤视野。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// `Serialize`(032 US2): Web `GET /api/markets` 直序本结构, 字段即 JSON 键
+/// `{spot,futures,filtered}`(见 specs/changes/032-web-ui-console/data-model.md §2)。
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct PairsView {
     pub spot: Vec<String>,
     pub futures: Vec<String>,

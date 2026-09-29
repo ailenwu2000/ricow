@@ -435,7 +435,12 @@ pub(crate) fn require_explicit_phrase(context: &str, expected: &str) -> ricow_co
 
 /// 已部署策略名 (`strategies/*.toml` 文件名, 排序)。
 pub(crate) fn deployed_strategy_names() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(strategies_dir()) else {
+    deployed_strategy_names_in(&project_root())
+}
+
+/// 同 [`deployed_strategy_names`], 但显式指定数据目录(Web 端点按请求的 root 取, 测试可注入)。
+pub(crate) fn deployed_strategy_names_in(root: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root.join("strategies")) else {
         return Vec::new();
     };
     let mut names: Vec<String> = entries

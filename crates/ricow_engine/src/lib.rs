@@ -30,5 +30,7 @@ pub use nasdaq::{parse_historical, NasdaqClient};
 pub use notify::{EventKind, Notifier, NotifyConfig, NotifyEvent};
 /// 订单号归属判定 (011 D6): 实现见 `ricow_strategy::align`, 此处转发便于引擎/CLI 直接用。
 pub use ricow_strategy::{is_owned, ownership_prefix};
-pub use strategy::{create_strategy, execute_strategy, extract_code};
+pub use strategy::{
+    create_strategy, execute_strategy, extract_code, write_strategy_files, DeployedStrategy,
+};
 pub use us_tickers::{is_leveraged, us_ticker_of, AssetClass, BstockMap, BSTOCK_MAP};

@@ -6,6 +6,8 @@
 //! - 本机端点(`127.0.0.1` / `localhost`)不要求密钥(如本地 Ollama), 其余端点必须带密钥;
 //! - 工具循环上限 = `Resolved::max_turns`(成本护栏), 每轮答复打印 token 用量。
 
+use std::path::Path;
+
 use futures::StreamExt;
 use ricow_core::{CoreError, CoreResult};
 use rig::agent::MultiTurnStreamItem;
@@ -14,8 +16,14 @@ use rig::prelude::*;
 use rig::providers::openai;
 use rig::streaming::StreamedAssistantContent;
 
-use super::config::Resolved;
+use super::config::{self, Resolved};
 use super::session::SessionSink;
+
+/// 032 US3 (FR-018): Web「AI 改 Lua」一次性问答的系统提示 —— 无工具、单轮,
+/// 只做一件事: 在原策略代码基础上按自然语言指令改写, 并只输出完整 Lua。
+const AI_EDIT_PREAMBLE: &str = "你是 ricow 的 Lua 交易策略编辑助手。你只负责改写策略代码, \
+    不做行情分析、不调用任何工具; 严格使用 ricow 既有 ctx API(不发明接口), \
+     与修改指令无关的原有逻辑必须逐字保留; 最终只输出一份完整 Lua 代码, 不加任何解释或 Markdown 围栏。";
 
 /// 构造 OpenAI 兼容客户端(自定义 base_url + 密钥)。
 pub fn build_client(resolved: &Resolved, api_key: &str) -> CoreResult<openai::CompletionsClient> {
@@ -182,6 +190,83 @@ impl Llm {
     }
 }
 
+/// 构造「AI 改 Lua」的用户提示词(032 FR-018, 纯函数便于离线单测)。
+///
+/// 三段固定结构: ① 策略参数说明摘要(只供模型理解参数语义, 由 manifest 数据拼出, 不含任何配置密钥);
+/// ② 原策略的**完整** Lua 代码; ③ 用户的自然语言修改指令。并显式约束输出形态:
+/// 只输出一份完整 Lua、无 ``` 围栏、无解释 —— 调用方随后用 [`ricow_engine::extract_code`]
+/// 再剥一次围栏做兜底, 然后强制过编译门禁, 全程不落盘。
+pub(crate) fn build_edit_prompt(
+    instruction: &str,
+    lua_code: &str,
+    manifest_summary: &str,
+) -> String {
+    format!(
+        "请按用户的修改指令, 在下面这份**原策略完整代码**的基础上改写策略。\n\
+         \n\
+         ## 策略参数说明(仅供理解, 不要擅自增删与本次指令无关的参数)\n\
+         {manifest_summary}\n\
+         \n\
+         ## 原策略完整 Lua 代码\n\
+         {lua_code}\n\
+         \n\
+         ## 用户的修改指令\n\
+         {instruction}\n\
+         \n\
+         ## 输出要求(必须严格遵守)\n\
+         1. 只输出**一份**改写后的完整 Lua 代码(包含完整的 on_tick 以及需要保留的 on_init 等函数);\n\
+         2. 不要输出 ```lua 之类的代码围栏, 不要输出任何解释、前后缀、寒暄或 Markdown;\n\
+         3. 只能使用 ricow 既有的 ctx API, 不要发明不存在的接口或参数;\n\
+         4. 与本次修改指令无关的原有逻辑逐字保留。"
+    )
+}
+
+/// 032 US3 (FR-018): Web「AI 改 Lua」的一次性非流式问答薄封装。
+///
+/// 与对话会话([`super::session::ChatSession`])取**同一套**配置: provider/model/base_url
+/// 只来自 `ricow.toml` 的 `[ai]` 段 + `RICOW_AI_*` 环境变量, Web 侧不提供任何覆盖入口;
+/// 密钥也**绝不**进入提示词(只用于构造客户端)。
+///
+/// 错误建模(供 Web 层稳定判定, 不新增 CoreError 变体):
+/// - 未配密钥(或客户端构造的鉴权前置失败)→ [`CoreError::Auth`] —— Web 映射 403 `need_keys`;
+/// - 调用超时 / 上游错误 → [`CoreError::Exchange`](`Llm::ask` 已做中文包装)—— Web 映射 400;
+/// - 其余配置/IO 错误原样透传(Auth/InvalidArgument 等);
+/// - 本机端点(如本地 Ollama)沿用 [`resolve_key`] 例外: 缺密钥时以占位值放行, 不判 need_keys。
+///
+/// 单轮不挂工具(`tools` 传空), `max_tokens` 跟随 rig/agent 默认 —— 不单独暴露。
+pub(crate) async fn quick_ask(
+    root: &Path,
+    instruction: &str,
+    lua_code: &str,
+    manifest_summary: &str,
+) -> CoreResult<String> {
+    // 唯一配置文件: ricow.toml(缺文件时生成模板; 与 ChatSession::open 逐字同路径)。
+    let file = crate::commands::config_file::load(root)?;
+    let cfg = config::AiConfig {
+        provider: file.ai.provider.clone(),
+        model: file.ai.model.clone().unwrap_or_default(),
+        base_url: file.ai.base_url.clone(),
+        max_turns: file
+            .ai
+            .max_turns
+            .map(config::check_max_turns)
+            .transpose()?
+            .unwrap_or(config::DEFAULT_MAX_TURNS),
+    };
+    // 覆盖优先级与对话会话一致: 环境变量 > ricow.toml > 预设(Web 无命令行覆盖层)。
+    let env_base_url = std::env::var(config::ENV_BASE_URL).ok();
+    let env_model = std::env::var(config::ENV_MODEL).ok();
+    let resolved = config::resolve(&cfg, env_base_url, env_model)?;
+
+    // 缺密钥(远程端点)在此即返回 CoreError::Auth, 发生在任何网络请求之前。
+    let api_key = resolve_key(&resolved.base_url, config::api_key(root, &resolved.provider))?;
+
+    let prompt = build_edit_prompt(instruction, lua_code, manifest_summary);
+    let llm = connect(resolved, &api_key, AI_EDIT_PREAMBLE, Vec::new())?;
+    let answer = llm.ask(&prompt).await?;
+    Ok(answer.text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +290,23 @@ mod tests {
         assert_eq!(resolve_key("http://127.0.0.1:11434/v1", missing()).unwrap(), "local-endpoint");
         // 远程端点无密钥: 报错
         assert!(resolve_key("https://api.deepseek.com/v1", missing()).is_err());
+    }
+
+    #[test]
+    fn test_build_edit_prompt_contains_all_sections_and_no_secrets() {
+        let instruction = "把网格间距改成 ATR 三倍";
+        let lua = "function on_tick(ctx)\n  ctx:log('hi')\nend\n";
+        let summary = "- 网格步长 (key=grid_step): f64, 必填";
+        let p = build_edit_prompt(instruction, lua, summary);
+        // 三段结构关键内容都要在
+        assert!(p.contains(summary), "参数摘要必须原样进入 prompt: {p}");
+        assert!(p.contains(lua), "原代码必须完整进入 prompt: {p}");
+        assert!(p.contains(instruction), "用户指令必须原样进入 prompt: {p}");
+        // 输出约束关键段
+        assert!(p.contains("on_tick"), "要求输出完整函数: {p}");
+        assert!(p.contains("围栏"), "必须要求不带代码围栏: {p}");
+        // 密钥类字样绝不进入 prompt(quick_ask 只在构造客户端时用 key)
+        assert!(!p.to_ascii_lowercase().contains("api_key"), "prompt 不得含密钥字样: {p}");
+        assert!(!p.to_ascii_lowercase().contains("secret"), "prompt 不得含密钥字样: {p}");
     }
 }

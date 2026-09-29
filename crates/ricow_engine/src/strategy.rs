@@ -100,14 +100,12 @@ pub struct DeployedStrategy {
 ///
 /// - `(preview_id, token)` 由 `confirm::consume` **原子**校验: 未批准 / token 不匹配 / 已消费 / 过期
 ///   都在此步失败, 因此部署无法绕过两步确认;
+/// - token 消费之后的纯文件落盘(校验/备份/写 lua+toml/回滚)全部在
+///   [`write_strategy_files`] 内核里 —— Web 页面直控保存(032 FR-028)复用同一内核,
+///   不经 preview/token; 本函数只负责"消费 preview/token 拿到 [`StrategyConfig`]"这一段;
 /// - **同名策略默认拒绝覆盖**(不覆盖用户已部署的策略, 也不静默改名) —— 默认路径是**换个新名**部署;
 /// - `allow_replace = true` 走 **FR-044 受控覆盖**: 必须由"已逐字确认"的调用方传入(对话内确认块),
-///   覆盖前**先把旧 `.lua`/`.toml` 备份**成 `<name>.<ext>.<ts>.bak`, 备份失败即中止(不拿用户资产冒险);
-/// - 落盘形态 (031): 代码进 `strategies/{market}/<name>.lua`(市场子目录, 与策略源码目录统一),
-///   实例 TOML 留在 `strategies/<name>.toml`(向后兼容), 只留 `params.script_path = "{market}/{name}.lua"`
-///   —— 避免把整段 Lua 内嵌回 TOML (loader 会把 `script_path` 的内容注入内存 `script`, 若不摘除就会在写回时被固化);
-/// - `market` 只允许 `spot`/`futures`(031 FR-006: 不存在第三个市场目录), 非法即拒、不落盘;
-/// - 写 TOML 失败时回收已写的 `.lua`, 不留半成品。
+///   覆盖前**先把旧 `.lua`/`.toml` 备份**成 `<name>.<ext>.<ts>.bak`, 备份失败即中止(不拿用户资产冒险)。
 pub async fn execute_strategy(
     db: &Database,
     preview_id: &str,
@@ -116,9 +114,31 @@ pub async fn execute_strategy(
     allow_replace: bool,
 ) -> CoreResult<DeployedStrategy> {
     let payload = crate::confirm::consume(db, preview_id, token).await?;
-    let mut config = StrategyConfig::from_toml(&payload)
+    let config = StrategyConfig::from_toml(&payload)
         .map_err(|e| CoreError::Parse(format!("preview 载荷解析失败: {e}")))?;
+    write_strategy_files(config, dir, allow_replace)
+}
 
+/// 纯文件落盘内核 (032 US3 抽出): 与 preview/token 解耦 —— 输入已是 [`StrategyConfig`],
+/// 只做"校验 → 备份 → 写 lua/toml → 失败回滚", 不碰数据库、不 `.await`(故为普通同步 fn:
+/// 内部只有文件 IO 与 TOML 序列化, 没有异步操作; 调用方在 async 上下文里直接调即可)。
+///
+/// 终端/对话渠道经 [`execute_strategy`] 消费一次性 token 后进入本内核; Web 页面保存渠道
+/// (用户本人即作者与确认者, 032 FR-028)在编译门禁后直接调本内核 —— 两条渠道落盘行为逐字一致。
+///
+/// - **同名策略默认拒绝覆盖**(不覆盖用户已部署的策略, 也不静默改名) —— 默认路径是**换个新名**部署;
+/// - `allow_replace = true` 走 **FR-044 受控覆盖**: 必须由"已逐字确认"的调用方传入,
+///   覆盖前**先把旧 `.lua`/`.toml` 备份**成 `<name>.<ext>.<ts>.bak`, 备份失败即中止(不拿用户资产冒险);
+/// - 落盘形态 (031): 代码进 `strategies/{market}/<name>.lua`(市场子目录, 与策略源码目录统一),
+///   实例 TOML 留在 `strategies/<name>.toml`(向后兼容), 只留 `params.script_path = "{market}/{name}.lua"`
+///   —— 避免把整段 Lua 内嵌回 TOML (loader 会把 `script_path` 的内容注入内存 `script`, 若不摘除就会在写回时被固化);
+/// - `market` 只允许 `spot`/`futures`(031 FR-006: 不存在第三个市场目录), 非法即拒、不落盘;
+/// - 写 TOML 失败时回收已写的 `.lua`, 不留半成品。
+pub fn write_strategy_files(
+    mut config: StrategyConfig,
+    dir: &Path,
+    allow_replace: bool,
+) -> CoreResult<DeployedStrategy> {
     let name = config.name.trim().to_string();
     if name.is_empty() {
         return Err(CoreError::InvalidArgument("preview 载荷缺策略名".into()));
@@ -333,6 +353,46 @@ mod tests {
             "旧 TOML 也应备份"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 032 US3: 抽出的纯文件内核 [`write_strategy_files`] 不经 preview/token 也可落盘 ——
+    /// 新名部署: 代码进市场子目录, TOML 留根且只引用 script_path, 无备份。
+    #[test]
+    fn test_write_strategy_files_deploys_new_name() {
+        let dir = tmp_dir("kernel-new");
+        let config = create_strategy("web-new", AI_CODE, "ETHUSDT", HashMap::new()).expect("门禁");
+
+        let out = write_strategy_files(config, &dir, false).expect("落盘成功");
+        assert_eq!(out.toml_path, dir.join("web-new.toml"));
+        assert_eq!(out.lua_path, dir.join("spot").join("web-new.lua"));
+        assert!(out.backup.is_none(), "全新部署无备份");
+        let body = std::fs::read_to_string(&out.toml_path).unwrap();
+        assert!(body.contains("script_path") && body.contains("spot/web-new.lua"));
+        assert!(!body.contains("function on_tick"), "Lua 不得内嵌进 TOML");
+        assert!(std::fs::read_to_string(&out.lua_path).unwrap().contains("function on_tick"));
+
+        // 同名再来一次(allow_replace=false): 逐字沿用 execute_strategy 的拒绝文案。
+        let again = create_strategy("web-new", AI_CODE, "ETHUSDT", HashMap::new()).unwrap();
+        let err = write_strategy_files(again, &dir, false).unwrap_err().to_string();
+        assert!(err.contains("同名策略已存在, 拒绝覆盖"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 032 US3: 内核的 futures 市场与非法 market 分支行为不变。
+    #[test]
+    fn test_write_strategy_files_accepts_futures_and_rejects_bad_market() {
+        let dir = tmp_dir("kernel-market");
+        let mut config =
+            create_strategy("web-fut", AI_CODE, "ETHUSDT", HashMap::new()).expect("门禁");
+        config.market = "futures".into();
+        let out = write_strategy_files(config, &dir, false).expect("futures 合法");
+        assert_eq!(out.lua_path, dir.join("futures").join("web-fut.lua"));
+
+        let mut bad = create_strategy("web-bad", AI_CODE, "ETHUSDT", HashMap::new()).unwrap();
+        bad.market = "options".into();
+        let err = write_strategy_files(bad, &dir, false).unwrap_err().to_string();
+        assert!(err.contains("market 仅支持 spot|futures"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

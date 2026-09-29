@@ -106,6 +106,12 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **前端三件套编译期嵌入**(D4): `index.html` / `app.js` / `style.css` 经 `include_str!` 进二进制, 运行期不依赖工作目录与外部 CDN; 界面**中英双语**, 语言与 CLI 共用 `ricow.toml [ui].lang`; 量化术语点击弹解释由 `web/terms.rs` 静态表提供。
 - **不做(D18)**: WebSocket / 公网访问 / 多用户 / 账号体系 / 图表可视化 / 会话导出 / 前端构建链。
 
+**Web UI 工作台化(032, 2026-09-29)**: `ricow web` 从「浏览器内对话工作台」升级为**多视图工作台** —— 左侧导航 + 五视图(对话 / 市场 / 策略 / 运行 / 设置), 视图间用 **hash 路由**(`#chat` / `#markets` / `#strategies[/{id}]` / `#runs` / `#settings`, 刷新恢复)。上列 D18 中的「图表可视化 / 前端构建链」由本变更推翻并按新口径执行, 其余(WSS / 公网 / 多用户 / 会话导出)仍不做。
+
+- **前端脚本拆分(仍无构建链)**: 三件套拆为 `common.js`(API/双语/工具) + `router.js`(hash 路由) + 五视图模块(`chat.js` / `markets.js` / `strategies.js` / `runs.js` / `settings.js`) + `app.js`(装配), 全部 `include_str!` 编译期嵌入; K 线图用 **lightweight-charts UMD 内嵌**(无 CDN 依赖); 每份脚本 URL 仍由服务端按 token 回填。浏览器持久存储依旧零写入(SC-011 静态扫描锁死)。
+- **新增只读/写端点**(全部仍在 token 中间件之后): 密钥与配置 `GET/POST /api/config/keys`(密钥静默写入 ricow.toml 只回显尾 4 位; 通用配置走 `updates` 数组 —— 市场视野开关 `market.show_all_pairs` 同端点); 行情 `GET /api/markets*`(免 key 公共行情 + 盘口 + K 线); 策略 `GET/POST /api/strategies`(POST = 创建/覆盖保存: 编译门禁 + 运行中 409 + 保留名/互前缀拒绝)、`GET .../source`(Lua/TOML 原文)、`POST .../ai-edit`(LLM 草稿, 编译失败 400 带行号)、`POST /api/backtest`(202 拿 job_id 后台跑 CLI 同一内核)+ `GET /api/backtest/{job_id}` 轮询; 运行 `GET /api/runs`、`POST /api/strategies/{id}/{status|start|stop}`(启停复用 CLI 同一内核 `commands::ctrl`, daemon 自举幂等)、`GET /api/logs/{name}/stream`(SSE 行内日志, 与对话视图各一条独立流)。
+- **Web 渠道确认规则(宪法 1.2.0, FR-027~029)**: 页面直控写操作的确认 = 页面显式交互(确认对话框/表单提交); live 不降级 —— 启动模态逐字输 `确认实盘 <策略名>`, 首次 live 另须风险披露确认(逐字输 `确认风险`, 落盘 `risk_ack.json`), daemon 侧门禁复用不变。
+
 ~~`keyring`~~ / ~~`setup`~~ / ~~`credentials`~~ / ~~`config`~~ —— 2026-09-14 随单一配置文件方案**全部删除**(019 D31: 文件即界面)。
 
 - 建策略(002, 写操作不得一步落盘): `ricow create --name <n> --pair <p> [--script <file|->] [--param k=v] [--days N] [--interval] [--market spot|futures]`

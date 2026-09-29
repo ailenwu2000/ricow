@@ -225,7 +225,7 @@ impl SessionSink for Recorder<'_> {
     fn input_line(&mut self, prompt: &str) -> Option<String> {
         self.flush_assistant();
         match self.inner.next_line(prompt)? {
-            // 前端是**乐观渲染**(见 `assets/app.js`): 用户气泡由浏览器自己先画, 实时流不回显,
+            // 前端是**乐观渲染**(见 `assets/chat.js`): 用户气泡由浏览器自己先画, 实时流不回显,
             // 所以用户行只能在这里补记 —— 否则刷新后整段提问都消失(FR-021 / SC-006)。
             Line::User(text) => {
                 self.recording = true;

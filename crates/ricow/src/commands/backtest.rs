@@ -1,6 +1,7 @@
 //! `ricow backtest` — 命令行回测。
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use clap::Args;
@@ -103,55 +104,180 @@ pub(crate) fn parse_param(s: &str) -> Option<(String, ConfigValue)> {
     Some((key, cv))
 }
 
-/// Option<f64> 格式化: None → "n/a"。
-/// 构造回测配置: 命中 strategies/<name>.toml → TOML 加载 (--param 透传覆盖);
-/// 未命中 → 策略类型直跑 (旧逻辑, 默认参数)。
-async fn resolve_config(args: &BacktestArgs) -> CoreResult<StrategyConfig> {
-    let strategies_dir = crate::commands::ensure_strategies_dir()?;
-    let toml_path = strategies_dir.join(format!("{}.toml", args.strategy));
-    if toml_path.exists() {
-        let mut config = crate::commands::load_strategy_toml(&strategies_dir, &args.strategy)?;
-        for p in &args.params {
-            if let Some((k, v)) = parse_param(p) {
-                config.params.insert(k, v);
-            }
-        }
-        return Ok(config);
-    }
-    let config = inline_config(args).await?;
-    Ok(config)
+/// 回测的「解析后执行输入」(032 US3 T025): CLI `ricow backtest` 与 Web 异步回测作业
+/// (`POST /api/backtest`) 先各自把入参组装成本结构, 再调**同一个** [`run_backtest_core`],
+/// 保证页面与命令行的 K 线拉取/预热/撮合/报告口径零分叉 (FR-019, 报告唯一来源 format_backtest_report)。
+#[derive(Debug, Clone)]
+pub(crate) struct BacktestRunSpec {
+    /// 数据目录(定位 `strategies/<name>.toml`; CLI=project_root, Web=WebState.root)。
+    pub(crate) root: PathBuf,
+    /// 策略: 已部署策略名/内置 id(命中实例 TOML)或可直跑的内置类型名 / "lua"。
+    pub(crate) strategy: String,
+    /// 交易对(TOML 已含 pair 时可缺省; 直跑模式必填)。
+    pub(crate) pair: Option<String>,
+    /// 回测天数(默认 90; start/end 显式窗口会覆盖)。
+    pub(crate) days: u32,
+    /// K 线间隔: 1m/5m/15m/1h/4h/1d(默认 1h)。
+    pub(crate) interval: String,
+    /// 窗口起点 YYYY-MM-DD(UTC)。
+    pub(crate) start: Option<String>,
+    /// 窗口终点 YYYY-MM-DD(UTC, 不含); 缺省=现在。
+    pub(crate) end: Option<String>,
+    /// 市场 spot|futures(None=随策略 TOML / spot)。
+    pub(crate) market: Option<String>,
+    /// 持仓模式 one-way|hedge(None=随策略 TOML / one-way)。
+    pub(crate) position_mode: Option<String>,
+    /// 策略参数覆盖(已按类型解析; CLI 来自 key=value, Web 来自 JSON)。
+    pub(crate) params: HashMap<String, ConfigValue>,
+    /// 直跑 lua 模式的脚本路径(仅 CLI `--script`; Web 首期不提供)。
+    pub(crate) script_path: Option<PathBuf>,
+    // ---- 回测参数三层覆盖的最上层 (None=不覆盖, 见 specs/backtest.md §三) ----
+    /// maker/taker 手续费同设 (bps)。
+    pub(crate) fee: Option<f64>,
+    /// maker 手续费 (bps)。
+    pub(crate) fee_maker: Option<f64>,
+    /// taker 手续费 (bps)。
+    pub(crate) fee_taker: Option<f64>,
+    /// 市价滑点 (bps)。
+    pub(crate) slippage_bps: Option<f64>,
+    /// 初始现金 (quote)。
+    pub(crate) cash: Option<f64>,
+    /// 合约杠杆 (逐仓)。
+    pub(crate) leverage: Option<f64>,
+    /// 合约杠杆上限。
+    pub(crate) max_leverage: Option<f64>,
+    /// 维持保证金率 MMR (%)。
+    pub(crate) mmr_pct: Option<f64>,
+    /// 资金费率 /8h。
+    pub(crate) funding_rate: Option<f64>,
 }
 
-/// 直跑模式: 只传运行环境信息(pair)与 lua 脚本(--script)。
-/// 策略参数全部由 Lua 策略自己的 fallback 默认值决定 —— 不在这里写任何策略参数名/默认值
-/// (目标 3: 新增/修改策略不改项目代码)。
-async fn inline_config(args: &BacktestArgs) -> CoreResult<StrategyConfig> {
-    let pair = args.pair.clone().ok_or_else(|| {
+impl BacktestRunSpec {
+    /// CLI 组装: 解析 `key=value` 参数、填默认值(与旧 `run_backtest` 的 unwrap_or 同值)。
+    pub(crate) fn from_cli_args(root: PathBuf, args: BacktestArgs) -> Self {
+        let BacktestArgs {
+            strategy,
+            pair,
+            days,
+            start,
+            end,
+            interval,
+            script,
+            params,
+            fee,
+            fee_maker,
+            fee_taker,
+            slippage_bps,
+            cash,
+            leverage,
+            max_leverage,
+            mmr_pct,
+            funding_rate,
+            market,
+            position_mode,
+        } = args;
+        let mut overrides = HashMap::new();
+        for p in params {
+            if let Some((k, v)) = parse_param(&p) {
+                overrides.insert(k, v);
+            }
+        }
+        Self {
+            root,
+            strategy,
+            pair,
+            days: days.unwrap_or(90),
+            interval: interval.unwrap_or_else(|| "1h".to_string()),
+            start,
+            end,
+            market,
+            position_mode,
+            params: overrides,
+            script_path: script.map(PathBuf::from),
+            fee,
+            fee_maker,
+            fee_taker,
+            slippage_bps,
+            cash,
+            leverage,
+            max_leverage,
+            mmr_pct,
+            funding_rate,
+        }
+    }
+
+    /// 组装回测参数三层覆盖表(原 `apply_backtest_cli` 的映射段; CLI/Web 共用, 不重复)。
+    fn backtest_overrides(&self) -> BacktestToml {
+        let mut ov = BacktestToml::default();
+        if let Some(v) = self.fee {
+            ov.fee_maker_bps = Some(v);
+            ov.fee_taker_bps = Some(v);
+        }
+        if let Some(v) = self.fee_maker {
+            ov.fee_maker_bps = Some(v);
+        }
+        if let Some(v) = self.fee_taker {
+            ov.fee_taker_bps = Some(v);
+        }
+        if let Some(v) = self.slippage_bps {
+            ov.slippage_bps = Some(v);
+        }
+        if let Some(v) = self.cash {
+            ov.initial_cash = Some(v);
+        }
+        if let Some(v) = self.leverage {
+            ov.leverage = Some(v);
+        }
+        if let Some(v) = self.max_leverage {
+            ov.max_leverage = Some(v);
+        }
+        if let Some(v) = self.mmr_pct {
+            ov.mmr_pct = Some(v);
+        }
+        if let Some(v) = self.funding_rate {
+            ov.funding_rate_8h = Some(v);
+        }
+        ov
+    }
+}
+
+/// 构造回测配置(可注入数据目录): 命中 `<root>/strategies/<name>.toml` → TOML 加载并叠加
+/// 参数覆盖; 未命中 → 内置类型直跑(pair 必填; `strategy=lua` 时读 script_path 文件)。
+///
+/// 引擎/CLI 生产代码不写死任何策略参数名(`pair`/`script`/`interval` 为通用键豁免)。
+fn load_run_config(
+    root: &Path,
+    strategy: &str,
+    pair: Option<&str>,
+    script_path: Option<&Path>,
+    overrides: HashMap<String, ConfigValue>,
+) -> CoreResult<StrategyConfig> {
+    let strategies_dir = crate::commands::ensure_strategies_dir_in(root)?;
+    let toml_path = strategies_dir.join(format!("{strategy}.toml"));
+    if toml_path.exists() {
+        let mut config = crate::commands::load_strategy_toml(&strategies_dir, strategy)?;
+        config.params.extend(overrides);
+        return Ok(config);
+    }
+
+    // 直跑模式: 只传运行环境信息(pair)与 lua 脚本; 参数全部由 Lua 自己的 fallback 默认决定。
+    let pair = pair.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
         CoreError::InvalidArgument("直跑模式需要 --pair <pair> (或使用已部署策略名)".into())
     })?;
-
     let mut params: HashMap<String, ConfigValue> = HashMap::new();
-    params.insert("pair".into(), ConfigValue::String(pair.clone()));
-    if args.strategy.as_str() == "lua" {
-        let script = args
-            .script
-            .as_ref()
+    params.insert("pair".into(), ConfigValue::String(pair.to_string()));
+    if strategy == "lua" {
+        let script = script_path
             .ok_or_else(|| CoreError::InvalidArgument("lua 策略需要 --script <path>".into()))?;
         let code = std::fs::read_to_string(script)
             .map_err(|e| CoreError::InvalidArgument(format!("读取脚本失败: {e}")))?;
         params.insert("script".into(), ConfigValue::String(code));
     }
-
-    // --param 透传覆盖(用户显式传参, 非写死默认值)。
-    for p in &args.params {
-        if let Some((k, v)) = parse_param(p) {
-            params.insert(k, v);
-        }
-    }
+    params.extend(overrides);
 
     crate::commands::resolve_builtin_script(StrategyConfig {
-        name: format!("{}-{}", args.strategy, pair),
-        strategy_type: args.strategy.clone(),
+        name: format!("{strategy}-{pair}"),
+        strategy_type: strategy.to_string(),
         enabled: true,
         exchange: "binance".into(),
         params,
@@ -163,43 +289,36 @@ async fn inline_config(args: &BacktestArgs) -> CoreResult<StrategyConfig> {
     })
 }
 
-/// CLI 回测参数三层覆盖 (内置默认 < 策略 TOML [backtest] < CLI flags, 见 specs/backtest.md
+/// 构造回测配置: 命中 strategies/<name>.toml → TOML 加载 (--param 透传覆盖);
+/// 未命中 → 策略类型直跑 (旧逻辑, 默认参数)。
+///
+/// 仅供既有单测使用(T025 后生产路径走 `BacktestRunSpec` + [`load_run_config`]);
+/// 数据目录取全局 project_root, 参数来自 CLI `key=value`。
+#[cfg(test)]
+fn resolve_config(args: &BacktestArgs) -> CoreResult<StrategyConfig> {
+    let mut overrides: HashMap<String, ConfigValue> = HashMap::new();
+    for p in &args.params {
+        if let Some((k, v)) = parse_param(p) {
+            overrides.insert(k, v);
+        }
+    }
+    load_run_config(
+        &crate::commands::project_root(),
+        &args.strategy,
+        args.pair.as_deref(),
+        args.script.as_deref().map(Path::new),
+        overrides,
+    )
+}
+
+/// 回测参数三层覆盖 (内置默认 < 策略 TOML [backtest] < 调用方覆盖, 见 specs/backtest.md
 /// §三): resolve 出全量有效值, futures 校验杠杆 (方案 A + L3), 把覆盖写回 config.params
 /// (BacktestContext::new 内 resolve 后 params 池同名键覆盖生效 — 单次回测覆盖全链路)。
-/// 单标的与 bs_momentum 组合入口共用 (2026-09-09 抽离)。
-fn apply_backtest_cli(
-    args: &BacktestArgs,
+/// 单标的与 bs_momentum 组合入口共用 (2026-09-09 抽离; 032 T025 改为吃已组装的覆盖表, CLI/Web 共用)。
+fn apply_backtest_overrides(
+    ov: BacktestToml,
     config: &mut StrategyConfig,
 ) -> CoreResult<BacktestParams> {
-    let mut ov = BacktestToml::default();
-    if let Some(v) = args.fee {
-        ov.fee_maker_bps = Some(v);
-        ov.fee_taker_bps = Some(v);
-    }
-    if let Some(v) = args.fee_maker {
-        ov.fee_maker_bps = Some(v);
-    }
-    if let Some(v) = args.fee_taker {
-        ov.fee_taker_bps = Some(v);
-    }
-    if let Some(v) = args.slippage_bps {
-        ov.slippage_bps = Some(v);
-    }
-    if let Some(v) = args.cash {
-        ov.initial_cash = Some(v);
-    }
-    if let Some(v) = args.leverage {
-        ov.leverage = Some(v);
-    }
-    if let Some(v) = args.max_leverage {
-        ov.max_leverage = Some(v);
-    }
-    if let Some(v) = args.mmr_pct {
-        ov.mmr_pct = Some(v);
-    }
-    if let Some(v) = args.funding_rate {
-        ov.funding_rate_8h = Some(v);
-    }
     let params = BacktestParams::resolve(config, &ov);
     // 杠杆校验 (方案 A + L3): resolve 后立即拦, 避免无效参数白拉 K 线。
     // 上限 = 三层合并结果 (默认 10); 校验后 params 池写回值即引擎消费值。
@@ -219,11 +338,13 @@ fn apply_backtest_cli(
     Ok(params)
 }
 
-pub(crate) async fn run_backtest(
-    args: BacktestArgs,
-) -> CoreResult<(String, ricow_strategy::BacktestReport)> {
-    let days = args.days.unwrap_or(90);
-    let interval = args.interval.clone().unwrap_or_else(|| "1h".to_string());
+/// 回测内核 (032 T025): 窗口计算 → 装载策略(TOML/直跑)→ 三层回测参数 → warmup 声明收集 →
+/// 分页拉 K 线(与 CLI 同一数据源)→ 引擎撮合 → `format_backtest_report` 出**唯一口径**文本。
+///
+/// CLI(`run_backtest`)与 Web 异步作业(`web::backtest_jobs`)共用本函数; 不含任何 stdout。
+pub(crate) async fn run_backtest_core(spec: BacktestRunSpec) -> CoreResult<String> {
+    let days = spec.days;
+    let interval = spec.interval.clone();
     let hours_per_bar = match interval.as_str() {
         "1m" => 1.0 / 60.0,
         "5m" => 5.0 / 60.0,
@@ -237,12 +358,12 @@ pub(crate) async fn run_backtest(
             )))
         }
     };
-    // --start/--end: 显式窗口 (自然年月分段); --end 缺省 = 现在。
-    let end_ms: Option<i64> = match args.end.as_deref() {
+    // start/end: 显式窗口 (自然年月分段); end 缺省 = 现在。
+    let end_ms: Option<i64> = match spec.end.as_deref() {
         Some(d) => Some(parse_ymd_ms(d)?),
         None => None,
     };
-    let (days, end_ms) = match args.start.as_deref() {
+    let (days, end_ms) = match spec.start.as_deref() {
         Some(s) => {
             let s_ms = parse_ymd_ms(s)?;
             let e_ms = end_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
@@ -254,9 +375,16 @@ pub(crate) async fn run_backtest(
     let limit = ((days as f64) * 24.0 / hours_per_bar) as u32;
 
     let exchange = crate::commands::bn_exchange()?;
-    let mut config = resolve_config(&args).await?;
-    // CLI 覆盖 market/position_mode (三层最上层; market 同时决定数据源分支, 见下)。
-    if let Some(m) = &args.market {
+    let mut config = load_run_config(
+        &spec.root,
+        &spec.strategy,
+        spec.pair.as_deref(),
+        spec.script_path.as_deref(),
+        spec.params.clone(),
+    )?;
+    // 覆盖 market/position_mode (三层最上层; market 同时决定数据源分支, 见下)。
+    // CLI 文案保持 "--market/--position-mode" 原样(终端输出逐字不变); Web 层在发起前已先拦非法值。
+    if let Some(m) = &spec.market {
         if m != "spot" && m != "futures" {
             return Err(CoreError::InvalidArgument(format!(
                 "--market 仅支持 spot|futures, 收到 '{m}'"
@@ -264,7 +392,7 @@ pub(crate) async fn run_backtest(
         }
         config.market = m.clone();
     }
-    if let Some(p) = &args.position_mode {
+    if let Some(p) = &spec.position_mode {
         if p != "one-way" && p != "hedge" {
             return Err(CoreError::InvalidArgument(format!(
                 "--position-mode 仅支持 one-way|hedge, 收到 '{p}'"
@@ -272,8 +400,8 @@ pub(crate) async fn run_backtest(
         }
         config.position_mode = p.clone();
     }
-    // 三层回测参数 (内置默认 < 策略 TOML [backtest] < CLI): 解析出全量有效值 + 写回 params。
-    let params = apply_backtest_cli(&args, &mut config)?;
+    // 三层回测参数 (内置默认 < 策略 TOML [backtest] < 调用方覆盖): 解析全量有效值 + 写回 params。
+    let params = apply_backtest_overrides(spec.backtest_overrides(), &mut config)?;
     // --interval 是主时钟粒度(通用配置, 与 pair 同类): 写入 params 供策略 need_klines("primary", ...)
     // 声明使用。用户显式 --param interval 优先(不覆盖)。若不写, 策略 primary 声明会 fallback "1h",
     // 与 --interval 拉的 K 线粒度错位 → warmup 换算错 → 高周期指标永不就绪(实测 0 成交)。
@@ -305,9 +433,9 @@ pub(crate) async fn run_backtest(
         warmup_bars = warmup_bars.max(need.max(1));
     }
     let fetch_limit = limit + warmup_bars;
-    // TOML 策略缺 pair 时用 --pair 兜底; 两者皆无报错。
+    // TOML 策略缺 pair 时用调用方给的 pair 兜底; 两者皆无报错。
     if config.get_str("pair").is_none() {
-        let pair = args.pair.clone().ok_or_else(|| {
+        let pair = spec.pair.clone().ok_or_else(|| {
             CoreError::InvalidArgument("TOML 策略缺 pair 参数, 需 --pair <pair>".into())
         })?;
         config.params.insert("pair".into(), ConfigValue::String(pair));
@@ -321,9 +449,9 @@ pub(crate) async fn run_backtest(
     const KLINE_PAGE_MAX: u32 = 1000;
     let fapi = if config.market == "futures" {
         let f = ricow_binance::FuturesDataClient::new()?;
-        // MMR 元数据: 用户未显式 --mmr-pct 时, 按 symbol 查内置首档表 (exchangeInfo 公共值不可靠,
+        // MMR 元数据: 调用方未显式给 mmr_pct 时, 按 symbol 查内置首档表 (exchangeInfo 公共值不可靠,
         // 见 specs/backtest.md §十一 T7); 表外回落 1.0%。
-        if args.mmr_pct.is_none() {
+        if spec.mmr_pct.is_none() {
             config
                 .params
                 .insert("mmr_pct".into(), ConfigValue::Float(ricow_binance::tier1_mmr_pct(&pair)));
@@ -397,7 +525,7 @@ pub(crate) async fn run_backtest(
 
     let is_futures = config.market == "futures";
     // 生效 MMR (报告显示用): 三层解析 + 可能的交易所首档拉取已写回 params; config move 前取出。
-    // (D3: 此前打印恒 2.5, --mmr-pct/TOML 覆盖不反映。)
+    // (D3: 此前打印恒 2.5, mmr_pct/TOML 覆盖不反映。)
     let effective_mmr_pct = config.get_f64("mmr_pct").unwrap_or(1.0);
     let report = Engine::new().backtest(config, initial_balance, &klines)?;
 
@@ -405,7 +533,7 @@ pub(crate) async fn run_backtest(
         &report,
         &format!(
             "回测报告: {} {pair} ({days} 天, {interval} K 线, {})",
-            args.strategy,
+            spec.strategy,
             if is_futures {
                 format!(
                     "合约 USDT-M · {} 持仓 · {:.0}x · MMR {:.2}%",
@@ -421,12 +549,18 @@ pub(crate) async fn run_backtest(
         is_futures,
     );
 
-    Ok((text, report))
+    Ok(text)
+}
+
+/// CLI/AI 工具入口包装: 把 [`BacktestArgs`] 组装成 [`BacktestRunSpec`] (数据目录=全局 project_root)
+/// 后跑同一内核; 返回的报告文本与 T025 前逐字一致。
+pub(crate) async fn run_backtest(args: BacktestArgs) -> CoreResult<String> {
+    run_backtest_core(BacktestRunSpec::from_cli_args(crate::commands::project_root(), args)).await
 }
 
 /// CLI 入口: 跑回测并打印报告(与 AI 工具 `run_backtest` 共用同一主体与同一份格式化)。
 pub async fn run(args: BacktestArgs) -> CoreResult<()> {
-    let (text, _report) = run_backtest(args).await?;
+    let text = run_backtest(args).await?;
     print!("{text}");
     Ok(())
 }
@@ -453,11 +587,9 @@ mod tests {
         assert!(parse_param("novalue").is_none());
     }
 
-    #[tokio::test]
-    // 测试专用: ENV_LOCK 串行化 RICOW_ROOT 的读写; 这里**有意**跨 await 持有整个测试体,
-    // 否则并行测试会读到彼此的环境变量(见 mod.rs 的 ENV_LOCK 说明)。
-    #[allow(clippy::await_holding_lock)]
-    async fn test_resolve_config_toml_priority() {
+    #[test]
+    // ENV_LOCK 串行化 RICOW_ROOT 的读写, 防止并行测试读到彼此的环境变量(见 mod.rs 的 ENV_LOCK 说明)。
+    fn test_resolve_config_toml_priority() {
         // strategies/<name>.toml 命中 → TOML 加载; --param 透传覆盖 TOML 参数。
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("RICOW_ROOT", "/tmp/ricow-bt-test");
@@ -499,7 +631,7 @@ order_size = 0.02
             market: None,
             position_mode: None,
         };
-        let cfg = resolve_config(&args).await.unwrap();
+        let cfg = resolve_config(&args).unwrap();
         assert_eq!(cfg.strategy_type, "lua", "内置名 TOML 应 Lua 化");
         assert_eq!(cfg.get_str("pair"), Some("ETH"));
         assert_eq!(cfg.get_f64("order_size"), Some(0.02));
@@ -508,11 +640,9 @@ order_size = 0.02
         std::env::remove_var("RICOW_ROOT");
     }
 
-    #[tokio::test]
-    // 测试专用: ENV_LOCK 串行化 RICOW_ROOT 的读写; 这里**有意**跨 await 持有整个测试体,
-    // 否则并行测试会读到彼此的环境变量(见 mod.rs 的 ENV_LOCK 说明)。
-    #[allow(clippy::await_holding_lock)]
-    async fn test_resolve_config_missing_pair_falls_back_to_args() {
+    #[test]
+    // ENV_LOCK 串行化 RICOW_ROOT 的读写, 防止并行测试读到彼此的环境变量(见 mod.rs 的 ENV_LOCK 说明)。
+    fn test_resolve_config_missing_pair_falls_back_to_args() {
         // TOML 无 pair → run 阶段用 --pair 兜底 (resolve_config 本身不报错)。
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("RICOW_ROOT", "/tmp/ricow-bt-test2");
@@ -550,7 +680,7 @@ exchange = "binance"
             market: None,
             position_mode: None,
         };
-        let cfg = resolve_config(&args).await.unwrap();
+        let cfg = resolve_config(&args).unwrap();
         assert!(cfg.get_str("pair").is_none(), "TOML 无 pair 时 resolve 不注入");
         std::env::remove_var("RICOW_ROOT");
     }

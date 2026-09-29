@@ -348,7 +348,10 @@ impl SetValue {
 }
 
 /// 允许外科式更新的键白名单((段, 键))。
-const WRITABLE: [(&str, &str); 10] = [
+///
+/// `pub(crate)`: Web 密钥配置端点(`web::keys`)在进入 [`set_values`] 之前要用**同一份**
+/// 白名单先做过滤/拒绝, 两处各抄一份必然漂移。
+pub(crate) const WRITABLE: [(&str, &str); 10] = [
     ("ai", "provider"),
     ("ai", "model"),
     ("ai", "base_url"),

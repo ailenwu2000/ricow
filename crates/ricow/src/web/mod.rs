@@ -4,8 +4,13 @@
 //! 会话线程登记与帧转发 —— 线程里跑的仍是 [`crate::commands::chat::repl`],
 //! 助手增量仍由 `provider::ask_stream` 逐段产出, 本层不复制任何 LLM 调用路径 (D2 / D5)。
 
+mod backtest_jobs;
+mod keys;
+mod markets;
+mod runs;
 mod sink;
 mod store;
+mod strategy_io;
 mod tail;
 mod terms;
 
@@ -44,12 +49,30 @@ const BIND_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// 帧只是实时视图, 补全靠消息接口 (FR-021)。
 const FRAME_CAPACITY: usize = 256;
 
-/// 前端三件套(D4): 编译期嵌进二进制, 运行期不依赖工作目录、不依赖外部 CDN。
+/// 前端静态资产(D4): 全部编译期嵌进二进制, 运行期不依赖工作目录、不依赖外部 CDN。
+/// 032 起脚本拆为多文件: 第三方图表库 + 公共件 + 路由 + 对话视图 + 入口(加载顺序见 index.html)。
 const INDEX_HTML: &str = include_str!("assets/index.html");
-const APP_JS: &str = include_str!("assets/app.js");
 const STYLE_CSS: &str = include_str!("assets/style.css");
+/// lightweight-charts v4 UMD(032 T001): 第三方图表库, 文件头保留 Apache-2.0 许可注释。
+const LWC_JS: &str = include_str!("assets/lightweight-charts.js");
+/// 公共件: TOKEN / api / TEXT 字典 / 通用 i18n 与纯工具(032 T002)。
+const COMMON_JS: &str = include_str!("assets/common.js");
+/// hash 路由与视图注册表(032 T003)。
+const ROUTER_JS: &str = include_str!("assets/router.js");
+/// 对话视图: 原 app.js 的会话 / SSE / 三个只读面板逻辑整体迁入(032 T006)。
+const CHAT_JS: &str = include_str!("assets/chat.js");
+/// 设置视图(032 US1): 密钥配置页, 读写 `/api/config/keys`。
+const SETTINGS_JS: &str = include_str!("assets/settings.js");
+/// 市场视图(032 US2): 交易对列表 / 订单簿 / K 线, 读写 `/api/markets*`。
+const MARKETS_JS: &str = include_str!("assets/markets.js");
+/// 策略管理视图(032 US3): 策略列表 / 源码编辑保存 / AI 改 Lua / 回测作业。
+const STRATEGIES_JS: &str = include_str!("assets/strategies.js");
+/// 运行管理视图(032 US4): 实例一览 / 启停 / 风险确认 / 行内日志。
+const RUNS_JS: &str = include_str!("assets/runs.js");
+/// 入口: 初始化对话视图 + router 首跳(032 T006)。
+const APP_JS: &str = include_str!("assets/app.js");
 
-/// 页面里 `style.css` / `app.js` 两个 URL 的 token 占位符, 由 [`index`] 按本次请求的 token 替换。
+/// 页面里各静态资源 URL 的 token 占位符, 由 [`index`] 按本次请求的 token 替换。
 ///
 /// 静态资源同样在 token 中间件之后, 而浏览器取 `<link>` / `<script>` 无法自定请求头 ——
 /// 只能把 token 拼进查询串, 走的正是 [`token_of`] 的同一条取值路径。
@@ -171,6 +194,8 @@ pub struct WebState {
     db: Database,
     store: SessionStore,
     hub: Arc<Hub>,
+    /// 032 US3 (FR-019): 回测异步作业表(纯内存, 进程重启即清空; 同名策略同时只一个 running)。
+    jobs: Arc<backtest_jobs::JobStore>,
 }
 
 impl WebState {
@@ -184,7 +209,15 @@ impl WebState {
         let root = Arc::new(root);
         // 数据目录交两份(同一块内存的两次克隆): handler 读写语言要用, 会话线程兜底报错也要用。
         let hub = Arc::new(Hub::new(starter, Arc::clone(&root)));
-        Self { token: Arc::new(token), root, db, store, hub }
+        // 作业表在 new 内部默认构造: 装配方(serve 命令)与全部测试调用点无需改签名。
+        Self {
+            token: Arc::new(token),
+            root,
+            db,
+            store,
+            hub,
+            jobs: Arc::new(backtest_jobs::JobStore::new()),
+        }
     }
 }
 
@@ -212,6 +245,15 @@ pub fn router(state: WebState) -> Router {
         // 单页与静态资源(FR-003 / FR-006): 页面本身也要 token, 资源 URL 里的 token 由 `index` 填。
         .route("/", get(index))
         .route("/style.css", get(style_css))
+        // 032: 脚本拆分后的五份静态资源(含第三方图表库), 同样挂在 token 中间件之后。
+        .route("/lightweight-charts.js", get(lwc_js))
+        .route("/common.js", get(common_js))
+        .route("/router.js", get(router_js))
+        .route("/chat.js", get(chat_js))
+        .route("/settings.js", get(settings_js))
+        .route("/markets.js", get(markets_js))
+        .route("/strategies.js", get(strategies_js))
+        .route("/runs.js", get(runs_js))
         .route("/app.js", get(app_js))
         .route("/api/ping", get(ping))
         // 会话 CRUD(FR-007): 列表 / 新建 / 删除 / 取消息。
@@ -225,9 +267,22 @@ pub fn router(state: WebState) -> Router {
         .route("/api/terms", get(list_terms))
         // 语言读写(FR-029): 与 CLI 共用 `[ui].lang`。
         .route("/api/lang", get(get_lang).post(set_lang))
+        // 密钥配置(032 US1 / FR-006 ~ FR-009): 读只给脱敏尾号, 写与向导共用同一份 ricow.toml。
+        .route("/api/config/keys", get(keys::get_keys).post(keys::post_keys))
+        // 市场浏览(032 US2 / FR-010 ~ FR-014): 交易对视野 + 订单簿 + K 线, 全部免 key 只读公共行情。
+        .route("/api/markets", get(markets::list_markets))
+        .route("/api/markets/{symbol}/orderbook", get(markets::get_orderbook))
+        .route("/api/markets/{symbol}/klines", get(markets::get_klines))
         // 策略目录(031 FR-013 / FR-014): 只读展示策略清单 + 参数 schema。
-        .route("/api/strategies", get(list_strategies))
+        .route("/api/strategies", get(list_strategies).post(strategy_io::save_strategy))
         .route("/api/strategies/{id}", get(get_strategy))
+        // 策略源码读取与页面保存(032 US3 / FR-015 ~ FR-017): 读 Lua/实例 TOML 原文;
+        // POST 保存走命名校验链 → 编译门禁 → 引擎同一落盘内核(免 preview, FR-028)。
+        .route("/api/strategies/{id}/source", get(strategy_io::get_strategy_source))
+        .route("/api/strategies/{id}/ai-edit", axum::routing::post(strategy_io::ai_edit_strategy))
+        // 回测异步作业 (032 US3 / FR-019): POST 202 拿 job_id 后台跑 CLI 同一内核, GET 轮询结果。
+        .route("/api/backtest", axum::routing::post(backtest_jobs::start_backtest))
+        .route("/api/backtest/{job_id}", get(backtest_jobs::get_backtest))
         // 交易面板数据(026 FR-010 / FR-012): 全部**只读**, 数据来自与引擎同一份本地库(D1);
         // 挂在本 `.layer` 之内 → 与既有端点同一道 token 门禁(D14 / FR-011)。
         .route("/api/trades/fills", get(trades_fills))
@@ -239,6 +294,13 @@ pub fn router(state: WebState) -> Router {
         .route("/api/logs", get(list_logs))
         .route("/api/logs/{name}/tail", get(log_tail))
         .route("/api/logs/{name}/stream", get(log_stream))
+        // 运行控制(032 US4 / FR-022 ~ FR-026): 运行态一览 / 单实例状态 / 拉起 / 停机 / 风险确认。
+        // 启停复用 CLI 同一 ctrl 内核, daemon 自举走幂等的 ensure_daemon —— 本层零控制逻辑复制。
+        .route("/api/runs", get(runs::list_runs))
+        .route("/api/strategies/{id}/status", get(runs::get_status))
+        .route("/api/strategies/{id}/start", axum::routing::post(runs::start_strategy))
+        .route("/api/strategies/{id}/stop", axum::routing::post(runs::stop_strategy))
+        .route("/api/risk-ack", axum::routing::post(runs::post_risk_ack))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -261,7 +323,7 @@ pub async fn serve(listener: TcpListener, state: WebState) -> CoreResult<()> {
         .map_err(|e| CoreError::Network(format!("Web 服务异常退出: {e}")))
 }
 
-/// 单页首页(FR-003 / FR-006): 把本次 token 填进两个静态资源的 URL(见 [`TOKEN_PLACEHOLDER`])。
+/// 单页首页(FR-003 / FR-006): 把本次 token 填进各静态资源的 URL(见 [`TOKEN_PLACEHOLDER`])。
 async fn index(req: Request) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -274,7 +336,47 @@ async fn style_css() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], STYLE_CSS)
 }
 
-/// 前端脚本: 编译期常量, 不含任何会话内容。
+/// 第三方图表库(032 T001): 编译期常量, 不含任何会话内容。
+async fn lwc_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], LWC_JS)
+}
+
+/// 前端公共件(032 T002): 编译期常量, 不含任何会话内容。
+async fn common_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], COMMON_JS)
+}
+
+/// 前端 hash 路由(032 T003): 编译期常量, 不含任何会话内容。
+async fn router_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], ROUTER_JS)
+}
+
+/// 前端对话视图(032 T006): 编译期常量, 不含任何会话内容。
+async fn chat_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], CHAT_JS)
+}
+
+/// 前端设置视图(032 US1): 编译期常量, 不含任何会话内容。
+async fn settings_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], SETTINGS_JS)
+}
+
+/// 前端市场视图(032 US2): 编译期常量, 不含任何会话内容。
+async fn markets_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], MARKETS_JS)
+}
+
+/// 前端策略管理视图(032 US3): 编译期常量, 不含任何会话内容。
+async fn strategies_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], STRATEGIES_JS)
+}
+
+/// 前端运行管理视图(032 US4): 编译期常量, 不含任何会话内容。
+async fn runs_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], RUNS_JS)
+}
+
+/// 前端入口脚本: 编译期常量, 不含任何会话内容。
 async fn app_js() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], APP_JS)
 }
@@ -458,13 +560,37 @@ async fn list_strategies() -> Json<Vec<StrategyRow>> {
     Json(rows)
 }
 
-/// 单个策略详情(只读): 完整清单(含参数 schema), 供前端参数表单渲染。
+/// 策略详情响应(032 T027 扩展): 清单字段整体扁平化(对话视图仍直接读 name/params 等),
+/// 另带用户实例的当前交易对 `pair` 与当前参数值 `current`(供控制台表单回填;
+/// 内置策略 / 无实例 TOML 时两者为 null, 前端回退清单默认值)。
+#[derive(serde::Serialize)]
+struct StrategyDetailReply {
+    #[serde(flatten)]
+    manifest: crate::strategies::catalog::StrategyManifest,
+    /// 已部署实例的当前交易对(无实例 → null)。
+    pair: Option<String>,
+    /// 已部署实例的当前参数值(已剔除 pair/script/script_path; 无实例 → null)。
+    current: Option<std::collections::HashMap<String, ricow_strategy::ConfigValue>>,
+}
+
+/// 单个策略详情(只读): 完整清单(含参数 schema) + 用户实例当前值, 供前端参数表单渲染。
 async fn get_strategy(
+    State(state): State<WebState>,
     UrlPath(id): UrlPath<String>,
-) -> Result<Json<crate::strategies::catalog::StrategyManifest>, WebError> {
+) -> Result<Json<StrategyDetailReply>, WebError> {
     let entry = crate::strategies::catalog::find(&id)
         .ok_or_else(|| WebError::bad_request(format!("没有策略 {id}")))?;
-    Ok(Json(entry.manifest))
+    // 内置策略只有编译期嵌入清单, 无用户实例; 用户策略读 strategies/<id>.toml 解析当前值。
+    let values = if entry.source == crate::strategies::catalog::Source::Builtin {
+        None
+    } else {
+        strategy_io::load_instance_values(&state.root, &id)?
+    };
+    Ok(Json(StrategyDetailReply {
+        manifest: entry.manifest,
+        pair: values.as_ref().and_then(|v| v.pair.clone()),
+        current: values.map(|v| v.current),
+    }))
 }
 
 /// 语言读写(FR-029): 与 CLI 共用 `ricow.toml` 的 `[ui].lang`, 不新增第二处语言状态。
@@ -950,26 +1076,79 @@ async fn log_stream(
 }
 
 /// handler 的错误出口: 只回状态码与一句原因 —— **不回任何会话内容**(D3 / FR-002)。
+///
+/// 032 US3 起错误体统一为 data-model §9 的 `{ "error": 中文, "code"?: 机器码 }` JSON;
+/// `code` / `line` 缺省(既有端点)序列化时跳过 —— 既有端点的中文文案一字不改。
 struct WebError {
     status: StatusCode,
-    reason: String,
+    body: WebErrorBody,
+}
+
+/// 统一错误响应体 (data-model §9): 机器码 / 行号可选, 缺省即不出现。
+#[derive(serde::Serialize)]
+struct WebErrorBody {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    /// 编译错误行号等定位信息(目前仅策略保存的编译失败带)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<u32>,
 }
 
 impl WebError {
+    fn new(
+        status: StatusCode,
+        reason: impl Into<String>,
+        code: Option<String>,
+        line: Option<u32>,
+    ) -> Self {
+        Self { status, body: WebErrorBody { error: reason.into(), code, line } }
+    }
+
     fn bad_request(reason: impl Into<String>) -> Self {
-        Self { status: StatusCode::BAD_REQUEST, reason: reason.into() }
+        Self::new(StatusCode::BAD_REQUEST, reason, None, None)
+    }
+
+    /// 400 + 机器码(如策略名非法 `invalid_name` / 编译失败 `compile`)。
+    fn bad_request_code(reason: impl Into<String>, code: &str) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, reason, Some(code.to_string()), None)
+    }
+
+    /// 404 + 中文一句(如未知策略 id)。
+    fn not_found(reason: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, reason, None, None)
+    }
+
+    /// 403 需前置动作 + 机器码(032 §6: AI 改 Lua 未配密钥 → `need_keys`, 引导先去设置页)。
+    fn forbidden(reason: impl Into<String>, code: &str) -> Self {
+        Self::new(StatusCode::FORBIDDEN, reason, Some(code.to_string()), None)
+    }
+
+    /// 409 冲突 + 机器码(策略保存: `prefix` / `reserved` / `running` / `exists`)。
+    fn conflict(reason: impl Into<String>, code: &str) -> Self {
+        Self::new(StatusCode::CONFLICT, reason, Some(code.to_string()), None)
+    }
+
+    /// 编译门禁失败: 400 + `code:"compile"`, 尽量带 mlua 行号 (data-model §5)。
+    fn compile_failed(reason: impl Into<String>, line: Option<u32>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, reason, Some("compile".to_string()), line)
+    }
+
+    /// 上游(交易所公共行情)失败: 502 + 中文一句(可带上游原文, FR-014)。
+    fn bad_gateway(reason: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, reason, None, None)
     }
 }
 
 impl From<CoreError> for WebError {
     fn from(e: CoreError) -> Self {
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, reason: e.to_string() }
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None, None)
     }
 }
 
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
-        (self.status, self.reason).into_response()
+        (self.status, Json(self.body)).into_response()
     }
 }
 
@@ -1026,12 +1205,40 @@ mod tests {
         assert!(!ct_eq("", "3f2a-9c"));
     }
 
-    /// 静态资源与首页(D4): 三份都非空; 首页的资源 URL 必须带上本次 token ——
+    /// 静态资源与首页(D4): 032 拆分后的各份资产都非空; 首页里每个资源 URL 必须带上本次 token ——
     /// 浏览器取 `<link>` / `<script>` 带不上请求头, 只能靠这里填进去。
     #[test]
     fn test_index_fills_token_into_asset_urls() {
-        assert!(!INDEX_HTML.is_empty() && !APP_JS.is_empty() && !STYLE_CSS.is_empty());
-        assert!(INDEX_HTML.contains("/style.css?token=") && INDEX_HTML.contains("/app.js?token="));
+        assert!(
+            !INDEX_HTML.is_empty()
+                && !STYLE_CSS.is_empty()
+                && !LWC_JS.is_empty()
+                && !COMMON_JS.is_empty()
+                && !ROUTER_JS.is_empty()
+                && !CHAT_JS.is_empty()
+                && !SETTINGS_JS.is_empty()
+                && !MARKETS_JS.is_empty()
+                && !STRATEGIES_JS.is_empty()
+                && !RUNS_JS.is_empty()
+                && !APP_JS.is_empty()
+        );
+        for asset in [
+            "/style.css",
+            "/lightweight-charts.js",
+            "/common.js",
+            "/router.js",
+            "/chat.js",
+            "/settings.js",
+            "/markets.js",
+            "/strategies.js",
+            "/runs.js",
+            "/app.js",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("{asset}?token=")),
+                "首页须引用带 token 的 {asset}"
+            );
+        }
         let html = render_index("tok-123");
         assert!(html.contains("tok-123"), "资源 URL 应带上本次 token");
         assert!(!html.contains(TOKEN_PLACEHOLDER), "占位符必须全部替换掉");
@@ -1045,25 +1252,41 @@ mod tests {
     /// 并把 `openSession` / `submitText` 打断(2026-09-19 实机走查发现)。
     #[test]
     fn test_frontend_stores_nothing_and_masks_secret_input() {
+        // 032 脚本拆分后, 扫描覆盖**全部**前端脚本(含第三方图表库 UMD): 一份都不许碰浏览器存储。
+        let js_assets = [
+            LWC_JS,
+            COMMON_JS,
+            ROUTER_JS,
+            CHAT_JS,
+            SETTINGS_JS,
+            MARKETS_JS,
+            STRATEGIES_JS,
+            RUNS_JS,
+            APP_JS,
+        ];
         for store in ["localStorage", "sessionStorage"] {
-            assert!(!APP_JS.contains(store), "前端不得使用 {store}(SC-011)");
+            for js in js_assets {
+                assert!(!js.contains(store), "前端不得使用 {store}(SC-011)");
+            }
         }
-        assert!(APP_JS.contains(r#"case "secret_prompt""#), "前端要处理密钥提示帧(FR-012)");
+        assert!(CHAT_JS.contains(r#"case "secret_prompt""#), "前端要处理密钥提示帧(FR-012)");
         assert!(
-            APP_JS.contains(r#"els.input.classList.toggle("masked""#),
+            CHAT_JS.contains(r#"els.input.classList.toggle("masked""#),
             "密钥录入期间输入框须遮蔽回显(SC-011)"
         );
-        assert!(
-            !APP_JS.contains("input.type =") && !APP_JS.contains("input.type="),
-            "`<textarea>` 的 type 只读, 赋值会抛 TypeError"
-        );
+        for js in js_assets {
+            assert!(
+                !js.contains("input.type =") && !js.contains("input.type="),
+                "`<textarea>` 的 type 只读, 赋值会抛 TypeError"
+            );
+        }
         assert!(STYLE_CSS.contains("#input.masked"), "遮蔽样式须随前端一并内嵌(D4)");
         assert!(
-            APP_JS.contains("!value.trim() && !state.secret"),
+            CHAT_JS.contains("!value.trim() && !state.secret"),
             "密钥期须放行空行(提示语承诺的\"回车放弃\", 服务端按空值不改配置)"
         );
         assert!(
-            APP_JS.contains("const suffix = state.lang;"),
+            COMMON_JS.contains("const suffix = R.lang;"),
             "`dataset` 键名是首字母小写驼峰, 取大写得 undefined(静态文案整片空白 / placeholder 变字面量)"
         );
     }
@@ -1072,11 +1295,11 @@ mod tests {
     /// 不对交易 / 日志端点发写请求; 撤单 / 平仓 / 停机仍然只能在对话里确认(D19 不做交易所直连)。
     #[test]
     fn test_frontend_panels_are_read_only() {
-        // 先确认面板真在, 否则下面全是空转。
+        // 先确认面板真在, 否则下面全是空转(032 后面板整体迁入 #view-chat, id 不变)。
         assert!(
             INDEX_HTML.contains(r#"id="trade-panel""#) && INDEX_HTML.contains(r#"id="log-panel""#)
         );
-        assert!(APP_JS.contains(r#"api("/api/trades/positions")"#), "交易面板数据须来自只读端点");
+        assert!(CHAT_JS.contains(r#"api("/api/trades/positions")"#), "交易面板数据须来自只读端点");
 
         // 面板区里没有按钮、没有内联事件 —— 只展示, 不动作。
         let start = INDEX_HTML.find(r#"<aside id="panels">"#).expect("右栏面板");
@@ -1085,14 +1308,26 @@ mod tests {
         assert!(!panels.contains("<button"), "面板是只读的, 不得有按钮(D17)");
         assert!(!panels.contains("onclick"), "面板是只读的, 不得有内联事件(D17)");
 
-        // 这两组端点在前端只以 GET 出现。
-        for line in APP_JS.lines().filter(|l| l.contains("/api/trades") || l.contains("/api/logs"))
+        // 这两组端点在对话视图里只以 GET 出现(032: 逻辑迁入 chat.js)。
+        for line in CHAT_JS.lines().filter(|l| l.contains("/api/trades") || l.contains("/api/logs"))
         {
             assert!(!line.contains("method:"), "交易 / 日志端点只读, 不得带写方法: {line}");
         }
-        // 前端整份资源里不出现交易所写动作的入口。
-        for banned in ["cancel_order", "cancelOrder", "close_position", "place_order"] {
-            assert!(!APP_JS.contains(banned), "前端不得出现交易所写动作 `{banned}`(D17 / FR-013)");
+        // 前端**全部脚本**(含第三方图表库)里不出现交易所写动作的入口。
+        for js in [
+            LWC_JS,
+            COMMON_JS,
+            ROUTER_JS,
+            CHAT_JS,
+            SETTINGS_JS,
+            MARKETS_JS,
+            STRATEGIES_JS,
+            RUNS_JS,
+            APP_JS,
+        ] {
+            for banned in ["cancel_order", "cancelOrder", "close_position", "place_order"] {
+                assert!(!js.contains(banned), "前端不得出现交易所写动作 `{banned}`(D17 / FR-013)");
+            }
         }
     }
 
@@ -1163,12 +1398,35 @@ mod tests {
         let _server = tokio::spawn(serve(listener, state));
 
         // 无 token: 首页与接口一律 401, 且响应体为空、不带任何会话内容。
-        for path in ["/", "/api/ping", &format!("/api/sessions/{sid}/messages")] {
+        for path in ["/", "/api/ping", "/api/config/keys", &format!("/api/sessions/{sid}/messages")]
+        {
             let res = get(port, path).await;
             assert!(res.starts_with("HTTP/1.1 401"), "无 token 应 401, 实际: {res}");
             assert!(body_of(&res).is_empty(), "401 响应体必须为空: {res}");
             assert!(!res.contains(SECRET), "401 不得泄漏会话内容: {res}");
         }
+        // 032 T007: 脚本拆分后的各静态资源同样挂在 token 门禁之后 —— 无 / 错 token 一律 401。
+        for path in [
+            "/style.css",
+            "/lightweight-charts.js",
+            "/common.js",
+            "/router.js",
+            "/chat.js",
+            "/settings.js",
+            "/markets.js",
+            "/strategies.js",
+            "/runs.js",
+            "/app.js",
+        ] {
+            let res = get(port, path).await;
+            assert!(res.starts_with("HTTP/1.1 401"), "无 token 取 {path} 应 401, 实际: {res}");
+            assert!(body_of(&res).is_empty(), "401 响应体必须为空: {path}");
+            let res = get(port, &format!("{path}?token=wrong")).await;
+            assert!(res.starts_with("HTTP/1.1 401"), "错 token 取 {path} 应 401, 实际: {res}");
+        }
+        // 对 token 取得到新资源(证明上面拦住的不是"路由不存在")。
+        let res = get(port, "/common.js?token=tok-ok").await;
+        assert!(res.starts_with("HTTP/1.1 200"), "对 token 应取到 common.js, 实际: {res}");
         // 错 token: 即便路径与会话 id 都正确, 同样 401 且不回内容。
         let res = get(port, &format!("/api/sessions/{sid}/messages?token=wrong")).await;
         assert!(res.starts_with("HTTP/1.1 401"), "错 token 应 401, 实际: {res}");
@@ -1177,6 +1435,44 @@ mod tests {
         let res = get(port, "/api/ping?token=tok-ok").await;
         assert!(res.starts_with("HTTP/1.1 200"), "对 token 应 200, 实际: {res}");
         assert_eq!(body_of(&res), "ok");
+
+        // 032 US1: 密钥端点的 POST 同样在 token 门禁之后 —— 无 / 错 token 一律 401、空体;
+        // 写请求体里放一把假密钥, 断言它不会被 401 响应原样带回。
+        async fn post_raw(port: u16, path: &str, token: Option<&str>, body: &str) -> String {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let target = match token {
+                Some(tok) => format!("{path}?token={tok}"),
+                None => path.to_string(),
+            };
+            let mut stream =
+                tokio::net::TcpStream::connect((BIND_ADDR, port)).await.expect("连上服务");
+            let req = format!(
+                "POST {target} HTTP/1.1\r\nHost: {BIND_ADDR}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(req.as_bytes()).await.expect("发出 POST");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("读回响应");
+            String::from_utf8_lossy(&buf).to_string()
+        }
+        const FAKE_KEY: &str = "FAKE-KEY-MUST-NOT-ECHO";
+        let body = format!(
+            "{{\"updates\":[{{\"section\":\"exchange\",\"key\":\"binance_key\",\"value\":\"{FAKE_KEY}\"}}]}}"
+        );
+        for probe in [None, Some("wrong")] {
+            let res = post_raw(port, "/api/config/keys", probe, &body).await;
+            assert!(res.starts_with("HTTP/1.1 401"), "无/错 token POST 应 401, 实际: {res}");
+            assert!(body_of(&res).is_empty(), "401 响应体必须为空: {res}");
+            assert!(!res.contains(FAKE_KEY), "401 不得回显请求中的密钥: {res}");
+        }
+        // 对 token: GET 密钥端点应 200 且响应不含任何密钥全文(空模板, 全部未配置)。
+        let res = get(port, "/api/config/keys?token=tok-ok").await;
+        assert!(res.starts_with("HTTP/1.1 200"), "对 token GET 密钥端点应 200, 实际: {res}");
+        let body_txt = body_of(&res);
+        assert!(body_txt.contains(r#""configured":false"#), "空模板应全部未配置: {body_txt}");
+        assert!(!body_txt.contains(FAKE_KEY), "读响应不得含密钥全文: {body_txt}");
     }
 
     /// FR-011 回归: 一次 `POST /input` **只投一行**。
@@ -1689,5 +1985,60 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200"), "流应 200: {text}");
         assert!(text.contains("text/event-stream"), "应为 SSE: {text}");
         assert!(text.contains("LINE-0001"), "首屏应给最近的行: {text}");
+    }
+
+    // ── 032 US2: 市场端点鉴权 + 参数硬失败 (FR-004 / FR-014; T015)──────────
+
+    /// 三个市场端点的 401 矩阵 + 非法参数 400。
+    ///
+    /// **不发真实网络**: 401 在中间件层短路; 对 token 的用例全部走"参数非法 → 400"路径 —
+    /// handler 严格按"先校验参数, 后取行情"排序, 400 在任何交易所请求之前返回,
+    /// 既证明路由真实存在(不是 404), 又让单测离线可跑。
+    #[tokio::test]
+    async fn test_markets_endpoints_require_token_and_reject_bad_params_offline() {
+        let root = trade_root("markets-auth");
+        let db = Database::open_in_memory().await.expect("开内存库");
+        let port = serve_trade_test(root, db).await;
+
+        // ① 无 / 错 token: 三端点一律 401 且空体(带齐参数也会在中间件被拦, 不触达行情)。
+        let guarded = [
+            "/api/markets",
+            "/api/markets/BTCUSDT/orderbook?market=spot&depth=20",
+            "/api/markets/BTCUSDT/klines?market=spot&interval=1h&limit=200",
+        ];
+        for path in guarded {
+            let sep = if path.contains('?') { "&" } else { "?" };
+            for probe in [path.to_string(), format!("{path}{sep}token=wrong")] {
+                let res = get_raw(port, &probe).await;
+                assert!(res.starts_with("HTTP/1.1 401"), "无/错 token 应 401: {probe} → {res}");
+                assert!(body_of(&res).is_empty(), "401 响应体必须为空: {probe}");
+            }
+        }
+
+        // ② 对 token + 非法参数: 一律 400 中文硬失败, 且不联网(handler 内校验先于取数)。
+        let bad_requests = [
+            ("/api/markets?all=2&token=tok-ok", "all 只支持 0/1"),
+            ("/api/markets?market=bogus&token=tok-ok", "market 只支持 spot / futures"),
+            ("/api/markets/BTCUSDT/orderbook?token=tok-ok", "market 必填"),
+            (
+                "/api/markets/BTCUSDT/orderbook?market=fx&depth=20&token=tok-ok",
+                "market 只支持 spot / futures",
+            ),
+            ("/api/markets/BTCUSDT/orderbook?market=spot&depth=99&token=tok-ok", "1..=50"),
+            ("/api/markets/BTCUSDT/orderbook?market=spot&depth=0&token=tok-ok", "1..=50"),
+            ("/api/markets/BTCUSDT/klines?token=tok-ok", "market 必填"),
+            ("/api/markets/BTCUSDT/klines?market=spot&interval=2h&token=tok-ok", "interval"),
+            ("/api/markets/BTCUSDT/klines?market=futures&limit=501&token=tok-ok", "1..=500"),
+        ];
+        for (path, expect) in bad_requests {
+            let res = get_raw(port, path).await;
+            assert!(res.starts_with("HTTP/1.1 400"), "{path} 应 400, 实际: {res}");
+            let body = body_of(&res);
+            assert!(body.contains(expect), "{path} 错误体应含「{expect}」: {body}");
+        }
+
+        // ③ /markets.js 静态资源对 token 可取(证明 401 拦的不是"路由不存在")。
+        let res = get_raw(port, "/markets.js?token=tok-ok").await;
+        assert!(res.starts_with("HTTP/1.1 200"), "对 token 应取到 markets.js: {res}");
     }
 }

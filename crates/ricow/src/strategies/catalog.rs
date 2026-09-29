@@ -136,7 +136,9 @@ const BUILTIN: &[(&str, &str, &str)] = &[
 ];
 
 /// 内置策略 id 是否为保留名。
-fn is_builtin_id(id: &str) -> bool {
+///
+/// 032 US3 起 Web 保存端点(FR-016)复用同一份清单做保留名拒绝 —— 不新增第二份保留名列表。
+pub(crate) fn is_builtin_id(id: &str) -> bool {
     BUILTIN.iter().any(|(bid, _, _)| *bid == id)
 }
 
