@@ -510,6 +510,20 @@ pub(crate) fn resolve_builtin_script(mut config: StrategyConfig) -> CoreResult<S
             bt.leverage = Some(lev);
         }
     }
+    // 清单 [backtest] 段 (045): 策略 TOML 的引擎级持久默认 (margin_mode 等) 必须生效。
+    // 合并语义 = 清单只填 config 未声明的键 (用户/CLI 显式值优先), 杠杆回填已在上面处理。
+    if let Some(bt) = manifest.backtest {
+        let cfg_bt = config.backtest.get_or_insert_with(Default::default);
+        if cfg_bt.fee_maker_bps.is_none() { cfg_bt.fee_maker_bps = bt.fee_maker_bps; }
+        if cfg_bt.fee_taker_bps.is_none() { cfg_bt.fee_taker_bps = bt.fee_taker_bps; }
+        if cfg_bt.slippage_bps.is_none() { cfg_bt.slippage_bps = bt.slippage_bps; }
+        if cfg_bt.initial_cash.is_none() { cfg_bt.initial_cash = bt.initial_cash; }
+        if cfg_bt.leverage.is_none() { cfg_bt.leverage = bt.leverage; }
+        if cfg_bt.max_leverage.is_none() { cfg_bt.max_leverage = bt.max_leverage; }
+        if cfg_bt.mmr_pct.is_none() { cfg_bt.mmr_pct = bt.mmr_pct; }
+        if cfg_bt.funding_rate_8h.is_none() { cfg_bt.funding_rate_8h = bt.funding_rate_8h; }
+        if cfg_bt.margin_mode.is_none() { cfg_bt.margin_mode = bt.margin_mode; }
+    }
     // ---- 清单默认值注入 (032 复审 B) ----
     for p in &manifest.params {
         if let Some(dflt) = &p.default {

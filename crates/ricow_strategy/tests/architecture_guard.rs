@@ -65,6 +65,7 @@ fn is_engine_channel_key(k: &str) -> bool {
             | "leverage"
             | "max_leverage"
             | "mmr_pct"
+            | "margin_mode"
             | "funding_rate_8h"
             | "fee_maker_bps"
             | "fee_taker_bps"

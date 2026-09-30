@@ -245,6 +245,9 @@ pub struct BacktestContext {
     mmr: Decimal,
     /// 资金费率 / 8h (0 = 关闭)。
     funding_rate_8h: Decimal,
+    /// 全仓模式 (margin_mode="cross"): hedge 双向持仓共享同一钱包, 多空未实现盈亏互抵,
+    /// 强平走组合权益模型 (`check_liquidation`, 对齐币安全仓公式); false = 逐仓 (默认, 现行口径)。
+    margin_cross: bool,
     /// 资金不足/无仓可平而被拒的订单数 (市价单丢弃; 报告如实显示)。
     rejected_count: u64,
     /// 下单工程护栏 (019-R5): 固定 100 单/秒, 与 Dry Run / 实盘同一实现; 平台不做投资风控。
@@ -344,6 +347,12 @@ impl BacktestContext {
         if let Some(v) = config.get_f64("funding_rate_8h") {
             p.funding_rate_8h = v;
         }
+        if let Some(v) = config.get_str("margin_mode") {
+            // params 池显式覆盖 (CLI --param margin_mode=...): cross/isolated 均可写回。
+            if v == "cross" || v == "isolated" {
+                p.margin_mode = v.to_string();
+            }
+        }
         // 统一覆盖回写 (Y7, 2026-09-09 bs_momentum Lua 化): resolve 出最终值后写回
         // config.params — 策略 (Lua ctx:config_f64 / Rust 通用) 读到的费率/滑点/杠杆/
         // MMR/资金费与撮合层 FeeModel/账户模型完全同源一致 (未显式配置的默认 10bps 等
@@ -358,6 +367,7 @@ impl BacktestContext {
         ] {
             config.params.insert(key.into(), ConfigValue::Float(v));
         }
+        config.params.insert("margin_mode".into(), ConfigValue::String(p.margin_mode.clone()));
         let fee_model = FeeModel::new(
             Decimal::from_f64_retain(p.fee_maker_bps).unwrap_or(Decimal::ZERO),
             Decimal::from_f64_retain(p.fee_taker_bps).unwrap_or(Decimal::ZERO),
@@ -390,6 +400,7 @@ impl BacktestContext {
             leverage: Decimal::from_f64_retain(p.leverage).unwrap_or(Decimal::ONE),
             mmr: Decimal::from_f64_retain(p.mmr_pct).unwrap_or(Decimal::ZERO) / dec!(100),
             funding_rate_8h: Decimal::from_f64_retain(p.funding_rate_8h).unwrap_or(Decimal::ZERO),
+            margin_cross: p.margin_mode == "cross",
             rejected_count: 0,
             guard,
             pending_orders: Vec::new(),
@@ -573,9 +584,10 @@ impl BacktestContext {
     ///
     /// 依据: 真实清算实测 (specs/backtest.md §十一 ④) —— hedge 两侧逐仓保证金独立占用、独立清算,
     /// 一侧被清算时另一侧钱包不受影响。所有按方向的资金操作都经此寻址, one-way 自动退化为 symbol 级。
+    /// 全仓 (margin_mode="cross") 例外: hedge 双向持仓**共享同一钱包** (对齐币安全仓), 键退化为 pair 级。
     fn wallet_key_of(&self, pair: &str, side: OrderSide) -> String {
         let key = self.resolve_key(pair);
-        if self.is_hedge() {
+        if self.is_hedge() && !self.margin_cross {
             let tag = match side {
                 OrderSide::Buy => "long",
                 OrderSide::Sell => "short",
@@ -805,20 +817,29 @@ impl BacktestContext {
             .into_iter()
             .collect();
         if self.is_hedge() {
-            for k in &pair_keys {
-                for side in [OrderSide::Buy, OrderSide::Sell] {
-                    self.check_liquidation_side(k, side, bar);
+            if self.margin_cross {
+                // 全仓: 多空共享钱包, 组合权益模型 (对齐币安全仓公式; 复用 one-way 路径,
+                // 其 E(p)=wallet+ΣUPNL vs MMR×Σ名义 判定 + 平浮亏侧保盈利侧即全仓语义)。
+                for k in &pair_keys {
+                    self.check_liquidation(k, bar, true);
+                }
+            } else {
+                for k in &pair_keys {
+                    for side in [OrderSide::Buy, OrderSide::Sell] {
+                        self.check_liquidation_side(k, side, bar);
+                    }
                 }
             }
         } else {
             for k in pair_keys {
-                self.check_liquidation(&k, bar);
+                self.check_liquidation(&k, bar, false);
             }
         }
     }
 
     /// 资金费结算一次 (FR-003): one-way 按净仓(单钱包, 同对多空自然抵消);
-    /// hedge 按侧独立 —— 多头钱包付、空头钱包收, **不跨侧抵消** (真实账户每侧独立钱包, 实测依据见 §十一 ④)。
+    /// hedge 按侧独立结算 —— 多头付、空头收; 逐仓两钱包互不抵消 (真实账户每侧独立钱包, 实测 §十一 ④),
+    /// 全仓 (cross, 045-R4) 现金即账户余额 → 资金费直接落袋现金 (与币安全仓一致)。
     fn settle_funding(&mut self, price: Decimal) {
         let rows: Vec<((String, OrderSide), Decimal)> = self
             .virtual_positions
@@ -833,7 +854,11 @@ impl BacktestContext {
                     OrderSide::Sell => self.funding_rate_8h * size * price,
                 };
                 if delta != Decimal::ZERO {
-                    self.add_wallet(&k, side, delta);
+                    if self.margin_cross {
+                        self.add_cash(delta);
+                    } else {
+                        self.add_wallet(&k, side, delta);
+                    }
                     self.funding_net += delta;
                 }
             }
@@ -849,7 +874,11 @@ impl BacktestContext {
             }
             for (k, net) in per_pair {
                 if net != Decimal::ZERO {
-                    self.add_wallet(&k, OrderSide::Buy, net);
+                    if self.margin_cross {
+                        self.add_cash(net);
+                    } else {
+                        self.add_wallet(&k, OrderSide::Buy, net);
+                    }
                     self.funding_net += net;
                 }
             }
@@ -917,12 +946,14 @@ impl BacktestContext {
         self.sweep_wallet_if_flat(pair_key);
     }
 
-    /// 单对强平检查 (K4/D10): 组合触发判定 —— 该对权益 E(p) = wallet + Σ未实现(p),
+    /// 单对强平检查 (K4/D10; 全仓 hedge 复用): 组合触发判定 —— 该对权益 E(p) = wallet + Σ未实现(p),
     /// 触发线 E(p) ≤ MMR × Σ名义(p); f(p) = E − MMR×名义 = A + B·p 为线性,
     /// B>0 (净多) → 价格跌穿越 (bar.low ≤ p_t), B<0 (净空/对冲) → 价格涨穿越 (bar.high ≥ p_t)。
     /// 单侧仓时 p_t 与逐仓强平价公式恒等; 触发按 p_t 平浮亏仓 (open 计价), 平后重算,
     /// 盈利侧使钱包恢复则自动保留; 每对每根 bar 至多计数一次; 平仓费 (taker) 从钱包扣。
-    fn check_liquidation(&mut self, pair_key: &str, bar: &Kline) {
+    /// `hedge_cross`: hedge 全仓调用时 fill 带 position_side/client_order_id 侧标
+    /// (策略 on_fill 按侧分账; one-way 保持 None 与 LIQ-{pair} 标识)。
+    fn check_liquidation(&mut self, pair_key: &str, bar: &Kline, hedge_cross: bool) {
         let mut counted = false;
         // 首轮组合触发不设方向门; 平掉浮亏仓后, 剩余仓的重判按 bar 运动方向收敛
         // (跌 bar 只判下行爆仓, 涨 bar 只判上行爆仓) —— 避免用平仓前的高/低点误判
@@ -948,8 +979,13 @@ impl BacktestContext {
             if s_l * e_l + s_s * e_s < dec!(1e-6) {
                 break;
             }
-            // one-way 为 symbol 级单钱包 (两侧寻址同一键), 取任一方向等价
-            let w = self.wallet_of(pair_key, OrderSide::Buy);
+            // one-way 为 symbol 级单钱包 (两侧寻址同一键), 取任一方向等价。
+            // 全仓 (cross, 045-R4): 钱包恒空, 组合权益的"已落袋部分"即现金 → 读 cash。
+            let w = if self.margin_cross {
+                self.cash()
+            } else {
+                self.wallet_of(pair_key, OrderSide::Buy)
+            };
             // f(p) = E(p) − MMR×Σ名义(p) = A + B·p (线性穿越判定)
             let a = w - e_l * s_l + e_s * s_s;
             let b = (s_l - s_s) - self.mmr * (s_l + s_s);
@@ -999,26 +1035,46 @@ impl BacktestContext {
             if size <= Decimal::ZERO {
                 break;
             }
-            let w2 = self.wallet_of(pair_key, OrderSide::Buy);
+            let w2 = if self.margin_cross {
+                self.cash()
+            } else {
+                self.wallet_of(pair_key, OrderSide::Buy)
+            };
             let a2 = w2 - e_l * s_l + e_s * s_s;
             let b2 = (s_l - s_s) - self.mmr * (s_l + s_s);
             let p_t = -a2 / b2;
             // 按强平价平掉整仓; 平仓费 (taker) 从钱包扣; fill 记录带 "LIQ" 标识。
+            // 全仓 (cross, 045-R4): 平仓盈亏落现金 (钱包恒空)。
             let realized = self.close_position(pair_key, side, size, p_t);
             let fee = self.fee_model.calc_fee(p_t, size, false);
-            self.add_wallet(pair_key, side, realized - fee);
+            if self.margin_cross {
+                self.add_cash(realized - fee);
+            } else {
+                self.add_wallet(pair_key, side, realized - fee);
+            }
             let fill = OrderFill {
                 trade_id: Some(uuid::Uuid::new_v4().to_string()),
                 exchange_order_id: format!("LIQ-{}", uuid::Uuid::new_v4()),
-                client_order_id: format!("LIQ-{}", pair_key),
+                client_order_id: if hedge_cross {
+                    format!(
+                        "LIQ-{pair_key}-{}",
+                        if side == OrderSide::Buy { "long" } else { "short" }
+                    )
+                } else {
+                    format!("LIQ-{pair_key}")
+                },
                 pair: pair_key.to_string(),
                 side,
                 fill_price: p_t,
                 fill_size: size,
                 fee,
                 timestamp: bar.close_time,
-                // one-way 组合强平: 按净仓方向, 非 hedge 方向仓 → None (032)。
-                position_side: None,
+                // one-way 组合强平: 按净仓方向, 非 hedge 方向仓 → None (032); hedge 全仓带侧标。
+                position_side: if hedge_cross {
+                    Some(if side == OrderSide::Buy { "long" } else { "short" }.into())
+                } else {
+                    None
+                },
             };
             self.pnl.record_fill(&fill);
             self.fill_queue.push(fill);
@@ -1724,12 +1780,49 @@ impl BacktestContext {
         // (开仓手续费从钱包扣, M 默认 ≫ fee, 划入后钱包恒 ≥ 0。)
         if let Some((_, sz)) = open {
             let margin = (sz * price) / self.leverage;
-            if self.cash() < margin {
+            if self.margin_cross {
+                // 全仓 (045-R3, 对齐币安全仓语义): 保证金**不按开仓静态划转占用** ——
+                // 可用 = 组合权益(现金+钱包+ΣUPNL) − |净名义|/L (mark-to-market)。
+                // 多空互抵按净敞口计占用 (2026-09-30 用户口径): 完全对冲 → 净敞口 0 →
+                // 全部权益可再部署, 低吸不再被锁死; 逐仓语义只适用于 isolated。
+                let (upnl, net_notional) = self.cross_account(&req.pair, price);
+                let equity = self.cash() + self.wallet.values().copied().sum::<Decimal>() + upnl;
+                if equity - net_notional / self.leverage < margin {
+                    return false;
+                }
+            } else if self.cash() < margin {
                 return false;
             }
         }
         let _ = close;
         true
+    }
+
+    /// 全仓资金口径辅助 (045-R3): 返回 (Σ未实现盈亏, Σ净名义)。
+    /// 给定 pair 用当前成交/触发价作标记价, 其余对用各自 mark_price (单对场景即精确)。
+    /// 净名义 = |多头名义 − 空头名义| (2026-09-30 用户口径): 全仓下多空互抵, 保证金占用
+    /// 按净敞口计 —— 对冲后可用资金更多, 而非两腿各占 名义/L。
+    fn cross_account(&self, pair: &str, price: &Decimal) -> (Decimal, Decimal) {
+        let key = self.resolve_key(pair);
+        let mut upnl = Decimal::ZERO;
+        let mut net_notional = Decimal::ZERO;
+        for ((k, side), p) in &self.virtual_positions {
+            if p.size <= Decimal::ZERO {
+                continue;
+            }
+            let mark = if *k == key { *price } else { p.mark_price };
+            match side {
+                OrderSide::Buy => {
+                    upnl += (mark - p.entry_price) * p.size;
+                    net_notional += p.size * mark;
+                }
+                OrderSide::Sell => {
+                    upnl += (p.entry_price - mark) * p.size;
+                    net_notional -= p.size * mark;
+                }
+            }
+        }
+        (upnl, net_notional.abs())
     }
 
     /// 平仓 (LIFO 配对, per-side 批次): 减少 (pair, side) 仓。
@@ -1809,8 +1902,9 @@ impl BacktestContext {
                 p.liquidation_price = None; // 归零 → 无爆仓价 (032)
             } else if let Some(avg) = new_entry {
                 p.entry_price = avg;
-                // 减仓重算 entry 后同步重算爆仓价 (032 FR-006, 显示口径)。
-                if fut {
+                // 减仓重算 entry 后同步重算爆仓价 (032 FR-006, 显示口径);
+                // 全仓 (cross) 多空互抵, 单侧爆仓价无定义 → None (对齐币安 App 显示 "–")。
+                if fut && !self.margin_cross {
                     p.liquidation_price = isolated_liq_price(avg, side, lev, mmr);
                 }
             }
@@ -1851,8 +1945,9 @@ impl BacktestContext {
             e.entry_price = (old_notional + fill_price * size) / e.size;
         }
         e.mark_price = fill_price;
-        // 爆仓价按公式填充 (032 FR-006, 显示口径; 现货不填)。
-        if fut {
+        // 爆仓价按公式填充 (032 FR-006, 显示口径; 现货不填);
+        // 全仓 (cross) 多空互抵, 单侧爆仓价无定义 → None (对齐币安 App 显示 "–")。
+        if fut && !self.margin_cross {
             e.liquidation_price = isolated_liq_price(e.entry_price, side, lev, mmr);
         }
     }
@@ -1873,7 +1968,11 @@ impl BacktestContext {
 
     /// 撮合成交统一入口 (K2/K3): 前置资金校验已由调用方通过; 此处记账。
     /// 现货: 仓位 (恒 Buy 侧) + 资金簿, 手续费真实扣余额 (Bug B 修复)。
-    /// 合约: 逐仓钱包转账 —— 平仓 wallet += realized − 平仓费; 开仓 cash −= M, wallet += M − 开仓费。
+    /// 合约逐仓 (isolated): 钱包转账 —— 平仓 wallet += realized − 平仓费; 开仓 cash −= M, wallet += M − 开仓费。
+    /// 合约全仓 (cross, 045-R4): **现金即账户余额** (对齐币安全仓, 无保证金静态划转) ——
+    /// 开仓只扣开仓费, 平仓 cash += realized − 平仓费; 钱包恒空, 清算/资金可用走组合权益口径。
+    /// (旧实现在 cross 下仍做静态划转 → 对冲后 cash≈0, 策略 cap_open 把后续调整量压到
+    ///  min_notional 以下静默跳过, 对冲腿失效; 2026-09-30 根因修复。)
     fn execute_fill(&mut self, order_id: &str, req: &OrderRequest, fill_price: Decimal) {
         // 023 T8: 首笔成交留痕 —— 成交价(基准买入价)/时刻(起算点)/当时权益(公平对照的起点)。
         // 记录必须在仓位与现金变动**之前**。
@@ -1919,6 +2018,26 @@ impl BacktestContext {
                     e.free -= req.size;
                     self.add_cash(notional - fee);
                 }
+            }
+        } else if self.margin_cross {
+            // ---- 合约记账 (045-R4 全仓: 现金即账户余额, 无保证金静态划转) ----
+            // 对齐币安全仓真实语义: 开仓不划转保证金 (可用额度由清算/has_funds 按组合权益判定),
+            // 平仓盈亏直接落现金; 钱包恒空 → mark_to_market / sweep / 权益曲线自动兼容。
+            let total_notional = req.size * fill_price;
+            let close_notional = close.map(|(_, sz)| sz * fill_price).unwrap_or(Decimal::ZERO);
+            let close_fee = if total_notional > Decimal::ZERO {
+                fee * close_notional / total_notional
+            } else {
+                Decimal::ZERO
+            };
+            let open_fee = fee - close_fee;
+            if let Some((cs, sz)) = close {
+                let realized = self.close_position(&req.pair, cs, sz, fill_price);
+                self.add_cash(realized - close_fee);
+            }
+            if let Some((os, sz)) = open {
+                self.add_cash(-open_fee);
+                self.open_position(&req.pair, os, sz, fill_price);
             }
         } else {
             // ---- 合约记账 (K3 逐仓钱包) ----
@@ -3336,6 +3455,209 @@ mod tests {
     }
 
     #[test]
+    fn test_futures_cross_hedged_never_liquidates() {
+        // 045 全仓(cross) hedge: 多空盈亏互抵合并清算(对齐币安全仓公式) —— 80% 对冲下
+        // 净敞口 20%, 深跌不爆仓; 同参数逐仓(isolated)多头必爆 → 模式差异回归锚。
+        let bt = BacktestToml {
+            leverage: Some(2.0),
+            mmr_pct: Some(2.5),
+            margin_mode: Some("cross".into()),
+            ..Default::default()
+        };
+        let mut ctx = test_ctx_bt("futures", "hedge", 100000, bt);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(200));
+        long.position_side = Some("long".into());
+        ctx.place_order(long).unwrap();
+        let mut short = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(160));
+        short.position_side = Some("short".into());
+        ctx.place_order(short).unwrap();
+        // 深跌至 45 (isolated 下多头爆仓价 ≈ 51.3 必触发)。
+        ctx.step_bar(kline(dec!(55), dec!(56), dec!(45), dec!(50)));
+        ctx.step_bar(kline(dec!(52), dec!(54), dec!(51), dec!(53)));
+        let report = ctx.report();
+        assert_eq!(report.liquidation_count, Some(0), "全仓对冲: 不得爆仓");
+        assert!(
+            ctx.position_side("ETH", OrderSide::Buy).map(|p| p.size).unwrap_or_default()
+                > Decimal::ZERO,
+            "多头仓应保留"
+        );
+        assert!(
+            ctx.position_side("ETH", OrderSide::Sell).map(|p| p.size).unwrap_or_default()
+                > Decimal::ZERO,
+            "空头仓应保留"
+        );
+        assert!(report.fills.iter().all(|f| !f.client_order_id.starts_with("LIQ")));
+    }
+
+    #[test]
+    fn test_futures_cross_funds_mark_to_market_frees_margin() {
+        // 045-R3 全仓资金口径: 可用 = 组合权益 − |净名义|/L, 多空互抵 (2026-09-30 用户口径)。
+        // 完全对冲 → 净名义 ≈ 0 → 权益几乎全部可再部署; 静态划转/毛名义口径均会锁死低吸。
+        let bt = BacktestToml {
+            leverage: Some(2.0),
+            mmr_pct: Some(2.5),
+            margin_mode: Some("cross".into()),
+            ..Default::default()
+        };
+        let mut ctx = test_ctx_bt("futures", "hedge", 10000, bt);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(100));
+        long.position_side = Some("long".into());
+        ctx.place_order(long).unwrap();
+        let mut short = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(98));
+        short.position_side = Some("short".into());
+        ctx.place_order(short).unwrap();
+        // 同价不跌: 净名义 = |100×100 − 98×100| = 200 → 可用 ≈ 权益 − 100, 加仓立即可成交。
+        let mut add = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(20));
+        add.position_side = Some("long".into());
+        ctx.place_order(add).unwrap();
+        assert!(
+            close_enough(
+                ctx.position_side("ETH", OrderSide::Buy).unwrap().size,
+                dec!(120)
+            ),
+            "全仓对冲互抵: 净名义极小, 加仓应立即成交 (多头 100→120)"
+        );
+    }
+
+    #[test]
+    fn test_futures_cross_liquidates_losing_side_keeps_profit_side() {
+        // 全仓权益击穿 → 只平浮亏侧(多头), 盈利空头保留; fill 带 LIQ-{pair}-long + position_side
+        // (策略 on_fill 按侧分账的契约)。
+        // 045-R4 纯现金口径: 10x, 多 9000@100 + 空 800@100, cash=200000−450−40=199510;
+        // p_t = (900000−80000−199510)/(8200−98) ≈ 76.58 (旧口径 89.2 因只读钱包忽略现金而虚高)。
+        let bt = BacktestToml {
+            leverage: Some(10.0),
+            mmr_pct: Some(1.0),
+            margin_mode: Some("cross".into()),
+            ..Default::default()
+        };
+        let mut ctx = test_ctx_bt("futures", "hedge", 200000, bt);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(9000));
+        long.position_side = Some("long".into());
+        ctx.place_order(long).unwrap();
+        let mut short = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(800));
+        short.position_side = Some("short".into());
+        ctx.place_order(short).unwrap();
+        // 跌至 70 (穿组合爆仓价 ≈ 76.58)。
+        ctx.step_bar(kline(dec!(80), dec!(81), dec!(70), dec!(72)));
+        ctx.step_bar(kline(dec!(52), dec!(54), dec!(51), dec!(53)));
+        let report = ctx.report();
+        assert_eq!(report.liquidation_count, Some(1), "权益击穿应强平一次");
+        let liq = report
+            .fills
+            .iter()
+            .find(|f| f.client_order_id.starts_with("LIQ"))
+            .expect("应有 LIQ fill");
+        assert_eq!(liq.client_order_id, "LIQ-bn:ETH-long", "强平亏损侧=多头, 带侧标");
+        assert_eq!(liq.position_side.as_deref(), Some("long"));
+        assert_eq!(liq.side, OrderSide::Buy, "平多 = Buy");
+        assert!(
+            ctx.position_side("ETH", OrderSide::Buy).map(|p| p.size).unwrap_or_default()
+                == Decimal::ZERO,
+            "多头应被强平"
+        );
+        assert!(
+            ctx.position_side("ETH", OrderSide::Sell).map(|p| p.size).unwrap_or_default()
+                > Decimal::ZERO,
+            "盈利空头应保留"
+        );
+    }
+
+    #[test]
+    fn test_futures_cross_single_side_matches_isolated() {
+        // 全仓单侧仓 (无额外空闲现金时) 与逐仓等价: 组合公式单侧退化 = 逐仓公式。
+        // 045-R4 纯现金口径: cash 恰等于逐仓应划转的保证金 (名义/L=10000) 时, 无空闲现金兜底,
+        // 爆仓价/现金与 test_futures_long_liquidation_at_liq_price (one-way+isolated) 一致。
+        // (若 cash ≫ 保证金, 全仓单侧不会被爆 —— 那正是全仓 vs 逐仓的本质差异, 见下测。)
+        let bt = BacktestToml {
+            leverage: Some(2.0),
+            mmr_pct: Some(2.5),
+            margin_mode: Some("cross".into()),
+            ..Default::default()
+        };
+        let mut ctx = test_ctx_bt("futures", "hedge", 10000, bt);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(200));
+        long.position_side = Some("long".into());
+        ctx.place_order(long).unwrap();
+        ctx.step_bar(kline(dec!(55), dec!(56), dec!(45), dec!(50)));
+        ctx.step_bar(kline(dec!(52), dec!(54), dec!(51), dec!(53)));
+        let report = ctx.report();
+        assert_eq!(report.liquidation_count, Some(1), "无空闲现金: 全仓单侧 = 逐仓, 必爆");
+        let liq = report.fills.iter().find(|f| f.client_order_id.starts_with("LIQ")).unwrap();
+        assert_eq!(liq.position_side.as_deref(), Some("long"));
+        // 爆仓价与逐仓口径一致 (≈ 51.33 同 test_futures_long_liquidation_at_liq_price)。
+        assert!((liq.fill_price.to_f64().unwrap() - 51.33).abs() < 0.1, "p_t={}", liq.fill_price);
+        // 纯现金口径期末现金 ≈ 251.53 (= 逐仓 90251.53 − 未划转的 90000 空闲保证金)。
+        assert!(close_enough(report.final_cash, dec!(251.53)), "cash={}", report.final_cash);
+    }
+
+    #[test]
+    fn test_futures_cross_free_cash_prevents_single_side_liq() {
+        // 045-R4 全仓本质: 单侧仓由大额空闲现金兜底 → 深跌不爆 (逐仓同参数必爆)。
+        // cash=100000, 多 200@100 (名义 20000, 2x 保证金 10000) → 90000 空闲现金使爆仓价为负。
+        let bt = BacktestToml {
+            leverage: Some(2.0),
+            mmr_pct: Some(2.5),
+            margin_mode: Some("cross".into()),
+            ..Default::default()
+        };
+        let mut ctx = test_ctx_bt("futures", "hedge", 100000, bt);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(200));
+        long.position_side = Some("long".into());
+        ctx.place_order(long).unwrap();
+        ctx.step_bar(kline(dec!(55), dec!(56), dec!(45), dec!(50)));
+        ctx.step_bar(kline(dec!(52), dec!(54), dec!(51), dec!(53)));
+        let report = ctx.report();
+        assert_eq!(report.liquidation_count, Some(0), "全仓空闲现金兜底: 单侧深跌不爆");
+        assert!(
+            ctx.position_side("ETH", OrderSide::Buy).map(|p| p.size).unwrap_or_default()
+                == dec!(200),
+            "多头仓应完整保留"
+        );
+    }
+
+    #[test]
+    fn test_futures_cross_hedge_does_not_lock_cash() {
+        // 045-R4 根因回归: 旧实现在 cross 下仍做保证金静态划转 → 建仓买多划走 cash、开空对冲再划走
+        // cash → cash≈0, 策略 cap_open 把后续对冲调整量压到 min_notional 以下静默跳过, 对冲腿失效。
+        // 纯现金口径: 连续开多+开空只扣手续费, balance() 仍反映真实可用 (≈ 本金), 对冲可持续加空。
+        let bt = BacktestToml {
+            leverage: Some(2.0),
+            mmr_pct: Some(2.5),
+            margin_mode: Some("cross".into()),
+            ..Default::default()
+        };
+        let mut ctx = test_ctx_bt("futures", "hedge", 10000, bt);
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(99), dec!(100)));
+        let mut long = OrderRequest::new_market("ETH", OrderSide::Buy, dec!(50));
+        long.position_side = Some("long".into());
+        ctx.place_order(long).unwrap();
+        let mut short = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(40));
+        short.position_side = Some("short".into());
+        ctx.place_order(short).unwrap();
+        // 纯现金: 只扣开仓费 (5000+4000)×0.0005 = 4.5 → balance ≈ 9995.5, 而非旧口径的 ≈2.5。
+        let avail = ctx.balance("USDT").unwrap();
+        assert!(
+            avail > dec!(9990),
+            "全仓对冲不得锁死现金 (balance 应≈本金−费), 实际 {avail}"
+        );
+        // 对冲腿可持续加空: 再开 30 空 (名义 3000) 应立即成交, 不被 cap_open 压量。
+        let mut more = OrderRequest::new_market("ETH", OrderSide::Sell, dec!(30));
+        more.position_side = Some("short".into());
+        ctx.place_order(more).unwrap();
+        assert_eq!(
+            ctx.position_side("ETH", OrderSide::Sell).map(|p| p.size).unwrap_or_default(),
+            dec!(70),
+            "对冲可持续加空 (40→70), 证明现金未被锁"
+        );
+    }
+
+    #[test]
     fn test_l4_market_noop_order_rejected_without_fee_or_fill() {
         // L4: hedge 下对"无多仓"发市价 sell + position_side="long"(= 平多)。
         // 修复前: 成交但零动作 —— 仍收手续费并记一笔成交 (成本/笔数虚增)。
@@ -4262,7 +4584,7 @@ mod tests {
         ctx.virtual_positions.get_mut(&key).unwrap().size = dec!(0.0000000000000000000000000001);
         let bar = kline_at(7200, dec!(50), dec!(51), dec!(1), dec!(2)); // 深跌 bar
         ctx.check_liquidation_side("ETH", OrderSide::Buy, &bar); // 不 panic 即通过
-        ctx.check_liquidation("ETH", &bar);
+        ctx.check_liquidation("ETH", &bar, false);
         assert_eq!(
             ctx.side_size("ETH", OrderSide::Buy),
             dec!(0.0000000000000000000000000001),

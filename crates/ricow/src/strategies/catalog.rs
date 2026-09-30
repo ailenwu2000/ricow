@@ -77,6 +77,11 @@ pub struct StrategyManifest {
     /// 默认杠杆 (032, 可选): 直跑路径无 `[backtest]` 段时回填 `leverage` (审核 S1)。
     #[serde(default)]
     pub default_leverage: Option<f64>,
+    /// `[backtest]` 段 (045, 可选): 回测引擎参数持久默认 (如 margin_mode), 由
+    /// `resolve_builtin_script` 合并进 config —— 直跑/回测路径策略 TOML 的引擎级
+    /// 默认值必须生效, 不能只对 `ricow create` 之类读原始 TOML 的路径生效。
+    #[serde(default)]
+    pub backtest: Option<ricow_strategy::BacktestToml>,
 }
 
 impl StrategyManifest {
@@ -145,9 +150,9 @@ const BUILTIN: &[(&str, &str, &str)] = &[
         include_str!("../../../../strategies/spot/shannon_grid.lua"),
     ),
     (
-        "shannon_grid_futures",
-        include_str!("../../../../strategies/futures/shannon_grid_futures.toml"),
-        include_str!("../../../../strategies/futures/shannon_grid_futures.lua"),
+        "shannon_hedge_grid_futures",
+        include_str!("../../../../strategies/futures/shannon_hedge_grid_futures.toml"),
+        include_str!("../../../../strategies/futures/shannon_hedge_grid_futures.lua"),
     ),
 ];
 
@@ -277,6 +282,7 @@ fn scan_user_with_problems() -> (Vec<CatalogEntry>, Vec<(String, String)>) {
                     params: Vec::new(),
                     position_mode: None,
                     default_leverage: None,
+                    backtest: None,
                 },
                 code,
                 source: Source::User,

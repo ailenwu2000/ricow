@@ -4,22 +4,27 @@
 # 本文件 [[params]] 的 key 不得与引擎按名读取的参数同名(leverage/mmr_pct 等),
 # 杠杆走清单顶层 default_leverage 字段, 由 resolve_builtin_script 回填 [backtest].leverage。
 
-id = "shannon_grid_futures"
-name = "合约香农网格"
+id = "shannon_hedge_grid_futures"
+name = "合约香农对冲网格"
 market = "futures"
 position_mode = "hedge"
 default_leverage = 2
-summary = "USDT-M 合约香农网格: 总资金=投入×杠杆, 总资金一半开多建仓, 虚拟账本恒 1:1 再平衡, 平衡价 ± atr_mult×ATR 挂开多/平多单; 爆仓价实时监控"
-description = """合约版香农恒定权重再平衡网格(hedge 模式只下 LONG 侧): 杠杆 1~5 倍(默认 2),
+summary = "USDT-M 合约香农对冲网格: 总资金=投入×杠杆, 总资金一半开多建仓, 虚拟账本恒 1:1 再平衡, 平衡价 ± atr_mult×ATR 挂开多/平多单; 可选对冲腿(按多头量 80% 持反向空头, 成交后市价调整); 爆仓价实时监控"
+description = """合约版香农对冲网格(hedge 模式只下 LONG 侧): 杠杆 1~5 倍(默认 2),
 总资金 = 投入资金 × 杠杆。价格低于 start_price 激活, 用总资金一半市价开多建仓(成交价 = 第一平衡价格);
 以虚拟账本(虚拟现金 + 虚拟仓位, 仓位与实际一致)计算, 平衡价 + atr_mult×ATR 挂开多单、平衡价 − atr_mult×ATR
 挂平多单, 每笔挂单量按"成交后虚拟现金与虚拟仓位价值恰好恢复 1:1"(含手续费修正)计算; 任一成交后成交价成为
 新平衡价格并全撤重挂两侧。虚拟现金隔离可用保证金随价格/浮盈亏的频繁波动; 虚拟买单超真实可用保证金时
-告警记录(挂单照常挂出)。卖出侧降杠杆(锚定建仓价值): 挂卖单时仓位名义超过 建仓名义×delev_cap_mult(默认 1),
-把超额随卖单一并卖掉; 回撤(低于建仓价值)不消减; 仓位名义封顶在建仓价值, 利润沉淀为现金, 有效杠杆随利润
-累积逐步下降, 降低爆仓风险。买入侧不变。
+告警记录(挂单照常挂出)。
 爆仓价实时监控(距爆仓价 < 阈值告警, 只提示不动作), 运行期记录距爆仓最近的
-时刻(stat_liq_dist_min/ts/price); 真发生爆仓(引擎 LIQ- 强平成交)即停机不再交易, 损失单列 stat_liq_pnl。ATR 周期与 K 线周期可配
+时刻(stat_liq_dist_min/ts/price); 真发生爆仓(引擎 LIQ- 强平成交)即停机不再交易, 损失单列 stat_liq_pnl。
+默认全仓(cross): hedge 双向持仓多空盈亏互抵、合并计算爆仓(对齐币安全仓公式), 对冲腿启用时净敞口
+仅 (1−hedge_ratio)×多头, 爆仓价大幅远离(单侧爆仓价显示 "–", stat_liq_dist_min 不适用);
+可用 --param margin_mode=isolated 切回逐仓(两腿独立保证金独立清算)。
+可选对冲腿(hedge_enabled=1): 按多头持仓量的 hedge_ratio(默认 0.8)持有反向空头仓位(hedge 双向持仓),
+偏差超过 hedge_adjust_threshold(默认 ±5%, 相对目标量)且调整量名义 ≥ hedge_min_notional 时, 在网格成交后
+市价调整对冲仓位。对冲腿与多头 1:1 虚拟账本完全隔离, 统计单列 stat_hedge_*; 空头腿爆仓只告警重建、
+不整体停机。代价: 调整为 taker 单 + 空头腿承担资金费。ATR 周期与 K 线周期可配
 (默认 1h K 线、14 周期、乘数 1.5), 间距随行情波动动态伸缩。无结束语义(公式自平衡)。
 ⚠ 合约有杠杆: 单边下跌将逼近爆仓价(2x 半仓初始爆仓距离约 49%), 请关注告警与 stat_liq_price_final。
 注意: 回测爆仓价为开仓口径估算, 费率/资金费侵蚀后实际更近。"""
@@ -97,11 +102,32 @@ desc = "单边手续费率(0.0005 = 合约 taker 0.05%/边)"
 default = 0.0005
 
 [[params]]
-key = "delev_cap_mult"
-name = "降杠杆价值上限倍数"
+key = "hedge_enabled"
+name = "启用对冲腿"
+type = "i64"
+desc = "1 = 启用对冲腿: 按多头持仓量的 hedge_ratio 比例持有反向空头仓位(hedge 双向持仓), 网格成交后市价调整对冲; 0/缺失 = 关闭(默认, 行为与无对冲版本逐分一致)。代价: 调整为 taker 单 + 空头腿承担资金费"
+default = 0
+
+[[params]]
+key = "hedge_ratio"
+name = "对冲比例"
 type = "f64"
-desc = "卖出侧降杠杆(锚定建仓价值): 仓位价值上限 = 建仓名义(entry_size×entry_price) × 该倍数。挂卖单时仓位名义超上限, 把超额随卖单一并卖掉(卖量取 正常1:1量 与 降杠杆量 较大者); 低于建仓价值(回撤)不消减, 买入侧不变。1 = 仓位名义封顶在建仓价值, 利润全沉淀为现金, 有效杠杆随利润累积下降; 0 = 默认 1; 负数禁用"
-default = 1
+desc = "对冲腿启用时, 目标空头量 = 该比例 × 引擎实际多头持仓量(默认 0.8); 0/缺失 = 默认 0.8"
+default = 0.8
+
+[[params]]
+key = "hedge_adjust_threshold"
+name = "对冲调整阈值"
+type = "f64"
+desc = "对冲偏差(相对目标空头量)超过该比例才市价调整(±死区, 默认 0.05 = ±5%); 0/缺失 = 默认 0.05。防小额偏差反复 taker 消耗"
+default = 0.05
+
+[[params]]
+key = "hedge_min_notional"
+name = "对冲单笔最小名义"
+type = "f64"
+desc = "对冲调整单笔最小名义金额(独立于网格 min_notional); 调整量名义不足则不动(防 dust 调整)"
+default = 5
 
 [[params]]
 key = "liq_warn_ratio"
@@ -109,3 +135,9 @@ name = "爆仓价告警阈值"
 type = "f64"
 desc = "小数(0.1=10%); 多头距爆仓价 < 该比例打 WARN(只告警不动作)。与引擎 014 的 liq_warn_pct(百分点)是两条通道"
 default = 0.1
+
+[backtest]
+# 全仓(cross): hedge 双向持仓多空盈亏互抵、合并计算爆仓(对齐币安全仓公式) —— 对冲腿启用时
+# 净敞口仅 (1−hedge_ratio)×多头, 基本不会爆仓; 单侧爆仓价无定义(pos_liq 显示 "-")。
+# 需要逐仓行为(两腿独立清算, 现行引擎旧口径)时 CLI --param margin_mode=isolated 覆盖。
+margin_mode = "cross"
