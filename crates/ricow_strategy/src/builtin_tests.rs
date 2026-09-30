@@ -1528,6 +1528,213 @@ fn test_shannon_hedge_grid_futures_hedge_short_liq_warns_without_halt() {
     assert!(get("stat_hedge_short_final").is_some(), "stat_hedge_short_final 应导出");
 }
 
+// ============================================================================
+// 047 合约香农网格 (shannon_grid_futures) 集成测试 —— 去对冲 + 自动降杠杆(auto_delev)
+// 母本 = shannon_hedge_grid_futures(复用 univ2_main/with_bar/tf_bars/run_univ2 时序)。
+// ============================================================================
+
+const SHANNON_GRID_FUT: &str = include_str!("../../../strategies/futures/shannon_grid_futures.lua");
+
+/// 合约 hedge 配置(默认: invest_cash=10000, 杠杆 2 → 总资金 20000, 建仓名义 10000)。
+fn shannon_grid_fut_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![
+        ("pair", ConfigValue::String("ETHUSDT".into())),
+        ("atr_interval", ConfigValue::String("1h".into())),
+        ("atr_period", ConfigValue::Integer(14)),
+        ("min_notional", ConfigValue::Float(50.0)),
+        ("fee_side", ConfigValue::Float(0.0005)),
+        ("invest_cash", ConfigValue::Float(10000.0)),
+    ];
+    params.extend_from_slice(extra);
+    let mut cfg = config(SHANNON_GRID_FUT, &params);
+    cfg.market = "futures".into();
+    cfg.position_mode = "hedge".into();
+    cfg.backtest = Some(crate::config::BacktestToml { leverage: Some(2.0), ..Default::default() });
+    cfg
+}
+
+/// 杠杆覆盖(同时改 param 与 [backtest], 母本 lev5 辅助同款口径)。
+fn shannon_grid_fut_cfg_lev(lev: f64, extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![("leverage", ConfigValue::Float(lev))];
+    params.extend_from_slice(extra);
+    let mut cfg = shannon_grid_fut_cfg(&params);
+    if let Some(b) = cfg.backtest.as_mut() {
+        b.leverage = Some(lev);
+    }
+    cfg
+}
+
+#[test]
+fn test_shannon_grid_futures_no_short_orders() {
+    // 对冲已移除: 默认跑激活序列, 全程不得出现任何 position_side=short 订单。
+    let cfg = shannon_grid_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    assert!(
+        orders.iter().flatten().flatten().all(|o| o.position_side.as_deref() != Some("short")),
+        "无对冲腿策略 -> 不得有任何空头订单"
+    );
+    assert_eq!(st.global_f64("fill_count").unwrap_or(0.0), 1.0, "应恰有建仓 1 笔成交");
+}
+
+#[test]
+fn test_shannon_grid_futures_delev_off_matches_hedge_grid() {
+    // auto_delev 缺失(默认关闭): 建仓/首挂与母本对冲网格(hedge 关闭态)逐值一致 ——
+    // 买 97 @1.5202 / 卖 103 @1.4809(纯 1:1 公式), delev_count=0。
+    let cfg = shannon_grid_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    assert_eq!(st.global_f64("balance_price"), Some(100.0));
+    let limits: Vec<_> = orders[15]
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    assert_eq!(buy.price, Some(dec!(97)));
+    assert_eq!(sell.price, Some(dec!(103)));
+    let q_buy_exp = (9995.0 - 100.0 * 97.0) / (97.0 * (2.0 + 0.0005));
+    let q_sell_exp = (100.0 * 103.0 - 9995.0) / (103.0 * (2.0 - 0.0005));
+    assert!(
+        (buy.size.to_f64().unwrap() - q_buy_exp).abs() < 1e-6,
+        "关闭态买量应=1:1 恢复量 {q_buy_exp}: {}",
+        buy.size
+    );
+    assert!(
+        (sell.size.to_f64().unwrap() - q_sell_exp).abs() < 1e-6,
+        "关闭态卖量应=1:1 恢复量 {q_sell_exp}: {}",
+        sell.size
+    );
+    assert_eq!(st.global_f64("delev_count"), Some(0.0), "关闭态不得有降杠杆卖单");
+    assert_eq!(st.global_f64("delev_trimmed"), Some(0.0), "关闭态不得削减虚拟现金");
+}
+
+#[test]
+fn test_shannon_grid_futures_delev_on_caps_sell_to_entry_value() {
+    // 2x + auto_delev=1: 建仓 100@100 → V0=10000; 首挂卖 103 时仓位名义 10300 > V0 →
+    // 卖量 = 降杠杆量 (10300−10000)/(103×0.9995)=2.91408 > 1:1 量 1.48095。
+    let cfg = shannon_grid_fut_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("auto_delev", ConfigValue::Float(1.0)),
+    ]);
+    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    let limits: Vec<_> = orders[15]
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    let q_delev_exp = (10300.0 - 10000.0) / (103.0 * (1.0 - 0.0005));
+    assert!(
+        (sell.size.to_f64().unwrap() - q_delev_exp).abs() < 1e-6,
+        "卖量应=降杠杆量 {q_delev_exp}: {}",
+        sell.size
+    );
+    assert_eq!(st.global_f64("delev_count"), Some(1.0), "首挂卖单应为降杠杆卖单");
+    assert!(st.global_f64("delev_extra_notional").unwrap_or(0.0) > 0.0, "超额名义应被记录");
+}
+
+#[test]
+fn test_shannon_grid_futures_delev_fill_trims_to_one_to_one() {
+    // 降杠杆卖 103 成交后: 收口把 v_cash 削到 v_pos×103(精确 1:1), 且仓位名义 ≈ V0=10000
+    // (利润沉淀为现金退出网格), delev_trimmed > 0。bar18=[101,103] 只触发卖侧。
+    let cfg = shannon_grid_fut_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("auto_delev", ConfigValue::Float(1.0)),
+    ]);
+    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 102, 103, 101, 102);
+    let (_orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    assert_eq!(st.global_f64("fill_count"), Some(2.0), "建仓 + 卖 103 各成交一次");
+    let v_pos = st.global_f64("v_pos").expect("v_pos");
+    let v_cash = st.global_f64("v_cash").expect("v_cash");
+    assert!(
+        (v_cash - v_pos * 103.0).abs() < 1e-9,
+        "收口后应精确 1:1: v_cash={v_cash} v_pos×103={}",
+        v_pos * 103.0
+    );
+    assert!(
+        (v_pos * 103.0 - 10000.0).abs() < 0.5,
+        "降杠杆卖成交后仓位名义应被压回建仓价值 V0=10000: {}",
+        v_pos * 103.0
+    );
+    let trimmed = st.global_f64("delev_trimmed").expect("delev_trimmed");
+    assert!(trimmed > 200.0, "削减现金应≈超额部分(>200): {trimmed}");
+}
+
+#[test]
+fn test_shannon_grid_futures_delev_inactive_below_2x() {
+    // 杠杆 1 + auto_delev=1: 选项不真正生效 —— 卖量回到纯 1:1 值, delev_count=0、无削减。
+    let cfg = shannon_grid_fut_cfg_lev(
+        1.0,
+        &[("start_price", ConfigValue::Float(150.0)), ("auto_delev", ConfigValue::Float(1.0))],
+    );
+    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
+    let limits: Vec<_> = orders[15]
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    // 1x: v_total=10000, 建仓 5000@100(50 币), v_cash=4997.5 → 卖量=(50×103−4997.5)/(103×1.9995)
+    let q_sell_exp = (50.0 * 103.0 - 4997.5) / (103.0 * (2.0 - 0.0005));
+    assert!(
+        (sell.size.to_f64().unwrap() - q_sell_exp).abs() < 1e-6,
+        "杠杆<2 卖量应=1:1 恢复量 {q_sell_exp}: {}",
+        sell.size
+    );
+    assert_eq!(st.global_f64("delev_count"), Some(0.0), "杠杆<2 不得有降杠杆卖单");
+    assert_eq!(st.global_f64("delev_trimmed"), Some(0.0), "杠杆<2 不得削减现金");
+}
+
+#[test]
+fn test_shannon_grid_futures_delev_drawdown_no_trim() {
+    // 下跌保持原处理: 建仓后价格跌穿买 97 成交(现价 < 建仓价) → 全程零削减(delev_trimmed=0),
+    // 卖单照常按 1:1 公式挂出。
+    let cfg = shannon_grid_fut_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("auto_delev", ConfigValue::Float(1.0)),
+    ]);
+    let mut bars = univ2_main(60, 200, 100, 10);
+    bars[30] = bar_at_hour(30, 97, 98, 96, 97); // 穿越买 97
+    let (_orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    assert!(st.global_f64("fill_count").unwrap_or(0.0) >= 2.0, "网格买 97 应成交");
+    assert_eq!(
+        st.global_f64("delev_trimmed"),
+        Some(0.0),
+        "现价低于建仓价的回撤中不得削减虚拟现金"
+    );
+}
+
+#[test]
+fn test_shannon_grid_futures_delev_state_snapshot_and_recon() {
+    // 续接/核对: delev_trimmed 持久化; on_stop 重建恒等式
+    // v_cash = v_total − m_fee − buy + sell − delev_trimmed 差 < 0.01; stat_delev_* 导出。
+    let cfg = shannon_grid_fut_cfg(&[
+        ("start_price", ConfigValue::Float(150.0)),
+        ("auto_delev", ConfigValue::Float(1.0)),
+    ]);
+    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 102, 103, 101, 102);
+    let (_orders, mut ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    let mut st = st;
+    st.on_stop(&mut ctx);
+    let snap: HashMap<String, String> = st.state_snapshot().into_iter().collect();
+    let trimmed: f64 = snap
+        .get("delev_trimmed")
+        .expect("delev_trimmed 应持久化")
+        .parse()
+        .expect("数值");
+    assert!(trimmed > 200.0, "削减现金应持久化: {trimmed}");
+    let diff: f64 = snap
+        .get("stat_v_recon_diff")
+        .expect("stat_v_recon_diff")
+        .parse()
+        .expect("数值");
+    assert!(diff.abs() < 0.01, "含 −delev_trimmed 的重建核对应通过: {diff}");
+    assert!(snap.contains_key("stat_delev_count"), "stat_delev_count 应导出");
+    assert!(snap.contains_key("stat_delev_extra_notional"), "stat_delev_extra_notional 应导出");
+    assert!(snap.contains_key("stat_delev_cash_trimmed"), "stat_delev_cash_trimmed 应导出");
+    assert_eq!(snap.get("stat_auto_delev").map(|s| s.as_str()), Some("1"));
+}
+
 #[test]
 fn test_notify_halt_and_stall_flags() {
     // 042: 引擎 halted/stall 通知的取值口径 —— Lua 全局 fatal 与 _RICOW_STATE 键
