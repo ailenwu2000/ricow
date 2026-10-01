@@ -1,94 +1,69 @@
--- 合约香农网格策略 (shannon_grid_futures) -- v1 (2026-10-01, 047)
+-- 合约香农网格 (shannon_grid_futures)
 --
--- ═══ 一句话 ═══
---   USDT-M 合约(hedge, 只下 LONG 侧)香农网格: 逐行承袭现货 shannon_grid 的恒定权重再平衡语义 ——
---   价格低于 start_price 激活, 用**总资金(投入×杠杆)的一半**市价开多建仓; 虚拟账本(虚拟现金 v_cash +
---   虚拟仓位 v_pos)价值恒 1:1, 平衡价 ± max(atr_mult×ATR, 间距下限) 挂买/平多单, 任一成交都把
---   成交价当作新平衡价、按"成交后 1:1 恢复"的量全撤重挂两侧。
---   可选"自动降杠杆"(auto_delev, 默认关闭): 杠杆≥2 时, 价格上涨使仓位名义超过建仓价值 V0 的
---   超额随卖单一并卖掉、成交后削减虚拟现金使账本回精确 1:1 —— 有效杠杆随利润累积棘轮下行。
+-- ═══ 语义 ═══
+--   USDT-M 合约(hedge 模式, 只下 LONG 侧)香农网格: 价格低于 start_price 激活, 用总资金(投入×杠杆)
+--   的一半市价开多建仓; 虚拟账本(现金 v_cash + 仓位 v_pos)恒 1:1 价值平衡, 平衡价 − 买间距 / + 卖间距
+--   挂开多/平多单(基础间距 = max(atr_mult×ATR, 间距下限×价格)), 任一成交后成交价成为新平衡价,
+--   按"成交后 1:1 恢复"的量全撤重挂两侧。
+--   方向 flag(卖笔数 − 买笔数, 建仓与强平不计)驱动趋势侧间距指数放大: |flag|≥2 时 flag<0 放大买间距、
+--   flag>0 放大卖间距, 间距 × flag_spacing_mult^(|flag|−1), 另一侧不变 —— 单边趋势成交变稀、
+--   回调收割不变; 回调成交即 flag 回退、放大自收缩。买卖量随不对称挂单价自动跟随, 成交后仍精确回 1:1。
 --
--- ═══ 与合约香农对冲网格(shannon_hedge_grid_futures)的差异 ═══
---   1) **无对冲腿**: 本策略只做多、不持反向空头, 母本的 hedge_* 全套(参数/函数/统计/short 分支)
---      整体移除; 保证金模式回归引擎默认 isolated(无对冲腿时 cross 组合清算无收益)。
---   2) **自动降杠杆(auto_delev)**: 见下方第 8 点与参数说明。
+-- ═══ 合约要点 ═══
+--   杠杆 1~5(默认 2, 清单 default_leverage 为唯一权威), 总资金 = 投入×杠杆; 手工改杠杆必须同步
+--   [backtest].leverage, 否则 v_total 虚增被引擎拒单。
+--   清算默认全仓(cross, 清单 [backtest].margin_mode): 投入资金整体作为清算缓冲, 爆仓距离按有效杠杆
+--   (名义/投入)走 —— 半仓建仓时 5x 声明只决定可开名义上限。逐仓(--param margin_mode=isolated)
+--   只认名义/杠杆划转的钱包保证金, 闲置现金不参与清算, 补仓资金救不了场。
+--   v_pos 恒等于引擎实际多头仓位(逐 fill 同步); v_cash 隔离真实保证金随价格/浮盈亏的波动, 挂单量
+--   以虚拟账本计算。卖平多的真实回笼(释放保证金+已实现盈亏)与虚拟记账(+q·p)合法分叉, 期末只核对
+--   v_pos 与账本重建恒等式, 不核对 v_cash vs 引擎现金。
+--   挂单带 position_side="long"(买=开多 / 卖=平多, 绝不反向开空); 平多量 cap 到实际持仓, 不自砍
+--   (残仓致钱包 sweep 永不触发、保证金滞留停摆)。
+--   爆仓监控: 每决策 bar 读 pos_liq, 距现价 < liq_warn_ratio 打 WARN(只告警不动作); cross 下单侧
+--   爆仓价无定义(pos_liq 返回 nil → 策略侧告警自动静默, 引擎按组合权益实际清算)。运行期记录
+--   距爆仓最近时刻(stat_liq_dist_*); 引擎强平 fill(LIQ- 前缀)触发即停机不再交易, 损失单列 stat_liq_pnl。
+--   虚拟买单量超真实可用保证金时 WARN + 计数, 照常挂出(引擎侧保持 pending 不阻塞)。
+--   CLOSE- 期末强平 fill 按普通卖出推进账本, 盈亏单列 stat_close_pnl; 不计 flag。
+--   ⚠ 再平衡固有语义: 下跌后反弹的首笔平多单相对高位开多是保本/微亏, 属恒定权重特性而非配对违约。
 --
--- ═══ 与现货 shannon_grid 的差异(仅 6 点合约化, 其余逐行一致) ═══
---   1) 杠杆: leverage 1~5(默认 2, 清单 default_leverage 为唯一权威); 总资金 v_total = 投入×杠杆,
---      激活用 v_total/2 名义开多。⚠ 手工改杠杆必须同步 [backtest].leverage, 否则 v_total 虚增被引擎拒单。
---   2) 虚拟账本: 引入 v_cash/v_pos —— v_pos 恒等于引擎实际多头仓位(逐 fill 推进); v_cash 隔离
---      "真实可用保证金随价格/浮盈亏频繁波动"的抖动, 让网格量公式稳定。建仓后 v_cash = v_total −
---      建仓名义 − 费; 之后按现货同款 1:1 恢复公式推进(fee 扣 v_cash)。挂单量以 v_cash/v_pos 计算。
---   3) 挂单带 position_side="long": 买=开多 / 卖=平多, **绝不反向开空**; 平多量 cap 到实际持仓
---      (paired cap_close 无折扣写法, **严禁** 1e-9 比例削裁 —— 残仓致逐仓钱包 sweep 永不触发,
---      保证金滞留停摆, 032 根因 A)。
---   4) 爆仓价监控(双通道): 策略侧每决策 bar 读 ctx:pos_liq(pair,"long"), 距现价 < liq_warn_ratio
---      打 WARN(只告警不动作, 去重防刷屏); 实盘通道 = 引擎 LiqWarn 事件。爆仓价为开仓口径估算,
---      费率/资金费侵蚀后实际更近(backtest.rs 口径)。040-L: 运行期记录"距爆仓最近"时刻
---      (stat_liq_dist_min/ts/price); 引擎强平 fill(LIQ- 前缀)触发即停机(halted 持久化, 重启不复活),
---      爆仓损失单列 stat_liq_pnl(均值成本口径)。
---   5) 虚拟资金不足可观测: 买单量**不砍**; 估算占用保证金 > 真实可用现金时 WARN +
---      stat_underfunded_buys/stat_underfunded_notional 计数(引擎侧限价单保持 pending, 不阻塞)。
---   6) on_stop 对账为**合约口径**: v_pos vs 引擎持仓差 < 0.01 WARN; v_cash 与引擎现金**本就合法
---      分叉**(卖平多真实回笼 = 释放保证金 q·p/L + 已实现盈亏, 虚拟记 +q·p; 资金费引擎 8h 计收、
---      虚拟账本不计), 只留档不告警。--close-at-end 的 CLOSE- 强平 fill 按普通卖出推进虚拟账本,
---      盈亏单列 stat_close_pnl(均值成本口径)。
---   7) 卖出侧不做常规降杠杆(041 已删的"每次卖都削 v_cash"副作用会杀死下跌低吸能力): 卖量默认纯 1:1
---      公式; 只有 auto_delev=1 时才按第 8 点锚定建仓价值超额卖出 + 收口。
---   8) 自动降杠杆(auto_delev, 047, 2026-10-01 用户口径, = 历史 041 v3 锚定建仓价值的 mult=1 特例):
---      auto_delev=1 且 leverage≥2 才真正生效(杠杆 <2 时完全按纯 1:1 处理)。建仓成交时按建仓价定格
---      **建仓价值 V0 = entry_size × entry_price**(只缩不增, 不 ratchet 上抬)。价格上涨(现价 ≥ 建仓价)
---      使卖单价下仓位名义 Q·sell_px 超过 V0 时, 把超额随卖单一并卖掉(卖量 = max(正常 1:1 量, 降杠杆量
---      q_delev=(Q·sell_px−V0)/(sell_px·(1−f)))), 成交后由 model_apply 收口把 v_cash 削到 v_pos×成交价
---      (强制精确 1:1): 削掉的现金退出虚拟网格(真实权益里仍在) → 虚拟总资金缩小 = 有效杠杆棘轮下行。
---      价格下跌(现价 < 建仓价)或仓位名义本就 ≤ V0 时完全不消减(不提前锁亏), 保持原 1:1 处理。买侧公式
---      与 046 漂移纠偏一律不动。⚠ 收口排除 LIQ- 强平(爆仓损失属 stat_liq_pnl 口径)。
---   ⚠ 再平衡固有语义(同现货): 下跌后反弹的首笔平多单相对高位历史开多是保本/微亏 —— 恒定权重
---   再平衡特性, 非配对违约; 不引入 min_pair_profit/栈顶锚定(那是 paired 系语义, 香农无栈)。
---
--- ═══ 参数(全部可配, 默认值可直接回测; 清单 [[params]] 同步声明 default 注入生效配置) ═══
+-- ═══ 参数(清单 [[params]] 同步声明 default) ═══
 --   pair              必填, 合约对(如 SOLUSDT)
 --   start_price       必填, 开始价格(低于它才激活); 缺失/≤0 启动停机
---   invest_cash       投入资金(保证金), 默认 0(= 激活时 quote 余额全额); 总资金 = 投入×杠杆,
---                     激活用总资金一半市价开多
---   interval          主时钟, 默认 1h(回测建议 1m 数据提升重挂/撮合粒度)
+--   invest_cash       投入资金(保证金), 默认 0(= 激活时 quote 余额全额)
+--   interval          主时钟, 默认 1h(回测建议 1m 提升撮合粒度)
 --   atr_interval      算 ATR 的 K 线周期, 默认 1h
 --   atr_period        ATR 周期, 默认 14
---   atr_mult          间距 = atr_mult × ATR, 默认 1.5
---   min_spacing_pct   最小间距(占价格比例), 默认 0.002(= 0.2% = 4×合约费率 0.05%); 负数禁用下限
---   min_notional      单笔最小名义, 默认 5(合约 SOLUSDT fapi 最小名义)
---   fee_side          单边费率, 默认 0.0005(合约 taker 5bps)
+--   atr_mult          基础间距 = atr_mult × ATR, 默认 1.5
+--   min_spacing_pct   最小间距(占价格比例), 默认 0.002; 负数禁用下限
+--   min_notional      单笔最小名义, 默认 5
+--   fee_side          单边费率, 默认 0.0005
 --   liq_warn_ratio    距爆仓价告警阈值, 默认 0.1
---   auto_delev        自动降杠杆开关, 默认 0(关闭); 1 = 开启(仅杠杆≥2 生效), 见差异 #8
---   (leverage 不进 [[params]]: 引擎保留键, 走清单 default_leverage=2 回填 [backtest].leverage;
---    Lua 仅防御性读取做 1~5 校验, 越界 FATAL 停机)
+--   flag_spacing_mult 间距放大系数, 默认 1.2; 1.0 = 禁用放大(<1 按 1 处理)
+--   (leverage 为引擎保留键, 走清单 default_leverage 回填, Lua 仅防御性校验 1~5)
 --
--- ═══ 守卫与可观测性(承袭现货) ═══
---   ATR 未就绪 → 不挂单(计数); 成本门槛: 生效间距/价格 < 4×fee_side → [FATAL] 停机
---   (0.2% 默认下限恰 = 4×0.05% 费率门槛, 往返毛利 0.1% > 0, 放行); 连续 1 天无任何挂单 → WARN。
---   期末: 虚拟权益自洽(v_cash + v_pos×末价 vs v_total − Σfee − Σdelev_trimmed) + v_pos vs 引擎持仓
---   对账 + stat_* 导出。
+-- ═══ 守卫 ═══
+--   ATR 未就绪 → 不挂单(计数); 生效间距 < 4×fee_side×价格 → [FATAL] 停机(启动校验一次);
+--   连续 1 天无任何挂单 → WARN。
 --
 -- ═══ 用法 ═══
 --   ricow backtest --strategy shannon_grid_futures --pair SOLUSDT --interval 1m --days 180 \
---     --cash 10000 --param start_price=<窗口起点价> --param invest_cash=10000 \
---     [--param auto_delev=1] --close-at-end
---   ricow run shannon_grid_futures --demo   (直跑: market/position_mode/杠杆由清单回填)
+--     --cash 10000 --param start_price=<窗口起点价> --param invest_cash=10000 --close-at-end
+--   ricow run shannon_grid_futures --demo
 --
 quote_asset = ""  -- 计价资产, on_init 里 detect_quote(pair) 动态检测
--- 状态
 built = false
 balance_price = nil       -- 平衡价格(建仓成交价 / 最近一次网格成交价)
 pending_entry = false     -- 建仓市价单在途
 need_rehang = false       -- 成交/续接后置 true: 下一 tick 撤旧单 + 重挂两侧
-halted = false            -- 成本门槛/参数校验不满足 → 停机
+halted = false            -- 停机标记(成本门槛/参数/爆仓)
 fatal = 0                 -- 数值化停机标记(单测经 global_f64 读取)
 cost_checked = false      -- 成本门槛只做一次启动校验
 last_bar_ts = nil
 invested0 = 0             -- 投入资金(激活时刻定格; 收益分解基准)
-entry_price = 0           -- 初始建仓成交价(持仓损益基准 / 降杠杆建仓价值锚)
-entry_size = 0            -- 初始建仓数量(降杠杆建仓价值锚)
--- 虚拟账本(合约差异 #2): v_pos = 引擎实际多头仓位; v_cash 隔离保证金波动
+entry_price = 0           -- 初始建仓成交价(持仓损益基准)
+entry_size = 0            -- 初始建仓数量
+-- 虚拟账本: v_pos = 引擎实际多头仓位; v_cash 隔离保证金波动
 v_cash = nil
 v_pos = nil
 v_total = 0               -- 总资金 = 投入 × 杠杆(激活时刻定格)
@@ -96,15 +71,14 @@ avg_entry = 0             -- 均值开仓成本(CLOSE- 强平盈亏口径)
 -- 爆仓价监控
 liq_warned = false
 liq_price_final = 0       -- 期末最后一次读到的爆仓价
--- 最近爆仓距离(040-L): 运行期"距爆仓最近"时刻快照, 只收紧不回退
-liq_dist_min = nil        -- 最小距离 (price−liq)/price, 小数; nil = 尚无有效爆仓价
+liq_dist_min = nil        -- 运行期距爆仓最小距离 (price−liq)/price; nil = 尚无有效爆仓价
 liq_dist_min_ts = nil     -- 上述最小距离发生的 bar 时间戳 ms
 liq_dist_min_price = 0    -- 上述最小距离发生时的现价
 liq_count = 0             -- 引擎爆仓(LIQ- fill)次数
-liq_pnl = 0               -- 爆仓成交额(负值, 平多卖出名义)
+liq_pnl = 0               -- 爆仓损益(均值成本口径)
 -- 停摆可观测性
 stall_bars = 0            -- 处于"无任何挂单"状态的主时钟 bar 数(累计, 每 bar 去重 +1)
-stall_bar_ts = nil        -- 上次 stall_bars +1 的 bar 时间戳 ms(去重: 同 bar 多次路径只计一次)
+stall_bar_ts = nil        -- 上次 stall_bars +1 的 bar 时间戳 ms(同 bar 去重)
 stall_since = nil         -- 进入停摆的 bar 时间戳 ms(按自然日 WARN)
 stall_warned_at = nil     -- 上次 WARN 的时间戳 ms
 -- 计数
@@ -115,17 +89,17 @@ skip_no_atr = 0
 skip_notional = 0
 skip_zero_buy_px = 0
 rehang_count = 0
-underfunded_buys = 0      -- 虚拟买单量超真实可用保证金的次数(合约差异 #5)
+underfunded_buys = 0      -- 虚拟买单量超真实可用保证金的次数
 underfunded_notional = 0  -- 上述买单的累计名义
 close_pnl = 0             -- CLOSE- 强平锁定损益(均值成本口径)
 m_fee = 0                 -- 虚拟账本累计手续费(Σ fill.fee)
 buy_notional = 0          -- 虚拟账本累计买入名义(账本重建核对用)
 sell_notional = 0         -- 虚拟账本累计卖出名义
 last_price = 0
--- 自动降杠杆(差异 #8): 卖出侧锚定建仓价值 + 削减虚拟现金
-delev_count = 0           -- 降杠杆卖单次数(含并入正常卖单的降杠杆量)
-delev_extra_notional = 0  -- 降杠杆超额卖出的累计名义(相对正常 1:1 卖量的增量部分)
-delev_trimmed = 0         -- 消减卖后从 v_cash 削掉的现金累计(账本强制回 1:1, 退出虚拟网格)
+-- 方向 flag: 卖笔数 − 买笔数(建仓与强平不计), 驱动趋势侧间距指数放大
+flag = 0
+flag_max = 0              -- flag 历史最大值(最多卖出几个网格)
+flag_min = 0              -- flag 历史最小值(负数, 最多买入几个网格)
 
 local function num(ctx, key, dflt)
     local v = ctx:config_f64(key)
@@ -135,7 +109,7 @@ local function num(ctx, key, dflt)
     return v
 end
 
--- 停摆 bar 计数(去重): 同一主时钟 bar 内多条路径(on_fill 链内 do_rehang / on_tick)只计一次。
+-- 停摆 bar 计数(去重): 同一主时钟 bar 内多条路径只计一次。
 local function bump_stall(ts)
     if ts ~= nil and ts ~= stall_bar_ts then
         stall_bar_ts = ts
@@ -143,7 +117,7 @@ local function bump_stall(ts)
     end
 end
 
--- 开多量保证金兜底(合约差异 #3, 同 paired cap_open): 名义/杠杆 ≤ 可用余额(预扣费+滑点余量)。
+-- 开多量保证金兜底: 名义/杠杆 ≤ 可用余额(预扣费+滑点余量)。
 local function cap_open(ctx, size, p, leverage, fee_bps)
     local cash = ctx:balance(quote_asset) or 0
     local max_sz = cash * leverage / (p * (1 + (fee_bps + 20) / 10000))
@@ -153,8 +127,7 @@ local function cap_open(ctx, size, p, leverage, fee_bps)
     return size
 end
 
--- 平多量持仓兜底: cap 到引擎实际多头持仓即可。**不自砍**(无 1e-9 折扣) ——
--- 残仓致逐仓钱包 sweep 永不触发 → 保证金滞留停摆(032 根因 A, 严禁恢复)。
+-- 平多量持仓兜底: cap 到引擎实际多头持仓即可, 不自砍(残仓致钱包 sweep 永不触发、保证金滞留停摆)。
 local function cap_close(ctx, pair, size)
     local pos = ctx:pos_size(pair, "long") or 0
     if size > pos then
@@ -163,21 +136,29 @@ local function cap_close(ctx, pair, size)
     return size
 end
 
--- 自动降杠杆生效判定(差异 #8): auto_delev=1 且杠杆≥2 且已建仓 且现价≥建仓价(非浮亏/回撤)。
--- 下跌/回撤中完全不消减(不提前锁亏, 用户口径)。锚定 V0 = entry_size×entry_price(建仓时定格,
--- 只缩不增, 不 ratchet)。
-local function delev_on(ctx, price)
-    return num(ctx, "auto_delev", 0) > 0
-        and num(ctx, "leverage", 2) >= 2
-        and entry_size > 0 and entry_price > 0
-        and price >= entry_price
+-- 方向 flag 间距指数放大: 返回 (buy_spacing, sell_spacing)。
+--   指数 e = max(|flag|−1, 0): |flag|≤1 两侧均不放大; flag<0(净买) → 买间距 × mult^e;
+--   flag>0(净卖) → 卖间距 × mult^e。mult < 1 钳到 1(= 禁用放大)。
+local function side_spacings(base_spacing, flag_, mult)
+    if mult < 1 then
+        mult = 1
+    end
+    local e = math.abs(flag_) - 1
+    if e < 0 then
+        e = 0
+    end
+    if flag_ < 0 then
+        return base_spacing * mult^e, base_spacing
+    elseif flag_ > 0 then
+        return base_spacing, base_spacing * mult^e
+    end
+    return base_spacing, base_spacing
 end
 
--- 虚拟账本按真实成交推进(合约差异 #2): 与现货 model_apply 同构, 只是账本是"虚拟"的 ——
--- v_pos 与引擎逐分同步, v_cash 的引擎对应物(可用保证金)随浮盈亏波动, 故对账口径见 on_stop。
+-- 虚拟账本按真实成交推进: v_pos 与引擎逐分同步, v_cash 随每笔成交同步变化。
 local function model_apply(ctx, fill, px, size)
     if v_cash == nil then
-        return -- 首笔(建仓)成交在 on_fill 里同步初始值, 不会走到这里
+        return -- 建仓成交在 on_fill 里初始化账本, 不会走到这里
     end
     if fill.side == "buy" then
         avg_entry = (avg_entry * v_pos + size * px) / math.max(v_pos + size, 1e-12)
@@ -188,24 +169,6 @@ local function model_apply(ctx, fill, px, size)
         v_cash = v_cash + size * px - (fill.fee or 0)
         v_pos = v_pos - size
         sell_notional = sell_notional + size * px
-        -- 降杠杆收口(差异 #8): 卖出后若 v_cash > v_pos×成交价(现金偏重, 只可能由消减卖造成),
-        -- 削掉超出部分强制回 1:1 —— 削掉的现金退出虚拟网格, 虚拟总资金缩小 = 降杠杆生效。
-        -- 正常 1:1 卖恰好 C=Q·px, 富余仅来自引擎 maker 实收(2bps) < fee_side 假设(5bps)的
-        -- 合法漂移: 每笔成交漂移 ≤ 3bps×名义, 卖前累计(买+卖各一笔)≈ 6bps×格量名义 <
-        -- 20bps×卖名义 = 4×fee_side×名义, 故阈值取 4×fee_side×名义, 正常卖单永不触发。
-        -- ⚠ 排除 LIQ- 真爆仓(爆仓损失属 stat_liq_pnl 口径)。
-        if delev_on(ctx, px) and (fill.client_order_id or ""):sub(1, 4) ~= "LIQ-" then
-            local fee_side = num(ctx, "fee_side", 0.0005)
-            local surplus = v_cash - v_pos * px
-            if surplus > 4 * fee_side * size * px then
-                v_cash = v_pos * px
-                delev_trimmed = delev_trimmed + surplus
-                ctx:log(string.format(
-                    "[shannon_grid_futures] 降杠杆消减收口: 卖后现金偏重 %.2f -> 削减虚拟现金 %.2f, " ..
-                    "账本回 1:1 (现金 %.2f = 仓位 %.6f×%.4f), 累计已削减 %.2f",
-                    surplus, surplus, v_cash, v_pos, px, delev_trimmed))
-            end
-        end
     end
     m_fee = m_fee + (fill.fee or 0)
 end
@@ -223,22 +186,19 @@ function save_state(ctx)
     end
     ctx:state_set("avg_entry", string.format("%.10f", avg_entry))
     -- 虚拟账本重建核对恒等式的累计项(续接后 on_stop 核对仍成立):
-    --   v_cash = v_total − m_fee − buy_notional + sell_notional − delev_trimmed
+    --   v_cash = v_total − m_fee − buy_notional + sell_notional
     ctx:state_set("m_fee", string.format("%.10f", m_fee))
     ctx:state_set("buy_notional", string.format("%.10f", buy_notional))
     ctx:state_set("sell_notional", string.format("%.10f", sell_notional))
-    -- 降杠杆(差异 #8): 削减现金累计持久化(续接后重建核对恒等式仍成立)
-    ctx:state_set("delev_trimmed", string.format("%.10f", delev_trimmed))
-    -- 终态持久化(防重启复活, 同 shannon 审计教训)
+    ctx:state_set("flag", string.format("%d", flag))
     ctx:state_set("halted", halted and "1" or "0")
-    -- 建仓单在途标记(防重启重复建仓)
     ctx:state_set("pending_entry", pending_entry and "1" or "0")
 end
 
 function on_init(ctx)
     local pair = ctx:config_str("pair")
     quote_asset = exec.detect_quote(pair)
-    -- 数据需求声明(策略 → 引擎): 主时钟 + ATR 序列(周期与根数由策略显式给出)。
+    -- 数据需求声明: 主时钟 + ATR 序列(周期与根数由策略显式给出)。
     ctx:need_klines("primary", ctx:config_str("interval") ~= nil
         and ctx:config_str("interval") ~= "" and ctx:config_str("interval") or "1h", 1000)
     local atr_need = math.floor(num(ctx, "atr_period", 14)) + 1
@@ -269,12 +229,12 @@ function on_init(ctx)
     liq_dist_min_price = 0
     liq_count = 0
     liq_pnl = 0
-    delev_count = 0
-    delev_extra_notional = 0
-    delev_trimmed = 0
+    flag = 0
+    flag_max = 0
+    flag_min = 0
 
-    -- 杠杆校验(合约差异 #1): 1~5 倍, 越界 FATAL 停机。杠杆唯一权威 = 清单 default_leverage
-    -- (回填 [backtest].leverage), 此处防御性读取; num() 将 0 折为默认, 下界用 <1 捕获。
+    -- 杠杆校验: 1~5 倍, 越界 FATAL 停机。杠杆唯一权威 = 清单 default_leverage;
+    -- num() 将 0 折为默认, 下界用 <1 捕获。
     local leverage = num(ctx, "leverage", 2)
     if leverage < 1 or leverage > 5 then
         halted = true
@@ -300,9 +260,9 @@ function on_init(ctx)
         m_fee = tonumber(ctx:state_get("m_fee")) or 0
         buy_notional = tonumber(ctx:state_get("buy_notional")) or 0
         sell_notional = tonumber(ctx:state_get("sell_notional")) or 0
-        delev_trimmed = tonumber(ctx:state_get("delev_trimmed")) or 0
+        flag = tonumber(ctx:state_get("flag")) or 0
         v_pos = ctx:pos_size(pair, "long") or 0
-        -- 账本完整性防御: 已建仓但虚拟现金缺失(状态损坏/旧版本状态) → 记账链断裂,
+        -- 账本完整性防御: 已建仓但虚拟现金缺失(状态损坏) → 记账链断裂,
         -- do_rehang 卖量公式会以 C=0 退化出 ≈Q/2 的半仓平多单 → 必须 FATAL 停机。
         if v_cash == nil or v_cash <= 0 then
             halted = true
@@ -320,14 +280,14 @@ function on_init(ctx)
             ctx:log("[shannon_grid_futures] 续接: 上次已停机(halted=true) -> 本次不再交易")
         end
         ctx:log(string.format(
-            "[shannon_grid_futures] 续接上次状态: 平衡价 %.4f, 投入 %.2f×%.1f, 建仓 %.6f@%.4f, v_cash %.2f, 已削减现金 %.2f",
-            balance_price, invested0, leverage, entry_size, entry_price, v_cash or 0, delev_trimmed))
+            "[shannon_grid_futures] 续接上次状态: 平衡价 %.4f, 投入 %.2f×%.1f, 建仓 %.6f@%.4f, v_cash %.2f, flag=%d",
+            balance_price, invested0, leverage, entry_size, entry_price, v_cash or 0, flag))
     end
 
     ctx:log(string.format(
         "[shannon_grid_futures] init pair=%s quote=%s 投入=%s 杠杆=%.1f(总资金=投入×杠杆) 建仓=总资金一半 " ..
         "主时钟=%s ATR=%s×%d mult=%.2f min_notional=%.2f fee_side=%.4f liq_warn=%.2f " ..
-        "自动降杠杆=%s(杠杆≥2 才生效) 保证金模式=%s",
+        "间距放大系数=%.2f(flag 驱动, 1.0=禁用) 保证金模式=%s",
         pair, quote_asset,
         (ctx:config_f64("invest_cash") or 0) > 0 and string.format("%.2f", ctx:config_f64("invest_cash"))
             or "激活时余额全额",
@@ -337,7 +297,7 @@ function on_init(ctx)
         atr_intv, num(ctx, "atr_period", 14), num(ctx, "atr_mult", 1.5),
         num(ctx, "min_notional", 5), num(ctx, "fee_side", 0.0005),
         num(ctx, "liq_warn_ratio", 0.1),
-        num(ctx, "auto_delev", 0) > 0 and "启用" or "关闭",
+        num(ctx, "flag_spacing_mult", 1.2),
         ctx:config_str("margin_mode") or "isolated"))
     ctx:log(string.format(
         "[shannon_grid_futures] 激活: 价格低于 start_price=%.4f 才激活, 用总资金一半市价开多, " ..
@@ -346,10 +306,9 @@ function on_init(ctx)
         num(ctx, "start_price", 0)))
 end
 
--- 全撤重挂(共享决策出口, 038 事件模型): on_fill 成交后与 on_tick 重挂共用。
--- 逐行承袭现货 do_rehang; 差异: C/Q = 虚拟账本 v_cash/v_pos; 挂单带 position_side="long";
--- 买量不砍但做真实可用保证金预估(underfunded 可观测); 卖量 cap_close 不自砍;
--- auto_delev=1 且杠杆≥2 且现价≥建仓价时, 卖量按锚定建仓价值超额(见差异 #8)。
+-- 全撤重挂(共享决策出口): on_fill 成交后与 on_tick 重挂共用。
+-- C/Q = 虚拟账本 v_cash/v_pos; 挂单带 position_side="long"; 买量不砍但做真实可用保证金预估
+-- (underfunded 可观测); 卖量 cap_close 不自砍; 两侧间距按方向 flag 指数放大。
 -- 返回订单表(含 cancel_pending)或 {}(无单可挂)。
 function do_rehang(ctx)
     local pair = ctx:config_str("pair")
@@ -381,7 +340,7 @@ function do_rehang(ctx)
         end
         return {}
     end
-    -- 生效间距 = max(atr_mult×ATR, 最小间距下限×价格)(同现货口径)
+    -- 生效间距 = max(atr_mult×ATR, 最小间距下限×价格)
     local spacing = atr_mult * atr
     local min_spacing = num(ctx, "min_spacing_pct", 0.002) * price
     if min_spacing < 0 then
@@ -390,31 +349,33 @@ function do_rehang(ctx)
     if spacing < min_spacing then
         spacing = min_spacing
     end
+    -- 方向 flag 间距放大: 生效间距之上按 mult^(|flag|−1) 放大趋势侧
+    local mult = num(ctx, "flag_spacing_mult", 1.2)
+    local buy_spacing, sell_spacing = side_spacings(spacing, flag, mult)
 
-    -- C/Q = 虚拟账本(合约差异 #2)
+    -- C/Q = 虚拟账本
     local C = v_cash or 0
     local Q = v_pos or 0
-    local buy_px = balance_price - spacing
-    local sell_px = balance_price + spacing
-    -- 漂移纠偏(046 死锁修复): 1:1 恒等式的定义价是 C/Q(该价处现金与仓位价值相等)。引擎对跳空 bar
-    -- 按开盘价成交(卖单挂 131.89 实成 133.76)使账本逐次漂移; 买侧漂移过度时 C ≤ Q×买价 → 买量出负
-    -- → 不挂买单 → 仅剩上方卖单, 行情持续下跌则卖单永不成交 → 平衡价冻结 → 死锁(实测 SOL 一年
-    -- 2026-01-19 后 8 个月零成交: C(8090) < Q×买价(8168) 买单挂不出, 价格一路跌到 60 无人接)。
-    -- 触发即把平衡价重锚到 C/Q(≤ 买价), 两侧恢复对称挂单(重锚后买量 = Q×间距/(…) > 0 恒成立)。
-    -- ⚠ 仅纠偏买侧: 卖侧 C ≥ Q×卖价(卖量出负)是合约差异 #5 的**合法** underfunded 观测场景
-    -- (虚拟账本故意记大), 且上涨时下方买单必成交解冻, 不会死锁 —— 不得纠偏(否则破坏该语义)。
-    -- 无漂移时 C > Q×买价 不触发, "成交后平衡价 := 成交价"的既有语义逐分不变。
+    local buy_px = balance_price - buy_spacing
+    local sell_px = balance_price + sell_spacing
+    -- 漂移纠偏: 引擎对跳空 bar 按开盘价成交使账本逐次漂移; 买侧漂移过度时 C ≤ Q×买价 → 买量出负
+    -- → 不挂买单 → 仅剩上方卖单, 下跌行情卖单永不成交 → 平衡价冻结 → 死锁。
+    -- 触发即把平衡价重锚到 C/Q(1:1 恒等式定义价), 两侧恢复挂单。无漂移时不触发,
+    -- "成交后平衡价 := 成交价"语义不变。
+    -- ⚠ 仅纠偏买侧: 卖侧 C ≥ Q×卖价(卖量出负)是合法的 underfunded 观测场景, 且上涨时下方
+    -- 买单必成交解冻, 不得纠偏。
+    -- ⚠ 重锚后重算挂单价必须用放大后的买/卖间距, 与实际挂单一致。
     if Q > 0 and C > 0 and C <= Q * buy_px then
         balance_price = C / Q
-        buy_px = balance_price - spacing
-        sell_px = balance_price + spacing
+        buy_px = balance_price - buy_spacing
+        sell_px = balance_price + sell_spacing
     end
     local orders = { { pair = pair, action = "cancel_pending" } }
 
     if buy_px > 0 then
         local q = (C - Q * buy_px) / (buy_px * (2 + f))
         if q > 0 then
-            -- 合约差异 #5: 买单量**不砍**; 估算占用保证金超真实可用 → 记录可观测
+            -- 买单量不砍: 估算占用保证金超真实可用 → 记录可观测, 照常挂出
             -- (引擎侧资金不足限价单保持 pending, 不阻塞)。
             local avail = ctx:balance(quote_asset) or 0
             local need_cash = q * buy_px * (1 + (fee_bps + 20) / 10000) / leverage
@@ -439,26 +400,6 @@ function do_rehang(ctx)
 
     if Q > 0 then
         local q = (Q * sell_px - C) / (sell_px * (2 - f))
-        -- 自动降杠杆(差异 #8): 仅 auto_delev=1 且杠杆≥2 且现价≥建仓价(非浮亏/回撤)时启用 ——
-        -- 下跌/回撤中完全不消减(不提前锁亏); 启用时若卖单价下可实现仓位名义 Q·sell_px 超过
-        -- 建仓价值 V0=entry_size×entry_price, 把超额随卖单一并卖掉, 最终卖量 = max(1:1 量, 降杠杆量);
-        -- 买侧不动。成交后由 model_apply 收口把账本强制回 1:1(超额现金削出虚拟网格), 见头注释差异 #8。
-        if delev_on(ctx, price) then
-            local cap = entry_size * entry_price
-            local pos_notional = Q * sell_px
-            if pos_notional > cap then
-                local q_delev = (pos_notional - cap) / (sell_px * (1 - f))
-                if q_delev > q then
-                    delev_extra_notional = delev_extra_notional + (q_delev - q) * sell_px
-                    delev_count = delev_count + 1
-                    ctx:log(string.format(
-                        "[shannon_grid_futures] 降杠杆卖出: 仓位名义 %.2f > 建仓价值上限 %.2f -> " ..
-                        "卖量 %.6f -> %.6f (超额名义 %.2f, 仓位名义压回建仓价值)",
-                        pos_notional, cap, q, q_delev, (q_delev - q) * sell_px))
-                    q = q_delev
-                end
-            end
-        end
         if q > 0 then
             q = cap_close(ctx, pair, q)
             if q > 0 and q * sell_px >= min_notional then
@@ -493,9 +434,9 @@ function do_rehang(ctx)
     rehang_count = rehang_count + 1
     save_state(ctx)
     ctx:log(string.format(
-        "[shannon_grid_futures] 网格重挂 #%d: 平衡价 %.4f 间距 %.4f (ATR %.4f×%.2f) -> 买 %s / 卖 %s | " ..
-        "虚拟现金 %.2f 虚拟持仓 %.6f",
-        rehang_count, balance_price, spacing, atr, atr_mult,
+        "[shannon_grid_futures] 网格重挂 #%d: 平衡价 %.4f 基础间距 %.4f (ATR %.4f×%.2f) flag=%d " ..
+        "买间距 %.4f / 卖间距 %.4f -> 买 %s / 卖 %s | 虚拟现金 %.2f 虚拟持仓 %.6f",
+        rehang_count, balance_price, spacing, atr, atr_mult, flag, buy_spacing, sell_spacing,
         buy_px > 0 and string.format("%.4f", buy_px) or "跳过(买价≤0)",
         Q > 0 and string.format("%.4f", sell_px) or "无(无持仓)",
         C, Q))
@@ -531,14 +472,14 @@ function on_tick(ctx)
     local f = fee_side
     local leverage = num(ctx, "leverage", 2)
 
-    -- 爆仓价监控(合约差异 #4, 每决策 bar 更新): 多头距爆仓价 < liq_warn_ratio 打 WARN,
+    -- 爆仓价监控(每决策 bar 更新): 多头距爆仓价 < liq_warn_ratio 打 WARN,
     -- 只告警不动作(去重防刷屏); 距离回升 1.5× 重置。
     local pos_now = ctx:pos_size(pair, "long") or 0
     if pos_now > 0 then
         local liq = ctx:pos_liq(pair, "long")
         if liq and liq > 0 then
             liq_price_final = liq
-            -- 最近爆仓距离追踪(040-L): 只收紧不回退
+            -- 最近爆仓距离追踪: 只收紧不回退
             local dist_all = (price - liq) / price
             if liq_dist_min == nil or dist_all < liq_dist_min then
                 liq_dist_min = dist_all
@@ -596,9 +537,10 @@ function on_tick(ctx)
     if spacing < min_spacing then
         spacing = min_spacing
     end
+    -- 死锁检测须用与实际挂单一致的放大后买间距
+    local buy_spacing = side_spacings(spacing, flag, num(ctx, "flag_spacing_mult", 1.2))
 
-    -- 成本门槛(启动硬校验一次, 同现货 4×fee 口径): 生效间距必须 ≥ 4×单边费率(严格小于才停机;
-    -- 默认 0.2% 下限恰等门槛, 往返毛利 0.1% > 0, 放行)
+    -- 成本门槛(启动硬校验一次): 生效间距必须 ≥ 4×单边费率(严格小于才停机)
     if not cost_checked then
         cost_checked = true
         local need = 4 * fee_side * price
@@ -677,11 +619,12 @@ function on_tick(ctx)
         stall_warned_at = nil
     end
 
-    -- 死锁检测(046): 买侧漂移死锁时 C ≤ Q×买价 → 买单挂不出, 仅剩上方卖单, 下跌行情永不成交
-    -- → need_rehang 永假 → do_rehang 的纠偏分支永远执行不到(SOL 实测 8 个月零成交)。
-    -- 按与 do_rehang 相同的触发条件强制置 need_rehang, 使纠偏生效解冻网格。
+    -- 死锁检测: 买侧漂移死锁时 C ≤ Q×买价 → 买单挂不出, 仅剩上方卖单, 下跌行情永不成交
+    -- → need_rehang 永假 → do_rehang 的纠偏分支永远执行不到。
+    -- 按与 do_rehang 相同的触发条件强制置 need_rehang, 使纠偏生效解冻网格
+    -- (买价用放大后的买间距, 与 do_rehang 实际挂单价一致)。
     if not need_rehang and balance_price ~= nil and (v_pos or 0) > 0 and (v_cash or 0) > 0
-        and (v_cash or 0) <= (v_pos or 0) * (balance_price - spacing) then
+        and (v_cash or 0) <= (v_pos or 0) * (balance_price - buy_spacing) then
         need_rehang = true
     end
 
@@ -689,7 +632,6 @@ function on_tick(ctx)
         return {} -- 两侧单未成交 → 平衡价不变, 不重挂
     end
 
-    -- 重挂出口(共享决策出口, 038 事件模型): 全撤重挂逻辑已抽至 do_rehang, 语义不变
     return do_rehang(ctx)
 end
 
@@ -702,9 +644,9 @@ function on_fill(ctx, fill)
     local size = fill.fill_size or 0
     local pair = ctx:config_str("pair")
 
-    -- 爆仓判定(040-L): 引擎强平 fill 的 client_order_id 以 "LIQ-" 开头
-    -- (hedge: LIQ-{pair}-long; one-way: LIQ-{pair})。⚠ 注意引擎强平 fill 的 side 语义是
-    -- "追加该方向"口径(平多报 buy), 不能按 side 走 model_apply —— 直接以引擎仓位为真值同步。
+    -- 爆仓判定: 引擎强平 fill 的 client_order_id 以 "LIQ-" 开头(hedge: LIQ-{pair}-long)。
+    -- ⚠ 引擎强平 fill 的 side 语义是"追加该方向"口径(平多报 buy), 不能按 side 走 model_apply
+    -- —— 直接以引擎仓位为真值同步。
     if (fill.client_order_id or ""):sub(1, 4) == "LIQ-" then
         liq_count = liq_count + 1
         liq_pnl = liq_pnl + size * (px - avg_entry)  -- 均值成本口径的爆仓损失(负值)
@@ -731,7 +673,7 @@ function on_fill(ctx, fill)
     end
 
     if pending_entry then
-        -- 建仓成交: 该笔成交价 = 第一平衡价格; 虚拟账本在此初始化:
+        -- 建仓成交: 成交价 = 第一平衡价格; 虚拟账本在此初始化:
         -- v_pos = 实际开仓量; v_cash = v_total − 建仓名义 − 费(总资金另一半留在虚拟现金侧)。
         pending_entry = false
         built = true
@@ -743,7 +685,7 @@ function on_fill(ctx, fill)
         v_cash = v_total - size * px - (fill.fee or 0)
         buy_notional = size * px
         m_fee = fill.fee or 0
-        -- 建仓也是真实成交: 计入成交统计(规范 §B)
+        -- 建仓也是真实成交: 计入成交统计(不计 flag)
         if fill.side == "buy" then
             buy_count = buy_count + 1
         else
@@ -754,11 +696,10 @@ function on_fill(ctx, fill)
         save_state(ctx)
         ctx:log(string.format(
             "[shannon_grid_futures] 建仓成交 %.6f @ %.4f (费 %.4f) -> 平衡价 := %.4f | " ..
-            "虚拟现金 %.2f 虚拟持仓 %.6f 仓位市值 %.2f (总资金 %.2f = 投入 %.2f × 杠杆) | 建仓价值锚 V0=%.2f",
+            "虚拟现金 %.2f 虚拟持仓 %.6f 仓位市值 %.2f (总资金 %.2f = 投入 %.2f × 杠杆)",
             size, px, fill.fee or 0, balance_price, v_cash or 0, v_pos or 0, (v_pos or 0) * px,
-            v_total, invested0, entry_size * entry_price))
-        -- 038 事件模型: 建仓成交立即全撤重挂(do_rehang)。链内限价单由引擎 038 R1 次 bar 生效,
-        -- 无同 bar 乒乓链; 撤单指令即时生效。
+            v_total, invested0))
+        -- 建仓成交立即全撤重挂
         if halted then
             return {}
         end
@@ -766,7 +707,8 @@ function on_fill(ctx, fill)
     end
 
     -- 网格成交: 平衡价 := 成交价; 虚拟账本按真实成交推进; CLOSE- 强平单盈亏单列(均值成本口径)
-    if fill.side == "sell" and (fill.client_order_id or ""):sub(1, 6) == "CLOSE-" then
+    local is_close = (fill.client_order_id or ""):sub(1, 6) == "CLOSE-"
+    if fill.side == "sell" and is_close then
         close_pnl = close_pnl + size * (px - avg_entry)
     end
     balance_price = px
@@ -776,26 +718,39 @@ function on_fill(ctx, fill)
     else
         sell_count = sell_count + 1
     end
+    -- 方向 flag 计数: 买 −1 / 卖 +1; CLOSE- 期末强平不计(非网格主动成交)。
+    -- 建仓/LIQ- 分支在上方各自独立处理, 均不计数。
+    if not is_close then
+        if fill.side == "buy" then
+            flag = flag - 1
+        else
+            flag = flag + 1
+        end
+        if flag > flag_max then
+            flag_max = flag
+        end
+        if flag < flag_min then
+            flag_min = flag
+        end
+    end
     fill_count = fill_count + 1
     need_rehang = true
     save_state(ctx)
     ctx:log(string.format(
-        "[FILL] #%d %s size=%.6f px=%.4f notional=%.2f 费=%.4f | 虚拟现金 %.2f 虚拟持仓 %.6f " ..
+        "[FILL] #%d %s size=%.6f px=%.4f notional=%.2f 费=%.4f | flag=%d 虚拟现金 %.2f 虚拟持仓 %.6f " ..
         "平衡价(新)=%.4f 1:1 检查: 虚拟现金/仓位市值 = %.4f",
-        fill_count, fill.side, size, px, size * px, fill.fee or 0,
+        fill_count, fill.side, size, px, size * px, fill.fee or 0, flag,
         v_cash or 0, v_pos or 0, balance_price,
         (v_pos and v_pos > 0 and v_pos * px > 0) and (v_cash or 0) / (v_pos * px) or 0))
-    -- 038 事件模型: 网格成交立即全撤重挂(平衡价 := 本笔成交价)。链内限价单由引擎 038 R1
-    -- 次 bar 生效, 无同 bar 乒乓链; 撤单指令即时生效。
-    -- 停机防御(038 + 040-L): halted 后**仍记账**(保持 v_pos 与引擎逐分同步)但不再产出订单。
+    -- 网格成交立即全撤重挂(平衡价 := 本笔成交价)。
+    -- halted 后仍记账(保持 v_pos 与引擎同步)但不再产出订单。
     if halted then
         return {}
     end
     return do_rehang(ctx)
 end
 
--- 拒单回传: 重挂防停摆。
--- 只处理 rejected; cancelled 是策略主动撤单(cancel_pending)的正常回传, 重挂已在 on_tick 里处理。
+-- 拒单回传: rejected → 重挂防停摆(cancelled 是策略主动撤单的正常回传, 不处理)。
 function on_order_update(ctx, upd)
     local status = upd and upd.status
     if status == "rejected" then
@@ -814,10 +769,9 @@ function on_stop(ctx)
     local pos = ctx:pos_size(pair, "long") or 0
     local eq = ctx:equity() or 0
 
-    -- 对账(合约差异 #6, 合约口径):
-    --   v_pos vs 引擎持仓: 应逐分一致, 差 > 0.01 → WARN;
-    --   v_cash vs 引擎现金: **本就合法分叉**(卖平多真实回笼 = 释放保证金 q·p/L + 已实现盈亏,
-    --   虚拟记 +q·p; 资金费引擎 8h 计收、虚拟账本不计), 只留档不告警。
+    -- 对账: v_pos vs 引擎持仓应逐分一致(差 > 0.01 → WARN);
+    -- v_cash 与引擎现金本就合法分叉(卖平多真实回笼 = 释放保证金 + 已实现盈亏, 虚拟记 +q·p;
+    -- 资金费引擎计收、虚拟账本不计), 只留档不告警。
     local d_pos = (v_pos or pos) - pos
     if math.abs(d_pos) > 0.01 then
         ctx:log(string.format(
@@ -825,10 +779,9 @@ function on_stop(ctx)
             v_pos or 0, pos, d_pos))
     end
 
-    -- 虚拟账本重建核对: v_cash 应恒等于 总资金 − Σ费 − Σ买名义 + Σ卖名义 − Σ降杠杆削减
-    -- (逐 fill 递推的封闭恒等式; Shannon 再平衡浮盈合法进入 v_cash, 降杠杆削减现金退出网格,
-    --  故不能用"v_cash+v_pos×价 vs 总资金"这类不含盈亏/削减项的伪恒等式)。差 > 0.01 → WARN。
-    local v_recon = v_total - m_fee - buy_notional + sell_notional - delev_trimmed
+    -- 虚拟账本重建核对: v_cash 应恒等于 总资金 − Σ费 − Σ买名义 + Σ卖名义
+    -- (逐 fill 递推的封闭恒等式; 再平衡浮盈合法进入 v_cash)。差 > 0.01 → WARN。
+    local v_recon = v_total - m_fee - buy_notional + sell_notional
     local v_recon_diff = (v_cash or 0) - v_recon
     if v_total > 0 and math.abs(v_recon_diff) > 0.01 then
         ctx:log(string.format(
@@ -839,12 +792,12 @@ function on_stop(ctx)
     -- 收益分解: 合计 = 期末权益 − 投入 = 持仓收益(期末持仓×(末价−建仓价)) + 交易收益(再平衡净贡献)
     local out = string.format(
         "[shannon_grid_futures] 停机(**不清仓**): 成交 %d(买 %d 卖 %d) / 跳过(ATR未就绪 %d, 小名义 %d, 买价≤0 %d) / " ..
-        "重挂 %d / 资金不足买 %d 次(累计名义 %.2f) / 降杠杆卖 %d 次(超额名义 %.2f, 削减现金 %.2f) / %s / 平衡价 %s / " ..
+        "重挂 %d / 资金不足买 %d 次(累计名义 %.2f) / flag=%d(峰值 +%d/%d) / %s / 平衡价 %s / " ..
         "期末虚拟现金 %.2f 持仓 %.6f(市值 %.2f) " ..
         "权益 %.2f / 虚拟费 %.4f / 强平锁定 %.2f / 爆仓 %d 次(损失 %.2f, 最近距离 %s) / 持仓差 %.8f",
         fill_count, buy_count, sell_count, skip_no_atr, skip_notional, skip_zero_buy_px,
         rehang_count, underfunded_buys, underfunded_notional,
-        delev_count, delev_extra_notional, delev_trimmed,
+        flag, flag_max, flag_min,
         halted and "已停机(成本门槛/参数/爆仓)" or "正常运行",
         balance_price and string.format("%.4f", balance_price) or "nil",
         v_cash or 0, pos, pos * (last_price or 0), eq, m_fee, close_pnl,
@@ -862,7 +815,7 @@ function on_stop(ctx)
     end
     ctx:log(out)
 
-    -- 规范 §C.1: stat_* 导出(报告"策略统计"区块)
+    -- stat_* 导出(报告"策略统计"区块)
     ctx:state_set("stat_eff_leverage", string.format("%.1f", num(ctx, "leverage", 2)))
     ctx:state_set("stat_eff_atr_interval", ctx:config_str("atr_interval") or "1h")
     ctx:state_set("stat_eff_atr_period",
@@ -897,7 +850,7 @@ function on_stop(ctx)
     ctx:state_set("stat_v_equity_final", string.format("%.2f", (v_cash or 0) + (v_pos or 0) * (last_price or 0)))
     ctx:state_set("stat_v_recon_diff", string.format("%.6f", v_recon_diff))
     ctx:state_set("stat_liq_price_final", string.format("%.6f", liq_price_final))
-    -- 040-L 爆仓风险可观测: 运行期最近爆仓距离 + 爆仓事件
+    -- 爆仓风险可观测: 运行期最近爆仓距离 + 爆仓事件
     ctx:state_set("stat_liq_dist_min",
         liq_dist_min and string.format("%.6f", liq_dist_min * 100) or "")
     ctx:state_set("stat_liq_dist_min_ts",
@@ -906,9 +859,10 @@ function on_stop(ctx)
     ctx:state_set("stat_liq_count", string.format("%d", liq_count))
     ctx:state_set("stat_liq_pnl", string.format("%.4f", liq_pnl))
     ctx:state_set("stat_halted", halted and "1" or "0")
-    -- 自动降杠杆可观测(差异 #8): 独立口径
-    ctx:state_set("stat_auto_delev", num(ctx, "auto_delev", 0) > 0 and "1" or "0")
-    ctx:state_set("stat_delev_count", string.format("%d", delev_count))
-    ctx:state_set("stat_delev_extra_notional", string.format("%.2f", delev_extra_notional))
-    ctx:state_set("stat_delev_cash_trimmed", string.format("%.4f", delev_trimmed))
+    -- 方向 flag 可观测
+    ctx:state_set("stat_eff_flag_spacing_mult",
+        string.format("%.4f", num(ctx, "flag_spacing_mult", 1.2)))
+    ctx:state_set("stat_flag", string.format("%d", flag))
+    ctx:state_set("stat_flag_max", string.format("%d", flag_max))
+    ctx:state_set("stat_flag_min", string.format("%d", flag_min))
 end

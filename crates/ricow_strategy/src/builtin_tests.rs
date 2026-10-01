@@ -1529,7 +1529,8 @@ fn test_shannon_hedge_grid_futures_hedge_short_liq_warns_without_halt() {
 }
 
 // ============================================================================
-// 047 合约香农网格 (shannon_grid_futures) 集成测试 —— 去对冲 + 自动降杠杆(auto_delev)
+// 048 合约香农网格 (shannon_grid_futures) 集成测试 —— 去对冲 + 去降杠杆 + 方向 flag 间距放大
+// (flag = 卖笔数 − 买笔数, 建仓与强平不计, 符号口径同 paired_grid; |flag|≥2 趋势侧间距 × mult^(|flag|−1))。
 // 母本 = shannon_hedge_grid_futures(复用 univ2_main/with_bar/tf_bars/run_univ2 时序)。
 // ============================================================================
 
@@ -1553,17 +1554,6 @@ fn shannon_grid_fut_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
     cfg
 }
 
-/// 杠杆覆盖(同时改 param 与 [backtest], 母本 lev5 辅助同款口径)。
-fn shannon_grid_fut_cfg_lev(lev: f64, extra: &[(&str, ConfigValue)]) -> StrategyConfig {
-    let mut params = vec![("leverage", ConfigValue::Float(lev))];
-    params.extend_from_slice(extra);
-    let mut cfg = shannon_grid_fut_cfg(&params);
-    if let Some(b) = cfg.backtest.as_mut() {
-        b.leverage = Some(lev);
-    }
-    cfg
-}
-
 #[test]
 fn test_shannon_grid_futures_no_short_orders() {
     // 对冲已移除: 默认跑激活序列, 全程不得出现任何 position_side=short 订单。
@@ -1574,12 +1564,13 @@ fn test_shannon_grid_futures_no_short_orders() {
         "无对冲腿策略 -> 不得有任何空头订单"
     );
     assert_eq!(st.global_f64("fill_count").unwrap_or(0.0), 1.0, "应恰有建仓 1 笔成交");
+    assert_eq!(st.global_f64("flag"), Some(0.0), "建仓成交不计 flag");
 }
 
 #[test]
-fn test_shannon_grid_futures_delev_off_matches_hedge_grid() {
-    // auto_delev 缺失(默认关闭): 建仓/首挂与母本对冲网格(hedge 关闭态)逐值一致 ——
-    // 买 97 @1.5202 / 卖 103 @1.4809(纯 1:1 公式), delev_count=0。
+fn test_shannon_grid_futures_default_symmetric_spacing() {
+    // flag=0(建仓不计)且默认 mult=1.2: |flag|≤1 不放大 —— 建仓/首挂与母本对冲网格(纯 1:1)逐值一致:
+    // 买 97 @1.5202 / 卖 103 @1.4809。
     let cfg = shannon_grid_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
     let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
     assert_eq!(st.global_f64("balance_price"), Some(100.0));
@@ -1596,143 +1587,140 @@ fn test_shannon_grid_futures_delev_off_matches_hedge_grid() {
     let q_sell_exp = (100.0 * 103.0 - 9995.0) / (103.0 * (2.0 - 0.0005));
     assert!(
         (buy.size.to_f64().unwrap() - q_buy_exp).abs() < 1e-6,
-        "关闭态买量应=1:1 恢复量 {q_buy_exp}: {}",
+        "flag=0 买量应=1:1 恢复量 {q_buy_exp}: {}",
         buy.size
     );
     assert!(
         (sell.size.to_f64().unwrap() - q_sell_exp).abs() < 1e-6,
-        "关闭态卖量应=1:1 恢复量 {q_sell_exp}: {}",
+        "flag=0 卖量应=1:1 恢复量 {q_sell_exp}: {}",
         sell.size
     );
-    assert_eq!(st.global_f64("delev_count"), Some(0.0), "关闭态不得有降杠杆卖单");
-    assert_eq!(st.global_f64("delev_trimmed"), Some(0.0), "关闭态不得削减虚拟现金");
+    assert_eq!(st.global_f64("flag"), Some(0.0), "仅建仓 -> flag=0(建仓不计)");
+}
+
+/// 扫描全部下单批次, 返回**最后一个同时含买/卖限价单**批次的 (买价, 卖价)。
+fn last_two_sided(orders: &[Vec<Vec<OrderRequest>>]) -> (f64, f64) {
+    let mut res = None;
+    for batches in orders {
+        for b in batches {
+            let buy = b
+                .iter()
+                .find(|o| o.order_type == OrderType::Limit && o.side == OrderSide::Buy && o.price.is_some());
+            let sell = b
+                .iter()
+                .find(|o| o.order_type == OrderType::Limit && o.side == OrderSide::Sell && o.price.is_some());
+            if let (Some(bu), Some(se)) = (buy, sell) {
+                res = Some((
+                    bu.price.unwrap().to_f64().unwrap(),
+                    se.price.unwrap().to_f64().unwrap(),
+                ));
+            }
+        }
+    }
+    res.expect("应存在同时含买卖限价单的重挂批次")
+}
+
+/// 两笔网格买入成交的序列: 建仓(bar15)@100 → 重挂买97/卖103; bar16 穿买97(flag−1)→买94/卖100;
+/// bar17 穿买94(flag−2)→重挂; bar18 守卫(不穿越)。返回该 bars 与 (orders, ctx, st)。
+fn shannon_two_buys(extra: &[(&str, ConfigValue)]) -> (Vec<Vec<Vec<OrderRequest>>>, BacktestContext, LuaStrategy) {
+    let mut params = vec![("start_price", ConfigValue::Float(150.0))];
+    params.extend_from_slice(extra);
+    let cfg = shannon_grid_fut_cfg(&params);
+    let bars = with_bar(
+        with_bar(
+            with_bar(univ2_main(19, 200, 100, 10), 16, 98, 99, 96, 97),
+            17,
+            95,
+            96,
+            93,
+            94,
+        ),
+        18,
+        95,
+        96,
+        94,
+        95,
+    );
+    run_univ2(cfg, &bars, Some(tf_bars(60)))
 }
 
 #[test]
-fn test_shannon_grid_futures_delev_on_caps_sell_to_entry_value() {
-    // 2x + auto_delev=1: 建仓 100@100 → V0=10000; 首挂卖 103 时仓位名义 10300 > V0 →
-    // 卖量 = 降杠杆量 (10300−10000)/(103×0.9995)=2.91408 > 1:1 量 1.48095。
-    let cfg = shannon_grid_fut_cfg(&[
-        ("start_price", ConfigValue::Float(150.0)),
-        ("auto_delev", ConfigValue::Float(1.0)),
-    ]);
-    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
-    let limits: Vec<_> = orders[15]
-        .iter()
-        .flatten()
-        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
-        .collect();
-    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
-    let q_delev_exp = (10300.0 - 10000.0) / (103.0 * (1.0 - 0.0005));
-    assert!(
-        (sell.size.to_f64().unwrap() - q_delev_exp).abs() < 1e-6,
-        "卖量应=降杠杆量 {q_delev_exp}: {}",
-        sell.size
-    );
-    assert_eq!(st.global_f64("delev_count"), Some(1.0), "首挂卖单应为降杠杆卖单");
-    assert!(st.global_f64("delev_extra_notional").unwrap_or(0.0) > 0.0, "超额名义应被记录");
+fn test_shannon_grid_futures_flag_counts_fills() {
+    // 建仓(买)不计 flag; 两笔网格买入成交 → flag=−2(若建仓也计则会是 −3)。买 −1 口径。
+    let (_orders, _ctx, st) = shannon_two_buys(&[]);
+    assert_eq!(st.global_f64("fill_count"), Some(3.0), "建仓 + 两笔网格买");
+    assert_eq!(st.global_f64("flag"), Some(-2.0), "建仓不计, 每笔买 −1 -> flag=−2");
+    assert_eq!(st.global_f64("flag_min"), Some(-2.0), "flag 历史最小值=−2");
+    assert_eq!(st.global_f64("flag_max"), Some(0.0), "全程无卖 -> flag_max=0");
 }
 
 #[test]
-fn test_shannon_grid_futures_delev_fill_trims_to_one_to_one() {
-    // 降杠杆卖 103 成交后: 收口把 v_cash 削到 v_pos×103(精确 1:1), 且仓位名义 ≈ V0=10000
-    // (利润沉淀为现金退出网格), delev_trimmed > 0。bar18=[101,103] 只触发卖侧。
-    let cfg = shannon_grid_fut_cfg(&[
-        ("start_price", ConfigValue::Float(150.0)),
-        ("auto_delev", ConfigValue::Float(1.0)),
-    ]);
-    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 102, 103, 101, 102);
-    let (_orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
-    assert_eq!(st.global_f64("fill_count"), Some(2.0), "建仓 + 卖 103 各成交一次");
-    let v_pos = st.global_f64("v_pos").expect("v_pos");
-    let v_cash = st.global_f64("v_cash").expect("v_cash");
-    assert!(
-        (v_cash - v_pos * 103.0).abs() < 1e-9,
-        "收口后应精确 1:1: v_cash={v_cash} v_pos×103={}",
-        v_pos * 103.0
-    );
-    assert!(
-        (v_pos * 103.0 - 10000.0).abs() < 0.5,
-        "降杠杆卖成交后仓位名义应被压回建仓价值 V0=10000: {}",
-        v_pos * 103.0
-    );
-    let trimmed = st.global_f64("delev_trimmed").expect("delev_trimmed");
-    assert!(trimmed > 200.0, "削减现金应≈超额部分(>200): {trimmed}");
+fn test_shannon_grid_futures_flag_buy_spacing_amplified() {
+    // flag=−2(两笔买)→ 买间距 ×1.2^(2−1)=×1.2, 卖间距不变。末次重挂(平衡 94):
+    // 买 94−3.6=90.4 / 卖 94+3=97。量随放大后买价自动跟随(1:1 由重建恒等式保证)。
+    let (orders, _ctx, st) = shannon_two_buys(&[]);
+    assert_eq!(st.global_f64("flag"), Some(-2.0));
+    let (buy_px, sell_px) = last_two_sided(&orders);
+    assert!((buy_px - 90.4).abs() < 0.01, "买间距应放大到 3.6 -> 买价 90.4: {buy_px}");
+    assert!((sell_px - 97.0).abs() < 0.01, "卖间距不变 -> 卖价 97: {sell_px}");
 }
 
 #[test]
-fn test_shannon_grid_futures_delev_inactive_below_2x() {
-    // 杠杆 1 + auto_delev=1: 选项不真正生效 —— 卖量回到纯 1:1 值, delev_count=0、无削减。
-    let cfg = shannon_grid_fut_cfg_lev(
-        1.0,
-        &[("start_price", ConfigValue::Float(150.0)), ("auto_delev", ConfigValue::Float(1.0))],
+fn test_shannon_grid_futures_flag_sell_spacing_amplified() {
+    // flag=+2(两笔卖)→ 卖间距 ×1.2, 买间距不变。建仓@100→卖103(fill,+1)→卖106(fill,+2)
+    // → 末次重挂(平衡 106): 买 106−3=103 / 卖 106+3.6=109.6。
+    let cfg = shannon_grid_fut_cfg(&[("start_price", ConfigValue::Float(150.0))]);
+    let bars = with_bar(
+        with_bar(
+            with_bar(univ2_main(19, 200, 100, 10), 16, 102, 104, 101, 103),
+            17,
+            105,
+            107,
+            104,
+            106,
+        ),
+        18,
+        105,
+        106,
+        104,
+        105,
     );
-    let (orders, _ctx, st) = run_univ2(cfg, &univ2_main(60, 200, 100, 10), Some(tf_bars(60)));
-    let limits: Vec<_> = orders[15]
-        .iter()
-        .flatten()
-        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
-        .collect();
-    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
-    // 1x: v_total=10000, 建仓 5000@100(50 币), v_cash=4997.5 → 卖量=(50×103−4997.5)/(103×1.9995)
-    let q_sell_exp = (50.0 * 103.0 - 4997.5) / (103.0 * (2.0 - 0.0005));
-    assert!(
-        (sell.size.to_f64().unwrap() - q_sell_exp).abs() < 1e-6,
-        "杠杆<2 卖量应=1:1 恢复量 {q_sell_exp}: {}",
-        sell.size
-    );
-    assert_eq!(st.global_f64("delev_count"), Some(0.0), "杠杆<2 不得有降杠杆卖单");
-    assert_eq!(st.global_f64("delev_trimmed"), Some(0.0), "杠杆<2 不得削减现金");
+    let (orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+    assert_eq!(st.global_f64("flag"), Some(2.0), "每笔卖 +1 -> flag=+2");
+    let (buy_px, sell_px) = last_two_sided(&orders);
+    assert!((buy_px - 103.0).abs() < 0.01, "买间距不变 -> 买价 103: {buy_px}");
+    assert!((sell_px - 109.6).abs() < 0.01, "卖间距应放大到 3.6 -> 卖价 109.6: {sell_px}");
 }
 
 #[test]
-fn test_shannon_grid_futures_delev_drawdown_no_trim() {
-    // 下跌保持原处理: 建仓后价格跌穿买 97 成交(现价 < 建仓价) → 全程零削减(delev_trimmed=0),
-    // 卖单照常按 1:1 公式挂出。
-    let cfg = shannon_grid_fut_cfg(&[
-        ("start_price", ConfigValue::Float(150.0)),
-        ("auto_delev", ConfigValue::Float(1.0)),
-    ]);
-    let mut bars = univ2_main(60, 200, 100, 10);
-    bars[30] = bar_at_hour(30, 97, 98, 96, 97); // 穿越买 97
-    let (_orders, _ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
-    assert!(st.global_f64("fill_count").unwrap_or(0.0) >= 2.0, "网格买 97 应成交");
-    assert_eq!(
-        st.global_f64("delev_trimmed"),
-        Some(0.0),
-        "现价低于建仓价的回撤中不得削减虚拟现金"
-    );
+fn test_shannon_grid_futures_flag_mult_one_disables() {
+    // flag_spacing_mult=1.0: 即使 flag=−2 也不放大 —— 末次重挂买 94−3=91 / 卖 94+3=97(对称)。
+    let (orders, _ctx, st) = shannon_two_buys(&[("flag_spacing_mult", ConfigValue::Float(1.0))]);
+    assert_eq!(st.global_f64("flag"), Some(-2.0));
+    let (buy_px, sell_px) = last_two_sided(&orders);
+    assert!((buy_px - 91.0).abs() < 0.01, "禁用放大 -> 买价 91: {buy_px}");
+    assert!((sell_px - 97.0).abs() < 0.01, "禁用放大 -> 卖价 97: {sell_px}");
 }
 
 #[test]
-fn test_shannon_grid_futures_delev_state_snapshot_and_recon() {
-    // 续接/核对: delev_trimmed 持久化; on_stop 重建恒等式
-    // v_cash = v_total − m_fee − buy + sell − delev_trimmed 差 < 0.01; stat_delev_* 导出。
-    let cfg = shannon_grid_fut_cfg(&[
-        ("start_price", ConfigValue::Float(150.0)),
-        ("auto_delev", ConfigValue::Float(1.0)),
-    ]);
-    let bars = with_bar(univ2_main(19, 200, 100, 10), 18, 102, 103, 101, 102);
-    let (_orders, mut ctx, st) = run_univ2(cfg, &bars, Some(tf_bars(60)));
+fn test_shannon_grid_futures_flag_state_persist_and_recon() {
+    // flag 持久化 + stat_flag_* 导出 + 重建恒等式(去 delev 项后)逐分闭合。
+    let (_orders, mut ctx, st) = shannon_two_buys(&[]);
     let mut st = st;
     st.on_stop(&mut ctx);
     let snap: HashMap<String, String> = st.state_snapshot().into_iter().collect();
-    let trimmed: f64 = snap
-        .get("delev_trimmed")
-        .expect("delev_trimmed 应持久化")
-        .parse()
-        .expect("数值");
-    assert!(trimmed > 200.0, "削减现金应持久化: {trimmed}");
+    assert_eq!(snap.get("flag").map(|s| s.as_str()), Some("-2"), "flag 应持久化");
+    assert_eq!(snap.get("stat_flag").map(|s| s.as_str()), Some("-2"));
+    assert_eq!(snap.get("stat_flag_min").map(|s| s.as_str()), Some("-2"));
+    assert_eq!(snap.get("stat_flag_max").map(|s| s.as_str()), Some("0"));
+    assert!(snap.contains_key("stat_eff_flag_spacing_mult"), "stat_eff_flag_spacing_mult 应导出");
     let diff: f64 = snap
         .get("stat_v_recon_diff")
         .expect("stat_v_recon_diff")
         .parse()
         .expect("数值");
-    assert!(diff.abs() < 0.01, "含 −delev_trimmed 的重建核对应通过: {diff}");
-    assert!(snap.contains_key("stat_delev_count"), "stat_delev_count 应导出");
-    assert!(snap.contains_key("stat_delev_extra_notional"), "stat_delev_extra_notional 应导出");
-    assert!(snap.contains_key("stat_delev_cash_trimmed"), "stat_delev_cash_trimmed 应导出");
-    assert_eq!(snap.get("stat_auto_delev").map(|s| s.as_str()), Some("1"));
+    assert!(diff.abs() < 0.01, "去 delev 项的重建核对应通过: {diff}");
+    assert!(!snap.contains_key("stat_delev_count"), "delev 统计应已移除");
 }
 
 #[test]

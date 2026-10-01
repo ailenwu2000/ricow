@@ -885,6 +885,25 @@ impl BacktestContext {
         }
     }
 
+    /// 强平即清市: 撤销该 pair 全部在途限价挂单 (pending_orders 按请求 pair 过滤,
+    /// 与 CancelPending 指令同一 resolve_key 口径; 市价单即时成交不入簿, 无需处理)。
+    fn cancel_pair_orders(&mut self, pair_key: &str) {
+        // 先收集订单号再 retain, 避免闭包内再借 self (同 CancelPending 指令写法)。
+        let ids: Vec<String> = self
+            .pending_orders
+            .iter()
+            .filter(|(_, o)| self.resolve_key(&o.pair) == pair_key)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let before = self.pending_orders.len();
+        self.pending_orders.retain(|(id, _)| !ids.contains(id));
+        let cancelled = before - self.pending_orders.len();
+        if cancelled > 0 {
+            tracing::info!(target: "strategy.backtest", pair = %pair_key, cancelled,
+                "强平清市: 撤销该对全部在途挂单");
+        }
+    }
+
     /// hedge 单侧强平判定 (013 FR-002, 依据 2026-09-05 真实清算实测 ①: 价格下行只清算 LONG 侧,
     /// SHORT 侧持仓与其强平价全程不变) ——
     /// E_side(p) = wallet_side + 未实现_side(p) ≤ MMR × 名义_side(p); f(p) = A + B·p 为线性:
@@ -943,6 +962,12 @@ impl BacktestContext {
         };
         self.pnl.record_fill(&fill);
         self.fill_queue.push(fill);
+        // 强平即清市: 该 pair 全部在途限价挂单立即失效 (市价单即时成交无残留)。
+        // 引擎强平发生在 bar 收尾结算 (settle_closed_bar), 策略 on_fill 链内返回的
+        // cancel_pending 要到下一 bar 才执行, 期间 038 R1 递延入簿的限价单会被
+        // match_pending 先撮合出残留仓位并可能触发二次强平 —— 真实交易所仓位被强平
+        // 时挂单同步撤销, 引擎必须同口径 (2026-10-01 SOL 5x cross 一年回测实证)。
+        self.cancel_pair_orders(pair_key);
         self.sweep_wallet_if_flat(pair_key);
     }
 
@@ -1078,6 +1103,9 @@ impl BacktestContext {
             };
             self.pnl.record_fill(&fill);
             self.fill_queue.push(fill);
+            // 强平即清市 (同 check_liquidation_side): 该 pair 在途限价挂单立即失效,
+            // 防策略 on_fill 链内递延单在下一 bar 撮合出残留仓位。
+            self.cancel_pair_orders(pair_key);
             // 该对全平 → 钱包余额转回现金。
             if self.side_size(pair_key, OrderSide::Buy) <= Decimal::ZERO
                 && self.side_size(pair_key, OrderSide::Sell) <= Decimal::ZERO
@@ -3452,6 +3480,37 @@ mod tests {
             report.fills.iter().any(|f| f.client_order_id.starts_with("LIQ")),
             "强平 fill 应带 LIQ 标识"
         );
+    }
+
+    #[test]
+    fn test_futures_liquidation_cancels_deferred_limit_no_residual() {
+        // 强平即清市回归锚 (2026-10-01 SOL 5x cross 一年回测实证): 引擎强平发生在 step_bar 的
+        // settle_closed_bar(prev), 而 on_fill 链内 (defer) 挂出的限价单此刻仍在 pending_orders,
+        // 随后同一次 step_bar 的 match_pending(current) 会把递延买单撮合成**残留仓位**并可能触发
+        // 二次强平 —— 策略 on_fill 返回的 cancel_pending 要到 step_bar 返回后才派发, 太晚。
+        // 修复: 两处强平落账时 cancel_pair_orders 立即清除该 pair 在途限价挂单。
+        let bt = BacktestToml { leverage: Some(2.0), mmr_pct: Some(2.5), ..Default::default() };
+        let mut ctx = test_ctx_bt("futures", "one-way", 100000, bt);
+        // bar A: 开仓价 100, low 40 (< 强平价 ≈51.3) —— A 收尾结算时触发强平。
+        ctx.step_bar(kline(dec!(100), dec!(101), dec!(40), dec!(100)));
+        ctx.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(200))).unwrap();
+        // 递延限价买单 (模拟 on_fill 链内挂单): defer 入簿, 不撮合当前 bar A。
+        ctx.set_defer_new_limits(true);
+        ctx.place_order(OrderRequest::new_limit("ETH", OrderSide::Buy, dec!(45), dec!(10))).unwrap();
+        ctx.set_defer_new_limits(false);
+        // bar B: low 44 ≤ 买限价 45 —— 若无修复, match_pending(B) 会成交递延买单出残留仓。
+        ctx.step_bar(kline(dec!(46), dec!(47), dec!(44), dec!(45)));
+        let report = ctx.report();
+        assert_eq!(report.liquidation_count, Some(1), "只应强平一次 (无残留仓二次强平)");
+        assert!(ctx.position("ETH").is_none(), "强平后不得有递延单成交出的残留仓位");
+        // 残留仓若存在, 必有一笔非 LIQ 的 buy fill 在强平之后 —— 断言强平后无普通成交。
+        let liq_idx = report.fills.iter().position(|f| f.client_order_id.starts_with("LIQ"));
+        if let Some(i) = liq_idx {
+            assert!(
+                report.fills[i..].iter().all(|f| f.client_order_id.starts_with("LIQ")),
+                "强平之后不得再有普通成交 (递延单应已被清市撤销)"
+            );
+        }
     }
 
     #[test]
