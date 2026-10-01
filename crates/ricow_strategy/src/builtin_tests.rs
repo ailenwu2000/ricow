@@ -1723,6 +1723,267 @@ fn test_shannon_grid_futures_flag_state_persist_and_recon() {
     assert!(!snap.contains_key("stat_delev_count"), "delev 统计应已移除");
 }
 
+// ============================================================================
+// 合约中性香农网格 (shannon_neutral_grid_futures) 集成测试 —— one-way 单向持仓、
+// 启动不建仓(虚拟账本自 start_price 起 1:1)、空仓卖单开空、双侧漂移纠偏、
+// 方向 flag 间距放大(同母本口径: 卖 +1 / 买 −1, 建仓/强平/期末清仓不计)。
+// (复用 univ2_main/with_bar/tf_bars/last_two_sided/run_univ2 时序; ATR 恒 2 → 间距 3)
+// ============================================================================
+
+const SHANNON_NEUTRAL_GRID_FUT: &str =
+    include_str!("../../../strategies/futures/shannon_neutral_grid_futures.lua");
+
+/// one-way 中性配置(invest_cash=10000, 杠杆 3 → 总资金 30000, Q0=150@100, v_cash=15000)。
+fn shannon_neutral_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![
+        ("pair", ConfigValue::String("ETHUSDT".into())),
+        ("start_price", ConfigValue::Float(100.0)),
+        ("atr_interval", ConfigValue::String("1h".into())),
+        ("atr_period", ConfigValue::Integer(14)),
+        ("min_notional", ConfigValue::Float(50.0)),
+        ("fee_side", ConfigValue::Float(0.0005)),
+        ("invest_cash", ConfigValue::Float(10000.0)),
+    ];
+    params.extend_from_slice(extra);
+    let mut cfg = config(SHANNON_NEUTRAL_GRID_FUT, &params);
+    cfg.market = "futures".into();
+    cfg.position_mode = "one-way".into();
+    cfg.backtest = Some(crate::config::BacktestToml {
+        leverage: Some(3.0),
+        margin_mode: Some("cross".into()),
+        ..Default::default()
+    });
+    cfg
+}
+
+/// 启动序列(bar15 ATR 就绪): 全程无市价单(不建仓), 首挂买 97 / 卖 103, 量按 1:1 恢复公式。
+#[test]
+fn test_shannon_neutral_startup_no_market_orders() {
+    let (orders, ctx, st) =
+        run_univ2(shannon_neutral_cfg(&[]), &univ2_main(20, 200, 100, 10), Some(tf_bars(60)));
+    assert_eq!(st.global_f64("fatal"), Some(0.0), "正常启动不得停机");
+    assert!(
+        orders.iter().flatten().flatten().all(|o| o.order_type != OrderType::Market),
+        "启动不建仓 -> 全程不得有市价单"
+    );
+    assert!(
+        orders.iter().flatten().flatten().all(|o| o.position_side.is_none() && !o.reduce_only),
+        "one-way 挂单不得带 position_side / reduce_only"
+    );
+    assert_eq!(st.global_f64("balance_price"), Some(100.0), "平衡价 := start_price");
+    assert_eq!(st.global_f64("q0"), Some(150.0), "Q0 = 30000/(2×100)");
+    assert_eq!(st.global_f64("v_cash"), Some(15000.0), "初始虚拟现金 = 总资金一半");
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "无成交(价 100 在带内)");
+    assert!(ctx.position_directional("ETHUSDT", OrderSide::Buy).is_none(), "真实仓位应为 0");
+    assert!(ctx.position_directional("ETHUSDT", OrderSide::Sell).is_none(), "真实仓位应为 0");
+    let limits: Vec<_> = orders[15]
+        .iter()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Limit && o.price.is_some())
+        .collect();
+    let buy = limits.iter().find(|o| o.side == OrderSide::Buy).expect("应有买单");
+    let sell = limits.iter().find(|o| o.side == OrderSide::Sell).expect("应有卖单");
+    assert_eq!(buy.price, Some(dec!(97)));
+    assert_eq!(sell.price, Some(dec!(103)));
+    let q_buy_exp = (15000.0 - 150.0 * 97.0) / (97.0 * (2.0 + 0.0005));
+    let q_sell_exp = (150.0 * 103.0 - 15000.0) / (103.0 * (2.0 - 0.0005));
+    assert!(
+        (buy.size.to_f64().unwrap() - q_buy_exp).abs() < 1e-6,
+        "买量应=1:1 恢复量 {q_buy_exp}: {}",
+        buy.size
+    );
+    assert!(
+        (sell.size.to_f64().unwrap() - q_sell_exp).abs() < 1e-6,
+        "卖量应=1:1 恢复量 {q_sell_exp}: {}",
+        sell.size
+    );
+}
+
+#[test]
+fn test_shannon_neutral_requires_start_price() {
+    let (orders, _ctx, st) = run_univ2(
+        shannon_neutral_cfg(&[("start_price", ConfigValue::Float(0.0))]),
+        &univ2_main(60, 200, 100, 10),
+        Some(tf_bars(60)),
+    );
+    assert!(orders.iter().all(|o| o.is_empty()), "缺必填 start_price 时不得下任何单");
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "缺参数应 FATAL 停机");
+}
+
+/// 两笔网格卖成交序列(bar16 穿卖 103, bar17 穿卖 106, bar18/19 守卫): flag=+2, 卖间距放大。
+fn neutral_two_sells() -> (Vec<Vec<Vec<OrderRequest>>>, BacktestContext, LuaStrategy) {
+    let bars = with_bar(
+        with_bar(
+            with_bar(univ2_main(20, 200, 100, 10), 16, 103, 104, 102, 103),
+            17,
+            106,
+            107,
+            105,
+            106,
+        ),
+        18,
+        106,
+        107,
+        105,
+        106,
+    );
+    // bar19 守卫(不穿越): 防末根 univ2_main 的 101 穿越放大后买 103 污染末次重挂断言。
+    let bars = with_bar(bars, 19, 106, 107, 105, 106);
+    run_univ2(shannon_neutral_cfg(&[]), &bars, Some(tf_bars(60)))
+}
+
+#[test]
+fn test_shannon_neutral_empty_sell_opens_short() {
+    // 中性核心: 空仓卖单成交开空(one-way 先平后开), 真实净仓 = v_pos − Q0 < 0。
+    let (_orders, ctx, st) = neutral_two_sells();
+    let short = ctx.position_directional("ETHUSDT", OrderSide::Sell).expect("应持有空头仓");
+    assert!(ctx.position_directional("ETHUSDT", OrderSide::Buy).is_none(), "不得有多头仓");
+    assert!(short.size.to_f64().unwrap() > 4.0, "两笔卖成交后空头应有实质规模: {}", short.size);
+    assert_eq!(st.global_f64("flag"), Some(2.0), "每笔卖 +1 -> flag=+2");
+    let v_pos = st.global_f64("v_pos").expect("v_pos");
+    let net = st.global_f64("r_long").unwrap_or(0.0) - st.global_f64("r_short").unwrap_or(0.0);
+    assert!(net < 0.0, "净仓应为负(空头): {net}");
+    assert!(
+        (v_pos - (150.0 + net)).abs() < 1e-6,
+        "净仓恒等式 v_pos = Q0 + 真实净仓: {v_pos} vs {}",
+        150.0 + net
+    );
+    assert!(
+        (short.size.to_f64().unwrap() - (150.0 - v_pos)).abs() < 1e-6,
+        "引擎空头 = Q0 − v_pos: {} vs {}",
+        short.size,
+        150.0 - v_pos
+    );
+}
+
+#[test]
+fn test_shannon_neutral_flag_sell_spacing_amplified() {
+    // flag=+2(两笔卖)→ 卖间距 ×1.2^(2−1)=×1.2, 买间距不变。末次重挂(平衡 106):
+    // 买 103 / 卖 109.6。
+    let (orders, _ctx, st) = neutral_two_sells();
+    assert_eq!(st.global_f64("flag"), Some(2.0));
+    assert_eq!(st.global_f64("flag_max"), Some(2.0));
+    let (buy_px, sell_px) = last_two_sided(&orders);
+    assert!((buy_px - 103.0).abs() < 0.01, "买间距不变 -> 买价 103: {buy_px}");
+    assert!((sell_px - 109.6).abs() < 0.01, "卖间距应放大到 3.6 -> 卖价 109.6: {sell_px}");
+}
+
+/// 两笔网格买成交序列(bar16 穿买 97, bar17 穿买 94, bar18/19 守卫): flag=−2, 买间距放大。
+fn neutral_two_buys() -> (Vec<Vec<Vec<OrderRequest>>>, BacktestContext, LuaStrategy) {
+    // 末根守卫(不穿越): 防 univ2_main 的 101 穿越卖单污染末次重挂断言。
+    let bars = with_bar(univ2_main(20, 200, 100, 10), 19, 95, 96, 94, 95);
+    let bars = with_bar(bars, 18, 95, 96, 94, 95);
+    let bars = with_bar(bars, 17, 94, 95, 93, 94);
+    let bars = with_bar(bars, 16, 97, 98, 96, 97);
+    run_univ2(shannon_neutral_cfg(&[]), &bars, Some(tf_bars(60)))
+}
+
+#[test]
+fn test_shannon_neutral_flag_buy_spacing_amplified() {
+    // flag=−2(两笔买)→ 买间距 ×1.2, 卖间距不变。末次重挂(平衡 94):
+    // 买 94−3.6=90.4 / 卖 94+3=97。
+    let (orders, _ctx, st) = neutral_two_buys();
+    assert_eq!(st.global_f64("flag"), Some(-2.0));
+    assert_eq!(st.global_f64("flag_min"), Some(-2.0));
+    let (buy_px, sell_px) = last_two_sided(&orders);
+    assert!((buy_px - 90.4).abs() < 0.01, "买间距应放大到 3.6 -> 买价 90.4: {buy_px}");
+    assert!((sell_px - 97.0).abs() < 0.01, "卖间距不变 -> 卖价 97: {sell_px}");
+}
+
+#[test]
+fn test_shannon_neutral_gap_drift_reanchors_sell_side() {
+    // 双侧漂移纠偏(卖侧镜像): bar16 跳空低开, 买 97 按开盘价 90 成交(引擎贴齐开盘价) →
+    // v_cash 相对新平衡价 90 超配(C ≥ Q×卖价 93)→ 卖量出负 → 仅剩下方买单, 上涨行情
+    // 永不成交 → 死锁。触发即重锚平衡价到 C/Q ≈ 97.106, 两侧恢复挂单。
+    // 末根守卫(不穿越): 防 univ2_main 末根 101 穿越卖单污染末次重挂断言。
+    let bars = with_bar(univ2_main(20, 200, 100, 10), 19, 98, 99, 97, 98);
+    let bars = with_bar(bars, 16, 90, 91, 89, 90);
+    let bars = with_bar(bars, 17, 98, 99, 97, 98);
+    let bars = with_bar(bars, 18, 98, 99, 97, 98);
+    let (orders, _ctx, st) = run_univ2(shannon_neutral_cfg(&[]), &bars, Some(tf_bars(60)));
+    let balance = st.global_f64("balance_price").expect("balance_price");
+    assert!(
+        (balance - 97.106).abs() < 0.01,
+        "卖侧漂移应触发重锚 C/Q ≈ 97.106(而非停在成交价 90): {balance}"
+    );
+    let (buy_px, sell_px) = last_two_sided(&orders);
+    assert!((buy_px - (balance - 3.0)).abs() < 0.01, "重锚后买价 = 平衡价 − 3: {buy_px}");
+    assert!((sell_px - (balance + 3.0)).abs() < 0.01, "重锚后卖价 = 平衡价 + 3: {sell_px}");
+}
+
+#[test]
+fn test_shannon_neutral_liq_halts() {
+    // one-way 组合强平(LIQ-{pair}, position_side=None): 记损失(自维护多头均价口径) + 停机。
+    let (_orders, mut ctx, mut st) = neutral_two_buys();
+    let r_long = st.global_f64("r_long").expect("前提: 持有净多头");
+    assert!(r_long > 0.0);
+    let avg_l = st.global_f64("avg_l").expect("多头均价");
+    let liq_fill = OrderFill {
+        trade_id: Some("t1".into()),
+        exchange_order_id: "ex1".into(),
+        client_order_id: "LIQ-ETHUSDT".into(),
+        pair: "ETHUSDT".into(),
+        side: OrderSide::Buy, // 多头被平(引擎 side = 被平方向)
+        fill_price: dec!(50),
+        fill_size: Decimal::from_f64_retain(r_long).unwrap(),
+        fee: dec!(0.1),
+        timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(19 * 3_600_000).unwrap(),
+        position_side: None, // one-way 组合强平无侧标
+    };
+    let follow = st.on_fill(&mut ctx, liq_fill);
+    assert!(
+        follow.iter().any(|o| o.action == OrderAction::CancelPending),
+        "爆仓应回传全撤"
+    );
+    assert_eq!(st.global_f64("liq_count"), Some(1.0));
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "真爆仓应停机");
+    assert!(st.halted());
+    let liq_pnl = st.global_f64("liq_pnl").expect("liq_pnl");
+    let expect = r_long * (50.0 - avg_l);
+    assert!((liq_pnl - expect).abs() < 0.01, "爆仓损失按多头均价口径 {expect}: {liq_pnl}");
+    // 停机后不再产单
+    assert!(st.on_tick(&mut ctx).is_empty(), "停机后不得再产单");
+}
+
+#[test]
+fn test_shannon_neutral_close_fill_no_flag_and_recon() {
+    // CLOSE- 期末强平: 按普通成交推进账本, 盈亏按被平侧自维护均价单列, 不计 flag;
+    // 重建恒等式 v_cash = v_init − Σ费 − Σ买 + Σ卖 逐分闭合。
+    let (_orders, mut ctx, mut st) = neutral_two_buys();
+    let r_long = st.global_f64("r_long").expect("前提: 持有净多头");
+    let avg_l = st.global_f64("avg_l").unwrap();
+    let flag_before = st.global_f64("flag").unwrap();
+    let close_fill = OrderFill {
+        trade_id: Some("t2".into()),
+        exchange_order_id: "ex2".into(),
+        client_order_id: "CLOSE-123".into(),
+        pair: "ETHUSDT".into(),
+        side: OrderSide::Sell, // 平多
+        fill_price: dec!(95),
+        fill_size: Decimal::from_f64_retain(r_long).unwrap(),
+        fee: dec!(0.1),
+        timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(19 * 3_600_000).unwrap(),
+        position_side: Some("long".into()),
+    };
+    st.on_fill(&mut ctx, close_fill);
+    assert_eq!(st.global_f64("flag"), Some(flag_before), "CLOSE- 不计 flag");
+    let close_pnl = st.global_f64("close_pnl").expect("close_pnl");
+    let expect = r_long * (95.0 - avg_l);
+    assert!((close_pnl - expect).abs() < 0.01, "期末清仓盈亏按多头均价口径 {expect}: {close_pnl}");
+    st.on_stop(&mut ctx);
+    let snap: HashMap<String, String> = st.state_snapshot().into_iter().collect();
+    let diff: f64 = snap
+        .get("stat_v_recon_diff")
+        .expect("stat_v_recon_diff")
+        .parse()
+        .expect("数值");
+    assert!(diff.abs() < 0.01, "重建恒等式应逐分闭合: {diff}");
+    assert!(snap.contains_key("stat_net_pos_final"), "stat_net_pos_final 应导出");
+    assert!(snap.contains_key("stat_max_net_notional"), "stat_max_net_notional 应导出");
+    assert!(snap.contains_key("stat_q0"), "stat_q0 应导出");
+    assert_eq!(snap.get("stat_flag_min").map(|s| s.as_str()), Some("-2"));
+}
+
 #[test]
 fn test_notify_halt_and_stall_flags() {
     // 042: 引擎 halted/stall 通知的取值口径 —— Lua 全局 fatal 与 _RICOW_STATE 键

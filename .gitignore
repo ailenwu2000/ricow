@@ -28,6 +28,8 @@ strategies/futures/*
 !strategies/futures/shannon_hedge_grid_futures.toml
 !strategies/futures/shannon_grid_futures.lua
 !strategies/futures/shannon_grid_futures.toml
+!strategies/futures/shannon_neutral_grid_futures.lua
+!strategies/futures/shannon_neutral_grid_futures.toml
 ricow.db
 ricow.db-shm
 ricow.db-wal

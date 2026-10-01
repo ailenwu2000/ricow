@@ -159,6 +159,11 @@ const BUILTIN: &[(&str, &str, &str)] = &[
         include_str!("../../../../strategies/futures/shannon_grid_futures.toml"),
         include_str!("../../../../strategies/futures/shannon_grid_futures.lua"),
     ),
+    (
+        "shannon_neutral_grid_futures",
+        include_str!("../../../../strategies/futures/shannon_neutral_grid_futures.toml"),
+        include_str!("../../../../strategies/futures/shannon_neutral_grid_futures.lua"),
+    ),
 ];
 
 /// 内置策略 id 是否为保留名。

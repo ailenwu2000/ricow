@@ -1,0 +1,126 @@
+# 合约中性香农网格 策略清单
+#
+# 清单是表现层数据(参数键不进引擎代码); 引擎/CLI/绑定层零策略参数名 ——
+# 本文件 [[params]] 的 key 不得与引擎按名读取的参数同名(leverage/mmr_pct 等),
+# 杠杆走清单顶层 default_leverage 字段, 由 resolve_builtin_script 回填 [backtest].leverage。
+
+id = "shannon_neutral_grid_futures"
+name = "合约中性香农网格"
+market = "futures"
+position_mode = "one-way"
+default_leverage = 3
+summary = "USDT-M 合约单向持仓(可多可空)中性香农网格: 启动不建仓, 虚拟账本自 start_price 起 1:1 平衡(总资金=投入×杠杆, 虚拟仓位=总资金一半), 真实净仓围绕 0 双向摆动; 平衡价 − 买间距 / + 卖间距挂双向网格单(基础间距 = atr_mult×ATR 与下限取大); 方向 flag 驱动趋势侧间距指数放大(flag_spacing_mult, 默认 1.2), 回调间距不变; 全仓清算"
+description = """合约版中性香农网格(one-way 单向持仓, 可多可空): 杠杆 1~5 倍(默认 3),
+总资金 = 投入资金 × 杠杆。启动不建仓: 以 start_price 为初始平衡价, 虚拟账本(虚拟现金 = 总资金一半,
+虚拟仓位 Q0 = 总资金/(2×start_price))即 1:1 价值平衡, 真实仓位为 0; 真实净仓 = 虚拟持仓 − Q0,
+围绕 0 双向摆动 —— 策略目标是实际仓位尽量保持 0(或随网格收割缓慢增长), 双向收割波动。
+平衡价 − 买间距挂买单、平衡价 + 卖间距挂卖单(基础间距 = max(atr_mult×ATR, 最小间距下限×价格)),
+每笔挂单量按"成交后虚拟现金与虚拟仓位价值恰好恢复 1:1"(含手续费修正)计算; 任一成交后成交价成为
+新平衡价格并全撤重挂两侧。卖单为普通 one-way 限价单(不带 position_side/reduce_only)——
+空仓卖出即开空, 是设计意图。
+方向 flag 间距放大(flag_spacing_mult, 默认 1.2): flag = 网格卖笔数 − 买笔数(强平与期末清仓不计);
+|flag|≥2 时趋势侧间距 × 系数^(|flag|−1) —— flag<0(净买、价格下探)放大买单间距,
+flag>0(净卖、价格上冲)放大卖单间距, 另一侧(回调侧)不变; 1.0 = 禁用放大。语义: 单边趋势下趋势方向
+成交自动变稀, 回调方向收割间距不变、更容易回调, 回调成交即 flag 回退、放大自动收缩。
+漂移纠偏双侧对称: 跳空成交使账本漂移、任一侧挂单量出负时, 平衡价重锚到 虚拟现金/虚拟仓位
+(1:1 恒等式定义价), 防止单侧挂单消失导致死锁。
+爆仓价实时监控(任一方向仓距爆仓价 < 阈值告警, 只提示不动作), 运行期记录距爆仓最近的
+时刻(stat_liq_dist_min/ts/price); 真发生爆仓(引擎 LIQ- 强平成交)即停机不再交易, 损失单列 stat_liq_pnl。
+ATR 周期与 K 线周期可配(默认 1h K 线、14 周期、乘数 1.5), 间距随行情波动动态伸缩。无结束语义(公式自平衡)。
+统计导出 stat_flag/stat_flag_max/stat_flag_min/stat_eff_flag_spacing_mult/stat_net_pos_final/
+stat_max_net_notional。
+⚠ 合约有杠杆: 默认全仓(cross)清算 —— 净敞口远小于总名义, 多空方向盈亏互抵;
+逐仓(--param margin_mode=isolated)两腿独立清算。请关注 stat_liq_dist_min 与 stat_max_net_notional。
+注意: cross 下单侧爆仓价无定义(pos_liq 显示 "-", 策略侧告警通道自动静默), 引擎按组合权益判定强平。"""
+suitable = "震荡市双向收割、期望实际仓位保持中性(≈0)的合约网格交易者; 单边趋势中希望趋势成交自动变稀、回调收割不变者"
+unsuitable = "极低波动(间距低于成本门槛自动停机)、单边不回头的极端行情(净敞口持续累积)"
+
+[[params]]
+key = "pair"
+name = "合约对"
+type = "string"
+desc = "USDT-M 合约交易对(如 SOLUSDT)"
+required = true
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "初始平衡价与虚拟仓位基准(必填; 回测请设为窗口起点价, 勿前视)"
+required = true
+
+[[params]]
+key = "invest_cash"
+name = "投入资金"
+type = "f64"
+desc = "投入资金(保证金, USDT); 总资金 = 投入 × 杠杆, 虚拟仓位 = 总资金/(2×start_price)。0 = 启动时 quote 余额全额"
+default = 0
+
+[[params]]
+key = "interval"
+name = "主时钟"
+type = "string"
+desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
+default = "1h"
+
+[[params]]
+key = "atr_interval"
+name = "ATR K 线周期"
+type = "string"
+desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
+default = "1h"
+
+[[params]]
+key = "atr_period"
+name = "ATR 周期"
+type = "i64"
+desc = "ATR 回看根数"
+default = 14
+
+[[params]]
+key = "atr_mult"
+name = "ATR 乘数"
+type = "f64"
+desc = "网格间距 = atr_mult × ATR"
+default = 1.5
+
+[[params]]
+key = "min_spacing_pct"
+name = "最小间距(价格占比)"
+type = "f64"
+desc = "间距下限(占价格比例, 0.002 = 0.2% = 4×合约费率; 负数 = 禁用下限); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损"
+default = 0.002
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额(合约 SOLUSDT fapi 最小名义 5)"
+default = 5
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "单边手续费率(0.0005 = 合约 taker 0.05%/边)"
+default = 0.0005
+
+[[params]]
+key = "flag_spacing_mult"
+name = "间距放大系数"
+type = "f64"
+desc = "方向 flag 驱动的网格间距指数放大系数, 默认 1.2: flag = 网格卖笔数 − 买笔数(强平与期末清仓不计); |flag|≥2 时趋势侧间距 × 系数^(|flag|−1)(flag<0 净买→放大买单间距, flag>0 净卖→放大卖单间距, 回调侧不变), 买卖量随间距自动跟随保持 1:1; 1.0 = 禁用放大(<1 按 1 处理)"
+default = 1.2
+
+[[params]]
+key = "liq_warn_ratio"
+name = "爆仓价告警阈值"
+type = "f64"
+desc = "小数(0.1=10%); 任一方向仓距爆仓价 < 该比例打 WARN(只告警不动作)。与引擎 014 的 liq_warn_pct(百分点)是两条通道"
+default = 0.1
+
+[backtest]
+# 全仓(cross): 投入资金整体作为该 pair 的清算缓冲; 单向持仓可多可空, 净敞口 = |多−空| 通常远小于
+# 总名义, 组合权益扛清算(对齐币安全仓语义)。逐仓(isolated, CLI --param margin_mode=isolated)
+# 两腿独立清算, 完全中性也可能单腿爆仓。
+margin_mode = "cross"
