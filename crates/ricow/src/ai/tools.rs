@@ -2297,9 +2297,24 @@ mod tests {
 
     static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
+    /// 造一个**保证干净**的临时 root。
+    ///
+    /// 命名里必须带单调不重复的 nonce: 只用 `pid + seq` 会被 Windows 的 PID 复用撞上
+    /// 上一轮进程留下的同名目录(seq 每轮从 0 重来), 而 `create_dir_all` 不清场 ——
+    /// 残留的 `strategies/<name>.toml` 会让"首次部署"被误判为"策略已存在",
+    /// 于是部署类用例在反复跑之后随机变红(与业务代码无关, 纯测试隔离缺陷)。
     fn r3_temp_root(tag: &str) -> PathBuf {
         let seq = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("ricow-r3-{tag}-{}-{seq}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("ricow-r3-{tag}-{}-{seq}-{nonce}", std::process::id()));
+        // 兜底: 万一路径还是撞上了, 清掉残留再建, 保证"首次部署"语义成立。
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         std::fs::create_dir_all(&dir)
             .unwrap_or_else(|e| panic!("建临时目录 {}: {e}", dir.display()));
         dir
@@ -2366,7 +2381,15 @@ mod tests {
         let config = ricow_engine::create_strategy(name, code, "BTCUSDT", HashMap::new())
             .expect("造 StrategyConfig(与 create 同校验)");
         let payload = config.to_toml().expect("config → TOML");
-        ricow_engine::create_preview(&db, "strategy", &payload).await.expect("seed preview")
+        let id =
+            ricow_engine::create_preview(&db, "strategy", &payload).await.expect("seed preview");
+        // **必须显式关池再返回**: `Database::open` 每次都会跑一遍 `migrate()`(DDL = 写事务),
+        // 而紧随其后的 prepare_deploy/execute_confirmed 会再开一次同一个 ricow.db。
+        // 靠 Drop 让连接异步收尾不可靠 —— `#[tokio::test]` 是 current_thread 运行时,
+        // 收尾任务可能被 Lua 编译这类 CPU 活儿挤在后面, 于是下一个 open 的 migrate 撞上
+        // 未释放的写锁 → `SQLITE_BUSY (code: 5) database is locked`(并行满载时随机变红)。
+        db.close_pool_for_test().await;
+        id
     }
 
     /// 模拟 REPL 确认后宿主执行 deploy, 返回执行回执。
@@ -2378,7 +2401,7 @@ mod tests {
         let prepared =
             prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": preview_id }))
                 .await
-                .expect("prepare_deploy 应通过");
+                .unwrap_or_else(|e| panic!("prepare_deploy 应通过: {e}"));
         *slot.lock().await = Some(prepared.action);
         let disposition = crate::ai::confirm::consume_line(&slot, "确认", Lang::Zh).await;
         let action = match disposition {
@@ -2399,7 +2422,7 @@ mod tests {
         let prepared =
             prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": preview_id }))
                 .await
-                .unwrap();
+                .unwrap_or_else(|e| panic!("prepare_deploy 应通过: {e}"));
         assert!(prepared.block.contains("落盘部署"), "{block}", block = prepared.block);
         assert_eq!(prepared.action.kind, ActionKind::Deploy);
         assert_eq!(prepared.action.expected_phrase(), format!("确认部署 {name}"));
@@ -2572,8 +2595,9 @@ mod tests {
         let id = seed_pending_preview(&root, name).await;
         let slot = crate::ai::confirm::new_slot();
         let ctx = test_ctx(&root, slot.clone());
-        let prepared =
-            prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": id })).await.unwrap();
+        let prepared = prepare_deploy(&ctx, ActionKind::Deploy, &json!({ "preview_id": id }))
+            .await
+            .unwrap_or_else(|e| panic!("prepare_deploy 应通过: {e}"));
         *slot.lock().await = Some(prepared.action);
 
         let disposition = crate::ai::confirm::consume_line(&slot, "拒绝", Lang::Zh).await;

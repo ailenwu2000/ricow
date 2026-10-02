@@ -35,7 +35,9 @@
 
 ## 测试基线
 
-- **当前基线 (2026-09-29, Windows, 032 Web UI 工作台化落地后实跑)**: `cargo test --workspace` = **589 passed / 0 failed / 22 ignored**; 较上次 538: **+51 通过 / ignored 不变**; 增量全部来自 032-web-ui-console(web 模块: 配置/密钥端点、策略保存与源码/AI 编辑/回测 job、运行面 ensure_daemon 与 start/stop/risk 门禁、401 矩阵与前端资产密钥扫描等单测)。三门禁全绿(fmt 0 差异 / clippy --all-targets -D warnings 0 / test 0 failed); 端到端以浏览器实测 + testnet 真实调用取证(场景 1/3/5 走查 + demo 实发下单 + live 拒绝路径), 见 `specs/changes/032-web-ui-console/quickstart.md` 执行记录。
+- **当前基线 (2026-10-02, Windows, 033 密钥管理页落地后实跑)**: `cargo test --workspace` = **608 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 589: **+19 通过 / ignored 不变**; ricow bin 用例 **279 → 300(+21)**, 增量全部来自 033 —— `commands/config_file.rs` 密钥环 12 例 + `web/keyring.rs` 密钥端点 9 例。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0。
+  **如实**: `ai_live_smoke` 的 2 例(`approve_requires_interactive_tty` / `piped_confirm_phrases_never_reach_the_host`)在**本机(agent 沙箱)**报 `ERROR_PIPE_BUSY(231)` —— 它们只是 `spawn ricow` 并喂 stdin 管道, 用一个不含任何 ricow 代码的 20 行 Rust 程序即可复现同一错误, 故为环境对管道创建的拦截, 非代码缺陷(032 基线在真机终端为全绿)。另在**高负载轮次**偶见 `ai::tools` 部署类用例 `SQLITE_BUSY(database is locked)` 抖动, 已定性为测试脚手架缺陷(同一 `ricow.db` 连开多池 + `Database::open` 每次跑 `migrate()` 写事务), 本次顺手修掉两处(见 `specs/changes/033-key-manager/converge.md` §六); 根治需产品代码语义变更, 留待单独决策。端到端以真实 HTTP + 临时数据目录 30 组对照取证, 见 `specs/changes/033-key-manager/converge.md`。
+- **前基线 (2026-09-29, Windows, 032 Web UI 工作台化落地后实跑)**: `cargo test --workspace` = **589 passed / 0 failed / 22 ignored**; 较上次 538: **+51 通过 / ignored 不变**; 增量全部来自 032-web-ui-console(web 模块: 配置/密钥端点、策略保存与源码/AI 编辑/回测 job、运行面 ensure_daemon 与 start/stop/risk 门禁、401 矩阵与前端资产密钥扫描等单测)。三门禁全绿(fmt 0 差异 / clippy --all-targets -D warnings 0 / test 0 failed); 端到端以浏览器实测 + testnet 真实调用取证(场景 1/3/5 走查 + demo 实发下单 + live 拒绝路径), 见 `specs/changes/032-web-ui-console/quickstart.md` 执行记录。
 - **前基线 (2026-09-25, Linux, 031 策略目录重构 + 清单 + 统一注册落地后实跑)**: `cargo test --workspace` = **538 passed / 0 failed / 22 ignored**; 较上次 529: **+9 通过 / ignored 不变**; 增量 = catalog.rs 清单解析/校验单测 8 例 + architecture_guard「清单键 == Lua 读取键」一致性 1 例。三门禁全绿(fmt 0 差异 / clippy -D warnings 0 / test 0 failed); 真实回测逐位一致验证通过: `--strategy {paired_grid,shannon_spot_grid}` 与迁移前(51ccb46 二进制)固定窗口报告逐位一致, 旧实例 TOML(`type=内置id`)加载行为不变。
 - **前基线 (2026-09-25, Linux, 内置策略收敛 + paired_grid 等比化后实跑)**: `cargo test --workspace` = **529 passed / 0 failed / 22 ignored**; 较上次 544/22: **−15 通过 / ignored 不变**; 变化 = 删除 shannon_rebalance(4 例) + executors/{dca,twap,vwap,pullback,ladder}(约 10 例) + paired_grid ATR 未就绪(1 例); paired_grid 改名「现货动态非对称网格」并等比化(买价 = ref÷(1+间距), 卖价 = 栈顶买入价×(1+间距))。
 - **前基线 (2026-09-19, Windows, 026 落地后实跑)**: `cargo test --workspace` = **504 passed / 0 failed / 21 ignored**; `cargo fmt --all -- --check` 0 差异; `cargo clippy --workspace --all-targets -- -D warnings` 0。
@@ -51,7 +53,7 @@
   ignored 全部为需真实外部环境的用例 (BN demo 现货 / 合约 / 用户流、Nasdaq 冒烟、019 AI 真机与 demo 联调), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
   220 → 204 的差额 = 009 移除 `locus_hl`(16 个内联测试); 204 → 216 = 008 新增 supervisor / CLI 命令面用例; 216 → 233 = 004 风控用例(频率窗口/两级熔断/装配与参数校验/接线); 233 → 270 = 011 用例(下单参数对齐 / 时钟预检判定 / 归属与停机清理编排 / 门禁 / proto 往返 / 现货事件解析 / 交易所过滤器解析 / 归属前缀长度约束)。
 - 验证方式: `cargo test --workspace`(纯逻辑) + 带 env key 的 `#[ignore]` 真实联调 (见 `specs/testnet.md`)。
-- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → **589(032 Web UI 工作台, 当前)**。
+- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → 589(032 Web UI 工作台) → **608(033 密钥管理页, 当前)**。
 
 ## 变更档案状态 (specs/changes/)
 
@@ -83,6 +85,19 @@
 > **026-trade-visibility(2026-09-19, 已实施)**: 让交易与日志**可见**(起因: 用户实测"跑测试网看不到交易信息与日志")。① **落库**: 引擎侧新增 `orders` / `positions` 两表(`CREATE TABLE IF NOT EXISTS` 幂等追加, 既有 8 张表**零改动**)并在下单提交 / 订单状态变化 / 成交回报 / 持仓刷新时写入; `pnl_snapshots` 由死表改为**每笔成交后写一条**且永久保留。② **Web 面板**: 新增只读交易面板(持仓 / 挂单 / 最近成交)+ 日志面板(策略切换 + 尾读 SSE 实时追加), 共 4 条交易端点(`/api/trades/{fills,orders,positions,pnl}`)与 3 条日志端点(`/api/logs`、`/tail`、`/stream`), 全部挂在**同一道 token 中间件之内**, 页面**无任何直连交易所的写按钮**(撤单 / 平仓 / 停机仍走对话确认)。③ **口径**: 数据源**唯一来源 = 本地库**(不直连交易所, 停机后仍能看最后状态并标注"截至 <时间>"); 每条回复带 `source` 三态(`ok` / `daemon_down` / `unreadable`), **不把"连不上 daemon"说成"没有交易"**; 成交的 `mode` 由 `exchange_order_id` ⟕ `orders` 带出, 关联不到即如实显示"未知"不猜。④ **修两处假阴性**: AI `instance_status` 把"连不上 daemon"说成"策略已经停着/没有可停止的对象"; demo 测试网停机误印「实盘停机」文案(现按**真实运行模式**措辞)。⑤ **AI 回流**: 新增三个只读工具(`positions` / `open_orders` / `pnl`), 写操作执行结果注入对话 history。测试 472 → **504 passed / 0 failed / 21 ignored**, 三门禁全绿; 端到端以**真实 demo 测试网**验证(禁 mock); 见 `specs/changes/026-trade-visibility/`。
 
 > **032-web-ui-console(2026-09-29, 已实施)**: Web UI **工作台化** —— 由单一对话视图演进为五视图工作台(左侧导航 + hash 路由, 无构建 vanilla JS): ① **设置页**(币安 API/demo/AI 密钥页内配置, 统一 `GET/POST /api/config/keys`, 密钥静默写 `ricow.toml` 只回显尾 4 位; 市场视野开关同端点); ② **市场**(现货/合约列表默认 bStock 可切全部 + 详情 + lightweight-charts K 线, UMD 内嵌编译进二进制); ③ **策略**(复制内置/新建/编辑落盘 — 用户亲手保存保留编译门禁、免沙箱回测+preview+approve 链; AI 修改产物须用户显式保存; 回测 202+job 轮询); ④ **运行**(Dry Run/demo/live 启停 + 状态 + 行内 SSE 日志; **live 全部动作不降级**: 逐字输 `确认实盘 <策略id>` + 首次 live 风险披露逐字 `确认风险` 落盘 `risk_ack.json`, 两道缺一不可); ⑤ **对话**(零回归, 与 CLI 同一会话引擎)。**写操作确认渠道由 2 个增至 3 个**(宪法 1.2.0: 新增 Web 渠道 — 页面显式交互承载普通写操作, live 不降级), 025 spec 已加演进注记。测试 538 → **589 passed / 0 failed / 22 ignored**, 三门禁全绿; demo 真实下单 + live 拒绝路径 testnet 实证; 见 `specs/changes/032-web-ui-console/`。
+
+> **033-key-manager(2026-10-02, 已实施)**: **密钥管理页** —— 密钥从"唯一一份生效值"升级为**带别名的密钥环(vault)**。
+> 左侧导航新增第 6 个一级视图「密钥」(`#keys`, 位于「运行」与「设置」之间): **AI 通道** 与 **币安凭据** 各一组,
+> 组内**左列条目列表(按别名) + 右列详情表单**; 每条可保存 / **选用**(显式动作, 写入 `[ai]` 或
+> `[exchange].binance_*` / `demo_*`) / **删除**(删除"使用中"条目时同步清空生效字段, 防"已删除却仍生效"的幽灵凭据)。
+> 密钥仍只存**唯一配置文件** `ricow.toml`(新增 `[[ai_key]]` / `[[exchange_key]]` 两个数组表, 块级行式编辑保留注释 +
+> 原子写 + 0600 / icacls), 读接口只回 `***` + 末 4 位(032 FR-007 契约不变), 密钥框**留空 = 不修改**语义不变;
+> 「设置」页不再重复承载密钥配置, 只留市场视野 + 指向密钥页的入口(避免两处配置漂移)。
+> 新增 8 条 `/api/keys*` 端点(全部在 token 中间件之内), legacy `/api/config/keys` 保持可用。
+> **宪法未改**(未新增确认渠道: 密钥写入属 032 已确立的 Web 渠道普通写操作, live 逐字短语门禁一字未动)。
+> 测试: ricow bin 279 → **300 passed / 0 failed / 1 ignored**(+21), 工作区 608 passed / 22 ignored、
+> 三门禁(fmt / clippy -D warnings / test)在本机除 `ai_live_smoke` 2 例环境性失败外全绿;
+> 端到端以真实 HTTP + 临时数据目录 30 组对照取证(含全部拒绝路径)。见 `specs/changes/033-key-manager/`。
 
 > SDD 产物规范: 计划与任务分解应存于 `specs/changes/<feature>/{spec,plan,tasks}.md`。
 > 005/006/007 的计划当时落在 `.hermes/plans/`(临时区, 已 git 忽略), 未回填档案 —— 后续变更须归档到位。

@@ -590,6 +590,8 @@ mod tests {
             exchange: ExchangeSection::default(),
             market: MarketSection::default(),
             ui: UiSection { lang: Some("zh".into()) },
+            // 密钥环(033)与本用例无关, 用默认空表即可。
+            ..File::default()
         }
     }
 

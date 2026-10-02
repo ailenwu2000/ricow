@@ -1,6 +1,6 @@
 // Ricow Web 前端「策略」视图 (032 US3, FR-015 ~ FR-021):
 //   列表(市场 × 来源四组) / 复制内置 / 新建空白 / 详情(参数表单 + Lua 编辑器) /
-//   保存(编译门禁, 运行中拒绝) / AI 改 Lua(草稿+撤销, need_keys 引导设置页) / 回测异步作业(轮询三态)。
+//   保存(编译门禁, 运行中拒绝) / AI 改 Lua(草稿+撤销, need_keys 引导密钥页) / 回测异步作业(轮询三态)。
 // 注册为 `R.views.strategies`; 全部数据走 R.api 的 `/api/strategies*` 与 `/api/backtest*`。
 //
 // 过期响应: 视图级"代际令牌" gen —— activate/deactivate 自增, 在途响应回来比对捕获值, 不一致即丢弃。
@@ -45,8 +45,8 @@
     sgAiGo: "AI 修改",
     sgAiBusy: "AI 修改中…",
     sgAiOk: "AI 草稿已生成(通过编译),确认无误后点「保存」才会落盘。",
-    sgNeedKeys: "AI 还没有可用密钥,先到设置页配置后再试。",
-    sgGoSettings: "去设置页配置",
+    sgNeedKeys: "AI 还没有可用密钥,先到密钥页添加一套后再试。",
+    sgGoSettings: "去密钥页添加",
     sgBacktest: "回测",
     sgInterval: "K 线周期",
     sgDays: "天数",
@@ -118,8 +118,8 @@
     sgAiGo: "Edit with AI",
     sgAiBusy: "AI working…",
     sgAiOk: "AI draft ready (compiles). Press Save to write it to disk.",
-    sgNeedKeys: "No AI key is configured yet. Set one up in Settings, then try again.",
-    sgGoSettings: "Go to Settings",
+    sgNeedKeys: "No AI key is configured yet. Add one on the Keys page, then try again.",
+    sgGoSettings: "Go to Keys",
     sgBacktest: "Backtest",
     sgInterval: "Interval",
     sgDays: "Days",
@@ -1067,7 +1067,7 @@
     }
   }
 
-  /// need_keys: 文案 + 一键去设置页(配置完用浏览器返回即可回到本视图)。
+  /// need_keys: 文案 + 一键去密钥页(配置完用浏览器返回即可回到本视图)。
   function showNeedKeys(message) {
     const el = $("sg-ai-msg");
     el.innerHTML = "";
@@ -1075,7 +1075,7 @@
     el.appendChild(h("span", null, message + " "));
     const go = h("button", "sg-btn sg-btn-mini", t("sgGoSettings"));
     go.type = "button";
-    go.addEventListener("click", () => R.navigate("settings"));
+    go.addEventListener("click", () => R.navigate("keys"));
     el.appendChild(go);
   }
 

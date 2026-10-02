@@ -5,6 +5,7 @@
 //! 助手增量仍由 `provider::ask_stream` 逐段产出, 本层不复制任何 LLM 调用路径 (D2 / D5)。
 
 mod backtest_jobs;
+mod keyring;
 mod keys;
 mod markets;
 mod runs;
@@ -61,8 +62,10 @@ const COMMON_JS: &str = include_str!("assets/common.js");
 const ROUTER_JS: &str = include_str!("assets/router.js");
 /// 对话视图: 原 app.js 的会话 / SSE / 三个只读面板逻辑整体迁入(032 T006)。
 const CHAT_JS: &str = include_str!("assets/chat.js");
-/// 设置视图(032 US1): 密钥配置页, 读写 `/api/config/keys`。
+/// 设置视图(032 US1): 市场视野开关; 密钥配置已迁至 033 密钥视图。
 const SETTINGS_JS: &str = include_str!("assets/settings.js");
+/// 密钥视图(033): 多套 AI / 币安密钥的别名条目 —— 列表 / 新增 / 选用 / 删除, 读写 `/api/keys*`。
+const KEYS_JS: &str = include_str!("assets/keys.js");
 /// 市场视图(032 US2): 交易对列表 / 订单簿 / K 线, 读写 `/api/markets*`。
 const MARKETS_JS: &str = include_str!("assets/markets.js");
 /// 策略管理视图(032 US3): 策略列表 / 源码编辑保存 / AI 改 Lua / 回测作业。
@@ -251,6 +254,7 @@ pub fn router(state: WebState) -> Router {
         .route("/router.js", get(router_js))
         .route("/chat.js", get(chat_js))
         .route("/settings.js", get(settings_js))
+        .route("/keys.js", get(keys_js))
         .route("/markets.js", get(markets_js))
         .route("/strategies.js", get(strategies_js))
         .route("/runs.js", get(runs_js))
@@ -269,6 +273,16 @@ pub fn router(state: WebState) -> Router {
         .route("/api/lang", get(get_lang).post(set_lang))
         // 密钥配置(032 US1 / FR-006 ~ FR-009): 读只给脱敏尾号, 写与向导共用同一份 ricow.toml。
         .route("/api/config/keys", get(keys::get_keys).post(keys::post_keys))
+        // 密钥管理(033): 多套 AI / 币安密钥的别名条目 —— 总览 / 保存 / 选用 / 删除 / 清空生效。
+        // 与上面一条的分工: 这里动的是**整条密钥环**(数组表), 上面那个是"外科式改单行 + 市场视野开关"。
+        .route("/api/keys", get(keyring::get_keys))
+        .route("/api/keys/ai/save", axum::routing::post(keyring::save_ai))
+        .route("/api/keys/ai/use", axum::routing::post(keyring::use_ai))
+        .route("/api/keys/ai/delete", axum::routing::post(keyring::delete_ai))
+        .route("/api/keys/exchange/save", axum::routing::post(keyring::save_exchange))
+        .route("/api/keys/exchange/use", axum::routing::post(keyring::use_exchange))
+        .route("/api/keys/exchange/delete", axum::routing::post(keyring::delete_exchange))
+        .route("/api/keys/clear", axum::routing::post(keyring::clear))
         // 市场浏览(032 US2 / FR-010 ~ FR-014): 交易对视野 + 订单簿 + K 线, 全部免 key 只读公共行情。
         .route("/api/markets", get(markets::list_markets))
         .route("/api/markets/{symbol}/orderbook", get(markets::get_orderbook))
@@ -359,6 +373,11 @@ async fn chat_js() -> impl IntoResponse {
 /// 前端设置视图(032 US1): 编译期常量, 不含任何会话内容。
 async fn settings_js() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], SETTINGS_JS)
+}
+
+/// 前端密钥视图(033): 编译期常量, 不含任何会话内容。
+async fn keys_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], KEYS_JS)
 }
 
 /// 前端市场视图(032 US2): 编译期常量, 不含任何会话内容。

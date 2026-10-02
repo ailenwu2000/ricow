@@ -112,6 +112,15 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **新增只读/写端点**(全部仍在 token 中间件之后): 密钥与配置 `GET/POST /api/config/keys`(密钥静默写入 ricow.toml 只回显尾 4 位; 通用配置走 `updates` 数组 —— 市场视野开关 `market.show_all_pairs` 同端点); 行情 `GET /api/markets*`(免 key 公共行情 + 盘口 + K 线); 策略 `GET/POST /api/strategies`(POST = 创建/覆盖保存: 编译门禁 + 运行中 409 + 保留名/互前缀拒绝)、`GET .../source`(Lua/TOML 原文)、`POST .../ai-edit`(LLM 草稿, 编译失败 400 带行号)、`POST /api/backtest`(202 拿 job_id 后台跑 CLI 同一内核)+ `GET /api/backtest/{job_id}` 轮询; 运行 `GET /api/runs`、`POST /api/strategies/{id}/{status|start|stop}`(启停复用 CLI 同一内核 `commands::ctrl`, daemon 自举幂等)、`GET /api/logs/{name}/stream`(SSE 行内日志, 与对话视图各一条独立流)。
 - **Web 渠道确认规则(宪法 1.2.0, FR-027~029)**: 页面直控写操作的确认 = 页面显式交互(确认对话框/表单提交); live 不降级 —— 启动模态逐字输 `确认实盘 <策略名>`, 首次 live 另须风险披露确认(逐字输 `确认风险`, 落盘 `risk_ack.json`), daemon 侧门禁复用不变。
 
+**密钥管理页(033, 2026-10-02)**: 密钥由「唯一一份生效值」升级为**带别名的密钥环(vault)** —— 左侧导航新增第 6 个一级视图「密钥」(`#keys`, 位于「运行」与「设置」之间), 视图脚本 `web/assets/keys.js`(仍 `include_str!` 编译期嵌入, 无构建链)。
+
+- **数据模型(唯一配置文件 `ricow.toml`)**: 生效值仍是 `[ai]` / `[exchange]` 两段(**字段一字未改**); 新增两个数组表存密钥环 —— `[[ai_key]]`(别名 `alias` · `provider` · `model` · `base_url` · `api_key`)、`[[exchange_key]]`(别名 `alias` · 环境 `env ∈ {live,demo}` · `key` · `secret`)。块级**行式编辑**(不整文件重写): 插入/替换/删除只动目标块, 其余内容(含注释)逐字保留; 复用既有原子写 + 0600 / icacls。
+- **语义**: **选用**是显式动作 —— AI 条把四元组写入 `[ai]`, 币安条按 `env` 写入 `[exchange].binance_*`(live)或 `demo_*`(demo); 编辑"使用中"的条目 → 生效值同步跟随(不留旧值); 删除"使用中"的条目 → **同时清空**对应生效字段(幽灵凭据防护); 别名同类内唯一(空/超长 24/控制字符/重复 → 400 带机器码, 未知别名 404)。
+- **新增 8 条端点**(全部在 token 中间件之内): `GET /api/keys`(总览: 条目 + `{configured,hint}` 脱敏 + 生效来源标记 `from_entry`/`live_from`/`demo_from` + 服务商预设表)、`POST /api/keys/ai/{save,use,delete}`、`POST /api/keys/exchange/{save,use,delete}`、`POST /api/keys/clear`(按 `target` 清空生效凭据)。legacy `GET/POST /api/config/keys` **保持可用**(对话通道与向导仍用它)。
+- **脱敏契约不变(032 FR-007 / FR-008)**: 读接口只回 `***` + 末 4 位, 任何响应与页面资源都不含密钥全文; 密钥框**留空 = 不修改**; 浏览器持久存储零写入。
+- **设置页职责收敛**: 不再重复承载密钥配置(只留市场视野 + 指向密钥页的入口), 避免两处配置漂移; 运行页与策略页的 `need_keys` 引导改指密钥页。
+- **范围外**: 密钥加密存储 / 轮转与到期提醒 / 多交易所(见 `specs/changes/033-key-manager/spec.md` §一)。
+
 ~~`keyring`~~ / ~~`setup`~~ / ~~`credentials`~~ / ~~`config`~~ —— 2026-09-14 随单一配置文件方案**全部删除**(019 D31: 文件即界面)。
 
 - 建策略(002, 写操作不得一步落盘): `ricow create --name <n> --pair <p> [--script <file|->] [--param k=v] [--days N] [--interval] [--market spot|futures]`

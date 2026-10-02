@@ -22,6 +22,47 @@ pub fn path(root: &Path) -> PathBuf {
     root.join(FILE)
 }
 
+/// 密钥环的数组表名(033): 每套备用 AI 凭据一个 `[[ai_key]]` 段。
+pub const AI_KEY_TABLE: &str = "ai_key";
+/// 密钥环的数组表名(033): 每套备用币安凭据一个 `[[exchange_key]]` 段。
+pub const EXCHANGE_KEY_TABLE: &str = "exchange_key";
+/// [`ExchangeKeyEntry::env`] 取值: 实盘主网(对应 `[exchange].binance_*`)。
+pub const ENV_LIVE: &str = "live";
+/// [`ExchangeKeyEntry::env`] 取值: 测试网 demo(对应 `[exchange].demo_*`)。
+pub const ENV_DEMO: &str = "demo";
+/// 别名长度上限(按**字符**计, 不是字节 —— 中文别名不应被字节数误伤)。
+/// 24 足够写下"工作号 DeepSeek 备用"这类描述, 又不至于把左列列表撑变形。
+pub const MAX_ALIAS_CHARS: usize = 24;
+
+/// 别名规范化 + 校验(033 FR-009), 返回去空白后的别名。
+///
+/// 纯函数、不碰磁盘: 终端与 Web 共用同一条规则, 免得两处各判一套。
+pub fn check_alias(raw: &str) -> Result<String, String> {
+    let a = raw.trim();
+    if a.is_empty() {
+        return Err("别名不能为空 —— 别名是你在页面上辨认这把密钥的唯一标识".to_string());
+    }
+    let n = a.chars().count();
+    if n > MAX_ALIAS_CHARS {
+        return Err(format!("别名过长: 最多 {MAX_ALIAS_CHARS} 个字符, 实际 {n} 个"));
+    }
+    if a.chars().any(char::is_control) {
+        return Err("别名不能包含换行 / 制表符等控制字符".to_string());
+    }
+    Ok(a.to_string())
+}
+
+/// 校验币安凭据的环境取值(033 FR-009), 返回去空白后的环境名。
+pub fn check_env(raw: &str) -> Result<String, String> {
+    match raw.trim() {
+        ENV_LIVE => Ok(ENV_LIVE.to_string()),
+        ENV_DEMO => Ok(ENV_DEMO.to_string()),
+        other => Err(format!(
+            "环境 `{other}` 非法: 只接受 \"{ENV_LIVE}\"(实盘主网) 或 \"{ENV_DEMO}\"(测试网 demo)"
+        )),
+    }
+}
+
 /// AI 段(provider 与其密钥同处一段, 一眼看清"这把 key 属于谁")。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiSection {
@@ -67,6 +108,35 @@ pub struct UiSection {
     pub lang: Option<String>,
 }
 
+/// 密钥环(033)里的一套**备用 AI 凭据**: 别名 + 服务商 + 模型 + 接口地址 + 密钥。
+///
+/// 与 [`AiSection`] 的分工: `[ai]` 段是**当前生效**的凭据, 本结构是"可按别名另存的一套";
+/// "选用"即把本结构的值写入 `[ai]`(见 `web::keyring`)。两处同名同义, 便于对照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiKeyEntry {
+    /// 别名(同类内唯一, ≤ [`MAX_ALIAS_CHARS`] 字符)—— 页面上就是靠它辨认"这是哪一把"。
+    pub alias: String,
+    /// 服务商: 内置预设名或自定义名(自定义必须自带 `base_url`, 规则同 [`crate::ai::config::resolve`])。
+    pub provider: String,
+    /// 模型名; 空 = 选用后由预设推荐值兜底。
+    pub model: String,
+    /// 接口地址; 空 = 用预设默认。
+    pub base_url: String,
+    /// 密钥; 空 = 该条不含密钥(如本机 ollama)。
+    pub api_key: Option<String>,
+}
+
+/// 密钥环(033)里的一套**备用币安凭据**(key + secret 成对)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeKeyEntry {
+    pub alias: String,
+    /// 这套凭据属于哪个环境: [`ENV_LIVE`](实盘主网) / [`ENV_DEMO`](测试网)。
+    /// 选用时据此决定写 `[exchange].binance_*` 还是 `demo_*`。
+    pub env: String,
+    pub key: Option<String>,
+    pub secret: Option<String>,
+}
+
 /// 整个配置文件的内存表示。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct File {
@@ -74,6 +144,10 @@ pub struct File {
     pub exchange: ExchangeSection,
     pub market: MarketSection,
     pub ui: UiSection,
+    /// 密钥环: 备用 AI 凭据(033)。**空 = 未使用密钥环**, 一切照旧走 [`AiSection`]。
+    pub ai_keys: Vec<AiKeyEntry>,
+    /// 密钥环: 备用币安凭据(033)。
+    pub exchange_keys: Vec<ExchangeKeyEntry>,
 }
 
 /// `ensure_template` 的结果。
@@ -124,7 +198,28 @@ pub fn template_text() -> String {
          # ── ④ 界面语言 / UI language ────────────────────────────────────\n\
          # zh = 中文(默认) · en = English。对话内可用 /lang 切换。\n\
          [ui]\n\
-         lang = \"zh\"\n"
+         lang = \"zh\"\n\
+         \n\
+         # ── ⑤ 密钥环 / Key vault (可选, 033) ──────────────────────────────\n\
+         # 上面 [ai] / [exchange] 段是**当前生效**的凭据;\n\
+         # 下面用 [[ai_key]] / [[exchange_key]] 可以按别名**另存多套**备用密钥,\n\
+         # 想用哪套就\"选用\"哪套(选用 = 把该套写回上面的生效段), 也可以随时删除。\n\
+         # Web 页左侧「密钥」视图可图形化管理(增/改/选用/删除), 一般无需手改本文件。\n\
+         # 每套 AI 密钥: alias(别名) / provider / model / base_url / api_key\n\
+         # 每套币安凭据: alias(别名) / env(live=实盘主网, demo=测试网) / key / secret\n\
+         # 示例(去掉行首的 # 即生效):\n\
+         #\n\
+         # [[ai_key]]\n\
+         # alias = \"工作号 DeepSeek\"\n\
+         # provider = \"deepseek\"\n\
+         # model = \"deepseek-flash\"\n\
+         # api_key = \"sk-...\"\n\
+         #\n\
+         # [[exchange_key]]\n\
+         # alias = \"测试网\"\n\
+         # env = \"demo\"\n\
+         # key = \"...\"\n\
+         # secret = \"...\"\n"
     )
 }
 
@@ -222,6 +317,12 @@ const AI_KEYS: [&str; 5] = ["provider", "model", "base_url", "max_turns", "api_k
 const EXCHANGE_KEYS: [&str; 4] = ["demo_key", "demo_secret", "binance_key", "binance_secret"];
 const MARKET_KEYS: [&str; 1] = ["show_all_pairs"];
 const UI_KEYS: [&str; 1] = ["lang"];
+/// `[[ai_key]]` 每套允许的键(全部字符串)。
+const AI_KEY_FIELDS: [&str; 5] = ["alias", "provider", "model", "base_url", "api_key"];
+/// `[[exchange_key]]` 每套允许的键(全部字符串)。
+const EXCHANGE_KEY_FIELDS: [&str; 4] = ["alias", "env", "key", "secret"];
+/// 未知段提示里的"允许的段"清单(只此一处, 报错文案与解析保持同步)。
+const SECTION_LIST: &str = "[ai] / [exchange] / [market] / [ui] / [[ai_key]] / [[exchange_key]]";
 
 /// 读取配置; **文件不存在 → 生成模板并按内置默认继续**(缺什么由使用处给出可执行提示)。
 pub fn load(root: &Path) -> CoreResult<File> {
@@ -237,9 +338,22 @@ pub fn load(root: &Path) -> CoreResult<File> {
 
     let mut out = File::default();
     for (section, value) in &table {
+        // 密钥环(033)是**数组表**(`[[ai_key]]`), 不是普通段 —— 先分流, 免得掉进下面的
+        // "不是段(table)" 报错里, 让用户拿着一句看不懂的话去猜。
+        match section.as_str() {
+            AI_KEY_TABLE => {
+                out.ai_keys = parse_ai_keys(&p, value)?;
+                continue;
+            }
+            EXCHANGE_KEY_TABLE => {
+                out.exchange_keys = parse_exchange_keys(&p, value)?;
+                continue;
+            }
+            _ => {}
+        }
         let t = value.as_table().ok_or_else(|| {
             CoreError::Auth(format!(
-                "配置文件 {} 的 `{section}` 不是段(table): 配置请按 [ai] / [exchange] / [market] / [ui] 分段书写",
+                "配置文件 {} 的 `{section}` 不是段(table): 配置请按 {SECTION_LIST} 分段书写",
                 p.display()
             ))
         })?;
@@ -286,7 +400,7 @@ pub fn load(root: &Path) -> CoreResult<File> {
             }
             other => {
                 let msg = format!(
-                    "配置文件 {} 里有未知段 `[{other}]`; 允许的段: [ai] / [exchange] / [market] / [ui]",
+                    "配置文件 {} 里有未知段 `[{other}]`; 允许的段: {SECTION_LIST}",
                     p.display()
                 );
                 return Err(CoreError::Auth(msg));
@@ -295,6 +409,98 @@ pub fn load(root: &Path) -> CoreResult<File> {
     }
     if out.ai.provider.trim().is_empty() {
         out.ai.provider = crate::ai::config::DEFAULT_PROVIDER.to_string();
+    }
+    Ok(out)
+}
+
+/// 解析 `[[ai_key]]` 数组表(033)。**报错不回落**: 缺别名 / 缺服务商 / 类型不对一律硬失败,
+/// 与 019 对 `[ai]` 段的取向一致 —— 用户少写一个 alias, 页面上就会多出一条"没名字的密钥"。
+fn parse_ai_keys(p: &Path, v: &toml::Value) -> CoreResult<Vec<AiKeyEntry>> {
+    let arr = v.as_array().ok_or_else(|| {
+        CoreError::Auth(format!(
+            "配置文件 {} 的 `{AI_KEY_TABLE}` 必须是数组表: 每套密钥写一个 [[{AI_KEY_TABLE}]] 段",
+            p.display()
+        ))
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let nth = i + 1;
+        let t = item.as_table().ok_or_else(|| {
+            CoreError::Auth(format!(
+                "配置文件 {} 的第 {nth} 个 [[{AI_KEY_TABLE}]] 不是段(table)",
+                p.display()
+            ))
+        })?;
+        check_keys(p, AI_KEY_TABLE, t, &AI_KEY_FIELDS)?;
+        let need = |key: &str| -> CoreResult<String> {
+            str_opt(t, key).ok_or_else(|| {
+                CoreError::Auth(format!(
+                    "配置文件 {} 的第 {nth} 个 [[{AI_KEY_TABLE}]] 缺少 `{key}`(不能为空)",
+                    p.display()
+                ))
+            })
+        };
+        let alias = check_alias(&need("alias")?).map_err(|e| {
+            CoreError::Auth(format!(
+                "配置文件 {} 的第 {nth} 个 [[{AI_KEY_TABLE}]] 的 alias 非法: {e}",
+                p.display()
+            ))
+        })?;
+        out.push(AiKeyEntry {
+            alias,
+            provider: need("provider")?,
+            model: str_opt(t, "model").unwrap_or_default(),
+            base_url: str_opt(t, "base_url").unwrap_or_default(),
+            api_key: str_opt(t, "api_key"),
+        });
+    }
+    Ok(out)
+}
+
+/// 解析 `[[exchange_key]]` 数组表(033)。语义同 [`parse_ai_keys`]; `env` 只认 live / demo。
+fn parse_exchange_keys(p: &Path, v: &toml::Value) -> CoreResult<Vec<ExchangeKeyEntry>> {
+    let arr = v.as_array().ok_or_else(|| {
+        CoreError::Auth(format!(
+            "配置文件 {} 的 `{EXCHANGE_KEY_TABLE}` 必须是数组表: 每套凭据写一个 [[{EXCHANGE_KEY_TABLE}]] 段",
+            p.display()
+        ))
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let nth = i + 1;
+        let t = item.as_table().ok_or_else(|| {
+            CoreError::Auth(format!(
+                "配置文件 {} 的第 {nth} 个 [[{EXCHANGE_KEY_TABLE}]] 不是段(table)",
+                p.display()
+            ))
+        })?;
+        check_keys(p, EXCHANGE_KEY_TABLE, t, &EXCHANGE_KEY_FIELDS)?;
+        let need = |key: &str| -> CoreResult<String> {
+            str_opt(t, key).ok_or_else(|| {
+                CoreError::Auth(format!(
+                    "配置文件 {} 的第 {nth} 个 [[{EXCHANGE_KEY_TABLE}]] 缺少 `{key}`(不能为空)",
+                    p.display()
+                ))
+            })
+        };
+        let alias = check_alias(&need("alias")?).map_err(|e| {
+            CoreError::Auth(format!(
+                "配置文件 {} 的第 {nth} 个 [[{EXCHANGE_KEY_TABLE}]] 的 alias 非法: {e}",
+                p.display()
+            ))
+        })?;
+        let env = check_env(&need("env")?).map_err(|e| {
+            CoreError::Auth(format!(
+                "配置文件 {} 的第 {nth} 个 [[{EXCHANGE_KEY_TABLE}]] 的 env 非法: {e}",
+                p.display()
+            ))
+        })?;
+        out.push(ExchangeKeyEntry {
+            alias,
+            env,
+            key: str_opt(t, "key"),
+            secret: str_opt(t, "secret"),
+        });
     }
     Ok(out)
 }
@@ -493,6 +699,186 @@ fn upsert_line(text: &str, section: &str, key: &str, rendered: &str) -> Result<S
         out.push_str(&new_line);
         Ok(out)
     }
+}
+
+// ---- 密钥环(033): 数组表块的增 / 改 / 删 ----
+//
+// 与 [`upsert_line`] 同一取向 —— **行式外科编辑**: 只动目标 `[[ai_key]]` 块, 文件里其余注释与
+// 用户内容逐字保留。整文件 `toml::to_string` 重写会把注释全抹掉, 那正是 019 明确要避免的。
+// 代价: 目标块**内部**的注释会被重写覆盖(块外一切不动) —— 块本身由页面生成, 属可接受取舍。
+
+/// 读出配置正文并保证以换行结尾(块级拼接的前提)。
+fn read_body(root: &Path) -> CoreResult<String> {
+    let p = path(root);
+    if !p.exists() {
+        return Err(CoreError::Auth(format!(
+            "配置文件 {} 不存在; 请先生成模板(首次启动会自动生成)",
+            p.display()
+        )));
+    }
+    let mut text = std::fs::read_to_string(&p)
+        .map_err(|e| CoreError::Auth(format!("读取配置文件 {} 失败: {e}", p.display())))?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+/// 行尾风格跟随原文件(判据同 [`upsert_line`])。
+fn newline_of(text: &str) -> &'static str {
+    if text.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// 数组表块 `[[header]]` 的行范围 `[start, end)`; 块 = 段头 + 到下一个段头之前的全部行。
+fn find_table_block(lines: &[String], header: &str) -> Option<(usize, usize)> {
+    let mut start: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        match start {
+            Some(s) if line.trim_start().starts_with('[') => return Some((s, i)),
+            Some(_) => {}
+            None if line.trim() == header => start = Some(i),
+            None => {}
+        }
+    }
+    start.map(|s| (s, lines.len()))
+}
+
+/// 从单块正文(含 `[[table]]` 段头)里读出 `alias`: 交给 TOML 解析而非手撕字符串,
+/// 用户手写的转义(`\\` / `\"`)与我们渲染出来的天然一致。
+fn block_alias(block: &str, table: &str) -> Option<String> {
+    let t: toml::Table = toml::from_str(block).ok()?;
+    t.get(table)?.as_array()?.first()?.as_table()?.get("alias")?.as_str().map(str::to_string)
+}
+
+/// 在同表的全部块里按别名定位目标块(块序号, 不是行号)。
+fn locate_block(lines: &[String], table: &str, alias: &str) -> Option<(usize, usize)> {
+    let header = format!("[[{table}]]");
+    let mut from = 0usize;
+    while from < lines.len() {
+        let (s, e) = find_table_block(&lines[from..], &header)?;
+        let (s, e) = (from + s, from + e);
+        if block_alias(&lines[s..e].concat(), table).as_deref() == Some(alias) {
+            return Some((s, e));
+        }
+        from = e;
+    }
+    None
+}
+
+/// 块级 upsert: `prev_alias` 给出时按它定位(改别名), 否则按新别名定位(覆盖保存), 都没有则末尾追加。
+fn upsert_table_block(
+    root: &Path,
+    table: &str,
+    alias: &str,
+    prev_alias: Option<&str>,
+    render: impl Fn(&str) -> String,
+) -> CoreResult<()> {
+    let text = read_body(root)?;
+    let nl = newline_of(&text);
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
+    let block_lines: Vec<String> = render(nl).split_inclusive('\n').map(str::to_string).collect();
+
+    let hit = prev_alias
+        .filter(|p| *p != alias)
+        .and_then(|p| locate_block(&lines, table, p))
+        .or_else(|| locate_block(&lines, table, alias));
+
+    match hit {
+        Some((s, e)) => {
+            lines.splice(s..e, block_lines);
+        }
+        None => {
+            // 末尾追加: 与上一段之间**恰好**留一个空行 —— 先把尾部的空行收干净再补一个,
+            // 于是无论进来时文件是什么状态(末尾无空行 / 连着好几个空行), 结果都稳定成一行。
+            while lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+                lines.pop();
+            }
+            if !lines.is_empty() {
+                lines.push(nl.to_string());
+            }
+            lines.extend(block_lines);
+        }
+    }
+    let body = lines.join("");
+    if body != text {
+        write_private(&path(root), &body)?;
+    }
+    Ok(())
+}
+
+/// 块级删除; 返回是否真的删掉了(`false` = 别名不存在, 交调用方回 404)。
+fn remove_table_block(root: &Path, table: &str, alias: &str) -> CoreResult<bool> {
+    let text = read_body(root)?;
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
+    let Some((s, e)) = locate_block(&lines, table, alias) else {
+        return Ok(false);
+    };
+    // 连带吃掉紧邻在前的空行 —— 与追加时的"块前留一个空行"对称, 反复增删不会攒空行。
+    let mut start = s;
+    while start > 0 && lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+    lines.drain(start..e);
+    write_private(&path(root), &lines.join(""))?;
+    Ok(true)
+}
+
+/// 渲染一个 `[[ai_key]]` 块(值统一走 [`SetValue::Str`] 转义, 别名里带引号也写不坏 TOML)。
+fn render_ai_key_block(e: &AiKeyEntry, nl: &str) -> String {
+    let q = |v: &str| SetValue::Str(v.to_string()).render();
+    let mut out = format!("[[{AI_KEY_TABLE}]]{nl}");
+    out.push_str(&format!("alias = {}{nl}", q(&e.alias)));
+    out.push_str(&format!("provider = {}{nl}", q(&e.provider)));
+    out.push_str(&format!("model = {}{nl}", q(&e.model)));
+    out.push_str(&format!("base_url = {}{nl}", q(&e.base_url)));
+    out.push_str(&format!("api_key = {}{nl}", q(e.api_key.as_deref().unwrap_or(""))));
+    out
+}
+
+/// 渲染一个 `[[exchange_key]]` 块。
+fn render_exchange_key_block(e: &ExchangeKeyEntry, nl: &str) -> String {
+    let q = |v: &str| SetValue::Str(v.to_string()).render();
+    let mut out = format!("[[{EXCHANGE_KEY_TABLE}]]{nl}");
+    out.push_str(&format!("alias = {}{nl}", q(&e.alias)));
+    out.push_str(&format!("env = {}{nl}", q(&e.env)));
+    out.push_str(&format!("key = {}{nl}", q(e.key.as_deref().unwrap_or(""))));
+    out.push_str(&format!("secret = {}{nl}", q(e.secret.as_deref().unwrap_or(""))));
+    out
+}
+
+/// 保存(新增或更新)一套备用 AI 凭据; `prev_alias` = 改名前的旧别名(`None` = 新增)。
+///
+/// **别名唯一性不在本函数判**: 调用方(Web 层)已从 [`load`] 拿到全量条目, 重名在进这里之前就挡掉,
+/// 免得"渲染新块 → 落盘"与"查重"两处各读一遍磁盘而产生竞态。
+pub fn upsert_ai_key(root: &Path, entry: &AiKeyEntry, prev_alias: Option<&str>) -> CoreResult<()> {
+    upsert_table_block(root, AI_KEY_TABLE, &entry.alias, prev_alias, |nl| {
+        render_ai_key_block(entry, nl)
+    })
+}
+
+/// 删除一套备用 AI 凭据; 返回是否删掉了。
+pub fn remove_ai_key(root: &Path, alias: &str) -> CoreResult<bool> {
+    remove_table_block(root, AI_KEY_TABLE, alias)
+}
+
+/// 保存(新增或更新)一套备用币安凭据; 语义同 [`upsert_ai_key`]。
+pub fn upsert_exchange_key(
+    root: &Path,
+    entry: &ExchangeKeyEntry,
+    prev_alias: Option<&str>,
+) -> CoreResult<()> {
+    upsert_table_block(root, EXCHANGE_KEY_TABLE, &entry.alias, prev_alias, |nl| {
+        render_exchange_key_block(entry, nl)
+    })
+}
+
+/// 删除一套备用币安凭据; 返回是否删掉了。
+pub fn remove_exchange_key(root: &Path, alias: &str) -> CoreResult<bool> {
+    remove_table_block(root, EXCHANGE_KEY_TABLE, alias)
 }
 
 fn str_opt(t: &toml::Table, key: &str) -> Option<String> {
@@ -838,6 +1224,266 @@ mod tests {
         set_values(&root, &[("ai", "api_key", SetValue::Str("same".into()))]).unwrap();
         let after = std::fs::read_to_string(path(&root)).unwrap();
         assert_eq!(before, after, "值未变时不应改写(保持 mtime/权限)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- 密钥环(033): 别名 / 环境校验 ----
+
+    #[test]
+    fn test_check_alias_trims_and_rejects_bad() {
+        assert_eq!(check_alias("  工作号 DeepSeek  ").unwrap(), "工作号 DeepSeek");
+        assert_eq!(check_alias("工作号 DeepSeek").unwrap().chars().count(), 12);
+        for bad in ["", "   ", "\n", "a\nb", "\t"] {
+            assert!(check_alias(bad).is_err(), "别名 {bad:?} 应被拒");
+        }
+        // 长度按**字符**算: 24 个汉字合法, 25 个非法(不被 UTF-8 字节数误伤)。
+        let ok: String = "密".repeat(MAX_ALIAS_CHARS);
+        assert!(check_alias(&ok).is_ok());
+        let too_long: String = "密".repeat(MAX_ALIAS_CHARS + 1);
+        let err = check_alias(&too_long).unwrap_err();
+        assert!(err.contains("过长"), "{err}");
+    }
+
+    #[test]
+    fn test_check_env_only_live_or_demo() {
+        assert_eq!(check_env(" live ").unwrap(), ENV_LIVE);
+        assert_eq!(check_env("demo").unwrap(), ENV_DEMO);
+        let err = check_env("testnet").unwrap_err();
+        assert!(err.contains("live") && err.contains("demo"), "{err}");
+    }
+
+    // ---- 密钥环(033): 解析 ----
+
+    #[test]
+    fn test_template_is_valid_toml_with_vault_examples_commented() {
+        // 模板里的密钥环示例必须是**注释**, 否则新用户一启动就凭空多出一堆空条目。
+        let t: toml::Table = toml::from_str(&template_text()).expect("模板必须合法");
+        assert!(!t.contains_key(AI_KEY_TABLE), "模板不应产生真实 [[ai_key]] 条目");
+        assert!(template_text().contains("# [[ai_key]]"), "模板应带注释形式的示例");
+        let root = tmp_root("vault-tmpl");
+        write(&root, &template_text());
+        let f = load(&root).unwrap();
+        assert!(f.ai_keys.is_empty() && f.exchange_keys.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_parse_vault_entries() {
+        let root = tmp_root("vault-read");
+        write(
+            &root,
+            "[[ai_key]]\n\
+             alias = \"工作号 DeepSeek\"\n\
+             provider = \"deepseek\"\n\
+             model = \"deepseek-flash\"\n\
+             base_url = \"\"\n\
+             api_key = \"sk-a\"\n\
+             \n\
+             [[ai_key]]\n\
+             alias = \"备用 Kimi\"\n\
+             provider = \"moonshot\"\n\
+             api_key = \"sk-b\"\n\
+             \n\
+             [[exchange_key]]\n\
+             alias = \"测试网\"\n\
+             env = \"demo\"\n\
+             key = \"K\"\n\
+             secret = \"S\"\n",
+        );
+        let f = load(&root).unwrap();
+        assert_eq!(f.ai_keys.len(), 2);
+        assert_eq!(f.ai_keys[0].alias, "工作号 DeepSeek");
+        assert_eq!(f.ai_keys[0].api_key.as_deref(), Some("sk-a"));
+        assert_eq!(f.ai_keys[1].provider, "moonshot");
+        assert_eq!(f.ai_keys[1].model, "", "缺 model = 空串(选用后由预设兜底)");
+        assert_eq!(f.exchange_keys.len(), 1);
+        assert_eq!(f.exchange_keys[0].env, ENV_DEMO);
+        assert_eq!(f.exchange_keys[0].secret.as_deref(), Some("S"));
+        // 空串密钥解析为 None(str_opt 的既定语义), 与 [ai].api_key 一致。
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_parse_vault_entries_hard_fail() {
+        // 缺 alias。
+        let root = tmp_root("vault-noalias");
+        write(&root, "[[ai_key]]\nprovider = \"deepseek\"\n");
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("alias"), "{err}");
+        // 缺 provider。
+        write(&root, "[[ai_key]]\nalias = \"a\"\n");
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("provider"), "{err}");
+        // env 非法。
+        write(&root, "[[exchange_key]]\nalias = \"a\"\nenv = \"prod\"\n");
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("env"), "{err}");
+        // 未知键。
+        write(&root, "[[ai_key]]\nalias = \"a\"\nprovider = \"p\"\nsekret = \"x\"\n");
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("未知键 `sekret`"), "{err}");
+        // 写成普通段(单中括号)= 不是数组表。
+        write(&root, "[ai_key]\nalias = \"a\"\n");
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("数组表"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- 密钥环(033): 块级增删改 ----
+
+    fn ai_entry(alias: &str, provider: &str, key: &str) -> AiKeyEntry {
+        AiKeyEntry {
+            alias: alias.into(),
+            provider: provider.into(),
+            model: "m-1".into(),
+            base_url: String::new(),
+            api_key: Some(key.into()),
+        }
+    }
+
+    #[test]
+    fn test_upsert_ai_key_appends_and_preserves_rest_verbatim() {
+        let root = tmp_root("vault-append");
+        let head = "# 我的注释\n[ai]\nprovider = \"deepseek\"\napi_key = \"\"\n";
+        write(&root, head);
+        upsert_ai_key(&root, &ai_entry("工作号", "deepseek", "sk-a"), None).unwrap();
+        let body = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(body.starts_with(head), "既有内容必须逐字保留在前: {body}");
+        assert!(body.contains("[[ai_key]]"), "{body}");
+        assert!(body.ends_with("api_key = \"sk-a\"\n"), "{body}");
+        // 再追加第二条: 两条都在, 且仍然回得来。
+        upsert_ai_key(&root, &ai_entry("备用", "moonshot", "sk-b"), None).unwrap();
+        let f = load(&root).unwrap();
+        assert_eq!(f.ai_keys.len(), 2);
+        assert_eq!(f.ai.provider, "deepseek", "写密钥环不影响生效段");
+        assert_eq!(f.ai.api_key, None, "生效段仍是空的");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_upsert_ai_key_replaces_in_place_and_renames() {
+        let root = tmp_root("vault-update");
+        write(&root, &template_text());
+        upsert_ai_key(&root, &ai_entry("A", "deepseek", "sk-1"), None).unwrap();
+        upsert_ai_key(&root, &ai_entry("B", "moonshot", "sk-2"), None).unwrap();
+        let before = std::fs::read_to_string(path(&root)).unwrap();
+        // 只数"真段头"(`[[ai_key]]` 独占一行); 模板注释里的同名文本不算。
+        let blocks_before = before.lines().filter(|l| l.trim() == "[[ai_key]]").count();
+        assert_eq!(blocks_before, 2);
+
+        // 覆盖保存(按新别名定位): 只改内容, 不新增块。
+        upsert_ai_key(&root, &ai_entry("A", "deepseek", "sk-1-new"), None).unwrap();
+        let f = load(&root).unwrap();
+        assert_eq!(f.ai_keys.len(), 2, "覆盖保存不得新增块");
+        assert_eq!(f.ai_keys[0].api_key.as_deref(), Some("sk-1-new"));
+        assert_eq!(f.ai_keys[0].alias, "A", "别名未变");
+
+        // 改名: prev_alias 定位旧块并在原位替换, 不产生第三块。
+        upsert_ai_key(&root, &ai_entry("A改", "deepseek", "sk-1-new"), Some("A")).unwrap();
+        let f = load(&root).unwrap();
+        assert_eq!(f.ai_keys.len(), 2, "改名不得新增块");
+        let aliases: Vec<&str> = f.ai_keys.iter().map(|e| e.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["A改", "B"], "顺序与剩余条目不变");
+        let body = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(body.contains("密钥环 / Key vault"), "块外注释必须保留");
+        assert!(body.contains("# [[ai_key]]"), "模板里的注释示例必须保留");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_remove_ai_key_drops_block_and_is_idempotent() {
+        let root = tmp_root("vault-remove");
+        write(&root, &template_text());
+        upsert_ai_key(&root, &ai_entry("A", "deepseek", "sk-1"), None).unwrap();
+        upsert_ai_key(&root, &ai_entry("B", "moonshot", "sk-2"), None).unwrap();
+        assert!(remove_ai_key(&root, "A").unwrap(), "删存在的别名应返回 true");
+        assert!(!remove_ai_key(&root, "A").unwrap(), "再删应返回 false(交调用方回 404)");
+        let f = load(&root).unwrap();
+        assert_eq!(f.ai_keys.len(), 1);
+        assert_eq!(f.ai_keys[0].alias, "B");
+        let body = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(!body.contains("sk-1"), "被删条目的密钥不得残留: {body}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_add_remove_cycles_do_not_accumulate_blank_lines() {
+        let root = tmp_root("vault-blank");
+        write(&root, "[ai]\nprovider = \"deepseek\"\n");
+        upsert_ai_key(&root, &ai_entry("A", "deepseek", "sk-1"), None).unwrap();
+        let one = std::fs::read_to_string(path(&root)).unwrap();
+        for _ in 0..5 {
+            remove_ai_key(&root, "A").unwrap();
+            upsert_ai_key(&root, &ai_entry("A", "deepseek", "sk-1"), None).unwrap();
+        }
+        let again = std::fs::read_to_string(path(&root)).unwrap();
+        assert_eq!(one, again, "反复增删应回到同一份正文(不攒空行)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_append_block_lands_after_exactly_one_blank_line() {
+        let root = tmp_root("vault-blank-normalize");
+        // ① 末尾无空行的文件: 追加后应补上一个空行作为与上一段的间隔。
+        write(&root, "[ai]\nprovider = \"deepseek\"\n");
+        upsert_ai_key(&root, &ai_entry("A", "deepseek", "sk-1"), None).unwrap();
+        let body = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(body.contains("provider = \"deepseek\"\n\n[[ai_key]]\n"), "{body:?}");
+
+        // ② 末尾连着 3 个空行(手工编辑留下的噪声): 追加另一张表时归一化成恰好 1 个。
+        write(&root, &format!("{body}\n\n\n"));
+        upsert_exchange_key(
+            &root,
+            &ExchangeKeyEntry {
+                alias: "X".into(),
+                env: ENV_LIVE.into(),
+                key: Some("K".into()),
+                secret: Some("S".into()),
+            },
+            None,
+        )
+        .unwrap();
+        let after = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(
+            after.contains("api_key = \"sk-1\"\n\n[[exchange_key]]\n"),
+            "跨表追加前应恰好一个空行: {after:?}"
+        );
+        assert!(!after.contains("\n\n\n"), "不该把空行攒起来: {after:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_exchange_key_roundtrip_and_crlf_kept() {
+        let root = tmp_root("vault-crlf");
+        write(&root, "[exchange]\r\nbinance_key = \"\"\r\n");
+        upsert_exchange_key(
+            &root,
+            &ExchangeKeyEntry {
+                alias: "主账户".into(),
+                env: ENV_LIVE.into(),
+                key: Some("K".into()),
+                secret: Some("S".into()),
+            },
+            None,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(body.contains("[[exchange_key]]\r\n"), "应跟随原文件的 CRLF: {body:?}");
+        let f = load(&root).unwrap();
+        assert_eq!(f.exchange_keys.len(), 1);
+        assert_eq!(f.exchange_keys[0].env, ENV_LIVE);
+        assert!(remove_exchange_key(&root, "主账户").unwrap());
+        assert!(load(&root).unwrap().exchange_keys.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_alias_with_quotes_roundtrips() {
+        let root = tmp_root("vault-quote");
+        write(&root, "[ai]\n");
+        upsert_ai_key(&root, &ai_entry("他说\"你好\"\\ok", "p", "sk-1"), None).unwrap();
+        let f = load(&root).unwrap();
+        assert_eq!(f.ai_keys[0].alias, "他说\"你好\"\\ok");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -16,10 +16,13 @@ use super::{WebError, WebState};
 // ---- 读响应 (data-model §1) ----
 
 /// 单个密钥字段的脱敏视图:**绝不**带原文。
+///
+/// `pub(super)`:033 的密钥环端点(`web::keyring`)复用同一套脱敏规则 —— 两个入口对"多短算短"
+/// 必须给同一答案, 各写一份必然漂移。
 #[derive(Debug, Serialize, PartialEq, Eq)]
-struct SecretView {
-    configured: bool,
-    hint: Option<String>,
+pub(super) struct SecretView {
+    pub(super) configured: bool,
+    pub(super) hint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,7 +52,7 @@ pub(super) struct KeysReply {
 
 /// 脱敏提示(FR-007): `***` + 末 4 个字符;原值不足 4 字符时一律固定 `"****"`,
 /// 不把"这是个短密钥"这一信息也泄露出去;`None`(未配置)= `configured:false, hint:null`。
-fn hint_of(v: Option<&str>) -> SecretView {
+pub(super) fn hint_of(v: Option<&str>) -> SecretView {
     match v {
         None => SecretView { configured: false, hint: None },
         Some(s) if s.chars().count() < 4 => {

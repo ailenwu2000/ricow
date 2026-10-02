@@ -1,5 +1,5 @@
 // Ricow Web 前端 hash 路由 (032): `#chat`(默认) / `#markets` / `#strategies` / `#runs` /
-// `#settings`, 二级 `#markets/{symbol}`、`#strategies/{id}`(本阶段只解析, 业务视图后续阶段接入)。
+// `#keys`(033) / `#settings`, 二级 `#markets/{symbol}`、`#strategies/{id}`(本阶段只解析, 业务视图后续阶段接入)。
 //
 // 视图模块往 `R.views.<name>` 注册 `{ activate(param), deactivate() }`(钩子均可缺省);
 // 本文件只负责切 `.view.active` 与调钩子, 不含任何业务逻辑。刷新按当前 hash 恢复;
@@ -13,7 +13,7 @@
   R.views = R.views || {};
 
   /// 一级视图名白名单: hash 首段不在这里面(且 hash 非空)即视为无匹配, 回退 #chat。
-  const VIEW_NAMES = ["chat", "markets", "strategies", "runs", "settings"];
+  const VIEW_NAMES = ["chat", "markets", "strategies", "runs", "keys", "settings"];
 
   /// 当前路由: `{ name, param }`, 首次跳转前为 null。
   let current = null;

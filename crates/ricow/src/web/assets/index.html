@@ -21,12 +21,13 @@
             + 新建
           </button>
         </div>
-        <!-- 032: 五项 hash 导航(对话/市场/策略/运行/设置); 高亮由 router.js 同步。 -->
+        <!-- 033: hex 导航增为六项(对话/市场/策略/运行/密钥/设置); 高亮由 router.js 同步。 -->
         <nav id="nav">
           <a href="#chat" data-zh="对话" data-en="Chat">对话</a>
           <a href="#markets" data-zh="市场" data-en="Markets">市场</a>
           <a href="#strategies" data-zh="策略" data-en="Strategies">策略</a>
           <a href="#runs" data-zh="运行" data-en="Runs">运行</a>
+          <a href="#keys" data-zh="密钥" data-en="Keys">密钥</a>
           <a href="#settings" data-zh="设置" data-en="Settings">设置</a>
         </nav>
         <!-- 会话列表始终显示(切到别的视图也保留在左栏)。 -->
@@ -124,6 +125,8 @@
         <section id="view-strategies" class="view" hidden></section>
         <!-- 运行管理(032 US4): 容器由 runs.js 渲染(实例表/弹窗/日志面板全部 JS 生成)。 -->
         <section id="view-runs" class="view" hidden></section>
+        <!-- 密钥环(033): 容器由 keys.js 渲染(条目列表/详情表单/生效摘要全部 JS 生成)。 -->
+        <section id="view-keys" class="view" hidden></section>
         <section id="view-settings" class="view" hidden>
           <h2 class="placeholder-title" data-zh="设置" data-en="Settings">设置</h2>
         </section>
@@ -135,6 +138,7 @@
     <script src="/router.js?token=__RICOW_TOKEN__"></script>
     <script src="/chat.js?token=__RICOW_TOKEN__"></script>
     <script src="/settings.js?token=__RICOW_TOKEN__"></script>
+    <script src="/keys.js?token=__RICOW_TOKEN__"></script>
     <script src="/markets.js?token=__RICOW_TOKEN__"></script>
     <script src="/strategies.js?token=__RICOW_TOKEN__"></script>
     <script src="/runs.js?token=__RICOW_TOKEN__"></script>

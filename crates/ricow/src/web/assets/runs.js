@@ -48,8 +48,8 @@
     rnModeLive: "Live(实盘,真实下单)",
     rnPhraseHint: "请逐字输入确认短语: ",
     rnPhraseEmpty: "确认短语不能为空",
-    rnDemoKeysMissing: "请先在设置页配置测试网密钥。",
-    rnGoSettings: "去设置",
+    rnDemoKeysMissing: "请先在密钥页添加一套测试网(demo)凭据。",
+    rnGoSettings: "去密钥页",
     rnAckTitle: "首次启动 Live:请先阅读风险披露",
     rnAckPhraseHint: "输入「确认风险」以确认已阅读: ",
     rnAckGo: "确认风险",
@@ -101,8 +101,8 @@
     rnModeLive: "Live (real orders)",
     rnPhraseHint: "Type the confirmation phrase exactly: ",
     rnPhraseEmpty: "The confirmation phrase must not be empty",
-    rnDemoKeysMissing: "Configure testnet keys in Settings first.",
-    rnGoSettings: "Go to Settings",
+    rnDemoKeysMissing: "Add a testnet (demo) credential set on the Keys page first.",
+    rnGoSettings: "Go to Keys",
     rnAckTitle: "First live start: read the risk disclosure",
     rnAckPhraseHint: "Type 确认风险 to confirm you have read it: ",
     rnAckGo: "Acknowledge",
@@ -682,7 +682,7 @@
       }
     }
 
-    /// demo 先查测试网密钥: 未配置则启动钮置灰 + 引导去设置页。
+    /// demo 先查测试网密钥: 未配置则启动钮置灰 + 引导去密钥页。
     async function checkDemoKeys() {
       let cfg;
       try {
@@ -712,7 +712,7 @@
       go.type = "button";
       go.addEventListener("click", () => {
         doClose();
-        R.navigate("settings");
+        R.navigate("keys");
       });
       demoHint.appendChild(go);
     }

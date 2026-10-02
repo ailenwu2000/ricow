@@ -31,3 +31,5 @@ logs/
 run/
 risk_ack.json
 .trae/
+.workbuddy/
+tmp/
