@@ -125,6 +125,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # 改成你的代理地址(或 HTTP_P
 - 报 `network error` 时先确认代理是否生效: `curl https://api.binance.com/api/v3/time` 应返回 JSON。
 - `RICOW_BN_BASE_URL` / `RICOW_FAPI_BASE_URL` 可整体替换 REST 域名(现货 / 合约): **公开数据与签名下单都跟着变**;
   币安官方公开数据域名 `https://data-api.binance.vision` **只提供公开数据**, 适合纯回测/看行情, **下单会失败** —— 别把它当常规解法。
+- 币安免费公开行情入口(无需账号): REST = `https://data-api.binance.vision`(K 线/快照/历史), WebSocket = `wss://data-stream.binance.vision`(实时推送)。注意当前 WS 端点由代码按 REST 域名自动映射(见 `ws.rs::ws_base`), 尚无独立 WS 域名配置。
 - demo(`--demo`)无需手配域名: CLI 自动走 `demo-api.binance.com` / `demo-fapi.binance.com`。
 
 ### 8. 安全须知

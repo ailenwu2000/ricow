@@ -120,6 +120,7 @@ export HTTPS_PROXY=http://127.0.0.1:7890   # your proxy (or HTTP_PROXY / ALL_PRO
 
 - On `network error`, first check the proxy: `curl https://api.binance.com/api/v3/time` should return JSON.
 - `RICOW_BN_BASE_URL` / `RICOW_FAPI_BASE_URL` replace the whole REST domain (spot / futures): **public data and signed orders both move with it**; Binance's public-data-only domain `https://data-api.binance.vision` has **no trading endpoints** — fine for pure backtests, but orders will fail there.
+- Binance free public-market endpoints (no account needed): REST = `https://data-api.binance.vision` (klines / snapshots / history), WebSocket = `wss://data-stream.binance.vision` (real-time streams). Note: the WS endpoint is currently derived in code from the REST base URL (see `ws.rs::ws_base`); there is no standalone WS domain config yet.
 - demo (`--demo`) needs no domain config: the CLI uses `demo-api.binance.com` / `demo-fapi.binance.com`.
 
 ### 8. Security notes

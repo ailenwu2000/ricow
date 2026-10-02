@@ -13,10 +13,12 @@ mod futures;
 mod futures_client;
 mod futures_data;
 mod futures_ws;
+mod klines_fetch;
 mod spot;
 mod ws;
 
 pub use client::{validate_quantity, BinanceClient};
+pub use klines_fetch::{fetch_klines_concurrent, merge_pages, plan_windows, KLINE_PAGE_BARS};
 pub use futures::{
     directional_positions_from_risk, fapi_position_side, is_benign_change_error,
     position_from_risk, BnFuturesExchange,

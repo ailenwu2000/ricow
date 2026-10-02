@@ -1,6 +1,7 @@
 //! `ricow backtest` — 命令行回测。
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use chrono::Utc;
 use clap::Args;
@@ -234,6 +235,8 @@ fn apply_backtest_cli(
 pub(crate) async fn run_backtest(
     args: BacktestArgs,
 ) -> CoreResult<(String, ricow_strategy::BacktestReport)> {
+    // 分阶段计时 (性能诊断, stderr): 配置 / 声明 / 拉数 / 引擎回放 / 报告导出。
+    let t_total = Instant::now();
     let days = args.days.unwrap_or(90);
     let interval = args.interval.clone().unwrap_or_else(|| "1h".to_string());
     let hours_per_bar = match interval.as_str() {
@@ -307,6 +310,7 @@ pub(crate) async fn run_backtest(
     // 030 数据需求声明收集: 构造空 ctx 跑一次 on_init, 策略 need_klines 写入 declarations;
     // 据此推 warmup(预热根数)。引擎不再读 atr_interval/regime_interval 等策略参数名。
     // on_init 幂等约定: 声明阶段只依赖 config, 不依赖 balance/K 线(见 specs/architecture.md)。
+    let t_phase = t_total.elapsed();
     let mut declare_strategy = ricow_engine::load_strategy(&config)?;
     let mut declare_ctx = ricow_strategy::BacktestContext::new(
         config.clone(),
@@ -314,6 +318,9 @@ pub(crate) async fn run_backtest(
     );
     declare_strategy.on_init(&mut declare_ctx);
     let declarations = declare_ctx.declarations();
+    let t_declare = t_total.elapsed();
+    eprintln!("[timing] 配置+策略编译 = {:.2}s", t_phase.as_secs_f64());
+    eprintln!("[timing] 数据需求声明 = {:.3}s", (t_declare - t_phase).as_secs_f64());
     // 主时钟周期 = primary 声明; 未声明(异常)时回退 CLI --interval 粒度。
     let main_tf_ms = declarations
         .iter()
@@ -341,10 +348,9 @@ pub(crate) async fn run_backtest(
     let pair = config.get_str("pair").unwrap().to_string();
     // 数据源分支 (三层配置的 market 决定, specs/backtest.md §五): 合约用 fapi 公共数据源,
     // 现货沿用交易所客户端。K 线 JSON 同构, 直接喂同一回测引擎。
-    // 分页取数 (2026-09-22, 030): 币安 K 线**单次请求上限 1000 根** —— 超过必须向前翻页拼接,
-    // 否则长窗口 (1m 数天 / 1h 数月) 会拿到错误响应: 表现为 "network error: error decoding
-    // response body" (120 天 1m) 或长时间无输出 (3 天/1 天 1m 实测)。此处按 1000 根/批往前翻页。
-    const KLINE_PAGE_MAX: u32 = 1000;
+    // 050 并发分页取数: 币安 K 线单次上限 1000 根, 年级 1m = 528 页 —— 旧串行翻页实测
+    // 527s 回测里占 96.8% (跨境 RTT ~0.95s/页)。改按固定时间片 buffer_unordered 并发拉取,
+    // 收齐后排序拼接 (结果与串行逐位一致); 单片失败重试 2 次, 仍失败整次报错 (不静默缺 bar)。
     // 数据源市场: 默认跟随策略 market; --klines-market 仅解耦拉数 (策略/引擎语义不变)。
     let kline_market = args.klines_market.as_deref().unwrap_or(&config.market);
     let fapi = if kline_market == "futures" {
@@ -356,29 +362,56 @@ pub(crate) async fn run_backtest(
                 .params
                 .insert("mmr_pct".into(), ConfigValue::Float(ricow_binance::tier1_mmr_pct(&pair)));
         }
-        Some(f)
+        Some(std::sync::Arc::new(f))
     } else {
         None
     };
-    let mut acc: Vec<ricow_core::Kline> = Vec::new();
-    let mut cursor = end_ms; // None = 到"现在"为止
-    while acc.len() < fetch_limit as usize {
-        let want = (fetch_limit as usize - acc.len()).min(KLINE_PAGE_MAX as usize) as u32;
-        let batch = match (&fapi, cursor) {
-            (Some(f), Some(e)) => f.get_klines_ending_at(&pair, &interval, want, e).await?,
-            (Some(f), None) => f.get_klines(&pair, &interval, want).await?,
-            (None, Some(e)) => exchange.get_klines_until(&pair, &interval, want, e).await?,
-            (None, None) => exchange.get_klines(&pair, &interval, want).await?,
-        };
-        if batch.is_empty() {
-            break;
-        }
-        cursor = Some(batch[0].open_time.timestamp_millis() - 1);
-        let mut merged = batch;
-        merged.extend(acc);
-        acc = merged;
-    }
-    let klines = acc;
+    let step_ms = (hours_per_bar * 3_600_000.0) as i64;
+    // 窗口右端: 显式 --end 或"现在" (与旧串行 cursor=end_ms / get_klines 到最新语义一致)。
+    let window_end = end_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
+    let window_start = window_end - (fetch_limit as i64) * step_ms;
+    let windows = ricow_binance::plan_windows(
+        window_start,
+        window_end,
+        step_ms,
+        ricow_binance::KLINE_PAGE_BARS,
+    );
+    // 并发度 = 16 (IO 密集, 与 CPU 核数无关)。币安 weight 限速: spot 6000/min、fapi 2400/min,
+    // klines 每请求 weight=2。16 并发 × ~1s/页 RTT ≈ 32 req/s = 1920 weight/min,
+    // 同时低于两者 (fapi 更严) → 不触发 429 限速, 也留足重试余量。
+    let conc = 16usize;
+    let pages = windows.len();
+    let (klines, net_ms) = if let Some(f) = &fapi {
+        let f = f.clone();
+        let p = pair.clone();
+        let iv = interval.clone();
+        let t = Instant::now();
+        let got = ricow_binance::fetch_klines_concurrent(&windows, conc, move |_, s, e| {
+            let (f, p, iv) = (f.clone(), p.clone(), iv.clone());
+            async move { f.get_klines_window(&p, &iv, s, e).await }
+        })
+        .await?;
+        (ricow_binance::merge_pages(got, fetch_limit as usize), t.elapsed().as_millis())
+    } else {
+        let ex = exchange.clone();
+        let p = pair.clone();
+        let iv = interval.clone();
+        let t = Instant::now();
+        let got = ricow_binance::fetch_klines_concurrent(&windows, conc, move |_, s, e| {
+            let (ex, p, iv) = (ex.clone(), p.clone(), iv.clone());
+            async move { ex.get_klines_window(&p, &iv, s, e).await }
+        })
+        .await?;
+        (ricow_binance::merge_pages(got, fetch_limit as usize), t.elapsed().as_millis())
+    };
+    let t_fetch = t_total.elapsed();
+    eprintln!(
+        "[timing] K线拉数 = {:.2}s ({} 片×≤{} 根, 并发 {conc}: 网络+解析+合并 {:.2}s)",
+        (t_fetch - t_declare).as_secs_f64(),
+        pages,
+        ricow_binance::KLINE_PAGE_BARS,
+        net_ms as f64 / 1000.0
+    );
     if klines.is_empty() {
         return Err(CoreError::Exchange(format!("no klines for {pair}")));
     }
@@ -427,8 +460,15 @@ pub(crate) async fn run_backtest(
     // 生效 MMR (报告显示用): 三层解析 + 可能的交易所首档拉取已写回 params; config move 前取出。
     // (D3: 此前打印恒 2.5, --mmr-pct/TOML 覆盖不反映。)
     let effective_mmr_pct = config.get_f64("mmr_pct").unwrap_or(1.0);
+    let t_engine0 = t_total.elapsed();
     let report =
         Engine::new().backtest(config.clone(), initial_balance, &klines, args.close_at_end)?;
+    let t_engine = t_total.elapsed();
+    eprintln!(
+        "[timing] 引擎回放 = {:.2}s ({} 根 bar, 含重采样/撮合/Lua 决策)",
+        (t_engine - t_engine0).as_secs_f64(),
+        klines.len()
+    );
 
     // 测试参数区块 (032+ 可观测性): 生效配置全量通用 dump (剔除 script 源码, 太长)。
     let mut test_params: Vec<(String, String)> = config
@@ -466,9 +506,15 @@ pub(crate) async fn run_backtest(
     );
 
     // 导出 (032+ 可观测性, --export-dir): 参数 / 逐笔成交 / 权益曲线 / 报告全文。
+    let t_export0 = t_total.elapsed();
     if let Some(dir) = &args.export_dir {
         export_backtest(dir, &args.strategy, &pair, &config, &klines, &report, &text)?;
     }
+    eprintln!(
+        "[timing] 报告+导出 = {:.2}s | 总计 = {:.2}s",
+        (t_total.elapsed() - t_export0).as_secs_f64(),
+        t_total.elapsed().as_secs_f64()
+    );
 
     Ok((text, report))
 }
