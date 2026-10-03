@@ -1984,6 +1984,308 @@ fn test_shannon_neutral_close_fill_no_flag_and_recon() {
     assert_eq!(snap.get("stat_flag_min").map(|s| s.as_str()), Some("-2"));
 }
 
+// ============================================================================
+// 现货虚拟香农网格 (shannon_virtual_grid) 集成测试 —— EMA 金叉/死叉事件驱动的
+// 市价再平衡(不挂限价单): 虚拟账本目标推进 + 真实现金封顶 + 死叉卖量超持仓重置,
+// 方向 flag 趋势侧间距指数放大(同合约口径: 卖 +1 / 买 −1, 建仓/种子/重置不计)。
+// tf 序列(64 根 1h, 每段 16 根等步长 0.5: 降→升→降→升, TR 恒 1 → ATR 恒 1):
+// 金叉@18 / 死叉@34 / 金叉@50, ATR 就绪@15, 间距 = 5×1 = 5。
+// ============================================================================
+
+const SHANNON_VIRTUAL_GRID: &str =
+    include_str!("../../../strategies/spot/shannon_virtual_grid.lua");
+
+/// 虚拟网格 tf 序列: 16 根降(100→92.5) + 16 根升 + 16 根降 + 16 根升, 步长 0.5。
+fn vgrid_tf() -> Vec<Kline> {
+    let mut closes: Vec<f64> = (0..16).map(|i| 100.0 - 0.5 * i as f64).collect();
+    let mut last = *closes.last().unwrap();
+    for _ in 0..16 {
+        last += 0.5;
+        closes.push(last);
+    }
+    for _ in 0..16 {
+        last -= 0.5;
+        closes.push(last);
+    }
+    for _ in 0..16 {
+        last += 0.5;
+        closes.push(last);
+    }
+    closes
+        .iter()
+        .enumerate()
+        .map(|(h, c)| {
+            let d = Decimal::from_f64_retain(*c).unwrap();
+            Kline {
+                open_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                    h as i64 * 3_600_000,
+                )
+                .unwrap(),
+                open: d,
+                high: d + dec!(0.5),
+                low: d - dec!(0.5),
+                close: d,
+                volume: Decimal::ONE,
+                close_time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                    h as i64 * 3_600_000 + 3_599_999,
+                )
+                .unwrap(),
+            }
+        })
+        .collect()
+}
+
+/// 主时钟序列: 每小时一根 flat bar(open=px), 策略读 price = bar.open(市价成交价)。
+fn vgrid_main(closes: &[f64]) -> Vec<Kline> {
+    closes
+        .iter()
+        .enumerate()
+        .map(|(h, p)| bar_at_f(h as i64, *p))
+        .collect()
+}
+
+fn vgrid_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![
+        ("pair", ConfigValue::String("ETHUSDT".into())),
+        ("atr_interval", ConfigValue::String("1h".into())),
+        ("ema_interval", ConfigValue::String("1h".into())),
+        ("atr_period", ConfigValue::Integer(14)),
+        ("ema_fast", ConfigValue::Integer(2)),
+        ("ema_slow", ConfigValue::Integer(3)),
+        ("min_notional", ConfigValue::Float(5.0)),
+        ("fee_side", ConfigValue::Float(0.001)),
+        ("invest_cash", ConfigValue::Float(10000.0)),
+    ];
+    params.extend_from_slice(extra);
+    config(SHANNON_VIRTUAL_GRID, &params)
+}
+
+/// 建仓开关配置(enable_build + build_price=101 + build_amount)。
+fn vgrid_build(amount: f64) -> Vec<(&'static str, ConfigValue)> {
+    vec![
+        ("enable_build", ConfigValue::Boolean(true)),
+        ("build_price", ConfigValue::Float(101.0)),
+        ("build_amount", ConfigValue::Float(amount)),
+    ]
+}
+
+#[test]
+fn test_shannon_virtual_grid_mult_out_of_range_halts() {
+    let mc = vec![100.0; 32];
+    let (orders, _ctx, st) = run_univ2(
+        vgrid_cfg(&[("virtual_mult", ConfigValue::Float(6.0))]),
+        &vgrid_main(&mc),
+        Some(vgrid_tf()),
+    );
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "虚拟倍数越界应 FATAL 停机");
+    assert!(orders.iter().all(|b| b.is_empty()), "停机后不得下单");
+}
+
+#[test]
+fn test_shannon_virtual_grid_requires_build_params() {
+    let mc = vec![100.0; 32];
+    let (orders, _ctx, st) = run_univ2(
+        vgrid_cfg(&[("enable_build", ConfigValue::Boolean(true))]),
+        &vgrid_main(&mc),
+        Some(vgrid_tf()),
+    );
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "enable_build 缺 build_price 应 FATAL");
+    assert!(orders.iter().all(|b| b.is_empty()));
+}
+
+#[test]
+fn test_shannon_virtual_grid_golden_cross_virtual_init_no_order() {
+    // 建仓关闭(回测默认): 首次金叉(bar18, 价 92)**只做虚拟初始化, 不下任何实际订单** ——
+    // 平衡价 := 现价+间距(92+5=97), 虚拟仓位按总资金 1:1 建立, 真实现金全额保留。
+    let mut mc = vec![100.0; 18];
+    mc.extend(vec![92.0; 12]);
+    let (orders, _ctx, st) =
+        run_univ2(vgrid_cfg(&[]), &vgrid_main(&mc), Some(vgrid_tf()));
+    assert!(
+        orders.iter().all(|b| b.is_empty()),
+        "不建仓口径: 首次金叉虚拟初始化不得下任何订单"
+    );
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "虚拟初始化无真实成交");
+    assert_eq!(st.global_f64("flag"), Some(0.0));
+    assert!((st.global_f64("balance_price").unwrap() - 97.0).abs() < 1e-6, "平衡价 := 现价+间距");
+    // 虚拟账本按总资金在平衡价精确 1:1 建立
+    let v_cash = st.global_f64("v_cash").unwrap();
+    let v_pos = st.global_f64("v_pos").unwrap();
+    assert!((v_cash - 10000.0).abs() < 1e-6, "虚拟现金 = 总资金一半");
+    assert!((v_cash - v_pos * 97.0).abs() / 20000.0 < 1e-6, "虚拟仓位 1:1 @平衡价");
+    assert_eq!(st.global_f64("m_pos").unwrap(), 0.0, "真实持仓保持 0(未建仓)");
+    assert!((st.global_f64("m_cash").unwrap() - 10000.0).abs() < 1e-6, "真实现金全额保留");
+}
+
+#[test]
+fn test_shannon_virtual_grid_cross_within_band_noop() {
+    // 建仓@100(bar15), 金叉@18 价 98: 平衡价−价 = 2 < 买间距(5) → 带内不补仓。
+    let mut mc = vec![100.0; 18];
+    mc.extend(vec![98.0; 12]);
+    let extra = vgrid_build(10000.0);
+    let mut refs: Vec<(&str, ConfigValue)> = Vec::new();
+    for (k, v) in &extra {
+        refs.push((k, v.clone()));
+    }
+    let (orders, _ctx, st) = run_univ2(vgrid_cfg(&refs), &vgrid_main(&mc), Some(vgrid_tf()));
+    let market: Vec<_> = orders
+        .iter()
+        .flatten()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Market)
+        .collect();
+    assert_eq!(market.len(), 1, "只应有建仓一笔, 带内金叉不补仓");
+    assert_eq!(st.global_f64("fill_count"), Some(1.0));
+    assert_eq!(st.global_f64("flag"), Some(0.0));
+}
+
+#[test]
+fn test_shannon_virtual_grid_death_cross_sell() {
+    // 建仓@100, 死叉@34 价 115: 价−平衡 = 15 ≥ 卖间距(5) → 市价卖一笔, flag+1。
+    let mut mc = vec![100.0; 18];
+    mc.extend(vec![103.0, 106.0, 109.0, 112.0, 115.0]);
+    mc.extend(vec![115.0; 13]);
+    let extra = vgrid_build(10000.0);
+    let mut refs: Vec<(&str, ConfigValue)> = Vec::new();
+    for (k, v) in &extra {
+        refs.push((k, v.clone()));
+    }
+    let (orders, _ctx, st) = run_univ2(vgrid_cfg(&refs), &vgrid_main(&mc), Some(vgrid_tf()));
+    let sells: Vec<_> = orders
+        .iter()
+        .flatten()
+        .flatten()
+        .filter(|o| o.order_type == OrderType::Market && o.side == OrderSide::Sell)
+        .collect();
+    assert_eq!(sells.len(), 1, "死叉越带应市价卖一笔");
+    assert_eq!(st.global_f64("flag"), Some(1.0), "卖 +1");
+    assert_eq!(st.global_f64("sell_count"), Some(1.0));
+}
+
+#[test]
+fn test_shannon_virtual_grid_death_cross_no_position_noop() {
+    // enable_build 且价恒 150 > build_price=101 → 永不建仓; 死叉@34 无仓 → 不处理。
+    let mc = vec![150.0; 52];
+    let extra = vgrid_build(10000.0);
+    let mut refs: Vec<(&str, ConfigValue)> = Vec::new();
+    for (k, v) in &extra {
+        refs.push((k, v.clone()));
+    }
+    let (orders, _ctx, st) = run_univ2(vgrid_cfg(&refs), &vgrid_main(&mc), Some(vgrid_tf()));
+    assert!(orders.iter().all(|b| b.is_empty()), "未建仓则死叉无仓不处理, 全程零单");
+    assert_eq!(st.global_f64("fill_count"), Some(0.0), "未建仓应零成交");
+}
+
+#[test]
+fn test_shannon_virtual_grid_flag_spacing_amplified() {
+    // 建仓@100(5000), 金叉@18 买@92(flag−1), 金叉@50 买@85(flag−2):
+    // 趋势侧(买)间距 ×1.2^(2−1)=×1.2, 卖间距不变 → last_buy/last_sell = 1.2。
+    let mut mc = vec![100.0; 18];
+    mc.push(92.0);
+    mc.extend(vec![85.0; 36]);
+    let extra = vgrid_build(5000.0);
+    let mut refs: Vec<(&str, ConfigValue)> = Vec::new();
+    for (k, v) in &extra {
+        refs.push((k, v.clone()));
+    }
+    let (_orders, _ctx, st) = run_univ2(vgrid_cfg(&refs), &vgrid_main(&mc), Some(vgrid_tf()));
+    assert_eq!(st.global_f64("flag"), Some(-2.0), "两笔网格买 → flag=−2");
+    assert_eq!(st.global_f64("flag_min"), Some(-2.0));
+    let bs = st.global_f64("last_buy_spacing").unwrap();
+    let ss = st.global_f64("last_sell_spacing").unwrap();
+    assert!((bs / ss - 1.2).abs() < 1e-6, "flag=−2 → 买间距 ×1.2, 卖间距不变: {bs} vs {ss}");
+}
+
+#[test]
+fn test_shannon_virtual_grid_buy_cash_limited() {
+    // 不建仓: 金叉@18 虚拟初始化(平衡价 97, 零现金支出); 价格深跌至 15 后金叉@50 →
+    // 虚拟买量 clip ≈704 币(名义 1.06 万)超真实现金 → 实发按现金截断, 计数 cash_limited,
+    // 虚拟持仓按目标推进显著高于真实持仓。
+    let mut mc = vec![100.0; 18];
+    mc.push(92.0);
+    mc.extend(vec![80.0; 15]);
+    mc.push(60.0);
+    mc.extend(vec![15.0; 16]);
+    let (_orders, _ctx, st) = run_univ2(
+        vgrid_cfg(&[("virtual_mult", ConfigValue::Float(5.0))]),
+        &vgrid_main(&mc),
+        Some(vgrid_tf()),
+    );
+    assert_eq!(st.global_f64("cash_limited_buys"), Some(1.0), "金叉买量超现金 → 截断计数");
+    assert_eq!(st.global_f64("fill_count"), Some(1.0), "虚拟初始化不下单, 仅这笔截断买单成交");
+    let v_pos = st.global_f64("v_pos").unwrap();
+    let m_pos = st.global_f64("m_pos").unwrap();
+    assert!(v_pos > m_pos * 1.4, "虚拟持仓按目标推进应高于真实(截断)持仓: v={v_pos} m={m_pos}");
+}
+
+#[test]
+fn test_shannon_virtual_grid_insufficient_sell_resets() {
+    // 建仓 1000(真实 10 币, 虚拟 100 币), 死叉@34 价 130: 卖量 ~11.5 > 真实 10 → 重置。
+    let mut mc = vec![100.0; 18];
+    mc.extend(vec![103.0, 106.0, 109.0, 112.0, 115.0, 118.0, 121.0, 124.0, 127.0, 130.0]);
+    mc.extend(vec![130.0; 16]);
+    let extra = vgrid_build(1000.0);
+    let mut refs: Vec<(&str, ConfigValue)> = Vec::new();
+    for (k, v) in &extra {
+        refs.push((k, v.clone()));
+    }
+    let (orders, _ctx, st) = run_univ2(vgrid_cfg(&refs), &vgrid_main(&mc), Some(vgrid_tf()));
+    assert_eq!(st.global_f64("reset_count"), Some(1.0), "死叉卖量超实际持仓 → 重置");
+    assert_eq!(st.global_f64("flag"), Some(0.0), "重置不发单不计 flag");
+    assert!((st.global_f64("balance_price").unwrap() - 130.0).abs() < 1e-6, "新平衡价 = 当前价");
+    // 重置回初始承诺: v_total = 投入×倍数 = 20000, v_cash = 一半 = 10000
+    assert!((st.global_f64("v_cash").unwrap() - 10000.0).abs() < 1e-6);
+    let sells: Vec<_> = orders
+        .iter()
+        .flatten()
+        .flatten()
+        .filter(|o| o.side == OrderSide::Sell)
+        .collect();
+    assert!(sells.is_empty(), "重置本次不发卖单");
+}
+
+#[test]
+fn test_shannon_virtual_grid_1to1_invariant() {
+    // 跑完建仓+死叉卖一轮: 虚拟账本 1:1 恒等 + 真实账本与引擎逐分对齐(回测规范 §C.4)。
+    let mut mc = vec![100.0; 18];
+    mc.extend(vec![103.0, 106.0, 109.0, 112.0, 115.0]);
+    mc.extend(vec![115.0; 13]);
+    let extra = vgrid_build(10000.0);
+    let mut refs: Vec<(&str, ConfigValue)> = Vec::new();
+    for (k, v) in &extra {
+        refs.push((k, v.clone()));
+    }
+    let (_orders, mut ctx, st) = run_univ2(vgrid_cfg(&refs), &vgrid_main(&mc), Some(vgrid_tf()));
+    let v_cash = st.global_f64("v_cash").unwrap();
+    let v_pos = st.global_f64("v_pos").unwrap();
+    let bal = st.global_f64("balance_price").unwrap();
+    let vt = st.global_f64("v_total").unwrap();
+    assert!((v_cash - v_pos * bal).abs() / vt < 1e-6, "虚拟账本 1:1 恒等应精确闭合");
+    let mut st = st;
+    st.on_stop(&mut ctx);
+    let snap: HashMap<String, String> = st.state_snapshot().into_iter().collect();
+    let dc: f64 = snap.get("stat_ledger_diff_cash").unwrap().parse().unwrap();
+    let dp: f64 = snap.get("stat_ledger_diff_pos").unwrap().parse().unwrap();
+    assert!(dc.abs() < 0.01 && dp.abs() < 0.01, "真实账本与引擎逐分对齐: cash差{dc} 仓差{dp}");
+}
+
+#[test]
+fn test_shannon_virtual_grid_thin_spacing_halts() {
+    // atr_mult≈0 + 禁用下限 → 生效间距 < 4×费率 → 成本门槛停机, 不建仓不交易。
+    let mc = vec![100.0; 32];
+    let extra = vgrid_build(10000.0);
+    let mut refs: Vec<(&str, ConfigValue)> = Vec::new();
+    for (k, v) in &extra {
+        refs.push((k, v.clone()));
+    }
+    refs.push(("atr_mult", ConfigValue::Float(0.0001)));
+    refs.push(("min_spacing_pct", ConfigValue::Float(-1.0)));
+    let (orders, _ctx, st) = run_univ2(vgrid_cfg(&refs), &vgrid_main(&mc), Some(vgrid_tf()));
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "间距低于成本门槛 → 停机");
+    assert!(orders.iter().all(|b| b.is_empty()), "停机不得下单");
+    assert_eq!(st.global_f64("fill_count"), Some(0.0));
+}
+
 #[test]
 fn test_notify_halt_and_stall_flags() {
     // 042: 引擎 halted/stall 通知的取值口径 —— Lua 全局 fatal 与 _RICOW_STATE 键

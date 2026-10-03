@@ -19,6 +19,8 @@ strategies/spot/*
 !strategies/spot/paired_grid.toml
 !strategies/spot/shannon_grid.lua
 !strategies/spot/shannon_grid.toml
+!strategies/spot/shannon_virtual_grid.lua
+!strategies/spot/shannon_virtual_grid.toml
 !strategies/futures/
 strategies/futures/*
 !strategies/futures/.gitkeep
@@ -41,3 +43,4 @@ logs/
 run/
 risk_ack.json
 .trae/
+backtests/
