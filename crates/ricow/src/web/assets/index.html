@@ -39,6 +39,12 @@
         <header id="topbar">
           <span id="session-title" class="muted"></span>
           <span id="status" class="status"></span>
+          <!-- 034: 主题切换, 值存 ricow.toml 的 [ui].theme(与语言同一来源)。 -->
+          <select id="theme-select" class="mini-select" title="主题 / Theme">
+            <option value="dark" data-zh="深色" data-en="Dark">深色</option>
+            <option value="light" data-zh="白色" data-en="Light">白色</option>
+            <option value="red" data-zh="红色" data-en="Red">红色</option>
+          </select>
           <button id="lang-toggle" class="ghost-btn" type="button" title="中 / EN">EN</button>
         </header>
 

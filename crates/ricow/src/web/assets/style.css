@@ -1,15 +1,74 @@
-/* Ricow Web 前端样式 (025): 深色系沿用 `website/style.css` 的同一套 `:root` 变量 (FR-023)。 */
+/* Ricow Web 前端样式 (025): 深色系沿用 `website/style.css` 的同一套 `:root` 变量 (FR-023)。
+   034: 主题变量化 —— `:root` = 深色(默认), `[data-theme="light"]` / `[data-theme="red"]`
+   各覆盖一份变量; 全部组件只准引用变量, 不准再写死颜色。 */
 :root {
+  color-scheme: dark;
   --bg: #0e1116;
   --panel: #161b22;
+  /* 面板之上再抬一层的表面: 会话悬停 / 用户气泡 / 输入行等。 */
+  --raised: #1d232b;
   --border: #2b333d;
   --fg: #e6edf3;
   --muted: #9aa7b4;
   --accent: #4dd4ac;
   --accent-dim: #2f8f74;
+  /* 强调色之上的文字(主按钮文字)。 */
+  --on-accent: #06231b;
+  --accent-soft: rgba(77, 212, 172, 0.12);
+  --accent-soft-2: rgba(77, 212, 172, 0.1);
   --warn: #e3b341;
   --error: #f85149;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --danger-border: rgba(248, 81, 73, 0.5);
+  --overlay: rgba(0, 0, 0, 0.55);
+  --raise-1: rgba(255, 255, 255, 0.02);
+  --raise-2: rgba(255, 255, 255, 0.035);
+  --mono:
+    "Cascadia Code", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+/* 034 白色浅色主题: 背景白、面板浅灰, 强调色加深保证对比度(WCAG AA)。 */
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --panel: #f5f7f9;
+  --raised: #eceff3;
+  --border: #d8dee5;
+  --fg: #1f2328;
+  --muted: #5b6672;
+  --accent: #0d9b6c;
+  --accent-dim: #0a7d57;
+  --on-accent: #ffffff;
+  --accent-soft: rgba(13, 155, 108, 0.12);
+  --accent-soft-2: rgba(13, 155, 108, 0.09);
+  --warn: #96660a;
+  --error: #cf222e;
+  --danger-border: rgba(207, 34, 46, 0.45);
+  --overlay: rgba(15, 23, 32, 0.4);
+  --raise-1: rgba(15, 23, 32, 0.025);
+  --raise-2: rgba(15, 23, 32, 0.05);
+}
+
+/* 034 红色主题: 深红褐面 + 珊瑚强调 —— 整体仍是暗色系, 红色为主色调。 */
+[data-theme="red"] {
+  color-scheme: dark;
+  --bg: #221013;
+  --panel: #2d151a;
+  --raised: #3a1c21;
+  --border: #56282f;
+  --fg: #f6e7e4;
+  --muted: #c19b97;
+  --accent: #ff8f7d;
+  --accent-dim: #c9604f;
+  --on-accent: #330f0e;
+  --accent-soft: rgba(255, 143, 125, 0.14);
+  --accent-soft-2: rgba(255, 143, 125, 0.1);
+  --warn: #e8b04b;
+  --error: #ff8494;
+  --danger-border: rgba(255, 132, 148, 0.5);
+  --overlay: rgba(12, 4, 5, 0.65);
+  --raise-1: rgba(255, 255, 255, 0.03);
+  --raise-2: rgba(255, 255, 255, 0.05);
 }
 * {
   box-sizing: border-box;
@@ -22,13 +81,16 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font:
-    15px/1.65 system-ui,
-    -apple-system,
-    "Segoe UI",
-    "Noto Sans SC",
-    "PingFang SC",
+  /* 034 现代字体栈: 优先各平台的可变系统字体, 中文回退苹方 / 微软雅黑 UI;
+     14px/1.6 是现代桌面应用的常规密度(原 15px/1.65 偏松)。 */
+  font-family:
+    Inter, "Segoe UI Variable Text", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", "PingFang SC", "Microsoft YaHei UI", "Noto Sans SC", "Source Han Sans SC",
     sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 #app {
   display: flex;
@@ -75,11 +137,11 @@ body {
   cursor: pointer;
 }
 #session-list li:hover {
-  background: #1d232b;
+  background: var(--raised);
   color: var(--fg);
 }
 #session-list li.active {
-  background: #1d232b;
+  background: var(--raised);
   border-left-color: var(--accent);
   color: var(--fg);
 }
@@ -179,7 +241,7 @@ body {
 .msg.user {
   margin-left: auto;
   padding: 8px 12px;
-  background: #1d232b;
+  background: var(--raised);
   border: 1px solid var(--border);
   border-radius: 10px;
 }
@@ -229,7 +291,7 @@ body {
   width: 100%;
   margin: 4px 0;
   padding: 7px 10px;
-  background: #1d232b;
+  background: var(--raised);
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--fg);
@@ -367,7 +429,7 @@ body {
   background: var(--accent-dim);
   border: none;
   border-radius: 10px;
-  color: #06231b;
+  color: var(--on-accent);
   font: inherit;
   font-weight: 600;
   cursor: pointer;
@@ -421,7 +483,7 @@ body {
 .source {
   margin: 10px 14px 0;
   padding: 6px 10px;
-  background: #1d232b;
+  background: var(--raised);
   border: 1px solid var(--border);
   border-radius: 8px;
   font-size: 0.8rem;
@@ -465,7 +527,7 @@ body {
 }
 .trow {
   padding: 4px 8px;
-  background: #1d232b;
+  background: var(--raised);
   border: 1px solid var(--border);
   border-radius: 6px;
   font-size: 0.8rem;
@@ -551,7 +613,7 @@ body {
   cursor: pointer;
 }
 .strategy-item:hover {
-  background: #1d232b;
+  background: var(--raised);
 }
 .strategy-name {
   display: block;
@@ -568,7 +630,7 @@ body {
 .strategy-detail {
   margin: 8px 14px 12px;
   padding: 10px;
-  background: #1d232b;
+  background: var(--raised);
   border: 1px solid var(--border);
   border-radius: 8px;
 }
@@ -639,11 +701,11 @@ body {
   font-size: 0.86rem;
 }
 #nav a:hover {
-  background: #1d232b;
+  background: var(--raised);
   color: var(--fg);
 }
 #nav a.active {
-  background: #1d232b;
+  background: var(--raised);
   border-left-color: var(--accent);
   color: var(--fg);
 }
@@ -814,7 +876,7 @@ body {
   background: var(--accent-dim);
   border: none;
   border-radius: 10px;
-  color: #06231b;
+  color: var(--on-accent);
   font: inherit;
   font-weight: 600;
   cursor: pointer;
@@ -947,7 +1009,7 @@ body {
 }
 .mk-row {
   padding: 6px 10px;
-  background: #1d232b;
+  background: var(--raised);
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--fg);
@@ -997,7 +1059,7 @@ body {
 }
 .mk-retry:hover {
   border-color: var(--accent-dim);
-  background: #1d232b;
+  background: var(--raised);
 }
 
 /* 详情态 */
@@ -1139,7 +1201,7 @@ body {
 .mk-iv.active {
   color: var(--accent);
   border-color: var(--accent-dim);
-  background: #1d232b;
+  background: var(--raised);
 }
 .mk-chart-box {
   position: relative;
@@ -1211,7 +1273,7 @@ body {
 }
 .sg-btn:hover {
   border-color: var(--accent-dim);
-  background: #1d232b;
+  background: var(--raised);
 }
 .sg-btn:disabled {
   opacity: 0.55;
@@ -1220,7 +1282,7 @@ body {
 .sg-btn-primary {
   background: var(--accent-dim);
   border-color: var(--accent-dim);
-  color: #06231b;
+  color: var(--on-accent);
   font-weight: 600;
 }
 .sg-btn-primary:hover {
@@ -1293,7 +1355,7 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  background: #1d232b;
+  background: var(--raised);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding-right: 6px;
@@ -1391,7 +1453,7 @@ body {
 .sg-hint {
   margin-bottom: 10px;
   padding: 8px 10px;
-  background: #1d232b;
+  background: var(--raised);
   border: 1px solid var(--border);
   border-left: 3px solid var(--warn);
   border-radius: 8px;
@@ -1628,7 +1690,7 @@ body {
   align-items: center;
   justify-content: center;
   padding: 16px;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--overlay);
 }
 .sg-modal-card {
   width: 100%;
@@ -1931,7 +1993,7 @@ body {
   justify-content: space-between;
   gap: 8px;
   padding: 7px 10px;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--raise-1);
   border-bottom: 1px solid var(--border);
   color: var(--muted);
   font-size: 0.75rem;
@@ -1966,10 +2028,10 @@ body {
   cursor: pointer;
 }
 .keys-item:hover {
-  background: rgba(255, 255, 255, 0.035);
+  background: var(--raise-2);
 }
 .keys-item.selected {
-  background: rgba(77, 212, 172, 0.12);
+  background: var(--accent-soft);
 }
 .keys-item-main {
   display: flex;
@@ -2031,7 +2093,7 @@ body {
   flex-direction: column;
   gap: 10px;
   padding: 12px 14px 14px;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--raise-1);
   border: 1px solid var(--border);
   border-radius: 10px;
 }
@@ -2067,11 +2129,11 @@ body {
 .keys-btn.primary {
   background: var(--accent-dim);
   border-color: var(--accent-dim);
-  color: #06231b;
+  color: var(--on-accent);
   font-weight: 600;
 }
 .keys-btn.danger {
-  border-color: rgba(248, 81, 73, 0.5);
+  border-color: var(--danger-border);
   color: var(--error);
 }
 .keys-btn.danger:hover {
@@ -2129,8 +2191,57 @@ body {
   cursor: pointer;
 }
 .settings-btn:hover {
-  background: rgba(77, 212, 172, 0.1);
+  background: var(--accent-soft-2);
 }
 .card-keys-link .settings-grid {
   grid-template-columns: 1fr;
+}
+
+/* ============================================================
+   034(纯追加, 上方既有规则一字未动): 历史消息折叠 + 主题切换。
+   ============================================================ */
+
+/* ---- 历史消息两行折叠 ----
+   规则: 流里除最新一块外, 更早的 .msg / .line 默认收成两行(超出淡出), 点击展开/再点收起。
+   .menu 不参与折叠(宿主菜单是交互块, 折起来就没法点了)。 */
+#stream .foldable {
+  position: relative;
+  cursor: pointer;
+}
+/* 精确两行截断: line-clamp 按行盒计数, 不受 padding 干扰(用户气泡有 8px 内边距,
+   max-height 会把内边距也算进去, 两行就缩成一行半)。 */
+#stream .foldable.folded {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+/* 淡出遮罩: 从透明渐到所在表面的底色 —— 用户气泡在 --raised 上, 其余在 --bg 上。 */
+#stream .foldable.folded::after {
+  content: attr(data-fold-hint);
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  padding-left: 6em;
+  background: linear-gradient(to right, transparent, var(--bg) 45%);
+  color: var(--accent);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  pointer-events: none;
+  white-space: nowrap;
+}
+#stream .msg.user.folded::after {
+  background: linear-gradient(to right, transparent, var(--raised) 45%);
+}
+/* 已被用户手动展开过的消息, 新消息到达时不再被自动收起。 */
+#stream .foldable[data-keep-open] {
+  cursor: auto;
+}
+#stream .foldable[data-keep-open]::after {
+  content: none;
+}
+
+/* ---- 顶栏主题选择 ---- */
+#theme-select {
+  min-width: 64px;
 }

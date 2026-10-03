@@ -159,6 +159,21 @@
 
   // ---------- 纯工具 ----------
 
+  // ---------- 主题(034) ----------
+  // 当前主题: 单一来源在 `ricow.toml` 的 `[ui].theme`(由 chat.js 的 boot 写入)。
+  // CSS 侧 `:root` = 深色兜底, `[data-theme="light"]` / `[data-theme="red"]` 各覆盖一份变量;
+  // 切换即换 `<html data-theme>`, 全站组件跟着变量走, 无需逐个重渲染。
+  R.theme = "dark";
+
+  R.applyTheme = function (theme) {
+    R.theme = theme === "light" || theme === "red" ? theme : "dark";
+    document.documentElement.dataset.theme = R.theme;
+    const sel = document.getElementById("theme-select");
+    if (sel) sel.value = R.theme;
+    // 广播给关心外观的模块(如 markets.js 的 K 线图要按新变量重取配色)。
+    window.dispatchEvent(new CustomEvent("ricow:theme", { detail: R.theme }));
+  };
+
   /// 秒级时间戳(会话列表的 `updated_at`)→ 展示串。交易端点的毫秒级时间戳不用这个,
   /// 由对话视图自己的 `formatStamp` 处理(口径不同, 不能合并)。
   R.formatTime = function (ts) {

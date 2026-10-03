@@ -106,6 +106,9 @@ pub struct MarketSection {
 pub struct UiSection {
     /// `None` = 尚未选择(首次向导会问一次); 仅接受 `"zh"` / `"en"`, 其它值硬失败。
     pub lang: Option<String>,
+    /// Web 界面主题(034): `None` = 未设置(前端按深色 `dark` 兜底);
+    /// 仅接受 `"dark"` / `"light"` / `"red"`, 其它值硬失败 —— 与 `[ui].lang` 同一纪律。
+    pub theme: Option<String>,
 }
 
 /// 密钥环(033)里的一套**备用 AI 凭据**: 别名 + 服务商 + 模型 + 接口地址 + 密钥。
@@ -199,6 +202,8 @@ pub fn template_text() -> String {
          # zh = 中文(默认) · en = English。对话内可用 /lang 切换。\n\
          [ui]\n\
          lang = \"zh\"\n\
+         # Web 界面主题(034): dark = 深色(默认) · light = 白色浅色 · red = 红色。\n\
+         # theme = \"dark\"\n\
          \n\
          # ── ⑤ 密钥环 / Key vault (可选, 033) ──────────────────────────────\n\
          # 上面 [ai] / [exchange] 段是**当前生效**的凭据;\n\
@@ -316,7 +321,7 @@ pub(crate) fn harden_secret_file(path: &Path) -> Result<(), String> {
 const AI_KEYS: [&str; 5] = ["provider", "model", "base_url", "max_turns", "api_key"];
 const EXCHANGE_KEYS: [&str; 4] = ["demo_key", "demo_secret", "binance_key", "binance_secret"];
 const MARKET_KEYS: [&str; 1] = ["show_all_pairs"];
-const UI_KEYS: [&str; 1] = ["lang"];
+const UI_KEYS: [&str; 2] = ["lang", "theme"];
 /// `[[ai_key]]` 每套允许的键(全部字符串)。
 const AI_KEY_FIELDS: [&str; 5] = ["alias", "provider", "model", "base_url", "api_key"];
 /// `[[exchange_key]]` 每套允许的键(全部字符串)。
@@ -396,6 +401,17 @@ pub fn load(root: &Path) -> CoreResult<File> {
                         )));
                     }
                     out.ui.lang = Some(v.to_string());
+                }
+                // [ui].theme(034): 白名单硬校验, 与 lang 同一纪律 —— 非法值宁可启动失败,
+                // 也不静默回退(否则用户改错一个字母会以为主题已生效)。
+                if let Some(v) = t.get("theme").and_then(|v| v.as_str()).map(str::trim) {
+                    if !matches!(v, "dark" | "light" | "red") {
+                        return Err(CoreError::Auth(format!(
+                            "配置文件 {} 的 [ui].theme 仅接受 \"dark\" / \"light\" / \"red\", 实际为 \"{v}\"",
+                            p.display()
+                        )));
+                    }
+                    out.ui.theme = Some(v.to_string());
                 }
             }
             other => {
@@ -557,7 +573,7 @@ impl SetValue {
 ///
 /// `pub(crate)`: Web 密钥配置端点(`web::keys`)在进入 [`set_values`] 之前要用**同一份**
 /// 白名单先做过滤/拒绝, 两处各抄一份必然漂移。
-pub(crate) const WRITABLE: [(&str, &str); 10] = [
+pub(crate) const WRITABLE: [(&str, &str); 11] = [
     ("ai", "provider"),
     ("ai", "model"),
     ("ai", "base_url"),
@@ -568,6 +584,7 @@ pub(crate) const WRITABLE: [(&str, &str); 10] = [
     ("exchange", "binance_secret"),
     ("market", "show_all_pairs"),
     ("ui", "lang"),
+    ("ui", "theme"),
 ];
 
 fn assert_writable(section: &str, key: &str) -> CoreResult<()> {
@@ -1140,6 +1157,44 @@ mod tests {
         let body = std::fs::read_to_string(path(&root)).unwrap();
         assert!(body.contains("[ui]") && body.contains("lang = \"en\""), "{body}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 034: `[ui].theme` 缺失 = 未设置(None, 前端按深色兜底); 非法值硬失败。
+    #[test]
+    fn test_ui_theme_missing_is_none_and_invalid_value_fails() {
+        let root = tmp_root("theme-none");
+        write(&root, "[ui]\nlang = \"zh\"\n");
+        assert_eq!(load(&root).unwrap().ui.theme, None, "缺失 = 未设置");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = tmp_root("theme-bad");
+        write(&root, "[ui]\ntheme = \"blue\"\n");
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("[ui].theme") && err.contains("dark"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 034: 三个主题值都能读回; 外科式写盘保留注释; 模板正文必须是合法 TOML。
+    #[test]
+    fn test_ui_theme_roundtrip_and_template_valid() {
+        for theme in ["dark", "light", "red"] {
+            let root = tmp_root("theme-ok");
+            write(&root, &format!("[ui]\nlang = \"zh\"\ntheme = \"{theme}\"\n"));
+            assert_eq!(load(&root).unwrap().ui.theme.as_deref(), Some(theme));
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        let root = tmp_root("theme-write");
+        write(&root, "[ai]\nprovider = \"deepseek\"\n\n# 主题注释\n[ui]\ntheme = \"dark\"\n");
+        set_values(&root, &[("ui", "theme", SetValue::Str("light".into()))]).unwrap();
+        let after = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(after.contains("# 主题注释"), "注释保留:\n{after}");
+        assert!(after.contains("theme = \"light\""));
+        assert_eq!(load(&root).unwrap().ui.theme.as_deref(), Some("light"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let t: toml::Table = toml::from_str(&template_text()).expect("模板必须合法");
+        assert!(t.contains_key("ui"), "模板含 [ui]");
     }
 
     #[test]

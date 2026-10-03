@@ -95,8 +95,39 @@
   }
 
   function append(node, pinned) {
+    foldPrevious(); // 034: 新块进门前, 把上一块收成两行 —— 最新的一块始终完整可见
     els.stream.appendChild(node);
     if (pinned) els.stream.scrollTop = els.stream.scrollHeight;
+  }
+
+  // ---------- 历史消息两行折叠 (034) ----------
+  //
+  // 规则: 流里除最新一块外, 更早的 .msg / .line 默认收成两行, 点击展开(再点收起)。
+  // `.menu`(宿主菜单)不参与 —— 它是交互块, 折起来就没法点了; 正在流式的气泡也不折。
+
+  /// 只有这两种块参与折叠: 它们才可能长过两行。菜单 / 浮层等不在其列。
+  function foldableBlock(node) {
+    return node &&
+        node.classList &&
+        (node.classList.contains("msg") || node.classList.contains("line"))
+      ? node
+      : null;
+  }
+
+  /// 把一块收成两行; 内容本就不超两行的块撤掉标记 —— 没东西可展开的块不该装作可点。
+  function foldUp(node) {
+    if (!foldableBlock(node) || node === state.streaming || node.dataset.keepOpen) return;
+    node.classList.add("foldable", "folded");
+    node.dataset.foldHint = R.lang === "en" ? "··· click to expand" : "··· 点击展开";
+    if (node.scrollHeight <= node.clientHeight + 1) {
+      node.classList.remove("foldable", "folded");
+      delete node.dataset.foldHint;
+    }
+  }
+
+  /// 收起流里当前最后一块(在追加新块之前调用)。
+  function foldPrevious() {
+    foldUp(els.stream.lastElementChild);
   }
 
   function appendLine(sev, text) {
@@ -131,6 +162,7 @@
   function appendDelta(text) {
     const pinned = atBottom();
     if (!state.streaming) {
+      foldPrevious(); // 034: 新回复气泡开张, 先把上一块收起来(走 append 的块由 append 收)
       state.streaming = document.createElement("div");
       state.streaming.className = "msg assistant";
       els.stream.appendChild(state.streaming);
@@ -601,6 +633,19 @@
     }
   });
 
+  // 主题切换(034): change 即写盘 —— 值存 `ricow.toml` 的 `[ui].theme`, 与语言同一来源;
+  // 失败回滚选项并如实报错。R.applyTheme 由 common.js 提供, 切换会广播 `ricow:theme`。
+  document.getElementById("theme-select").addEventListener("change", async (ev) => {
+    const wanted = ev.target.value;
+    try {
+      const info = await R.api("/api/theme", { method: "POST", body: { theme: wanted } });
+      R.applyTheme(info.theme);
+    } catch (err) {
+      ev.target.value = R.theme;
+      appendLine("error", t("failed") + err.message);
+    }
+  });
+
   // 浮层的关闭手势(FR-024): 点别处 / Esc; 滚动或改窗宽后位置不再贴合, 一并收起。
   document.addEventListener("click", (ev) => {
     if (pop.contains(ev.target)) return; // 浮层内的点击(选中文字)不该关掉它
@@ -611,6 +656,34 @@
   });
   els.stream.addEventListener("scroll", closeTerm, { passive: true });
   window.addEventListener("resize", closeTerm);
+
+  // 历史消息折叠(034): 点收起的块展开、再点收起。
+  // 例外都不抢手势: 点术语(顺带把它所在的折叠块展开, 否则解释会被截断看不见)、
+  // 点任何按钮 / 链接 / 菜单、以及正在选文字(复制)时。
+  els.stream.addEventListener("click", (ev) => {
+    const target = ev.target;
+    if (target.closest(".menu, button, a")) return;
+    const term = target.closest(".term");
+    if (term) {
+      const owner = term.closest(".foldable");
+      if (owner && owner.classList.contains("folded")) {
+        owner.classList.remove("folded");
+        owner.dataset.keepOpen = "1";
+      }
+      return;
+    }
+    const selection = window.getSelection();
+    if (selection && String(selection).length) return;
+    const block = target.closest(".foldable");
+    if (!block || !els.stream.contains(block)) return;
+    if (block.classList.contains("folded")) {
+      block.classList.remove("folded");
+      block.dataset.keepOpen = "1"; // 手动展开过的, 新消息到达时不再被自动收起
+    } else {
+      block.classList.add("folded");
+      delete block.dataset.keepOpen;
+    }
+  });
 
   // ---------- 交易面板 (026 FR-012 / FR-013 / FR-014; D11 / D17) ----------
   //
@@ -1004,6 +1077,11 @@
       applyLang((await R.api("/api/lang")).lang); // 与 CLI 共用 `[ui].lang`(D12)
     } catch (_) {
       applyLang("zh");
+    }
+    try {
+      R.applyTheme((await R.api("/api/theme")).theme); // 034: 与 CLI 共用 `[ui].theme`
+    } catch (_) {
+      R.applyTheme("dark"); // 读不到(服务异常): 按深色兜底, 不影响其余功能
     }
     try {
       await loadTerms();

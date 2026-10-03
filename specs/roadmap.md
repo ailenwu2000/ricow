@@ -35,8 +35,9 @@
 
 ## 测试基线
 
-- **当前基线 (2026-10-02, Windows, 033 密钥管理页落地后实跑)**: `cargo test --workspace` = **608 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 589: **+19 通过 / ignored 不变**; ricow bin 用例 **279 → 300(+21)**, 增量全部来自 033 —— `commands/config_file.rs` 密钥环 12 例 + `web/keyring.rs` 密钥端点 9 例。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0。
-  **如实**: `ai_live_smoke` 的 2 例(`approve_requires_interactive_tty` / `piped_confirm_phrases_never_reach_the_host`)在**本机(agent 沙箱)**报 `ERROR_PIPE_BUSY(231)` —— 它们只是 `spawn ricow` 并喂 stdin 管道, 用一个不含任何 ricow 代码的 20 行 Rust 程序即可复现同一错误, 故为环境对管道创建的拦截, 非代码缺陷(032 基线在真机终端为全绿)。另在**高负载轮次**偶见 `ai::tools` 部署类用例 `SQLITE_BUSY(database is locked)` 抖动, 已定性为测试脚手架缺陷(同一 `ricow.db` 连开多池 + `Database::open` 每次跑 `migrate()` 写事务), 本次顺手修掉两处(见 `specs/changes/033-key-manager/converge.md` §六); 根治需产品代码语义变更, 留待单独决策。端到端以真实 HTTP + 临时数据目录 30 组对照取证, 见 `specs/changes/033-key-manager/converge.md`。
+- **当前基线 (2026-10-03, Windows, 034 UI 主题+折叠落地后实跑)**: `cargo test --workspace` = **611 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 608: **+3 通过 / ignored 不变**; ricow bin 用例 **300 → 303(+3)**, 增量全部来自 034 —— `[ui].theme` 配置解析 2 例 + `/api/theme` 端点 1 例。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0。三主题(深/白/红)与历史消息两行折叠以真实浏览器截图取证, 见 `specs/changes/034-ui-themes-fold/converge.md`。
+  **如实**: `ai_live_smoke` 的 2 例(`approve_requires_interactive_tty` / `piped_confirm_phrases_never_reach_the_host`)在**本机(agent 沙箱)**报 `ERROR_PIPE_BUSY(231)` —— 它们只是 `spawn ricow` 并喂 stdin 管道, 用一个不含任何 ricow 代码的 20 行 Rust 程序即可复现同一错误, 故为环境对管道创建的拦截, 非代码缺陷(032 基线在真机终端为全绿)。另在**高负载轮次**偶见 `ai::tools` 部署类用例 `SQLITE_BUSY(database is locked)` 抖动, 已定性为测试脚手架缺陷(同一 `ricow.db` 连开多池 + `Database::open` 每次跑 `migrate()` 写事务), 033 已顺手修掉两处(见 `specs/changes/033-key-manager/converge.md` §六); 根治需产品代码语义变更, 留待单独决策。
+- **前基线 (2026-10-02, Windows, 033 密钥管理页落地后实跑)**: `cargo test --workspace` = **608 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 589: **+19 通过 / ignored 不变**; ricow bin 用例 **279 → 300(+21)**, 增量全部来自 033 —— `commands/config_file.rs` 密钥环 12 例 + `web/keyring.rs` 密钥端点 9 例。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0。
 - **前基线 (2026-09-29, Windows, 032 Web UI 工作台化落地后实跑)**: `cargo test --workspace` = **589 passed / 0 failed / 22 ignored**; 较上次 538: **+51 通过 / ignored 不变**; 增量全部来自 032-web-ui-console(web 模块: 配置/密钥端点、策略保存与源码/AI 编辑/回测 job、运行面 ensure_daemon 与 start/stop/risk 门禁、401 矩阵与前端资产密钥扫描等单测)。三门禁全绿(fmt 0 差异 / clippy --all-targets -D warnings 0 / test 0 failed); 端到端以浏览器实测 + testnet 真实调用取证(场景 1/3/5 走查 + demo 实发下单 + live 拒绝路径), 见 `specs/changes/032-web-ui-console/quickstart.md` 执行记录。
 - **前基线 (2026-09-25, Linux, 031 策略目录重构 + 清单 + 统一注册落地后实跑)**: `cargo test --workspace` = **538 passed / 0 failed / 22 ignored**; 较上次 529: **+9 通过 / ignored 不变**; 增量 = catalog.rs 清单解析/校验单测 8 例 + architecture_guard「清单键 == Lua 读取键」一致性 1 例。三门禁全绿(fmt 0 差异 / clippy -D warnings 0 / test 0 failed); 真实回测逐位一致验证通过: `--strategy {paired_grid,shannon_spot_grid}` 与迁移前(51ccb46 二进制)固定窗口报告逐位一致, 旧实例 TOML(`type=内置id`)加载行为不变。
 - **前基线 (2026-09-25, Linux, 内置策略收敛 + paired_grid 等比化后实跑)**: `cargo test --workspace` = **529 passed / 0 failed / 22 ignored**; 较上次 544/22: **−15 通过 / ignored 不变**; 变化 = 删除 shannon_rebalance(4 例) + executors/{dca,twap,vwap,pullback,ladder}(约 10 例) + paired_grid ATR 未就绪(1 例); paired_grid 改名「现货动态非对称网格」并等比化(买价 = ref÷(1+间距), 卖价 = 栈顶买入价×(1+间距))。
@@ -53,7 +54,7 @@
   ignored 全部为需真实外部环境的用例 (BN demo 现货 / 合约 / 用户流、Nasdaq 冒烟、019 AI 真机与 demo 联调), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
   220 → 204 的差额 = 009 移除 `locus_hl`(16 个内联测试); 204 → 216 = 008 新增 supervisor / CLI 命令面用例; 216 → 233 = 004 风控用例(频率窗口/两级熔断/装配与参数校验/接线); 233 → 270 = 011 用例(下单参数对齐 / 时钟预检判定 / 归属与停机清理编排 / 门禁 / proto 往返 / 现货事件解析 / 交易所过滤器解析 / 归属前缀长度约束)。
 - 验证方式: `cargo test --workspace`(纯逻辑) + 带 env key 的 `#[ignore]` 真实联调 (见 `specs/testnet.md`)。
-- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → 589(032 Web UI 工作台) → **608(033 密钥管理页, 当前)**。
+- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → 589(032 Web UI 工作台) → 608(033 密钥管理页) → **611(034 UI 主题+折叠, 当前)**。
 
 ## 变更档案状态 (specs/changes/)
 
@@ -98,6 +99,20 @@
 > 测试: ricow bin 279 → **300 passed / 0 failed / 1 ignored**(+21), 工作区 608 passed / 22 ignored、
 > 三门禁(fmt / clippy -D warnings / test)在本机除 `ai_live_smoke` 2 例环境性失败外全绿;
 > 端到端以真实 HTTP + 临时数据目录 30 组对照取证(含全部拒绝路径)。见 `specs/changes/033-key-manager/`。
+
+> **034-ui-themes-fold(2026-10-03, 已实施)**: **UI 主题 + 现代字体 + 历史消息折叠**。
+> ① **主题三选一**: 顶栏新增主题下拉(语言钮旁), `dark`(默认)/`light`(白色)/`red`(红色),
+> 值存 `ricow.toml` 的 `[ui].theme`(与 `[ui].lang` 同路径: 白名单 + 行式编辑保留注释, 非法值硬失败),
+> 新端点 `GET/POST /api/theme`; CSS 全面变量化(20 处硬编码颜色收敛为 `--raised` 等变量),
+> 三套主题各是一份变量表, K 线图配色随 `ricow:theme` 事件用缓存数据就地重绘(不重新拉数据)。
+> ② **现代字体**: 正文 15px/1.65 → 14px/1.6, 字体栈前置 Inter / Segoe UI Variable,
+> 中文回退苹方 / 微软雅黑 UI, 等宽栈前置 Cascadia Code / JetBrains Mono, 开抗锯齿。
+> ③ **历史消息两行折叠**: 对话流里除最新一块外, 更早的 `.msg`/`.line` 默认收成两行
+> (`-webkit-line-clamp`, 不受气泡内边距干扰), 淡出遮罩 + "··· 点击展开"提示(随语言);
+> 点击展开 / 再点收起; 宿主菜单与流式中的气泡不折, 手动展开过的块不被新消息重新收起,
+> 点术语先展开所在块, 选文字(复制)不触发手势。测试 608 → **611 passed / 22 ignored**(+3),
+> 三门禁全绿(除 2 例环境性失败); 三主题与折叠以真实浏览器截图取证。
+> 见 `specs/changes/034-ui-themes-fold/`。
 
 > SDD 产物规范: 计划与任务分解应存于 `specs/changes/<feature>/{spec,plan,tasks}.md`。
 > 005/006/007 的计划当时落在 `.hermes/plans/`(临时区, 已 git 忽略), 未回填档案 —— 后续变更须归档到位。

@@ -271,6 +271,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/terms", get(list_terms))
         // 语言读写(FR-029): 与 CLI 共用 `[ui].lang`。
         .route("/api/lang", get(get_lang).post(set_lang))
+        // 主题读写(034): 与语言同路径 —— `[ui].theme`, 纯界面外观, 不碰会话线程。
+        .route("/api/theme", get(get_theme).post(set_theme))
         // 密钥配置(032 US1 / FR-006 ~ FR-009): 读只给脱敏尾号, 写与向导共用同一份 ricow.toml。
         .route("/api/config/keys", get(keys::get_keys).post(keys::post_keys))
         // 密钥管理(033): 多套 AI / 币安密钥的别名条目 —— 总览 / 保存 / 选用 / 删除 / 清空生效。
@@ -662,6 +664,47 @@ const SUPPORTED_LANGS: [&str; 2] = ["zh", "en"];
 /// 当前界面语言 = 配置里的 `[ui].lang`(缺省中文)。每次现读, 与 CLI 看到的永远一致。
 fn current_lang(root: &Path) -> CoreResult<Lang> {
     Ok(crate::i18n::resolve(&config_file::load(root)?))
+}
+
+// ---- 主题读写(034): 与语言同构, 但纯外观 —— 不需要给会话线程送控制行 ----
+
+/// 可选主题(单一来源: 前端主题选择控件按它渲染; 白名单与 `config_file` 的 `[ui].theme` 一致)。
+const SUPPORTED_THEMES: [&str; 3] = ["dark", "light", "red"];
+
+#[derive(serde::Serialize)]
+struct ThemeReply {
+    theme: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ThemeBody {
+    theme: String,
+}
+
+/// 当前主题 = 配置里的 `[ui].theme`(缺省深色)。每次现读, 与配置文件永远一致。
+async fn get_theme(State(state): State<WebState>) -> Result<Json<ThemeReply>, WebError> {
+    let file = config_file::load(&state.root)?;
+    let theme = file.ui.theme.unwrap_or_else(|| "dark".to_string());
+    Ok(Json(ThemeReply { theme }))
+}
+
+async fn set_theme(
+    State(state): State<WebState>,
+    Json(body): Json<ThemeBody>,
+) -> Result<Json<ThemeReply>, WebError> {
+    let theme = body.theme.trim().to_string();
+    if !SUPPORTED_THEMES.contains(&theme.as_str()) {
+        return Err(WebError::bad_request(format!(
+            "不支持的主题: {} (可选: {})",
+            body.theme,
+            SUPPORTED_THEMES.join(" / ")
+        )));
+    }
+    // 先确保配置存在(首次运行会生成模板), 再按白名单写回并保留注释(与 `set_lang` 同路径);
+    // 非法值在 `load` 里本就会硬失败, 这里再挡一道是为了给出统一的 400 报错。
+    config_file::load(&state.root)?;
+    config_file::set_values(&state.root, &[("ui", "theme", SetValue::Str(theme.clone()))])?;
+    Ok(Json(ThemeReply { theme }))
 }
 
 // ---- 交易可见性 (026 FR-010 ~ FR-014; D1 / D10 / D11 / D14) ----
@@ -1492,6 +1535,78 @@ mod tests {
         let body_txt = body_of(&res);
         assert!(body_txt.contains(r#""configured":false"#), "空模板应全部未配置: {body_txt}");
         assert!(!body_txt.contains(FAKE_KEY), "读响应不得含密钥全文: {body_txt}");
+    }
+
+    /// 034: `/api/theme` 读写 —— 缺省 dark; 合法值写盘并回读; 非法值 400 且不落盘。
+    #[tokio::test]
+    async fn test_theme_endpoint_roundtrip_and_reject() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use ricow_strategy::Database;
+
+        async fn raw(port: u16, req: String) -> String {
+            let mut stream =
+                tokio::net::TcpStream::connect((BIND_ADDR, port)).await.expect("连上服务");
+            stream.write_all(req.as_bytes()).await.expect("发出请求");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("读回响应");
+            String::from_utf8_lossy(&buf).to_string()
+        }
+        async fn get(port: u16, path: &str) -> String {
+            raw(
+                port,
+                format!("GET {path} HTTP/1.1\r\nHost: {BIND_ADDR}\r\nConnection: close\r\n\r\n"),
+            )
+            .await
+        }
+        async fn post(port: u16, path: &str, body: &str) -> String {
+            raw(
+                port,
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: {BIND_ADDR}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+            .await
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "ricow-web-theme-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("时钟正常")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("建临时数据目录");
+        let db = Database::open_in_memory().await.expect("开内存库");
+        let store = SessionStore::new(db.clone());
+        let starter: Starter = Arc::new(|_id: &str, _sink: &mut WebSink| Ok(()));
+        let state = WebState::new("tok-ok".to_string(), root.clone(), db, store, starter);
+        let (listener, port) = bind(0).await.expect("绑定回环端口");
+        let _server = tokio::spawn(serve(listener, state));
+
+        // 缺省 = 深色(与前端兜底一致)。
+        let res = get(port, "/api/theme?token=tok-ok").await;
+        assert!(res.starts_with("HTTP/1.1 200"), "GET /api/theme 应 200, 实际: {res}");
+        assert!(body_of(&res).contains(r#""theme":"dark""#), "缺省主题应为 dark: {res}");
+
+        // 合法值: 200, 回读一致; ricow.toml 里真有 theme = "light"。
+        let res = post(port, "/api/theme?token=tok-ok", r#"{"theme":"light"}"#).await;
+        assert!(res.starts_with("HTTP/1.1 200"), "POST 合法主题应 200, 实际: {res}");
+        let res = get(port, "/api/theme?token=tok-ok").await;
+        assert!(body_of(&res).contains(r#""theme":"light""#), "写盘后应回读 light: {res}");
+        let toml_text = std::fs::read_to_string(config_file::path(&root)).expect("读 ricow.toml");
+        assert!(toml_text.contains("theme = \"light\""), "配置应落盘: {toml_text}");
+
+        // 非法值: 400, 且不得覆盖已有主题。
+        let res = post(port, "/api/theme?token=tok-ok", r#"{"theme":"blue"}"#).await;
+        assert!(res.starts_with("HTTP/1.1 400"), "非法主题应 400, 实际: {res}");
+        let res = get(port, "/api/theme?token=tok-ok").await;
+        assert!(body_of(&res).contains(r#""theme":"light""#), "非法值不得覆盖已有主题: {res}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// FR-011 回归: 一次 `POST /input` **只投一行**。

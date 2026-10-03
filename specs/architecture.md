@@ -121,6 +121,24 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **设置页职责收敛**: 不再重复承载密钥配置(只留市场视野 + 指向密钥页的入口), 避免两处配置漂移; 运行页与策略页的 `need_keys` 引导改指密钥页。
 - **范围外**: 密钥加密存储 / 轮转与到期提醒 / 多交易所(见 `specs/changes/033-key-manager/spec.md` §一)。
 
+**UI 主题 + 现代字体 + 历史消息折叠(034, 2026-10-03)**: 纯前端 + 一个只读配置项, 无新表、无新确认渠道。
+
+- **主题三选一**: 顶栏(语言钮旁) `#theme-select` 下拉, `dark`(默认)/`light`(白色)/`red`(红色);
+  值存 `ricow.toml` 的 `[ui].theme`(`UiSection.theme`, 白名单 `UI_KEYS`/`WRITABLE` 各加一项, 非法值硬失败),
+  新端点 `GET/POST /api/theme`(镜像 `/api/lang`, 但**不**给会话线程送控制行 —— 纯外观);
+  `common.js` 的 `R.applyTheme` 切 `<html data-theme>` 并广播 `ricow:theme` 事件。
+- **CSS 全面变量化**: `:root` = 深色兜底, `[data-theme="light"]` / `[data-theme="red"]` 各覆盖一份变量;
+  034 收敛了此前写死的 20 处颜色(`#1d232b`×16 / `#06231b`×4 / 7 处 rgba)为新变量
+  `--raised / --on-accent / --accent-soft(-2) / --danger-border / --overlay / --raise-1/2`,
+  组件层零硬编码; K 线图(`markets.js`)创建时从 CSS 变量取色, 主题事件触发用缓存 K 线就地重绘。
+- **现代字体**: 正文 15px/1.65 → **14px/1.6**, 字体栈前置 Inter / Segoe UI Variable,
+  中文回退苹方 / 微软雅黑 UI; 等宽栈前置 Cascadia Code / JetBrains Mono; 开抗锯齿。
+- **历史消息两行折叠**: 对话流(`#stream`)里除最新一块外, 更早的 `.msg`/`.line` 默认收成两行
+  (`-webkit-line-clamp: 2`, 按行盒计数, 不受气泡内边距与全局 border-box 干扰), 淡出遮罩 +
+  "··· 点击展开"(`data-fold-hint`, 随语言); 点击展开/再点收起。例外: `.menu` 不折、流式中气泡不折、
+  手动展开过的块(`data-keep-open`)不被自动收起、点术语先展开所在块、选文字不触发。
+  入口钩子在 `chat.js` 的 `append` / `appendDelta`(最新一块始终完整可见)。
+
 ~~`keyring`~~ / ~~`setup`~~ / ~~`credentials`~~ / ~~`config`~~ —— 2026-09-14 随单一配置文件方案**全部删除**(019 D31: 文件即界面)。
 
 - 建策略(002, 写操作不得一步落盘): `ricow create --name <n> --pair <p> [--script <file|->] [--param k=v] [--days N] [--interval] [--market spot|futures]`

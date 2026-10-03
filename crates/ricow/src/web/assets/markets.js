@@ -455,29 +455,39 @@
     }
   }
 
+  /// 034: 图表配色跟随当前主题 —— 现场从 CSS 变量取值(变量随 `<html data-theme>` 切换)。
+  function themeColor(name, fallback) {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  }
+
+  let lastKlines = null; // 最近一次成功渲染的 K 线数据(切主题时免重新拉取即可重绘)
+
   function renderChart(box, rows) {
     box.innerHTML = "";
+    lastKlines = rows;
     if (!rows.length) {
       box.appendChild(h("div", "mk-empty mk-chart-empty", t("mkChartEmpty")));
       return;
     }
+    const border = themeColor("--border", "#2b333d");
     const LWC = window.LightweightCharts;
     chart = LWC.createChart(box, {
       // autoSize: v4 内置 ResizeObserver 自适应容器宽高, 无需手写 resize 监听。
       autoSize: true,
-      layout: { background: { color: "transparent" }, textColor: "#9aa7b4" },
+      layout: { background: { color: "transparent" }, textColor: themeColor("--muted", "#9aa7b4") },
       grid: {
-        vertLines: { color: "#2b333d" },
-        horzLines: { color: "#2b333d" },
+        vertLines: { color: border },
+        horzLines: { color: border },
       },
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#2b333d" },
+      timeScale: { timeVisible: true, secondsVisible: false, borderColor: border },
     });
     const series = chart.addCandlestickSeries({
-      upColor: "#4dd4ac",
-      downColor: "#f85149",
+      upColor: themeColor("--accent", "#4dd4ac"),
+      downColor: themeColor("--error", "#f85149"),
       borderVisible: false,
-      wickUpColor: "#4dd4ac",
-      wickDownColor: "#f85149",
+      wickUpColor: themeColor("--accent", "#4dd4ac"),
+      wickDownColor: themeColor("--error", "#f85149"),
     });
     const data = rows
       .map((k) => ({
@@ -517,6 +527,19 @@
     }
     return ret;
   };
+
+  // 034: 切主题时 K 线图跟着换配色 —— 用缓存的 K 线就地重绘, 不重新发请求。
+  window.addEventListener("ricow:theme", () => {
+    try {
+      if (chart && lastKlines && lastKlines.length && chart.parentElement) {
+        const box = chart.parentElement;
+        destroyChart();
+        renderChart(box, lastKlines);
+      }
+    } catch (_) {
+      // 主题广播到达时视图可能正在切换, 图表已被销毁: 忽略, 下次进详情按新主题重取。
+    }
+  });
 
   R.views.markets = {
     /// `param` = 二级 hash 解码后的符号; 缺省 = 列表态。
