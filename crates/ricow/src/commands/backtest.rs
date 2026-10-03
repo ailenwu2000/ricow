@@ -8,6 +8,7 @@ use clap::Args;
 use ricow_core::{Balance, CoreError, CoreResult};
 use ricow_engine::Engine;
 use rust_decimal::Decimal;
+use sha2::{Digest, Sha256};
 
 use crate::commands::format_backtest_report;
 use ricow_strategy::{BacktestParams, BacktestToml, ConfigValue, Context, StrategyConfig};
@@ -81,6 +82,15 @@ pub struct BacktestArgs {
     /// 持仓模式 one-way|hedge (默认随策略 TOML / one-way)
     #[arg(long = "position-mode")]
     pub position_mode: Option<String>,
+    // ---- 敏感性扫描 (036; 分析文档第四节) ----
+    /// 滑点敏感性: 同一策略同一窗口按多档滑点(bps)各跑一次, 看结论是否翻转。
+    /// 省略档位即用默认阶梯 0,5,10; 例: `--sensitivity 0,3,6,12`
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub sensitivity: Option<String>,
+    /// 费用敏感性: 按多档手续费(bps)各跑一次 (每档把 maker/taker 同设, 与 `--fee` 同口径)。
+    /// 省略档位即用默认阶梯 5,10,20; 例: `--sensitivity-fee 2,5,10,20`
+    #[arg(long = "sensitivity-fee", num_args = 0..=1, default_missing_value = "")]
+    pub sensitivity_fee: Option<String>,
 }
 
 /// 解析 `key=value` 参数: 值按 f64 优先, 否则字符串。
@@ -175,6 +185,9 @@ impl BacktestRunSpec {
             funding_rate,
             market,
             position_mode,
+            // 敏感性是 CLI 编排层的事(扫多轮), 不进单次回测的输入 -> 此处刻意丢弃。
+            sensitivity: _,
+            sensitivity_fee: _,
         } = args;
         let mut overrides = HashMap::new();
         for p in params {
@@ -338,11 +351,56 @@ fn apply_backtest_overrides(
     Ok(params)
 }
 
+/// 一次回测的结构化结果 (036 抽出): 文本报告 / run card / 敏感性扫描共用同一内核。
+///
+/// 拆出来的动机 = 敏感性扫描要**逐档读指标**, 不该去解析格式化后的文本。
+pub(crate) struct BacktestOutcome {
+    /// 引擎产出的一次完整报告。
+    pub(crate) report: ricow_strategy::BacktestReport,
+    /// 生效的标的 / 窗口 / 粒度 / 市场 (报告标题与敏感性表头共用)。
+    pub(crate) pair: String,
+    pub(crate) days: u32,
+    pub(crate) interval: String,
+    pub(crate) is_futures: bool,
+    pub(crate) initial_cash: Decimal,
+    pub(crate) effective_mmr_pct: f64,
+    /// 三层合并后的全量回测参数 (敏感性表头如实打印生效成本)。
+    pub(crate) params: BacktestParams,
+    /// 数据来源 (`binance-rest` / `local-cache`)。
+    pub(crate) data_source: String,
+    /// 证据卡 (未落盘; 由调用方决定写不写 —— 敏感性扫描不为每档都落一张卡)。
+    card: RunCard,
+}
+
+impl BacktestOutcome {
+    /// 报告标题 (单一口径: 回测正文与敏感性表头都从这里取)。
+    fn header(&self, strategy: &str) -> String {
+        format!(
+            "回测报告: {} {} ({} 天, {} K 线, {})",
+            strategy,
+            self.pair,
+            self.days,
+            self.interval,
+            if self.is_futures {
+                format!(
+                    "合约 USDT-M · {} 持仓 · {:.0}x · MMR {:.2}%",
+                    self.report.position_mode.as_deref().unwrap_or("one-way"),
+                    self.report.leverage.unwrap_or(1.0),
+                    self.effective_mmr_pct
+                )
+            } else {
+                "现货".to_string()
+            }
+        )
+    }
+}
+
 /// 回测内核 (032 T025): 窗口计算 → 装载策略(TOML/直跑)→ 三层回测参数 → warmup 声明收集 →
-/// 分页拉 K 线(与 CLI 同一数据源)→ 引擎撮合 → `format_backtest_report` 出**唯一口径**文本。
+/// 分页拉 K 线(与 CLI 同一数据源, 035 起优先命中本地缓存)→ 引擎撮合 → 结构化结果。
 ///
 /// CLI(`run_backtest`)与 Web 异步作业(`web::backtest_jobs`)共用本函数; 不含任何 stdout。
-pub(crate) async fn run_backtest_core(spec: BacktestRunSpec) -> CoreResult<String> {
+/// 报告文本、run card 落盘、敏感性扫描都建立在本函数之上 ([`BacktestOutcome`])。
+pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<BacktestOutcome> {
     let days = spec.days;
     let interval = spec.interval.clone();
     let hours_per_bar = match interval.as_str() {
@@ -460,25 +518,62 @@ pub(crate) async fn run_backtest_core(spec: BacktestRunSpec) -> CoreResult<Strin
     } else {
         None
     };
-    let mut acc: Vec<ricow_core::Kline> = Vec::new();
-    let mut cursor = end_ms; // None = 到"现在"为止
-    while acc.len() < fetch_limit as usize {
-        let want = (fetch_limit as usize - acc.len()).min(KLINE_PAGE_MAX as usize) as u32;
-        let batch = match (&fapi, cursor) {
-            (Some(f), Some(e)) => f.get_klines_ending_at(&pair, &interval, want, e).await?,
-            (Some(f), None) => f.get_klines(&pair, &interval, want).await?,
-            (None, Some(e)) => exchange.get_klines_until(&pair, &interval, want, e).await?,
-            (None, None) => exchange.get_klines(&pair, &interval, want).await?,
-        };
-        if batch.is_empty() {
-            break;
+    // 035: 取数优先命中本地 klines 缓存 —— 仅当窗口**已全部收盘**时启用
+    // (`end` 早于 now 至少一根 bar), 保证"实时尾 bar 可能未收盘"不会被缓存固化。
+    // 未命中/根数不足 → 直连交易所取数并**回填**缓存 (best-effort, 失败不影响回测)。
+    let market_key = config.market.clone();
+    let step_ms_i = (hours_per_bar * 3_600_000.0) as i64;
+    let now_ms = Utc::now().timestamp_millis();
+    let window_end = end_ms.unwrap_or(now_ms);
+    let cache_eligible = window_end <= now_ms - step_ms_i;
+    let cache_db = crate::commands::open_cache_db(&spec.root).await;
+    let mut data_source = "binance-rest";
+    let mut klines: Vec<ricow_core::Kline> = Vec::new();
+    if cache_eligible {
+        if let Some(db) = &cache_db {
+            let start_ms = window_end - (fetch_limit as i64) * step_ms_i;
+            match db
+                .get_klines_range(&market_key, &pair, &interval, start_ms, window_end, fetch_limit)
+                .await
+            {
+                // 缓存覆盖整个窗口 (根数与请求一致) → 直接用, 零网络。
+                Ok(cached) if cached.len() as u32 >= fetch_limit => {
+                    klines = cached;
+                    data_source = "local-cache";
+                    tracing::info!(pair = %pair, interval = %interval, bars = klines.len(), "回测命中本地 K 线缓存");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "读 K 线缓存失败, 回退直连交易所"),
+            }
         }
-        cursor = Some(batch[0].open_time.timestamp_millis() - 1);
-        let mut merged = batch;
-        merged.extend(acc);
-        acc = merged;
     }
-    let klines = acc;
+    if klines.is_empty() {
+        let mut acc: Vec<ricow_core::Kline> = Vec::new();
+        let mut cursor = end_ms; // None = 到"现在"为止
+        while acc.len() < fetch_limit as usize {
+            let want = (fetch_limit as usize - acc.len()).min(KLINE_PAGE_MAX as usize) as u32;
+            let batch = match (&fapi, cursor) {
+                (Some(f), Some(e)) => f.get_klines_ending_at(&pair, &interval, want, e).await?,
+                (Some(f), None) => f.get_klines(&pair, &interval, want).await?,
+                (None, Some(e)) => exchange.get_klines_until(&pair, &interval, want, e).await?,
+                (None, None) => exchange.get_klines(&pair, &interval, want).await?,
+            };
+            if batch.is_empty() {
+                break;
+            }
+            cursor = Some(batch[0].open_time.timestamp_millis() - 1);
+            let mut merged = batch;
+            merged.extend(acc);
+            acc = merged;
+        }
+        klines = acc;
+        // 回填缓存 (best-effort): 下次同窗口回测即可零网络命中。
+        if let Some(db) = &cache_db {
+            if let Err(e) = db.insert_klines(&market_key, &pair, &interval, &klines).await {
+                tracing::warn!(error = %e, "K 线回填缓存失败 (不影响回测)");
+            }
+        }
+    }
     if klines.is_empty() {
         return Err(CoreError::Exchange(format!("no klines for {pair}")));
     }
@@ -527,35 +622,101 @@ pub(crate) async fn run_backtest_core(spec: BacktestRunSpec) -> CoreResult<Strin
     // 生效 MMR (报告显示用): 三层解析 + 可能的交易所首档拉取已写回 params; config move 前取出。
     // (D3: 此前打印恒 2.5, mmr_pct/TOML 覆盖不反映。)
     let effective_mmr_pct = config.get_f64("mmr_pct").unwrap_or(1.0);
+    // 035: run card 的策略/参数快照须在 config move 进引擎前采集。
+    let card_strategy = RunCardStrategy {
+        name: spec.strategy.clone(),
+        kind: config.strategy_type.clone(),
+        source_sha256: config
+            .get_str("script")
+            .map(|s| sha256_hex(s.as_bytes()))
+            .unwrap_or_else(|| "none".to_string()),
+        source_bytes: config.get_str("script").map(str::len).unwrap_or(0),
+    };
+    let card_params = params_json(&config);
+    let card_window_meta = (config.market.clone(), config.position_mode.clone());
     let report = Engine::new().backtest(config, initial_balance, &klines)?;
 
-    let text = format_backtest_report(
-        &report,
-        &format!(
-            "回测报告: {} {pair} ({days} 天, {interval} K 线, {})",
-            spec.strategy,
-            if is_futures {
-                format!(
-                    "合约 USDT-M · {} 持仓 · {:.0}x · MMR {:.2}%",
-                    report.position_mode.as_deref().unwrap_or("one-way"),
-                    report.leverage.unwrap_or(1.0),
-                    effective_mmr_pct
-                )
-            } else {
-                "现货".to_string()
-            }
-        ),
-        initial_cash,
+    // 035: 可复现 run card —— 策略源码指纹 + 数据窗口 + 参数 + 指标, 供归档/diff/复现。
+    // **不在此落盘**: 敏感性扫描会跑多轮, 每轮都落一张卡会污染归档目录; 落盘由调用方决定。
+    let card = RunCard {
+        schema_version: RUN_CARD_SCHEMA_VERSION,
+        generated_at: Utc::now().to_rfc3339(),
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        strategy: card_strategy,
+        params: card_params,
+        window: RunCardWindow {
+            pair: pair.clone(),
+            interval: interval.clone(),
+            market: card_window_meta.0,
+            position_mode: card_window_meta.1,
+            requested_bars: fetch_limit,
+            warmup_bars,
+            bars: klines.len(),
+            first_open_time_ms: klines.first().map(|k| k.open_time.timestamp_millis()),
+            last_open_time_ms: klines.last().map(|k| k.open_time.timestamp_millis()),
+            end_ms,
+            data_source: data_source.to_string(),
+        },
+        metrics: RunCardMetrics {
+            total_trades: report.total_trades,
+            rejected_count: report.rejected_count,
+            net_pnl: report.net_pnl.to_string(),
+            realized_pnl: report.realized_pnl.to_string(),
+            total_fees: report.total_fees.to_string(),
+            win_rate: report.win_rate,
+            max_drawdown: report.max_drawdown.to_string(),
+            annual_return: report.annual_return,
+            annual_volatility: report.annual_volatility,
+            sharpe: report.sharpe,
+            sortino: report.sortino,
+            calmar: report.calmar,
+            profit_factor: report.profit_factor,
+            turnover_ratio: report.turnover_ratio,
+            equity_change_pct: report.equity_change_pct,
+            benchmark_return_pct: report.benchmark_return_pct,
+        },
+    };
+    Ok(BacktestOutcome {
+        report,
+        pair,
+        days,
+        interval,
         is_futures,
-    );
+        initial_cash,
+        effective_mmr_pct,
+        params,
+        data_source: data_source.to_string(),
+        card,
+    })
+}
 
-    Ok(text)
+/// 单次回测的文本入口 (CLI `ricow backtest` / AI 工具 / Web 作业共用): 跑内核 → 落 run card
+/// → 出**唯一口径**文本报告。
+pub(crate) async fn run_backtest_core(spec: BacktestRunSpec) -> CoreResult<String> {
+    let out = run_backtest_inner(&spec).await?;
+    // 035: run card 落盘失败只 warn (回测结果本身仍有效, 不因辅助产物回滚一次成功的回测)。
+    match write_run_card(&spec.root, &out.card) {
+        Ok(p) => tracing::info!(path = %p.display(), "回测 run card 已落盘"),
+        Err(e) => tracing::warn!(error = %e, "回测 run card 落盘失败 (不影响回测结果)"),
+    }
+    Ok(format_backtest_report(
+        &out.report,
+        &out.header(&spec.strategy),
+        out.initial_cash,
+        out.is_futures,
+    ))
 }
 
 /// CLI/AI 工具入口包装: 把 [`BacktestArgs`] 组装成 [`BacktestRunSpec`] (数据目录=全局 project_root)
-/// 后跑同一内核; 返回的报告文本与 T025 前逐字一致。
+/// 后跑同一内核; 未给敏感性开关时返回的报告文本与 T025 前逐字一致。
 pub(crate) async fn run_backtest(args: BacktestArgs) -> CoreResult<String> {
-    run_backtest_core(BacktestRunSpec::from_cli_args(crate::commands::project_root(), args)).await
+    let slippage_ladder = parse_ladder(args.sensitivity.as_deref(), DEFAULT_SLIPPAGE_LADDER)?;
+    let fee_ladder = parse_ladder(args.sensitivity_fee.as_deref(), DEFAULT_FEE_LADDER)?;
+    let spec = BacktestRunSpec::from_cli_args(crate::commands::project_root(), args);
+    if slippage_ladder.is_some() || fee_ladder.is_some() {
+        return run_backtest_sensitivity(spec, slippage_ladder, fee_ladder).await;
+    }
+    run_backtest_core(spec).await
 }
 
 /// CLI 入口: 跑回测并打印报告(与 AI 工具 `run_backtest` 共用同一主体与同一份格式化)。
@@ -563,6 +724,405 @@ pub async fn run(args: BacktestArgs) -> CoreResult<()> {
     let text = run_backtest(args).await?;
     print!("{text}");
     Ok(())
+}
+
+// ---- 滑点/费用敏感性 (036; 分析文档第四节「回测乐观多少」) ----
+//
+// 不引入复杂撮合模型 (YAGNI), 只做一件可直接回答问题的扫描: **同一策略、同一数据窗口**,
+// 沿一个成本轴跑多档, 看"成本后是否盈利"这个结论在哪一档翻转。
+//
+// 为什么值得: 回测里 `slippage_bps` 默认 0 (理想成交), 手续费也只是交易所挂牌价 ——
+// 实盘的冲击成本/滑点通常高于假设。跑一遍阶梯就能知道"结论对成本有多敏感"。
+
+/// 滑点阶梯的默认档位 (bps): 0 = 理想(完全无滑点) / 5 / 10。
+const DEFAULT_SLIPPAGE_LADDER: &[f64] = &[0.0, 5.0, 10.0];
+
+/// 费用阶梯的默认档位 (bps, 每档 maker=taker 同设): 5 (BN 合约 taker) / 10 (BN 现货基准) / 20 (双倍)。
+const DEFAULT_FEE_LADDER: &[f64] = &[5.0, 10.0, 20.0];
+
+/// 解析敏感性阶梯: `None` = 不扫该轴; `Some("")` = 用默认档位; `Some("0,5,10")` = 显式档位。
+///
+/// 至少 2 档 —— 单档不构成"敏感性"(扫一档等于什么都没说), 宁可当场报错也不给一份假扫描。
+fn parse_ladder(raw: Option<&str>, default_ladder: &[f64]) -> CoreResult<Option<Vec<f64>>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let trimmed = raw.trim();
+    let mut levels: Vec<f64> = Vec::new();
+    if trimmed.is_empty() {
+        levels.extend_from_slice(default_ladder);
+    } else {
+        for part in trimmed.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let value: f64 = part.parse().map_err(|_| {
+                CoreError::InvalidArgument(format!("敏感性档位不是数字: '{part}' (bps, 逗号分隔)"))
+            })?;
+            if !value.is_finite() || value < 0.0 {
+                return Err(CoreError::InvalidArgument(format!(
+                    "敏感性档位须为有限非负数 (bps): '{part}'"
+                )));
+            }
+            levels.push(value);
+        }
+    }
+    if levels.len() < 2 {
+        return Err(CoreError::InvalidArgument(
+            "敏感性阶梯至少需要 2 档 (单档不成敏感性); 例: --sensitivity 0,5,10".into(),
+        ));
+    }
+    Ok(Some(levels))
+}
+
+/// 敏感性表的一行 = 一次完整回测的标量。
+struct SensitivityRow {
+    /// 档位展示文本: 基准行为 `基准`, 其余为 bps 值。
+    label: String,
+    total_trades: u64,
+    net_pnl: Decimal,
+    equity_change_pct: f64,
+    max_drawdown: Decimal,
+    sharpe: Option<f64>,
+    win_rate: f64,
+    total_fees: Decimal,
+}
+
+impl SensitivityRow {
+    fn from_outcome(label: String, out: &BacktestOutcome) -> Self {
+        Self {
+            label,
+            total_trades: out.report.total_trades,
+            net_pnl: out.report.net_pnl,
+            equity_change_pct: out.report.equity_change_pct,
+            max_drawdown: out.report.max_drawdown,
+            sharpe: out.report.sharpe,
+            win_rate: out.report.win_rate,
+            total_fees: out.report.total_fees,
+        }
+    }
+
+    /// 这一档的结论 = **成本后是否盈利** (净盈亏符号)。这是回测要回答的唯一问题, 不另造阈值。
+    fn verdict(&self) -> &'static str {
+        match self.net_pnl.cmp(&Decimal::ZERO) {
+            std::cmp::Ordering::Greater => "盈利",
+            std::cmp::Ordering::Less => "亏损",
+            std::cmp::Ordering::Equal => "持平",
+        }
+    }
+
+    fn sign(&self) -> i8 {
+        match self.net_pnl.cmp(&Decimal::ZERO) {
+            std::cmp::Ordering::Greater => 1,
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+        }
+    }
+}
+
+/// 一个成本轴的扫描结果。
+struct SensitivityAxis {
+    /// 轴名(`滑点` / `费用`)。
+    name: &'static str,
+    /// 轴补充说明(费用轴: `maker=taker 同设`)。
+    note: &'static str,
+    rows: Vec<SensitivityRow>,
+}
+
+/// `bps` 显示: 整数不带小数点, 小数保留两位 (0 → "0", 2.5 → "2.50")。
+fn fmt_bps(v: f64) -> String {
+    if (v.fract()).abs() < 1e-9 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// 终端显示宽度: CJK 全角字符算 2 列 (只为把表头对齐, 不外引依赖)。
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| {
+            let u = c as u32;
+            let wide = (0x1100..=0x115F).contains(&u)
+                || (0x2E80..=0xA4CF).contains(&u)
+                || (0xAC00..=0xD7A3).contains(&u)
+                || (0xF900..=0xFAFF).contains(&u)
+                || (0xFE30..=0xFE6F).contains(&u)
+                || (0xFF00..=0xFF60).contains(&u)
+                || (0xFFE0..=0xFFE6).contains(&u);
+            if wide {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// 按显示宽度右补空格 (不足处补到 `width` 列)。
+fn pad_display(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    format!("{s}{}", " ".repeat(width.saturating_sub(w)))
+}
+
+/// 表格列宽 (显示宽度): 档位 / 成交 / 净盈亏 / 权益变化 / 最大回撤 / 夏普 / 胜率 / 手续费 / 结论。
+const SENS_COLS: [usize; 9] = [8, 8, 14, 14, 12, 8, 10, 12, 8];
+const SENS_HEADERS: [&str; 9] =
+    ["档位", "成交", "净盈亏", "权益变化%", "最大回撤%", "夏普", "胜率%", "手续费", "结论"];
+
+/// 一行表格。
+fn sens_line(cells: [String; 9]) -> String {
+    let mut out = String::from("  ");
+    for (i, cell) in cells.iter().enumerate() {
+        out.push_str(&pad_display(cell, SENS_COLS[i]));
+    }
+    out.trim_end().to_string()
+}
+
+impl SensitivityRow {
+    fn to_cells(&self) -> [String; 9] {
+        [
+            self.label.clone(),
+            self.total_trades.to_string(),
+            self.net_pnl.to_string(),
+            format!("{:+.2}%", self.equity_change_pct),
+            format!("{:.2}%", self.max_drawdown * Decimal::from(100)),
+            self.sharpe.map(|v| format!("{v:.2}")).unwrap_or_else(|| "n/a".into()),
+            format!("{:.2}%", self.win_rate * 100.0),
+            self.total_fees.to_string(),
+            self.verdict().to_string(),
+        ]
+    }
+}
+
+/// 一个轴的结论段: 阶梯内净盈亏符号是否一致; 不一致就点名翻转处。
+fn axis_summary(axis: &SensitivityAxis) -> String {
+    if axis.rows.iter().all(|r| r.sign() > 0) {
+        return "结论: 阶梯内净盈亏始终为正 —— 该成本区间内结论稳健。".into();
+    }
+    if axis.rows.iter().all(|r| r.sign() < 0) {
+        return "结论: 阶梯内净盈亏始终为负 —— 结论稳健(该窗口本就不赚), 与成本档无关。".into();
+    }
+    let flips: Vec<String> = axis
+        .rows
+        .windows(2)
+        .filter(|w| w[0].sign() != w[1].sign())
+        .map(|w| format!("{} → {} bps", w[0].label, w[1].label))
+        .collect();
+    format!(
+        "结论: 净盈亏符号在 {} 处翻转 —— 结论对成本假设敏感, 回测口径须按实际成本复核后再定。",
+        flips.join(" / ")
+    )
+}
+
+/// 敏感性表头信息 (由基准那次回测取出, 与表格本身解耦以便单测)。
+struct SensitivityBase {
+    /// 基准报告标题 (与单次回测报告同款)。
+    header: String,
+    /// 生效成本一行 (三层合并结果)。
+    cost_line: String,
+    /// 数据来源 (`binance-rest` / `local-cache`)。
+    data_source: String,
+}
+
+/// 敏感性报告文本 (纯函数, 便于单测)。
+fn format_sensitivity_report(base: &SensitivityBase, axes: &[SensitivityAxis]) -> String {
+    let mut out = String::new();
+    out.push_str("=== 回测敏感性 (滑点/费用) ===\n");
+    out.push_str(&base.header);
+    out.push('\n');
+    out.push_str(&format!(
+        "  基准成本 (三层合并: 内置默认 < 策略 [backtest] < 本次覆盖): {}\n",
+        base.cost_line
+    ));
+    out.push_str(&format!("  数据来源: {}\n", base.data_source));
+    for axis in axes {
+        out.push('\n');
+        out.push_str(&format!(
+            "--- {}敏感性 (bps{}) ---\n",
+            axis.name,
+            if axis.note.is_empty() { String::new() } else { format!(", {}", axis.note) }
+        ));
+        out.push_str(&sens_line(SENS_HEADERS.map(str::to_string)));
+        out.push('\n');
+        for row in &axis.rows {
+            out.push_str(&sens_line(row.to_cells()));
+            out.push('\n');
+        }
+        out.push_str(&format!("  {}\n", axis_summary(axis)));
+    }
+    out.push('\n');
+    out.push_str(
+        "说明: 每档都是一次完整回测(同一策略、同一数据窗口); 净盈亏为**成本后**口径(已含手续费与滑点);\n",
+    );
+    out.push_str("      「基准」行 = 未加敏感性覆盖的那一次(即默认 `ricow backtest` 的口径)。\n");
+    out
+}
+
+/// 敏感性扫描入口: 先跑一次未覆盖的基准, 再按各轴阶梯逐档跑, 输出对照表。
+///
+/// 逐档都走 [`run_backtest_inner`](同一撮合与指标口径), 不复制任何回测逻辑;
+/// **刻意不为每档落 run card** —— 扫描是探索手段, 归档证据请走单次回测(会落卡)。
+pub(crate) async fn run_backtest_sensitivity(
+    spec: BacktestRunSpec,
+    slippage_ladder: Option<Vec<f64>>,
+    fee_ladder: Option<Vec<f64>>,
+) -> CoreResult<String> {
+    let base = run_backtest_inner(&spec).await?;
+    let base_info = SensitivityBase {
+        header: base.header(&spec.strategy),
+        cost_line: format!(
+            "手续费 maker {} / taker {} bps · 滑点 {} bps",
+            fmt_bps(base.params.fee_maker_bps),
+            fmt_bps(base.params.fee_taker_bps),
+            fmt_bps(base.params.slippage_bps),
+        ),
+        data_source: base.data_source.clone(),
+    };
+    let mut axes = Vec::new();
+    if let Some(ladder) = slippage_ladder {
+        let mut rows = vec![SensitivityRow::from_outcome("基准".into(), &base)];
+        for bps in ladder {
+            let mut level_spec = spec.clone();
+            level_spec.slippage_bps = Some(bps);
+            let out = run_backtest_inner(&level_spec).await?;
+            rows.push(SensitivityRow::from_outcome(fmt_bps(bps), &out));
+        }
+        axes.push(SensitivityAxis { name: "滑点", note: "", rows });
+    }
+    if let Some(ladder) = fee_ladder {
+        let mut rows = vec![SensitivityRow::from_outcome("基准".into(), &base)];
+        for bps in ladder {
+            let mut level_spec = spec.clone();
+            // 该档**完全决定**费用: 清掉同义覆盖, maker/taker 同设 (与 `--fee` 同口径)。
+            level_spec.fee = None;
+            level_spec.fee_maker = Some(bps);
+            level_spec.fee_taker = Some(bps);
+            let out = run_backtest_inner(&level_spec).await?;
+            rows.push(SensitivityRow::from_outcome(fmt_bps(bps), &out));
+        }
+        axes.push(SensitivityAxis { name: "费用", note: "maker=taker 同设", rows });
+    }
+    Ok(format_sensitivity_report(&base_info, &axes))
+}
+
+// ---- 回测 run card (035): 可复现证据落盘 ----
+//
+// 对标 Vibe-Trading 的 trust-layer run card: 把"这次回测用了什么策略源码 / 什么数据窗口 /
+// 什么参数 / 得到什么指标"固化成一份可归档、可 diff 的 JSON, 服务 P4 dogfood 的证据留档。
+
+/// run card 结构版本 (字段增删时 +1; 与 `specs/backtest.md` 同步)。
+const RUN_CARD_SCHEMA_VERSION: u32 = 1;
+
+/// 策略源码 SHA-256 (小写 hex)。
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 文件名安全化: 非 `[A-Za-z0-9._-]` 一律替换为 `_`。
+fn sanitize_ident(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect()
+}
+
+/// 策略参数 JSON (剔除 `script` —— Lua 源码由 `source_sha256` 代表, 不重复落盘)。
+fn params_json(config: &StrategyConfig) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (k, v) in &config.params {
+        if k == "script" {
+            continue;
+        }
+        if let Ok(j) = serde_json::to_value(v) {
+            out.insert(k.clone(), j);
+        }
+    }
+    out
+}
+
+/// run card 的策略区。
+#[derive(serde::Serialize)]
+struct RunCardStrategy {
+    /// 调用方给出的策略名 (内置 id 或已部署策略名)。
+    name: String,
+    /// 策略类型 (`lua` / 内置类型名)。
+    #[serde(rename = "type")]
+    kind: String,
+    /// Lua 源码 SHA-256 (小写 hex); 无源码 (不应发生) 时为 `none`。
+    source_sha256: String,
+    /// Lua 源码字节数。
+    source_bytes: usize,
+}
+
+/// run card 的数据窗口区。
+#[derive(serde::Serialize)]
+struct RunCardWindow {
+    pair: String,
+    interval: String,
+    market: String,
+    position_mode: String,
+    /// 请求取数根数 (窗口 + 预热)。
+    requested_bars: u32,
+    warmup_bars: u32,
+    /// 实际喂给引擎的 K 线根数 (裁掉终点 bar 后)。
+    bars: usize,
+    first_open_time_ms: Option<i64>,
+    last_open_time_ms: Option<i64>,
+    /// 窗口终点 (毫秒, 不含); None = 到"现在"。
+    end_ms: Option<i64>,
+    /// 数据来源 (`binance-rest`; 2.2 本地缓存落地后可命中 `local-cache`)。
+    data_source: String,
+}
+
+/// run card 的指标区 (回测报告标量; Decimal 一律转字符串保精度)。
+#[derive(serde::Serialize)]
+struct RunCardMetrics {
+    total_trades: u64,
+    rejected_count: u64,
+    net_pnl: String,
+    realized_pnl: String,
+    total_fees: String,
+    win_rate: f64,
+    max_drawdown: String,
+    annual_return: Option<f64>,
+    annual_volatility: Option<f64>,
+    sharpe: Option<f64>,
+    sortino: Option<f64>,
+    calmar: Option<f64>,
+    profit_factor: Option<f64>,
+    turnover_ratio: f64,
+    equity_change_pct: f64,
+    benchmark_return_pct: Option<f64>,
+}
+
+/// 一次回测的可复现证据卡。
+#[derive(serde::Serialize)]
+struct RunCard {
+    schema_version: u32,
+    generated_at: String,
+    engine_version: String,
+    strategy: RunCardStrategy,
+    params: serde_json::Map<String, serde_json::Value>,
+    window: RunCardWindow,
+    metrics: RunCardMetrics,
+}
+
+/// 把 run card 写到 `<root>/run/backtest/<ts>-<strategy>-<pair>.json`, 返回落盘路径。
+fn write_run_card(root: &Path, card: &RunCard) -> CoreResult<PathBuf> {
+    let dir = root.join("run").join("backtest");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CoreError::InvalidArgument(format!("创建 run card 目录失败: {e}")))?;
+    let fname = format!(
+        "{}-{}-{}.json",
+        Utc::now().timestamp_millis(),
+        sanitize_ident(&card.strategy.name),
+        sanitize_ident(&card.window.pair)
+    );
+    let path = dir.join(fname);
+    let json = serde_json::to_string_pretty(card)
+        .map_err(|e| CoreError::Parse(format!("run card 序列化失败: {e}")))?;
+    std::fs::write(&path, json)
+        .map_err(|e| CoreError::InvalidArgument(format!("写 run card 失败: {e}")))?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -611,25 +1171,9 @@ order_size = 0.02
         .unwrap();
         let _exchange = crate::commands::bn_exchange().unwrap();
         let args = BacktestArgs {
-            start: None,
-            end: None,
             strategy: "demo".into(),
-            pair: None,
-            days: None,
-            interval: None,
-            script: None,
             params: vec!["rebalance_band=0.01".into()],
-            fee: None,
-            fee_maker: None,
-            fee_taker: None,
-            slippage_bps: None,
-            cash: None,
-            leverage: None,
-            max_leverage: None,
-            mmr_pct: None,
-            funding_rate: None,
-            market: None,
-            position_mode: None,
+            ..Default::default()
         };
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(cfg.strategy_type, "lua", "内置名 TOML 应 Lua 化");
@@ -660,28 +1204,152 @@ exchange = "binance"
         .unwrap();
         let _exchange = crate::commands::bn_exchange().unwrap();
         let args = BacktestArgs {
-            start: None,
-            end: None,
             strategy: "nopair".into(),
             pair: Some("BNBUSDT".into()),
-            days: None,
-            interval: None,
-            script: None,
-            params: vec![],
-            fee: None,
-            fee_maker: None,
-            fee_taker: None,
-            slippage_bps: None,
-            cash: None,
-            leverage: None,
-            max_leverage: None,
-            mmr_pct: None,
-            funding_rate: None,
-            market: None,
-            position_mode: None,
+            ..Default::default()
         };
         let cfg = resolve_config(&args).unwrap();
         assert!(cfg.get_str("pair").is_none(), "TOML 无 pair 时 resolve 不注入");
         std::env::remove_var("RICOW_ROOT");
+    }
+
+    #[test]
+    fn test_run_card_sha256_and_sanitize() {
+        // 空串 SHA-256 已知向量。
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(sanitize_ident("shannon_spot_grid"), "shannon_spot_grid");
+        assert_eq!(sanitize_ident("ETH/USDT:x"), "ETH_USDT_x", "非法字符应替换为 _");
+    }
+
+    #[test]
+    fn test_run_card_params_json_excludes_script() {
+        let mut params = HashMap::new();
+        params.insert("pair".into(), ConfigValue::String("ETHUSDT".into()));
+        params.insert("script".into(), ConfigValue::String("-- lua 源码".into()));
+        params.insert("order_size".into(), ConfigValue::Float(0.02));
+        let cfg = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "lua".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        let j = params_json(&cfg);
+        assert!(!j.contains_key("script"), "script 不应落盘 (由 source_sha256 代表)");
+        assert_eq!(j.get("pair").and_then(|v| v.as_str()), Some("ETHUSDT"));
+        assert_eq!(j.get("order_size").and_then(|v| v.as_f64()), Some(0.02));
+    }
+
+    // ---- 敏感性扫描 (036) ----
+
+    /// 造一行敏感性结果 (只看净盈亏符号与展示)。
+    fn sens_row(label: &str, net: i64) -> SensitivityRow {
+        SensitivityRow {
+            label: label.into(),
+            total_trades: 1,
+            net_pnl: Decimal::from(net),
+            equity_change_pct: 0.0,
+            max_drawdown: Decimal::ZERO,
+            sharpe: None,
+            win_rate: 0.0,
+            total_fees: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_parse_ladder_defaults_and_errors() {
+        // 未给开关 = 不扫。
+        assert!(parse_ladder(None, DEFAULT_SLIPPAGE_LADDER).unwrap().is_none());
+        // 只给开关不给档位 = 用默认阶梯。
+        let d = parse_ladder(Some(""), DEFAULT_SLIPPAGE_LADDER).unwrap().unwrap();
+        assert_eq!(d, vec![0.0, 5.0, 10.0]);
+        let f = parse_ladder(Some("  "), DEFAULT_FEE_LADDER).unwrap().unwrap();
+        assert_eq!(f, vec![5.0, 10.0, 20.0], "空白同样落默认");
+        // 显式档位(含小数与多余空格)。
+        let e = parse_ladder(Some(" 0, 2.5 ,10 "), DEFAULT_SLIPPAGE_LADDER).unwrap().unwrap();
+        assert_eq!(e, vec![0.0, 2.5, 10.0]);
+        // 单档不成敏感性。
+        assert!(parse_ladder(Some("5"), DEFAULT_SLIPPAGE_LADDER).is_err());
+        // 非数字 / 负数 / 默认档位被逗号清空 → 都当场报错, 不给假扫描。
+        assert!(parse_ladder(Some("a,b"), DEFAULT_SLIPPAGE_LADDER).is_err());
+        assert!(parse_ladder(Some("-1,5"), DEFAULT_SLIPPAGE_LADDER).is_err());
+        assert!(parse_ladder(Some(","), DEFAULT_SLIPPAGE_LADDER).is_err());
+    }
+
+    #[test]
+    fn test_axis_summary_steady_and_flip() {
+        let steady_up = SensitivityAxis {
+            name: "滑点",
+            note: "",
+            rows: vec![sens_row("基准", 100), sens_row("5", 40), sens_row("10", 3)],
+        };
+        assert!(axis_summary(&steady_up).contains("始终为正"));
+
+        let steady_down = SensitivityAxis {
+            name: "滑点",
+            note: "",
+            rows: vec![sens_row("基准", -100), sens_row("5", -40)],
+        };
+        assert!(axis_summary(&steady_down).contains("始终为负"));
+
+        // 翻转: 点名翻转落在哪两档之间 (基准 → 10 bps)。
+        let flip = SensitivityAxis {
+            name: "费用",
+            note: "maker=taker 同设",
+            rows: vec![sens_row("基准", 100), sens_row("5", 20), sens_row("10", -30)],
+        };
+        let s = axis_summary(&flip);
+        assert!(s.contains("翻转"), "{s}");
+        assert!(s.contains("5 → 10 bps"), "{s}");
+    }
+
+    #[test]
+    fn test_fmt_bps_and_display_width() {
+        assert_eq!(fmt_bps(0.0), "0");
+        assert_eq!(fmt_bps(10.0), "10");
+        assert_eq!(fmt_bps(2.5), "2.50");
+        // CJK 全角按 2 列算, 表头才能对齐。
+        assert_eq!(display_width("档位"), 4);
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(pad_display("档位", 8).chars().count(), 6, "2 个全角字 + 4 个补位空格");
+        assert_eq!(display_width(&pad_display("档位", 8)), 8);
+    }
+
+    #[test]
+    fn test_sensitivity_table_includes_axes_and_rows() {
+        let base = SensitivityBase {
+            header: "回测报告: demo ETHUSDT (90 天, 1h K 线, 现货)".into(),
+            cost_line: "手续费 maker 10 / taker 10 bps · 滑点 0 bps".into(),
+            data_source: "local-cache".into(),
+        };
+        let axes = vec![
+            SensitivityAxis {
+                name: "滑点",
+                note: "",
+                rows: vec![sens_row("基准", 100), sens_row("10", -5)],
+            },
+            SensitivityAxis {
+                name: "费用",
+                note: "maker=taker 同设",
+                rows: vec![sens_row("10", -5)],
+            },
+        ];
+        let text = format_sensitivity_report(&base, &axes);
+        assert!(text.contains("回测敏感性"));
+        assert!(text.contains("local-cache"), "数据来源要如实打印: {text}");
+        assert!(text.contains("--- 滑点敏感性 (bps) ---"), "{text}");
+        assert!(text.contains("--- 费用敏感性 (bps, maker=taker 同设) ---"), "{text}");
+        // 两轴都在, 每轴都有表头行与结论段。
+        assert_eq!(text.matches("档位").count(), 2);
+        assert_eq!(text.matches("结论:").count(), 2);
+        assert!(text.contains("净盈亏为**成本后**口径"));
     }
 }

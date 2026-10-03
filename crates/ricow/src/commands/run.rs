@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use clap::Args;
 use ricow_core::{Balance, CoreError, CoreResult, Exchange};
-use ricow_engine::{live_gate, Engine, LiveGate, RunMode, RunOutcome, StopReason, StopRequest};
-use ricow_strategy::{ConfigValue, Database, StrategyConfig};
+use ricow_engine::{
+    live_gate, Engine, LiveGate, RunMode, RunOutcome, RunTelemetry, StopReason, StopRequest,
+};
+use ricow_strategy::{ConfigValue, Database, SqlxResultExt, StrategyConfig};
 use rust_decimal::Decimal;
 
 #[derive(Args)]
@@ -75,9 +77,23 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
 
     let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();
 
-    let db = Database::open(&crate::commands::default_db_path())
-        .await
-        .map_err(|e| CoreError::InvalidArgument(format!("打开数据库失败: {e}")))?;
+    let db = Database::open(&crate::commands::default_db_path()).await.core()?;
+
+    // 运行事件流 (035 / 3.3): 每个实例一份 `run/<name>/events.jsonl`, 一行一事件。
+    // 建不出来也**照跑**(`None`) —— 观测能力缺失不该阻断交易, 只是事后少了机器可读的证据。
+    let events = match ricow_strategy::events::EventWriter::create(
+        &crate::commands::project_root(),
+        &config.name,
+    ) {
+        Ok(w) => Some(Arc::new(w)),
+        Err(e) => {
+            tracing::warn!(
+                target: "events", name = %config.name,
+                "运行事件流不可用(不影响交易): {e}"
+            );
+            None
+        }
+    };
 
     // 停机信号: stdin 指令 (含 daemon 下发的 stop 与管道 EOF) + Ctrl-C
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(None);
@@ -128,7 +144,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                 Some(&db),
                 Some(stop_rx),
                 args.close_all,
-                RunMode::Demo,
+                RunTelemetry { mode: RunMode::Demo, events },
             )
             .await?;
         print_run_outcome(&outcome);
@@ -178,7 +194,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                     Some(&db),
                     Some(stop_rx),
                     args.close_all,
-                    RunMode::Live,
+                    RunTelemetry { mode: RunMode::Live, events },
                 )
                 .await?;
             print_run_outcome(&outcome);
@@ -209,7 +225,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                 config.name
             );
             let outcome = Engine::new()
-                .run_dry_run(config, exchange, initial_balance, Some(&db), Some(stop_rx))
+                .run_dry_run(config, exchange, initial_balance, Some(&db), Some(stop_rx), events)
                 .await?;
             print_run_outcome(&outcome);
             // 行情流中断属异常: 非零退出, 供管理器/用户识别 (不静默 Ok)

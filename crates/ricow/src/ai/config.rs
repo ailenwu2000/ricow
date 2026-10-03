@@ -103,6 +103,14 @@ pub struct Resolved {
     pub max_turns: usize,
 }
 
+/// 默认预设 = 预设表**首项**(引导页里排第一的那个, 即"官方推荐")。
+///
+/// 独立成函数是为了让 `ricow.toml` 模板、`Default` 实现、以及各项空值兜底**共用同一个来源** ——
+/// 否则很容易出现"模板里写 A、代码默认 B"的静默分叉, 用户按模板填完却和默认行为不一致。
+pub fn default_preset() -> &'static Preset {
+    PRESETS.first().expect("PRESETS 是常量表且非空")
+}
+
 pub fn preset_by_id(id: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.id == id)
 }
@@ -200,6 +208,13 @@ mod tests {
             base_url: None,
             max_turns: DEFAULT_MAX_TURNS,
         }
+    }
+
+    /// `DEFAULT_PROVIDER` 必须就是预设表首项 —— 否则"引导页推荐 A / 代码默认 B"会分叉。
+    #[test]
+    fn test_default_provider_is_first_preset() {
+        assert_eq!(DEFAULT_PROVIDER, default_preset().id);
+        assert!(!default_preset().model.is_empty(), "默认预设必须有推荐模型(模板要写进配置)");
     }
 
     #[test]

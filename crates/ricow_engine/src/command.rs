@@ -12,6 +12,7 @@ use ricow_core::{
     Balance, CoreError, CoreResult, Exchange, Kline, Market, OrderAck, OrderFill, OrderSide,
     OrderStatus, OrderUpdate, Position, UserEvent,
 };
+use ricow_strategy::events;
 use ricow_strategy::{
     is_owned, ConfigValue, Context, Database, DryRunContext, LiveContext, OrderRecord,
     PnlSnapshotRecord, PnlTracker, PositionRecord, Strategy, StrategyConfig,
@@ -27,6 +28,22 @@ use crate::notify::{Notifier, NotifyEvent};
 
 /// 引擎入口 — 无状态命令分发。
 pub struct Engine;
+
+/// 记一条**实例级**运行事件(启动 / 停止)。
+///
+/// 事件流是旁路: 写失败由 [`events::EventWriter::emit`] 自己吞掉(并只提醒一次),
+/// 这里刻意不返回 `Result` —— 观测能力缺失不该阻断交易。
+fn emit_run_event(
+    w: &events::EventWriter,
+    kind: &str,
+    strategy: &str,
+    mode: &str,
+    reason: Option<String>,
+) {
+    let mut ev = events::RunEvent::new(kind, strategy, mode, chrono::Utc::now().timestamp_millis());
+    ev.reason = reason;
+    w.emit(&ev);
+}
 
 /// 停机原因 (由调用方注入的信号决定; 用于日志与实例台账)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +111,18 @@ impl RunMode {
             RunMode::Live => "实盘",
         }
     }
+}
+
+/// 运行的观测上下文 (035): 运行模式标签 + 可选事件流写入器。
+///
+/// 两者都在 CLI 侧装配 (`run.rs`), 引擎只消费; 打包成一个参数是为了不让 `run_live`
+/// 的签名继续膨胀 (独立传参时 8 个, 超过 clippy 阈值)。
+#[derive(Clone)]
+pub struct RunTelemetry {
+    /// 运行模式: 日志标签 (`label()`) 与落库口径 (`as_str()`) 的唯一来源。
+    pub mode: RunMode,
+    /// 运行事件流: `None` = 不记事件 (库内调用 / 单测)。
+    pub events: Option<Arc<events::EventWriter>>,
 }
 
 /// 停机清理后吸干用户流的窗口: 兜底平仓的成交只能靠用户流送达 (少了它会漏记成交)。
@@ -591,6 +620,8 @@ impl Engine {
         initial_balance: Balance,
         db: Option<&Database>,
         mut stop: Option<StopSignal>,
+        // 运行事件流 (035 / 3.3): `None` = 不记事件(单测/库内调用); 实例运行由 CLI 注入。
+        events: Option<Arc<ricow_strategy::events::EventWriter>>,
     ) -> CoreResult<RunOutcome> {
         // 出站通知 (003): 未配 `params.notify_webhook` → None (不打通道)
         let notifier = Notifier::from_config(&config);
@@ -601,6 +632,10 @@ impl Engine {
 
         let mut ctx = DryRunContext::new(exchange.clone(), config.clone(), initial_balance);
         // 预装 K 线历史见 on_init 之后 —— 须先跑声明阶段收集 need_klines。
+        if let Some(w) = events.as_ref() {
+            ctx.set_events(w.clone(), mode.as_str());
+            emit_run_event(w, events::KIND_STARTED, &strategy_name, mode.as_str(), None);
+        }
 
         let mut strategy = load_strategy(&config)?;
         // 030 断点续接: 把上次会话保存的策略状态注回 (无记录 = 首次运行)。
@@ -817,6 +852,21 @@ impl Engine {
             ticks = outcome.ticks, fills = outcome.fills, errors = outcome.order_errors,
             "dry run stopped"
         );
+        if let Some(w) = events.as_ref() {
+            emit_run_event(
+                w,
+                events::KIND_STOPPED,
+                &strategy_name,
+                mode.as_str(),
+                Some(format!(
+                    "{} · ticks={} fills={} 下单错误={}",
+                    outcome.stop_reason.map(|r| r.to_string()).unwrap_or_default(),
+                    outcome.ticks,
+                    outcome.fills,
+                    outcome.order_errors
+                )),
+            );
+        }
         Ok(outcome)
     }
 
@@ -833,9 +883,10 @@ impl Engine {
         db: Option<&Database>,
         stop: Option<StopSignal>,
         close_all: bool,
-        // 运行模式: 日志标签(`label()`)必须如实标注, 不得把 demo 说成实盘; 落库口径走 `as_str()`
-        mode: RunMode,
+        // 观测上下文 (035): 运行模式如实标注 + 可选事件流; 两者都由 CLI 装配。
+        telemetry: RunTelemetry,
     ) -> CoreResult<RunOutcome> {
+        let RunTelemetry { mode, events } = telemetry;
         let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();
         let strategy_name = config.name.clone();
 
@@ -855,6 +906,16 @@ impl Engine {
         let rt = tokio::runtime::Handle::current();
         let mut ctx = LiveContext::new(exchange.clone(), config.clone(), rt);
         // 预装 K 线历史见 on_init 之后 —— 须先跑声明阶段收集 need_klines。
+        if let Some(w) = events.as_ref() {
+            ctx.set_events(w.clone(), mode.as_str());
+            emit_run_event(
+                w,
+                events::KIND_STARTED,
+                &strategy_name,
+                mode.as_str(),
+                Some(format!("pair={pair} close_all={close_all}")),
+            );
+        }
 
         ctx.set_markets(&markets);
         let prefix = ctx.order_prefix().to_string();
@@ -1431,6 +1492,25 @@ impl Engine {
             residual_orders = residual, residual_position = %residual_pos,
             "live run stopped"
         );
+        if let Some(w) = events.as_ref() {
+            emit_run_event(
+                w,
+                events::KIND_STOPPED,
+                &strategy_name,
+                mode.as_str(),
+                Some(format!(
+                    "{} · ticks={} fills={} 下单错误={} · 停机撤单 {} 张(失败 {}) · 残留挂单 {} / 残留持仓 {}",
+                    outcome.stop_reason.map(|r| r.to_string()).unwrap_or_default(),
+                    outcome.ticks,
+                    outcome.fills,
+                    outcome.order_errors,
+                    canceled,
+                    cancel_failed,
+                    residual,
+                    residual_pos
+                )),
+            );
+        }
         Ok(outcome)
     }
 

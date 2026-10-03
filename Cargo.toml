@@ -22,6 +22,15 @@ homepage = "https://github.com/ailenwu2000/ricow"
 readme = "README.md"
 
 [workspace.dependencies]
+# 内部 crate: **必须**同时写 path 与 version。
+# - 只写 path = "通配版本", 会被 deny.toml 的 `wildcards = "deny"` 门禁挡下 (合理的规则:
+#   通配版本不可复现, 且将来若误发布, 下游会静默解析到 crates.io 上的任意版本);
+# - 版本号与 `[workspace.package] version` 同源, 升级时**只改这一处**, 成员里写 `xxx.workspace = true`。
+ricow_core = { path = "crates/ricow_core", version = "0.7.0" }
+ricow_binance = { path = "crates/ricow_binance", version = "0.7.0" }
+ricow_strategy = { path = "crates/ricow_strategy", version = "0.7.0" }
+ricow_engine = { path = "crates/ricow_engine", version = "0.7.0" }
+
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

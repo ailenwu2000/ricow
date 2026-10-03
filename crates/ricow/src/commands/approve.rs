@@ -11,7 +11,7 @@
 use clap::Args;
 use ricow_core::{CoreError, CoreResult};
 use ricow_engine::{approve as confirm_approve, get_preview, reject};
-use ricow_strategy::{Database, StrategyConfig};
+use ricow_strategy::{Database, SqlxResultExt, StrategyConfig};
 
 use std::io::IsTerminal;
 
@@ -97,9 +97,7 @@ pub async fn run(args: ApproveArgs) -> CoreResult<()> {
     // 019 spec §七 R2: 人工批准必须发生在**交互终端** —— 管道/脚本/agent 工具调用喂入短语一律拒绝
     // (否则"逐字短语"只约束格式, 不约束"是否真人当场确认")。
     crate::commands::require_interactive_terminal(std::io::stdin().is_terminal())?;
-    let db = Database::open(&crate::commands::default_db_path())
-        .await
-        .map_err(|e| CoreError::Exchange(e.to_string()))?;
+    let db = Database::open(&crate::commands::default_db_path()).await.core()?;
 
     let preview = get_preview(&db, &args.preview_id).await?;
     print!("{}", confirmation_block(&preview.kind, &preview.payload_json));

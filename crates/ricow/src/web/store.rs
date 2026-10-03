@@ -143,9 +143,9 @@ fn make_title(first_user_message: &str) -> String {
     format!("{head}…")
 }
 
-/// 存储错误统一走会话既有错误类型(与 `commands/mod.rs` 里 `Database::open` 的映射同口径)。
+/// 存储错误统一走会话既有错误类型: 本地库的问题就是本地库的问题, 不混进 `Exchange`。
 fn db_err(e: impl std::fmt::Display) -> CoreError {
-    CoreError::Exchange(e.to_string())
+    CoreError::Db(e.to_string())
 }
 
 #[cfg(test)]

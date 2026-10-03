@@ -19,6 +19,8 @@ use ricow_core::{CoreError, CoreResult, Kline, Market};
 use rust_decimal::Decimal;
 use serde_json::Value;
 
+use crate::retry::{send_with_retry, status_error, RequestKind, RetryPolicy};
+
 /// USDT-M 合约主网 REST。
 const FAPI_MAINNET_REST: &str = "https://fapi.binance.com";
 
@@ -143,11 +145,13 @@ impl FuturesDataClient {
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> CoreResult<T> {
         let resp =
-            self.http.get(url).send().await.map_err(|e| CoreError::Network(e.to_string()))?;
+            send_with_retry(|| self.http.get(url), RequestKind::Read, RetryPolicy::default())
+                .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(CoreError::Exchange(format!("fapi HTTP {status}: {body}")));
+            // 429/418 → RateLimit, 其余 → Exchange (035; 与现货口径统一)。
+            return Err(status_error(status, &body));
         }
         resp.json().await.map_err(|e| CoreError::Network(e.to_string()))
     }

@@ -16,6 +16,15 @@ use crate::indicators_api;
 
 const MINUTE_MS: i64 = 60_000;
 
+/// 取锁并**容忍毒化**。
+///
+/// 这两把 Mutex 里只装"每根高周期 bar 算一次的 memo"(纯缓存, 丢了重算即可)。
+/// 用 `.lock().unwrap()` 会把"另一个线程 panic 过"升级成"整条策略链路此后每次调用都 panic" ——
+/// 长跑实例里这是把一个局部故障放大成全局停摆。缓存毒化没有正确性代价, 直接取回守卫。
+fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// K 线周期标签 → 毫秒(仅支持本引擎既有周期; 未知返回 None)。
 pub fn tf_ms_of(tf: &str) -> Option<i64> {
     let ms = match tf {
@@ -198,7 +207,7 @@ impl TfCache {
             return None;
         }
         let last_ts = self.bars[n - 1].open_time.timestamp_millis();
-        if let Some((ts, v)) = self.memo.lock().unwrap().get(&period) {
+        if let Some((ts, v)) = lock_or_recover(&self.memo).get(&period) {
             if *ts == last_ts {
                 return Some(*v);
             }
@@ -208,7 +217,7 @@ impl TfCache {
         let start = n.saturating_sub(period * 3 + 1);
         let v = indicators_api::atr(&self.bars[start..n], period)?;
         self.computes.fetch_add(1, Ordering::SeqCst);
-        self.memo.lock().unwrap().insert(period, (last_ts, v));
+        lock_or_recover(&self.memo).insert(period, (last_ts, v));
         Some(v)
     }
 
@@ -235,14 +244,14 @@ impl TfCache {
             return None;
         }
         let last_ts = self.bars[n - 1].open_time.timestamp_millis();
-        if let Some((ts, v)) = self.ema_memo.lock().unwrap().get(&period) {
+        if let Some((ts, v)) = lock_or_recover(&self.ema_memo).get(&period) {
             if *ts == last_ts {
                 return Some(*v);
             }
         }
         let v = indicators_api::ema(&self.bars[..n], period)?;
         self.computes.fetch_add(1, Ordering::SeqCst);
-        self.ema_memo.lock().unwrap().insert(period, (last_ts, v));
+        lock_or_recover(&self.ema_memo).insert(period, (last_ts, v));
         Some(v)
     }
 

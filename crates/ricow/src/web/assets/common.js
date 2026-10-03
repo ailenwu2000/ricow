@@ -136,6 +136,59 @@
     return res.json();
   };
 
+  /// 统一 SSE 打开器(036): 指数退避 + 抖动的重连。
+  ///
+  /// 浏览器 `EventSource` 自带重连但**不退避也不封顶**(服务真停了会按固定节奏永远打);
+  /// 且原生重连只在**同一个** EventSource 对象上自动携带 `Last-Event-ID`, 这里接管后
+  /// 重开的是新对象 —— 故记录最后一帧的 id, 重开时拼进 `last_event_id` 查询参数
+  /// (日志流服务端读它续传, 会话流忽略之)。`url` 须已带查询串(`?token=...`), 追加用 `&`。
+  /// 连续失败 5 次(1s → 2s → 4s → 8s 封顶, ±20% 抖动)放弃并回调 `onfail` 一次;
+  /// 任一次连上(`onopen`)即清零重计。返回 `{ close() }`。
+  R.sse = function (url, handlers) {
+    const MAX_RETRIES = 5;
+    let es = null;
+    let attempts = 0;
+    let lastId = null;
+    let timer = null;
+    let closed = false;
+
+    function open() {
+      if (closed) return;
+      const target =
+        lastId === null ? url : url + "&last_event_id=" + encodeURIComponent(lastId);
+      es = new EventSource(target);
+      es.onopen = () => {
+        attempts = 0;
+        if (handlers.onopen) handlers.onopen();
+      };
+      es.onmessage = (ev) => {
+        if (ev.lastEventId) lastId = ev.lastEventId;
+        if (handlers.onmessage) handlers.onmessage(ev);
+      };
+      es.onerror = () => {
+        es.close();
+        es = null;
+        if (attempts >= MAX_RETRIES) {
+          if (handlers.onfail) handlers.onfail();
+          return;
+        }
+        const base = Math.min(1000 * Math.pow(2, attempts), 8000);
+        const wait = base * (0.8 + Math.random() * 0.4); // ±20% 抖动
+        attempts += 1;
+        timer = setTimeout(open, wait);
+      };
+    }
+    open();
+    return {
+      close() {
+        closed = true;
+        if (timer) clearTimeout(timer);
+        if (es) es.close();
+        es = null;
+      },
+    };
+  };
+
   /// 双语切换的**通用部分**(FR-027 / FR-028): 静态标签就地换, 语言值本身存在
   /// `ricow.toml` 的 `[ui].lang`。各视图自己的重渲染(会话列表 / 面板等)由各模块在
   /// 调完本函数后追加, 不在这里耦合。

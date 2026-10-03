@@ -11,6 +11,8 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use sha2::Sha256;
 
+use crate::retry::{send_with_retry, status_error, RequestKind, RetryPolicy};
+
 const SPOT_MAINNET_REST: &str = "https://api.binance.com";
 const SPOT_TESTNET_REST: &str = "https://testnet.binance.vision";
 
@@ -215,11 +217,12 @@ impl BinanceClient {
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> CoreResult<T> {
         let resp =
-            self.http.get(url).send().await.map_err(|e| CoreError::Network(e.to_string()))?;
+            send_with_retry(|| self.http.get(url), RequestKind::Read, RetryPolicy::default())
+                .await?;
         let status = resp.status();
         let text = resp.text().await.map_err(|e| CoreError::Network(e.to_string()))?;
         if !status.is_success() {
-            return Err(CoreError::Exchange(format!("BN {status}: {text}")));
+            return Err(status_error(status, &text));
         }
         serde_json::from_str(&text).map_err(|e| CoreError::Parse(format!("{e}: {text}")))
     }
@@ -230,13 +233,12 @@ impl BinanceClient {
         let qs = build_query_string(&params);
         let url = format!("{}{}?{}", self.base_url, path, qs);
         let (api_key, _) = self.ensure_credentials()?;
-        let resp = self
-            .http
-            .get(&url)
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
-            .map_err(|e| CoreError::Network(e.to_string()))?;
+        let resp = send_with_retry(
+            || self.http.get(&url).header("X-MBX-APIKEY", api_key),
+            RequestKind::Read,
+            RetryPolicy::default(),
+        )
+        .await?;
         check_bn_response(resp).await
     }
 
@@ -246,13 +248,12 @@ impl BinanceClient {
         let qs = build_query_string(&p);
         let url = format!("{}{}?{}", self.base_url, path, qs);
         let (api_key, _) = self.ensure_credentials()?;
-        let resp = self
-            .http
-            .post(&url)
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
-            .map_err(|e| CoreError::Network(e.to_string()))?;
+        let resp = send_with_retry(
+            || self.http.post(&url).header("X-MBX-APIKEY", api_key),
+            RequestKind::Write,
+            RetryPolicy::default(),
+        )
+        .await?;
         check_bn_response(resp).await
     }
 
@@ -262,13 +263,12 @@ impl BinanceClient {
         let qs = build_query_string(&p);
         let url = format!("{}{}?{}", self.base_url, path, qs);
         let (api_key, _) = self.ensure_credentials()?;
-        let resp = self
-            .http
-            .delete(&url)
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
-            .map_err(|e| CoreError::Network(e.to_string()))?;
+        let resp = send_with_retry(
+            || self.http.delete(&url).header("X-MBX-APIKEY", api_key),
+            RequestKind::Write,
+            RetryPolicy::default(),
+        )
+        .await?;
         check_bn_response(resp).await
     }
 
@@ -289,11 +289,8 @@ pub(crate) async fn check_bn_response(resp: reqwest::Response) -> CoreResult<Val
     let status = resp.status();
     let text = resp.text().await.map_err(|e| CoreError::Network(e.to_string()))?;
     if !status.is_success() {
-        let msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v["msg"].as_str().map(String::from))
-            .unwrap_or(text);
-        return Err(CoreError::Exchange(format!("BN {status}: {msg}")));
+        // 429/418 → RateLimit, 其余 → Exchange (035; 统一走 retry::status_error)。
+        return Err(status_error(status, &text));
     }
     let v: Value =
         serde_json::from_str(&text).map_err(|e| CoreError::Parse(format!("{e}: {text}")))?;
@@ -397,11 +394,13 @@ pub(crate) async fn fetch_klines_paged(
         if end_time.is_some() {
             url.push_str(&format!("&endTime={end_ms}"));
         }
-        let resp = http.get(&url).send().await.map_err(|e| CoreError::Network(e.to_string()))?;
+        let resp =
+            send_with_retry(|| http.get(url.clone()), RequestKind::Read, RetryPolicy::default())
+                .await?;
         let status = resp.status();
         let text = resp.text().await.map_err(|e| CoreError::Network(e.to_string()))?;
         if !status.is_success() {
-            return Err(CoreError::Exchange(format!("BN {status}: {text}")));
+            return Err(status_error(status, &text));
         }
         let raw: Vec<Vec<Value>> =
             serde_json::from_str(&text).map_err(|e| CoreError::Parse(format!("{e}: {text}")))?;

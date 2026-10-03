@@ -5,7 +5,7 @@
 
 use chrono::Utc;
 use ricow_core::{CoreError, CoreResult};
-use ricow_strategy::{Database, PreviewRecord};
+use ricow_strategy::{Database, PreviewRecord, SqlxResultExt};
 
 /// preview 有效期 (秒)。
 ///
@@ -26,7 +26,7 @@ pub async fn create_preview(db: &Database, kind: &str, payload_json: &str) -> Co
         created_at: now,
         expires_at: now + PREVIEW_TTL_SECS,
     };
-    db.insert_preview(&rec).await.map_err(|e| CoreError::Exchange(e.to_string()))?;
+    db.insert_preview(&rec).await.core()?;
     Ok(preview_id)
 }
 
@@ -43,10 +43,8 @@ pub async fn approve(db: &Database, preview_id: &str) -> CoreResult<String> {
         return Err(CoreError::InvalidArgument("preview 已过期".into()));
     }
     let token = uuid::Uuid::new_v4().to_string();
-    let affected = db
-        .update_preview(preview_id, "pending", "approved", Some(&token))
-        .await
-        .map_err(|e| CoreError::Exchange(e.to_string()))?;
+    let affected =
+        db.update_preview(preview_id, "pending", "approved", Some(&token)).await.core()?;
     if affected != 1 {
         return Err(CoreError::InvalidArgument("preview 状态已被并发修改, 请重新创建".into()));
     }
@@ -70,10 +68,7 @@ pub async fn consume(db: &Database, preview_id: &str, token: &str) -> CoreResult
         return Err(CoreError::InvalidArgument("preview 已过期".into()));
     }
     // 原子 CAS: 条件更新防并发双花 (两个携同一 token 的并发调用只有一个能命中)。
-    let affected = db
-        .update_preview(preview_id, "approved", "consumed", None)
-        .await
-        .map_err(|e| CoreError::Exchange(e.to_string()))?;
+    let affected = db.update_preview(preview_id, "approved", "consumed", None).await.core()?;
     if affected != 1 {
         return Err(CoreError::InvalidArgument("preview 已被并发消费, 请重新创建".into()));
     }
@@ -90,10 +85,7 @@ pub async fn reject(db: &Database, preview_id: &str) -> CoreResult<()> {
         )));
     }
     // 不校验过期: 过期记录也需要能清理 (标记 rejected 为终态)。
-    let affected = db
-        .update_preview(preview_id, "pending", "rejected", None)
-        .await
-        .map_err(|e| CoreError::Exchange(e.to_string()))?;
+    let affected = db.update_preview(preview_id, "pending", "rejected", None).await.core()?;
     if affected != 1 {
         return Err(CoreError::InvalidArgument("preview 状态已被并发修改, 请重新创建".into()));
     }
@@ -108,7 +100,7 @@ pub async fn get_preview(db: &Database, preview_id: &str) -> CoreResult<PreviewR
 async fn fetch(db: &Database, preview_id: &str) -> CoreResult<PreviewRecord> {
     db.get_preview(preview_id)
         .await
-        .map_err(|e| CoreError::Exchange(e.to_string()))?
+        .core()?
         .ok_or_else(|| CoreError::InvalidArgument(format!("preview 不存在: {preview_id}")))
 }
 

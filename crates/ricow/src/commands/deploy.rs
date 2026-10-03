@@ -3,8 +3,8 @@
 //! token 只能由 `ricow approve` 从 pending 状态生成, 且一次性; 无 token 无法部署 (写操作不得一步落盘)。
 
 use clap::Args;
-use ricow_core::{CoreError, CoreResult};
-use ricow_strategy::Database;
+use ricow_core::CoreResult;
+use ricow_strategy::{Database, SqlxResultExt};
 
 use crate::commands::{default_db_path, ensure_strategies_dir};
 
@@ -18,8 +18,7 @@ pub struct DeployArgs {
 }
 
 pub async fn run(args: DeployArgs) -> CoreResult<()> {
-    let db =
-        Database::open(&default_db_path()).await.map_err(|e| CoreError::Exchange(e.to_string()))?;
+    let db = Database::open(&default_db_path()).await.core()?;
     let dir = ensure_strategies_dir()?;
 
     // `replace = false` 是有意的: CLI 这条路**只落新名**, 同名已存在即被引擎拒绝。

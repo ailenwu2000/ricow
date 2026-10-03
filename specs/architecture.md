@@ -32,7 +32,7 @@ ricow_core: Exchange trait ─► ricow_binance
 | ricow_binance | Binance 现货 REST/HMAC/WS (place_order/cancel/account) + USDT-M 公共数据源 (`FuturesDataClient`: fapi K 线 / 首档 MMR 表) + **fapi 签名交易客户端 `FuturesClient`** (下单/账户/持仓/杠杆/双向持仓, 2026-09-04 testnet 联调新增; 域名 RICOW_BN_BASE_URL / RICOW_FAPI_BASE_URL 可配 demo 测试网) |
 | ricow_strategy | 策略引擎: Lua 沙箱 / ctx 与 exec 注册 / 指标(ta)/ 回测 / PnL / SQLite / **固定 100 单·秒⁻¹ 护栏 `order_guard`(2026-09-16 019-R5: 原 `risk.rs` 四条静态限额与装配器已删除)** |
 | ricow_engine | headless 核心: Engine 命令分发 / backtest_runner(单标的 + 组合) / confirm(preview+approve)/ loader / market / **美股层 `nasdaq`(Nasdaq 日线客户端) / `us_tickers`(bStock↔美股映射, 70 只快照) / `market_class`(bStock 现货池识别, 通用能力保留: 当前无内置消费者)** |
-| ricow | 二进制 `ricow`: clap 子命令分发 + **AI 助手 `ai/`(019: 提示词、工具白名单 L0 只读 + L1 虚拟、审批门 `ToolGuard`; 会话缝 `ai/session.rs`(`ChatSession` + `SessionSink`, 零 stdio); R3/R4 对话内确认状态机 `ai/confirm.rs` 7 动作)** + **Web UI `web/`(025: axum + SSE 骨架 `mod.rs` / 第二个 sink `sink.rs` / 会话历史 `store.rs` / 术语表 `terms.rs`; 只绑 `127.0.0.1`, 一次性 token)** + 首次向导 `commands/onboard.rs` + 单一配置文件读写 `commands/config_file.rs`(含 `set_values` 白名单 9 键) |
+| ricow | 二进制 `ricow`: clap 子命令分发 + **AI 助手 `ai/`(019: 提示词、工具白名单 L0 只读 + L1 虚拟、审批门 `ToolGuard`; 会话缝 `ai/session.rs`(`ChatSession` + `SessionSink`, 零 stdio); R3/R4 对话内确认状态机 `ai/confirm.rs` 7 动作)** + **Web UI `web/`(025: axum + SSE, 只绑 `127.0.0.1`, 一次性 token; 036 起按端点族拆文件 —— 骨架与装配在 `mod.rs`(服务 `bind`/`router`/`serve`、`Hub`/`WebState`/`WebError`), 端点族各归 `assets`/`auth`(token+来源门)/`sessions`/`settings`/`trades`/`logs`/`strategies` 各自带 `routes()` 与测试, 共享测试脚手架 `test_support.rs`(仅 cfg(test)), `strategy_io`/`runs` 目录化测试体下沉 `tests.rs`)** + 首次向导 `commands/onboard.rs` + 单一配置文件读写 `commands/config_file.rs`(含 `set_values` 白名单 9 键) |
 
 > **内置 AI 助手已落地**(019-ai-assistant): `ricow ai` 调用用户自配的 LLM(`ricow.toml [ai]` provider+api_key)。
 > **LLM 接口统一为 rig 0.42 的 OpenAI 兼容通道**(2026-09-16 重审): 7 个预设(deepseek 首项, 默认模型 `deepseek-flash`; 其余为 OpenAI 兼容的主流厂商)+ custom 自定义 base_url, 供应商差异只收敛在 `ai/provider.rs` 一个文件, 无需 Anthropic 等第二通道; 不支持工具调用的模型如实报错, 不自动降级。
@@ -97,7 +97,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 **裸入口(019 R4)**: `ricow` 不带子命令 → 直接进对话(`commands::chat`); 缺 AI key 且非本地 ollama 时先走首次向导(`commands::onboard`: 供应商选择 → 静默录入密钥 → 可选连通校验 → 外科式写回 `ricow.toml`), 币安凭据可跳过后用 `/keys demo` 补录。非 tty 一律双语报错 + 打印配置路径, exit 1(不静默降级)。原 clap 子命令全部保留, 变成同一 `ChatSession` 的薄壳。对话内斜杠命令: `/keys [ai|demo|live]` 查看/静默录入密钥(只回显尾 4 位)、`/market [bstock|all]` 查看/切换交易对视野(`[market] show_all_pairs`)。
 
-**Web UI 接入点(025)**: `ricow web` 在 `127.0.0.1` 上起内置 axum 服务(端口 0 = 系统分配空闲端口), 启动时生成**一次性 token**(`uuid` v4, 不落盘、不进日志, 进程退出即失效)并把带 token 的 URL 打印到终端, 同时尝试打开浏览器(Windows `cmd /C start` / macOS `open` / Linux `xdg-open`, 打开失败只 warn 不影响服务)。**全部端点(含静态资源)都在 token 中间件之后** —— 无 token 或错 token 一律 `401` 且**响应体不含任何会话内容**(D3 / FR-002); token 走 `Authorization: Bearer` 或 `?token=`, 页面里 `style.css` / `app.js` 的 URL 由服务端按本次请求的 token 回填。
+**Web UI 接入点(025)**: `ricow web` 在 `127.0.0.1` 上起内置 axum 服务(端口 0 = 系统分配空闲端口), 启动时生成**一次性 token**(`uuid` v4, 不落盘、不进日志, 进程退出即失效)并把带 token 的 URL 打印到终端, 同时尝试打开浏览器(Windows `cmd /C start` / macOS `open` / Linux `xdg-open`, 打开失败只 warn 不影响服务)。**全部端点(含静态资源)都在 token 中间件之后** —— 无 token 或错 token 一律 `401` 且**响应体不含任何会话内容**(D3 / FR-002); token 走 `Authorization: Bearer` 或 `?token=`, 页面里 `style.css` / `app.js` 的 URL 由服务端按本次请求的 token 回填。**来源门(036)**: 同一道 `require_token` 中间件内, token 校验之后对**写方法**(`POST/PUT/PATCH/DELETE`)加 `Origin`(缺失退 `Referer`)回环白名单 —— 非回环来源一律 `403` 空体(理由: token 因 `EventSource` 限制出现在 URL 查询串, 可能经 Referer 外流, 来源门挡住"别的站点拿着 token 发写请求"); 读方法不设限(curl/脚本可用), 两者都没有 → 放行(非浏览器请求)。
 
 - **与 CLI 同源(D2 / D5)**: 每个会话线程里跑的仍是 `commands::chat::repl`, 助手增量仍由 `provider::ask_stream` 逐段产出 —— 本层只做 HTTP 骨架、线程登记与帧转发, 不复制任何会话/LLM 路径。
 - **会话缝的第二个 sink**: `web/sink.rs` 的 `WebSink` 实现 `SessionSink`, 把宿主输出转成 SSE 帧 `delta{text}` / `line{text,sev}` / `secret_prompt{prompt}` / `turn_end` / `closed`; `Severity` 由宿主显式标注, 前端只按级别着色(不做关键字猜测)。`turn_end` 是唯一轮次分界线, `closed` 在 sink 析构时必发。
@@ -167,8 +167,13 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - `RICOW_ROOT`(数据目录, 决策 D4): 显式覆盖 > 当前目录已有 `ricow.db`/`strategies/` 时沿用现状 > 平台标准目录
   (Windows `%APPDATA%\ricow` / macOS `~/Library/Application Support/ricow` / Linux `$XDG_DATA_HOME|~/.local/share`+`/ricow`)
-- `RICOW_DB`(默认 `RICOW_ROOT/ricow.db`): SQLite, **共 10 张表** — `klines`(交易所 K 线缓存)/ `fills`(成交, 含 `strategy_id`)/ `pnl_snapshots`(盈亏快照)/ `previews`(写操作预览)/ `us_klines`(美股 Nasdaq 日线, 信号轨与交易日历; **缓存不回源, 需手工增量补最后若干天**)/ `funding_fees`(资金费流水, `tran_id` 幂等)/ `web_sessions` + `web_messages`(025: 会话与对话流水, 外键级联删除)/ `orders` + `positions`(026: 订单与当前持仓, 各带 `mode`)
-- `RICOW_ROOT/run/`: `daemon.json`(daemon pid/端口/token, Unix 0600 / Windows 仅当前用户 ACL)/ `<name>.json`(实例台账: pid/启动时间/模式/上次退出码与原因)
+- `RICOW_DB`(默认 `RICOW_ROOT/ricow.db`): SQLite, **共 10 张表** — `klines`(交易所 K 线缓存, **主键含 `market` 维度**隔离现货/合约)/ `fills`(成交, 含 `strategy_id`)/ `pnl_snapshots`(盈亏快照)/ `previews`(写操作预览)/ `us_klines`(美股 Nasdaq 日线, 信号轨与交易日历; **缓存不回源, 需手工增量补最后若干天**)/ `funding_fees`(资金费流水, `tran_id` 幂等)/ `web_sessions` + `web_messages`(025: 会话与对话流水, 外键级联删除)/ `orders` + `positions`(026: 订单与当前持仓, 各带 `mode`)
+  > **schema 版本化(035, 2026-10-03)**: 迁移由 `PRAGMA user_version` 驱动(`SCHEMA_VERSION` 常量)。
+  > `migrate()` 分两步: ① **幂等基线建表**(全新库直接建出最新结构); ② **版本迁移**(仅 `v < SCHEMA_VERSION` 时执行并推进版本号)。
+  > **版本已最新时零写事务直接返回** —— 这消除了旧实现"每次 `open` 都重跑全量建表"在多连接池同库并发下的偶发 `SQLITE_BUSY`;
+  > `Database::open` 另加**锁错误**(`SQLITE_BUSY=5` / `SQLITE_LOCKED=6`)线性退避重试(用 `tokio::time::sleep`, 阻塞式 sleep 会卡死 current_thread 运行时把上一池的 `close()` 收尾一起阻塞)。
+  > v0 → v1: `klines` 主键加 `market`, 旧行标 `spot`, 走"建新表 → 搬数据 → 删旧表 → 改名"单事务且幂等可重入。后续"给表加列"这类演进有了正规通道。
+- `RICOW_ROOT/run/`: `daemon.json`(daemon pid/端口/token, Unix 0600 / Windows 仅当前用户 ACL)/ `<name>.json`(实例台账: pid/启动时间/模式/上次退出码与原因)/ `<name>/events.jsonl`(035: 该实例的**结构化运行事件流**, 一行一事件、写完即 flush、坏行读取时跳过)/ `backtest/<ts>-<策略>-<pair>.json`(035: 回测 run card, 见 `specs/backtest.md` §六.6)
   > ⚠️ 多进程共享同一 `ricow.db` 的并发写依赖 WAL + `busy_timeout`(sqlx 默认 5s): 实测 3 进程 × 200 事务在 busy_timeout=5s 下全部成功, =0 时失败 83%(`.hermes`→已归档 `specs/research/process-model-probe-2026-09.md` §四)。**不得把 `busy_timeout` 设为 0, 也不得把数据目录放在网络盘/云同步盘**(SQLite WAL 明确不支持网络文件系统)
 - `RICOW_ROOT/logs/`: `<name>.log`(策略进程 stdout/stderr 追加日志; 启动时 >10MB 轮转 `.log.1`)与 `daemon.log`
 - 密钥: 单一明文配置文件 `ricow.toml`(Unix 0600 / Windows 仅当前用户 ACL; 019 D31/R4; OS Keyring 与 headless 加密文件 fallback 已于 2026-09-14 移除)
@@ -179,9 +184,31 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **数据源口径(D1)**: **本地库是唯一来源**。`/api/trades/*` 只读 `ricow.db`, 不直连交易所; 运行中与已停机一视同仁(停机后仍能看最后状态, 并标注"截至 <时间>")。
 - **三态如实(D10)**: 每条回复带 `source` ∈ `ok` / `daemon_down` / `unreadable`(读库报错优先, 其次 daemon 不在)。后两者**不把"连不上 daemon"说成"没有交易"**, `reason` 给出原因, 前端按三态分开呈现。
 - **mode 关联(D5)**: `fills` 表**不加列**(守住既有 8 张表结构零改动); 成交的 `mode`(∈ `dry_run` / `demo` / `live`)由 `fills.exchange_order_id` ⟕ `orders.exchange_order_id` 带出。026 之前的历史成交在 `orders` 里无对应行 → 面板与 AI **如实**显示"未知", 不猜。
-- **端点**(全部**只读**, 挂在同一道 token 中间件之内): `GET /api/trades/{fills,orders,positions,pnl}`(查询串 `strategy_id` / `limit`) + `GET /api/logs`(策略日志清单) / `GET /api/logs/{name}/tail?lines=`(尾读, 缺省 50、一律夹到 200) / `GET /api/logs/{name}/stream`(SSE, 服务端 500ms 尾读驱动, **独立通道**不共用会话 SSE)。日志**原样返回** —— 不解析、不改写、不做着色推断; 策略未运行也能看历史日志。
+- **端点**(全部**只读**, 挂在同一道 token 中间件之内): `GET /api/trades/{fills,orders,positions,pnl}`(查询串 `strategy_id` / `limit`) + `GET /api/logs`(策略日志清单) / `GET /api/logs/{name}/tail?lines=`(尾读, 缺省 50、一律夹到 200) / `GET /api/logs/{name}/stream`(SSE, 服务端 500ms 尾读驱动, **独立通道**不共用会话 SSE; **断线续传(036)**: 事件 id = 文件字节 offset, 重连按 `Last-Event-ID` 头(前端统一打开器重开新对象时以 `last_event_id` 查询参数兜底, 头优先)从断点续读, 不重发已给过的行)。日志**原样返回** —— 不解析、不改写、不做着色推断; 策略未运行也能看历史日志。前端消费侧(036): `common.js` 的 `R.sse` 统一打开器 —— 指数退避(1s→2s→4s→8s 封顶, ±20% 抖动)接管浏览器原生重连(不退避也不封顶), 连续失败 5 次放弃回调 `onfail`; `new EventSource` 全前端只此一处。
 - **前端只读(D17)**: 交易面板与日志面板只做展示 + 轮询/订阅, **没有任何直连交易所的写按钮** —— 撤单 / 平仓 / 停机仍走既有的对话确认。
 - **AI 回流(FR-019 ~ FR-024)**: 新增三个只读工具(`positions` / `open_orders` / `pnl`); 写操作执行结果注入对话 history, 使下一轮 LLM 看得到"刚才那步真做了什么"。
+
+### 网络请求重试与限流(035, 2026-10-03)
+
+- 单点定义在 `ricow_binance/src/retry.rs`(`send_with_retry` / `status_error`), 现货 / 合约 / fapi 公共数据三处客户端共用。
+- **按请求语义分档**是安全红线: `Read`(K 线/行情/查询)可重试传输错误 + 429/418/408/5xx;
+  `Write`(下单/撤单/改杠杆等改账户状态)**仅连接层失败**(`is_connect` = 请求确定未送达)可重试 ——
+  响应超时/5xx 可能"其实已成交", 重放 = 重复下单。
+- 退避 = 指数 + ±20% 抖动(默认 300ms 起、上限 8s); 429/418 优先尊重响应 `Retry-After`(仅秒形式, 上限 30s 防挂起)。
+- 429/418 最终仍失败时由 `status_error` 归一为 **`CoreError::RateLimit`**(此前是**死变体**, 全仓无一处构造)。
+
+### 运行可观测性与事件流(035, 2026-10-03)
+
+- 结构: `ricow_strategy/src/events.rs` —— `RunEvent`(一行一 JSON)+ `EventWriter`(`create(root, name)` → `run/<name>/events.jsonl`)+ `read_events`(坏行跳过)。
+- 事件种类: 实例级 `started` / `stopped`(引擎埋点); 订单级 `order_placed` / `order_rejected` / `order_canceled`(上下文埋点, Live 与 Dry Run 都有)。
+- **不反压主循环**: `emit` **永不返回错误** —— 锁毒化用 `into_inner`, 写失败只提醒一次; 观测能力缺失不该阻断交易。
+- 与 run card 同源(2.3): 两者都是"旁路产物", 落盘失败只 warn, 不回滚主流程。
+
+### 错误归一(035, 2026-10-03)
+
+- 新增 `CoreError::Db(String)`(与 `Exchange` 分开: 数据库故障不是交易所故障, 上层可按变体区分)。
+- `SqlxResultExt::core()` 在存储边界把 `sqlx::Error` 一次归一到 `CoreError`; 上层不再手工 `map_err(|e| CoreError::Exchange(e.to_string()))` 猜错误种类(约 16 处已替换)。
+- 长跑服务的锁毒化面(`multiframe.rs` / `web/backtest_jobs.rs`)改 `lock_or_recover` —— 单点 panic 不再级联成"后续请求全失败"。
 
 ## 七、安全模型
 
@@ -226,7 +253,10 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-09-24, paired_grid 新增后实跑)**: `cargo test --workspace` = **544 passed / 0 failed / 22 ignored**(ignored 仍为需真实外部环境的联调用例, 不 mock 替代; paired_grid 新增 4 条集成测试: ATR 未就绪不动 / 激活建仓与上下单结构 / 配对卖价恒>买价 / 连续下跌 flag 为负)
+- **基线(2026-10-03, 035 工程底座加固后实跑)**: `cargo test --workspace --no-fail-fast` = **642 passed / 22 ignored**(另有 2 例 `ai_live_smoke` **本机沙箱环境性失败**: `ERROR_PIPE_BUSY(231)`, 非代码缺陷; 真机终端为全绿)。
+  门禁四件: `fmt --check` 0 差异 / `clippy --workspace --all-targets -D warnings` 0 / `cargo deny --locked check` 全绿(许可证白名单 + 已知漏洞 + 重复版本 warn + 来源禁未知) / `bash scripts/ci_grep_gates.sh` 四条安全红线全绿(AI 工具层零落盘 · 明文密钥不进日志 · 无调试残留 · `execute_strategy` 调用点白名单; 按 `#[cfg(test)]` 配平跳过测试代码)。
+  CI 矩阵 ubuntu + windows + **macOS**(发布了 macOS 产物就必须测); `release.yml` 去 PR 触发(dist 持久开关在 `dist-workspace.toml` 的 `pr-run-mode`)。
+- 前基线(2026-09-24, paired_grid 新增后实跑): `cargo test --workspace` = **544 passed / 0 failed / 22 ignored**(ignored 仍为需真实外部环境的联调用例, 不 mock 替代; paired_grid 新增 4 条集成测试: ATR 未就绪不动 / 激活建仓与上下单结构 / 配对卖价恒>买价 / 连续下跌 flag 为负)
 - 历史基线(2026-09-15, 021 clippy 清零后): 339 passed / 0 failed / 12 ignored; 更早(2026-09-13, 018 实施后): 308 passed / 0 failed / 11 ignored(ignored = 需真实外部环境的联调用例, 不 mock 替代; 构成: BN demo 现货 4 + 合约 5 + Nasdaq 冒烟 2)
 - 实盘链路真实验证(011 demo 现货 / 012 demo 合约): 用户流订阅 → 真实下单 → 成交回写落库 → 停机撤单兜底/平仓 → 交易所侧零残留(合约含 one-way 与 hedge 双向); 记录见 `specs/testnet.md`
 - 账目类数字(SQLite `SUM`)须在 Rust 侧用 `Decimal` 聚合: SQL 的 INTEGER 兜底可击穿 f64 解码(崩溃), REAL 往返会污染小数(012 实测)

@@ -12,9 +12,9 @@ readme.workspace = true
 doctest = false
 
 [dependencies]
-ricow_core = { path = "../ricow_core" }
-ricow_binance = { path = "../ricow_binance" }
-ricow_strategy = { path = "../ricow_strategy" }
+ricow_core.workspace = true
+ricow_binance.workspace = true
+ricow_strategy.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

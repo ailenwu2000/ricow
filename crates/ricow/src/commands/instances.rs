@@ -6,7 +6,7 @@
 use clap::Args;
 use ricow_core::{CoreError, CoreResult};
 use ricow_engine::{is_owned, ownership_prefix};
-use ricow_strategy::Database;
+use ricow_strategy::{Database, SqlxResultExt};
 use std::fmt::Write as _;
 
 use crate::supervisor::client::Client;
@@ -341,9 +341,7 @@ pub async fn format_info(args: InfoArgs) -> CoreResult<String> {
         None => line!(out, "配置: 无 TOML (直跑实例, 参数来自命令行)"),
     }
 
-    let db = Database::open(&crate::commands::default_db_path())
-        .await
-        .map_err(|e| CoreError::InvalidArgument(format!("打开数据库失败: {e}")))?;
+    let db = Database::open(&crate::commands::default_db_path()).await.core()?;
     let sid = cfg.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| args.name.clone());
     match db.fill_stats(&sid).await {
         Ok((n, fees, last)) => line!(
@@ -497,9 +495,7 @@ async fn live_account_snapshot(name: &str, mode: crate::commands::Mode) -> CoreR
 
 pub async fn format_fills(args: FillsArgs) -> CoreResult<String> {
     let mut out = String::new();
-    let db = Database::open(&crate::commands::default_db_path())
-        .await
-        .map_err(|e| CoreError::InvalidArgument(format!("打开数据库失败: {e}")))?;
+    let db = Database::open(&crate::commands::default_db_path()).await.core()?;
     let sid = args.name.as_deref().map(|n| {
         crate::commands::read_strategy_config(n).map(|c| c.name).unwrap_or_else(|| n.to_string())
     });
@@ -568,9 +564,7 @@ fn resolve_sid(root: &std::path::Path, name: Option<&str>) -> Option<String> {
 
 /// 打开本地库 (与引擎同一路径 `db_path_in(root)`)。
 async fn open_db(root: &std::path::Path) -> CoreResult<Database> {
-    Database::open(&crate::commands::db_path_in(root))
-        .await
-        .map_err(|e| CoreError::InvalidArgument(format!("打开数据库失败: {e}")))
+    Database::open(&crate::commands::db_path_in(root)).await.core()
 }
 
 /// `mode` 列显示: 空串 = 未知(不猜), 其余走既有 [`mode_text`] 口径。

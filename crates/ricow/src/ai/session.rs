@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use ricow_core::{CoreError, CoreResult};
-use ricow_strategy::Database;
+use ricow_strategy::{Database, SqlxResultExt};
 use rig::message::Message;
 
 use super::confirm::{self, ActionKind, LineDisposition, PendingAction, PendingSlot};
@@ -697,6 +697,14 @@ impl ChatSession {
         sink.line("");
         sink.line(&turn_divider(self.lang, self.turn));
 
+        // 3.4: 送模型之前先把 history 折进字符预算 —— 否则长会话会一路涨到顶穿上下文窗口,
+        // 那一轮会**整体失败**。折叠是静默的(只写 debug 日志): 折的是更早的往返, 用户当下
+        // 关心的就是最近这几轮, 并不会有观感变化; 而每轮弹一句"已省略历史"纯属噪声。
+        let folded = provider::compact_history(&mut self.history);
+        if folded > 0 {
+            tracing::debug!(folded_rounds = folded, "对话历史已按上下文预算折叠");
+        }
+
         let reply = if self.plain {
             self.llm.ask(q).await.inspect(|a| sink.line(&a.text))
         } else {
@@ -1095,9 +1103,7 @@ pub(crate) async fn execute_confirmed(
             let id = action.preview_id.as_deref().ok_or_else(|| {
                 CoreError::InvalidArgument("内部状态错误: deploy 待办缺 preview_id".into())
             })?;
-            let db = Database::open(&crate::commands::db_path_in(root))
-                .await
-                .map_err(|e| CoreError::Exchange(e.to_string()))?;
+            let db = Database::open(&crate::commands::db_path_in(root)).await.core()?;
             let dir = crate::commands::ensure_strategies_dir_in(root)?;
             let token = ricow_engine::approve(&db, id).await?;
             // FR-044: 覆盖部署时引擎会先备份旧脚本再覆盖; 备份路径如实回报, 不省略。

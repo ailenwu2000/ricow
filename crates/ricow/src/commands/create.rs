@@ -16,7 +16,7 @@ use std::io::Read;
 use clap::Args;
 use ricow_core::{CoreError, CoreResult};
 use ricow_engine::Engine;
-use ricow_strategy::{ConfigValue, Database};
+use ricow_strategy::{ConfigValue, Database, SqlxResultExt};
 use rust_decimal::Decimal;
 
 use crate::commands::backtest::parse_param;
@@ -135,8 +135,7 @@ pub async fn create_preview(
     }
 
     // ⑤ 沙箱回测 (第二关) + preview (第三关的第一步)
-    let db =
-        Database::open(&default_db_path()).await.map_err(|e| CoreError::Exchange(e.to_string()))?;
+    let db = Database::open(&default_db_path()).await.core()?;
     // 预览记录清理(019 T040 / FR-046): 迭代会不断新增预览行, 生成新预览前先清过期与终态行, 避免单调增长。
     if let Err(e) = db.prune_previews(chrono::Utc::now().timestamp()).await {
         eprintln!("提示: 预览记录清理失败(不影响本次生成): {e}");

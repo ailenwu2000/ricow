@@ -2,9 +2,10 @@
 
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 use chrono::DateTime;
-use ricow_core::{Kline, OrderFill};
+use ricow_core::{CoreError, CoreResult, Kline, OrderFill};
 use rust_decimal::Decimal;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -14,6 +15,12 @@ use sqlx::{Row, SqlitePool};
 pub struct Database {
     pool: SqlitePool,
 }
+
+/// 当前 schema 版本 (落盘于 `PRAGMA user_version`)。
+///
+/// 每次**结构性**变更 +1, 并在 [`Database::run_version_migrations`] 末尾追加一个 `if v < N` 分支。
+/// v1 (035): `klines` 主键加 `market` 维度 (现货/合约同 pair 不复用同一行)。
+pub(crate) const SCHEMA_VERSION: i64 = 1;
 
 /// 成交查询结果行 (含策略标识, 供 `ricow fills` / `ricow info` 使用)。
 #[derive(Debug, Clone, PartialEq)]
@@ -82,17 +89,93 @@ pub struct FillWithMode {
     pub mode: Option<String>,
 }
 
+/// 从一行 K 线结果 (列名 open_time/open/high/low/close/volume/close_time) 构造 [`Kline`]。
+///
+/// 供 `get_klines` / `get_klines_range` 复用; 任一分量解析失败即返回 `None` (该行被跳过)。
+fn kline_from_row(r: &sqlx::sqlite::SqliteRow) -> Option<Kline> {
+    let open_time: i64 = r.get("open_time");
+    let close_time: i64 = r.get("close_time");
+    Some(Kline {
+        open_time: DateTime::from_timestamp_millis(open_time)?,
+        open: Decimal::from_str(r.get::<String, _>("open").as_str()).ok()?,
+        high: Decimal::from_str(r.get::<String, _>("high").as_str()).ok()?,
+        low: Decimal::from_str(r.get::<String, _>("low").as_str()).ok()?,
+        close: Decimal::from_str(r.get::<String, _>("close").as_str()).ok()?,
+        volume: Decimal::from_str(r.get::<String, _>("volume").as_str()).ok()?,
+        close_time: DateTime::from_timestamp_millis(close_time)?,
+    })
+}
+
+/// `sqlx::Error` → [`CoreError`] 的边界归一 (3.2)。
+///
+/// db 层返回 `sqlx::Error` 是那层的**原生**错误, 但上层不该再各自猜它属于哪一类 ——
+/// 过去一律 `CoreError::Exchange(e.to_string())`, 于是"本地库打不开 / 表结构不符"和
+/// "交易所拒单 / 网络抖动"在日志与提示里长得一模一样。统一走 `.core()` 收口,
+/// 让错误种类在边界上不丢。用法: `db.kline_count().await.core()?`。
+pub trait SqlxResultExt<T> {
+    /// 把 sqlx 错误映射为 [`CoreError::Db`]。
+    fn core(self) -> CoreResult<T>;
+}
+
+impl<T> SqlxResultExt<T> for Result<T, sqlx::Error> {
+    fn core(self) -> CoreResult<T> {
+        self.map_err(|e| CoreError::Db(e.to_string()))
+    }
+}
+
+/// 判断 sqlx 错误是否为 SQLite "库被占用"(`SQLITE_BUSY` = 5 / `SQLITE_LOCKED` = 6)。
+///
+/// 单独识别它是因为**它值得重试**, 而其余错误(语法错、文件不存在、schema 不符)重试无意义。
+fn is_locked_error(err: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db_err) = err else {
+        return false;
+    };
+    matches!(db_err.code().as_deref(), Some("5") | Some("6")) || {
+        let msg = db_err.message().to_ascii_lowercase();
+        msg.contains("database is locked") || msg.contains("database table is locked")
+    }
+}
+
 impl Database {
     /// 打开 (如不存在则创建) 指定路径的 SQLite 数据库, 并运行建表迁移。
+    ///
+    /// **锁竞争退避重试 (035)**: 同一进程里"先开一个池、关掉、马上再开"是常态 (预览写一条 →
+    /// 确认时再读一次)。新连接建池时 sqlx 会执行 `PRAGMA journal_mode=WAL`, 而它需要库文件的
+    /// 独占锁 —— 偏偏 SQLite 对"另一个连接正在用"的情形**不调用 busy handler**, 直接返回
+    /// `SQLITE_BUSY` (`database is locked`)。于是负载一高就随机变红 (并行测试 / Web 端偶发 500)。
+    /// 竞争者只活几十毫秒 (`pool.close().await` 的 WAL checkpoint + 删文件), 所以这里小步退避重试
+    /// 消化抖动, 而不是把它透传给调用方。
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
             }
         }
+        const MAX_ATTEMPTS: u32 = 10;
+        let mut last_err: Option<sqlx::Error> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match Self::connect_and_migrate(path).await {
+                Ok(db) => return Ok(db),
+                Err(e) if is_locked_error(&e) => {
+                    last_err = Some(e);
+                    // 异步 sleep 而非 `std::thread::sleep`: 后者会**阻塞** current_thread 运行时,
+                    // 把上一个池的 close/checkpoint 收尾任务一起卡死 → 越等越锁。
+                    // 5/10/15…ms 线性退避, 10 次累计 ~275ms, 远小于任何超时但仍足够让收尾跑完。
+                    tokio::time::sleep(Duration::from_millis(5 * u64::from(attempt + 1))).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.expect("重试循环至少记录一次错误"))
+    }
+
+    /// 单次尝试: 建池 + 迁移 (被 [`Database::open`] 的退避重试包裹)。
+    async fn connect_and_migrate(path: &Path) -> Result<Self, sqlx::Error> {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true)
             .foreign_keys(true)
+            // 并发写自动等待而非立即失败 (多连接池同库 + 短事务; 消除偶发 SQLITE_BUSY)。
+            .busy_timeout(Duration::from_secs(5))
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
         let pool = SqlitePoolOptions::new().max_connections(4).connect_with(opts).await?;
         let db = Self { pool };
@@ -102,7 +185,9 @@ impl Database {
 
     /// 内存数据库 (测试用)。
     pub async fn open_in_memory() -> Result<Self, sqlx::Error> {
-        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await?;
+        let opts =
+            SqliteConnectOptions::from_str("sqlite::memory:")?.busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await?;
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
@@ -116,9 +201,29 @@ impl Database {
         self.pool.close().await;
     }
 
+    /// 建表与版本迁移入口。
+    ///
+    /// 分两步 (035 起): ① **幂等基线建表** —— 全新库直接建出最新结构, 旧库已存在的表原样保留;
+    /// ② **版本迁移** —— 按 `PRAGMA user_version` 把旧库结构补齐到最新并推进版本号。
+    ///
+    /// **版本号已最新时直接返回 (零写事务)** —— 这消除了旧实现"每次 `open` 都重跑全量建表语句"
+    /// 在多连接池同库并发下引发的偶发 `SQLITE_BUSY` (见 specs/roadmap.md 测试基线注记)。
     async fn migrate(&self) -> Result<(), sqlx::Error> {
+        let v: i64 = sqlx::query_scalar("PRAGMA user_version").fetch_one(&self.pool).await?;
+        if v >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        self.create_baseline_tables().await?;
+        self.run_version_migrations(v).await?;
+        Ok(())
+    }
+
+    /// 幂等基线建表 (全部 `CREATE TABLE IF NOT EXISTS`, 均为**最新**结构)。
+    async fn create_baseline_tables(&self) -> Result<(), sqlx::Error> {
+        // klines 主键含 market (035): 现货/合约同 pair 的 K 线不得互相污染。
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS klines (
+                market TEXT NOT NULL DEFAULT 'spot',
                 pair TEXT NOT NULL,
                 interval TEXT NOT NULL,
                 open_time INTEGER NOT NULL,
@@ -128,7 +233,7 @@ impl Database {
                 close TEXT NOT NULL,
                 volume TEXT NOT NULL,
                 close_time INTEGER NOT NULL,
-                PRIMARY KEY (pair, interval, open_time)
+                PRIMARY KEY (market, pair, interval, open_time)
             )",
         )
         .execute(&self.pool)
@@ -316,19 +421,87 @@ impl Database {
         Ok(())
     }
 
+    /// 版本迁移: 按当前版本 `v` 依次执行缺失的迁移并推进版本号 (只由 [`Self::migrate`] 调用,
+    /// 且仅在 `v < SCHEMA_VERSION` 时进入)。
+    async fn run_version_migrations(&self, v: i64) -> Result<(), sqlx::Error> {
+        // v0 → v1 (035): klines 新增 market 维度。旧表主键 (pair, interval, open_time) 无法
+        // 容纳"同 pair 的现货 + 合约"两套 K 线 → 重建表并整体标记为现货 (旧数据只可能是现货:
+        // 此前 db sync 与回测缓存均只走现货路径)。全新库由基线建表已含 market, 此处自动跳过。
+        if v < 1 && self.klines_lacks_market_column().await? {
+            self.rebuild_klines_with_market().await?;
+        }
+
+        if v < SCHEMA_VERSION {
+            sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// klines 旧表是否缺 market 列 (表不存在时返回 false —— 全新库由基线建表保证含该列)。
+    async fn klines_lacks_market_column(&self) -> Result<bool, sqlx::Error> {
+        let cols = sqlx::query("PRAGMA table_info(klines)").fetch_all(&self.pool).await?;
+        if cols.is_empty() {
+            return Ok(false);
+        }
+        Ok(!cols.iter().any(|r| r.get::<String, _>("name") == "market"))
+    }
+
+    /// 重建 klines 表 (v0 → v1): 主键加 market 维度, 旧行原样迁移并标记为 'spot'。
+    ///
+    /// SQLite 不能改主键, 故走标准的「建新表 → 搬数据 → 删旧表 → 改名」流程, 全程单事务。
+    async fn rebuild_klines_with_market(&self) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // 上次迁移若中断可能残留临时表, 先清干净 (幂等)。
+        sqlx::query("DROP TABLE IF EXISTS klines_old_v0").execute(&mut *tx).await?;
+        sqlx::query("ALTER TABLE klines RENAME TO klines_old_v0").execute(&mut *tx).await?;
+        sqlx::query(
+            "CREATE TABLE klines (
+                market TEXT NOT NULL DEFAULT 'spot',
+                pair TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                open_time INTEGER NOT NULL,
+                open TEXT NOT NULL,
+                high TEXT NOT NULL,
+                low TEXT NOT NULL,
+                close TEXT NOT NULL,
+                volume TEXT NOT NULL,
+                close_time INTEGER NOT NULL,
+                PRIMARY KEY (market, pair, interval, open_time)
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO klines (market, pair, interval, open_time, open, high, low, close, volume, close_time)
+             SELECT 'spot', pair, interval, open_time, open, high, low, close, volume, close_time
+             FROM klines_old_v0",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DROP TABLE klines_old_v0").execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ---- K 线 ----
 
     /// 插入或忽略一条 K 线 (主键冲突时跳过, 增量去重)。
+    ///
+    /// `market` = `spot` | `futures` (035): 与 pair/interval 同属主键维度, 现货合约互不覆盖。
     pub async fn insert_kline(
         &self,
+        market: &str,
         pair: &str,
         interval: &str,
         k: &Kline,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT OR IGNORE INTO klines (pair, interval, open_time, open, high, low, close, volume, close_time)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO klines (market, pair, interval, open_time, open, high, low, close, volume, close_time)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(market)
         .bind(pair)
         .bind(interval)
         .bind(k.open_time.timestamp_millis())
@@ -343,43 +516,123 @@ impl Database {
         Ok(())
     }
 
+    /// 批量插入 K 线 (单事务; 主键冲突跳过) —— 回测取数落库用 (035)。
+    ///
+    /// 逐条 `insert_kline` 每次一个事务, 长窗口数千根时开销明显; 此处合并成一个事务。
+    pub async fn insert_klines(
+        &self,
+        market: &str,
+        pair: &str,
+        interval: &str,
+        klines: &[Kline],
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut n = 0u64;
+        for k in klines {
+            let res = sqlx::query(
+                "INSERT OR IGNORE INTO klines (market, pair, interval, open_time, open, high, low, close, volume, close_time)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(market)
+            .bind(pair)
+            .bind(interval)
+            .bind(k.open_time.timestamp_millis())
+            .bind(k.open.to_string())
+            .bind(k.high.to_string())
+            .bind(k.low.to_string())
+            .bind(k.close.to_string())
+            .bind(k.volume.to_string())
+            .bind(k.close_time.timestamp_millis())
+            .execute(&mut *tx)
+            .await?;
+            n += res.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(n)
+    }
+
     /// 查询 K 线 (按 open_time 升序, 最近 limit 条)。
+    ///
+    /// `market` = `spot` | `futures` (035)。
     pub async fn get_klines(
         &self,
+        market: &str,
         pair: &str,
         interval: &str,
         limit: u32,
     ) -> Result<Vec<Kline>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT open_time, open, high, low, close, volume, close_time
-             FROM klines WHERE pair = ? AND interval = ?
+             FROM klines WHERE market = ? AND pair = ? AND interval = ?
              ORDER BY open_time DESC LIMIT ?",
         )
+        .bind(market)
         .bind(pair)
         .bind(interval)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut klines: Vec<Kline> = rows
-            .iter()
-            .filter_map(|r| {
-                let open_time = r.get::<i64, _>("open_time");
-                let close_time = r.get::<i64, _>("close_time");
-                Some(Kline {
-                    open_time: DateTime::from_timestamp_millis(open_time)?,
-                    open: Decimal::from_str(r.get::<String, _>("open").as_str()).ok()?,
-                    high: Decimal::from_str(r.get::<String, _>("high").as_str()).ok()?,
-                    low: Decimal::from_str(r.get::<String, _>("low").as_str()).ok()?,
-                    close: Decimal::from_str(r.get::<String, _>("close").as_str()).ok()?,
-                    volume: Decimal::from_str(r.get::<String, _>("volume").as_str()).ok()?,
-                    close_time: DateTime::from_timestamp_millis(close_time)?,
-                })
-            })
-            .collect();
+        let mut klines: Vec<Kline> = rows.iter().filter_map(kline_from_row).collect();
         // 反转为升序
         klines.reverse();
         Ok(klines)
+    }
+
+    /// 按 open_time 闭区间查询 K 线 (升序) —— 回测缓存命中判定用 (035)。
+    ///
+    /// `start_ms` / `end_ms` 为毫秒闭区间; `limit` 取区间内**最近**的若干根 (DESC 截断后反转升序),
+    /// 与 `get_klines` 的"最近 N 根"语义一致 —— 窗口宽度 = N×step 时正好覆盖整个窗口。
+    pub async fn get_klines_range(
+        &self,
+        market: &str,
+        pair: &str,
+        interval: &str,
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<Kline>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT open_time, open, high, low, close, volume, close_time
+             FROM klines
+             WHERE market = ? AND pair = ? AND interval = ? AND open_time >= ? AND open_time <= ?
+             ORDER BY open_time DESC LIMIT ?",
+        )
+        .bind(market)
+        .bind(pair)
+        .bind(interval)
+        .bind(start_ms)
+        .bind(end_ms)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: Vec<Kline> = rows.iter().filter_map(kline_from_row).collect();
+        out.reverse();
+        Ok(out)
+    }
+
+    /// 本地已缓存 K 线中最早/最晚的 open_time (毫秒); 空表返回 None (035)。
+    pub async fn kline_span(
+        &self,
+        market: &str,
+        pair: &str,
+        interval: &str,
+    ) -> Result<Option<(i64, i64)>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT MIN(open_time) AS lo, MAX(open_time) AS hi
+             FROM klines WHERE market = ? AND pair = ? AND interval = ?",
+        )
+        .bind(market)
+        .bind(pair)
+        .bind(interval)
+        .fetch_one(&self.pool)
+        .await?;
+        let lo: Option<i64> = row.get("lo");
+        let hi: Option<i64> = row.get("hi");
+        Ok(match (lo, hi) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        })
     }
 
     /// K 线总数。
@@ -1305,14 +1558,139 @@ mod tests {
     #[tokio::test]
     async fn test_insert_and_get_klines() {
         let db = Database::open_in_memory().await.unwrap();
-        db.insert_kline("ETH", "1m", &sample_kline(1000)).await.unwrap();
-        db.insert_kline("ETH", "1m", &sample_kline(1_060_000)).await.unwrap();
+        db.insert_kline("spot", "ETH", "1m", &sample_kline(1000)).await.unwrap();
+        db.insert_kline("spot", "ETH", "1m", &sample_kline(1_060_000)).await.unwrap();
         // 重复插入被去重
-        db.insert_kline("ETH", "1m", &sample_kline(1000)).await.unwrap();
+        db.insert_kline("spot", "ETH", "1m", &sample_kline(1000)).await.unwrap();
+        // 同 pair 同 open_time 的合约 K 线独立存一行 (market 维度隔离, 035)
+        db.insert_kline("futures", "ETH", "1m", &sample_kline(1000)).await.unwrap();
 
-        let klines = db.get_klines("ETH", "1m", 10).await.unwrap();
-        assert_eq!(klines.len(), 2);
-        assert_eq!(db.kline_count().await.unwrap(), 2);
+        let spot = db.get_klines("spot", "ETH", "1m", 10).await.unwrap();
+        assert_eq!(spot.len(), 2);
+        let fut = db.get_klines("futures", "ETH", "1m", 10).await.unwrap();
+        assert_eq!(fut.len(), 1, "合约与现货互不覆盖");
+        assert_eq!(db.kline_count().await.unwrap(), 3);
+    }
+
+    /// 035 回归: 「开池 → 关池 → 立刻再开」是预览/确认链路的标准节奏, 不得因
+    /// `PRAGMA journal_mode=WAL` 抢不到独占锁而报 `database is locked`。
+    #[tokio::test]
+    async fn test_reopen_same_file_after_close_is_never_locked() {
+        let dir = std::env::temp_dir().join(format!(
+            "ricow-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ricow.db");
+        for i in 0..12 {
+            let db =
+                Database::open(&path).await.unwrap_or_else(|e| panic!("第 {i} 次打开失败: {e}"));
+            db.close_pool_for_test().await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 3.2: 库层错误在边界上归一到 `CoreError::Db`, 不再被上层猜成 `Exchange`/`InvalidArgument`。
+    #[tokio::test]
+    async fn test_sqlx_error_normalizes_to_core_db_variant() {
+        let base = std::env::temp_dir().join(format!(
+            "ricow-dberr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        // 用一个**普通文件**当目录 → 建父目录这一步必失败, 与平台无关且可重复。
+        let blocker = base.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        // `Database` 不是 Debug, 不能直接 unwrap_err, 故显式分派。
+        let err = match Database::open(&blocker.join("ricow.db")).await.core() {
+            Ok(_) => panic!("把普通文件当目录不该打开成功"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, CoreError::Db(_)), "库错误必须归一到 Db, 实际 {err:?}");
+        assert!(err.to_string().starts_with("db error:"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 035: v0 (klines 无 market 列) → v1 迁移保留旧数据、推进 user_version、且幂等可重入。
+    #[tokio::test]
+    async fn test_migration_v0_to_v1_adds_market_column() {
+        let path = std::env::temp_dir().join("ricow-mig-v0v1.db");
+        let _ = std::fs::remove_file(&path);
+
+        // 造一个 v0 结构的库: klines 无 market 列, user_version 缺省 0。
+        {
+            let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                .unwrap()
+                .create_if_missing(true);
+            let pool =
+                SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE klines (
+                    pair TEXT NOT NULL, interval TEXT NOT NULL, open_time INTEGER NOT NULL,
+                    open TEXT NOT NULL, high TEXT NOT NULL, low TEXT NOT NULL, close TEXT NOT NULL,
+                    volume TEXT NOT NULL, close_time INTEGER NOT NULL,
+                    PRIMARY KEY (pair, interval, open_time))",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO klines VALUES ('ETH','1m',1000,'1','1','1','1','1',1060)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+
+        let db = Database::open(&path).await.unwrap();
+        // 旧行保留并标记为现货。
+        let spot = db.get_klines("spot", "ETH", "1m", 10).await.unwrap();
+        assert_eq!(spot.len(), 1, "v0 旧行应保留并标记为 spot");
+        assert_eq!(spot[0].open_time.timestamp_millis(), 1000);
+        // 版本号已推进, 二次 open 幂等且数据不丢。
+        let v: i64 = sqlx::query_scalar("PRAGMA user_version").fetch_one(&db.pool).await.unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        drop(db);
+        let db2 = Database::open(&path).await.unwrap();
+        assert_eq!(db2.get_klines("spot", "ETH", "1m", 10).await.unwrap().len(), 1);
+        // 迁移后主键含 market → 合约可独立写入同一 pair/时间戳。
+        db2.insert_kline("futures", "ETH", "1m", &sample_kline(1000)).await.unwrap();
+        assert_eq!(db2.get_klines("futures", "ETH", "1m", 10).await.unwrap().len(), 1);
+        drop(db2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 035: 区间查询取"最近 limit 根"并升序返回; kline_span 报告首尾。
+    #[tokio::test]
+    async fn test_get_klines_range_recent_ascending_and_span() {
+        let db = Database::open_in_memory().await.unwrap();
+        for i in 0..5 {
+            db.insert_kline("spot", "ETH", "1m", &sample_kline(1000 + i * 60_000)).await.unwrap();
+        }
+        // 区间含前 4 根, limit=3 → 取最近 3 根 (第 2/3/4 根), 升序。
+        let got =
+            db.get_klines_range("spot", "ETH", "1m", 1000, 1000 + 3 * 60_000, 3).await.unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].open_time.timestamp_millis(), 1000 + 60_000);
+        assert_eq!(got[2].open_time.timestamp_millis(), 1000 + 3 * 60_000);
+        // 空区间 → 空。
+        assert!(db.get_klines_range("spot", "ETH", "1m", 10, 20, 3).await.unwrap().is_empty());
+        // 首尾跨度。
+        assert_eq!(
+            db.kline_span("spot", "ETH", "1m").await.unwrap(),
+            Some((1000, 1000 + 4 * 60_000))
+        );
+        // 不同 market 的空间相互独立 (futures 无数据)。
+        assert_eq!(db.kline_span("futures", "ETH", "1m").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1410,14 +1788,14 @@ mod tests {
         db.insert_us_kline("TSLA", &sample_kline(1000)).await.unwrap();
         db.insert_us_kline("TSLA", &sample_kline(1_060_000)).await.unwrap();
         db.insert_us_kline("TSLA", &sample_kline(1000)).await.unwrap(); // 去重
-        db.insert_kline("TSLA", "1d", &sample_kline(1000)).await.unwrap(); // 币安侧同 key 独立
+        db.insert_kline("spot", "TSLA", "1d", &sample_kline(1000)).await.unwrap(); // 币安侧同 key 独立
 
         let us = db.get_us_klines("TSLA", 10).await.unwrap();
         assert_eq!(us.len(), 2, "us_klines 只含美股插入");
         assert_eq!(us[0].open_time.timestamp_millis(), 1000);
         assert_eq!(us[1].open_time.timestamp_millis(), 1_060_000);
         // 币安 klines 表不受 us_klines 影响。
-        let bn = db.get_klines("TSLA", "1d", 10).await.unwrap();
+        let bn = db.get_klines("spot", "TSLA", "1d", 10).await.unwrap();
         assert_eq!(bn.len(), 1);
         // 空查询安全。
         let empty = db.get_us_klines("AAPL", 10).await.unwrap();

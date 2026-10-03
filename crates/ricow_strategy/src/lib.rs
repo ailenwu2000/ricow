@@ -11,6 +11,7 @@ mod backtest;
 mod config;
 mod context;
 mod db;
+pub mod events;
 mod exec;
 mod fee;
 mod indicators_api;
@@ -32,8 +33,8 @@ pub use config::{BacktestParams, BacktestToml, ConfigValue, StrategyConfig};
 pub use context::{Context, DryRunContext, LiveContext};
 pub use db::{
     Database, FillRecord, FillWithMode, OrderRecord, PnlSnapshotRecord, PositionRecord,
-    PreviewRecord, WebMessageRecord, WebSessionRecord, WEB_ROLE_ASSISTANT, WEB_ROLE_HOST,
-    WEB_ROLE_USER,
+    PreviewRecord, SqlxResultExt, WebMessageRecord, WebSessionRecord, WEB_ROLE_ASSISTANT,
+    WEB_ROLE_HOST, WEB_ROLE_USER,
 };
 pub use fee::FeeModel;
 pub use lua::{validate_lua, validate_script_source, LuaStrategy};

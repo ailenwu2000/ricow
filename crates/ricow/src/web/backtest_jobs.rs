@@ -90,6 +90,15 @@ pub(super) struct JobStore {
     inner: Mutex<HashMap<String, BacktestJob>>,
 }
 
+/// 取锁并**容忍毒化**。
+///
+/// 作业表是纯内存、进程重启即清空的缓存, 毒化(另一线程持锁时 panic)不构成正确性威胁;
+/// 而 `.expect("作业表锁")` 会让**此后每个**回测请求都 500 —— daemon 里一处 panic 放大成
+/// 整个回测面板永久停摆。宁可带毒继续, 也不要级联失败。
+fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl JobStore {
     pub(super) fn new() -> Self {
         Self { inner: Mutex::new(HashMap::new()) }
@@ -106,7 +115,7 @@ impl JobStore {
 
     /// 发起作业: 先清过期记录, 再查同名 running; 通过则登记 running 并回新 job_id。
     pub(super) fn start(&self, strategy: &str, now: DateTime<Utc>) -> Result<String, JobBusy> {
-        let mut map = self.inner.lock().expect("作业表锁");
+        let mut map = lock_or_recover(&self.inner);
         Self::prune(&mut map, now);
         if map.values().any(|j| j.strategy == strategy && j.status == JobStatus::Running) {
             return Err(JobBusy);
@@ -144,7 +153,7 @@ impl JobStore {
         error: Option<String>,
         now: DateTime<Utc>,
     ) {
-        let mut map = self.inner.lock().expect("作业表锁");
+        let mut map = lock_or_recover(&self.inner);
         if let Some(job) = map.get_mut(job_id) {
             if job.status == JobStatus::Running {
                 job.status = status;
@@ -157,7 +166,7 @@ impl JobStore {
 
     /// 查询: 先清过期, 再取记录克隆(Unknown/已清理 → None, handler 回 404)。
     pub(super) fn get(&self, job_id: &str, now: DateTime<Utc>) -> Option<JobReply> {
-        let mut map = self.inner.lock().expect("作业表锁");
+        let mut map = lock_or_recover(&self.inner);
         Self::prune(&mut map, now);
         map.get(job_id).map(JobReply::from)
     }

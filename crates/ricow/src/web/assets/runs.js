@@ -433,18 +433,19 @@
       LOG_TAIL_LINES +
       "&token=" +
       encodeURIComponent(R.TOKEN);
-    const es = new EventSource(url);
-    logStream = es;
-    es.onmessage = (ev) => {
-      if (logStream !== es) return; // 切行/收起后旧流可能还有余帧, 丢
-      let event;
-      try {
-        event = JSON.parse(ev.data);
-      } catch (_) {
-        return;
-      }
-      appendLogLine(event);
-    };
+    const handle = R.sse(url, {
+      onmessage: (ev) => {
+        if (logStream !== handle) return; // 切行/收起后旧流可能还有余帧, 丢
+        let event;
+        try {
+          event = JSON.parse(ev.data);
+        } catch (_) {
+          return;
+        }
+        appendLogLine(event);
+      },
+    });
+    logStream = handle;
   }
 
   function closeStream() {

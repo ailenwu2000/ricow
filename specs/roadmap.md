@@ -35,8 +35,11 @@
 
 ## 测试基线
 
-- **当前基线 (2026-10-03, Windows, 034 UI 主题+折叠落地后实跑)**: `cargo test --workspace` = **611 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 608: **+3 通过 / ignored 不变**; ricow bin 用例 **300 → 303(+3)**, 增量全部来自 034 —— `[ui].theme` 配置解析 2 例 + `/api/theme` 端点 1 例。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0。三主题(深/白/红)与历史消息两行折叠以真实浏览器截图取证, 见 `specs/changes/034-ui-themes-fold/converge.md`。
-  **如实**: `ai_live_smoke` 的 2 例(`approve_requires_interactive_tty` / `piped_confirm_phrases_never_reach_the_host`)在**本机(agent 沙箱)**报 `ERROR_PIPE_BUSY(231)` —— 它们只是 `spawn ricow` 并喂 stdin 管道, 用一个不含任何 ricow 代码的 20 行 Rust 程序即可复现同一错误, 故为环境对管道创建的拦截, 非代码缺陷(032 基线在真机终端为全绿)。另在**高负载轮次**偶见 `ai::tools` 部署类用例 `SQLITE_BUSY(database is locked)` 抖动, 已定性为测试脚手架缺陷(同一 `ricow.db` 连开多池 + `Database::open` 每次跑 `migrate()` 写事务), 033 已顺手修掉两处(见 `specs/changes/033-key-manager/converge.md` §六); 根治需产品代码语义变更, 留待单独决策。
+- **当前基线 (2026-10-03, Windows, 036 回测敏感性 + Web 工程债加固落地后实跑)**: `cargo test --workspace --no-fail-fast` = **650 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 642: **+8 通过 / ignored 不变(22)**。增量构成: 敏感性阶梯与报告 4(`commands/backtest.rs`) + 来源门变体矩阵 2(`web/auth.rs`) + SSE 断线续传 1(`web/logs.rs`) + 会话入站 1(`web/sessions.rs`)。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 零代码告警 / 安全红线门禁 4 条全绿; `web::` 全组 102 用例未改断言全绿(拆文件零行为变化取证); 逐条见 `specs/changes/036-backtest-sensitivity-web-hardening/`。
+- **前基线 (2026-10-03, Windows, 035 工程底座加固落地后实跑)**: `cargo test --workspace --no-fail-fast` = **642 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 611: **+31 通过 / ignored 不变(22)**。增量构成: 2.1 币安 REST 重试 4(`ricow_binance/src/retry.rs`) + 2.2 K 线缓存 1 + 2.3 回测 run card 2(`commands/backtest.rs`) + 2.4 编号迁移与锁抖动 3(`ricow_strategy/src/db.rs`) + 3.3 运行事件流 9(`ricow_strategy/src/{events,context}.rs`) + 3.4 LLM 重试与历史预算 6(`ai/provider.rs`) + 3.5 配置 schema 版本 6(`commands/config_file.rs` + `ai/config.rs`)。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0 / `cargo deny --locked check` = advisories/bans/licenses/sources **全 ok**; 逐条见 `specs/changes/035-engineering-hardening/`。
+  **如实**: 2.4 顺带根治了本机**高频抖动**的 `ai::tools` 部署类用例 `SQLITE_BUSY(database is locked)` —— 根因是 `Database::open` 每次跑全量建表写事务, 而 `PRAGMA journal_mode=WAL` 建池需独占锁、SQLite 对"另一连接正在用"**不调用 busy handler** 直接返回 `SQLITE_BUSY`, 竞争者只活几十毫秒。修法双管: ① 迁移改为 `PRAGMA user_version` 驱动、版本已最新时**零写事务**; ② `open` 加 10 次线性退避重试(仅锁错误, `tokio::time::sleep` 以免卡死 current_thread 运行时)。连续 3 次 `cargo test -p ricow --bin ricow` 全绿(`317 passed / 0 failed / 1 ignored`)。
+- **前基线 (2026-10-03, Windows, 034 UI 主题+折叠落地后实跑)**: `cargo test --workspace` = **611 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 608: **+3 通过 / ignored 不变**; ricow bin 用例 **300 → 303(+3)**, 增量全部来自 034 —— `[ui].theme` 配置解析 2 例 + `/api/theme` 端点 1 例。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0。三主题(深/白/红)与历史消息两行折叠以真实浏览器截图取证, 见 `specs/changes/034-ui-themes-fold/converge.md`。
+  **如实**: `ai_live_smoke` 的 2 例(`approve_requires_interactive_tty` / `piped_confirm_phrases_never_reach_the_host`)在**本机(agent 沙箱)**报 `ERROR_PIPE_BUSY(231)` —— 它们只是 `spawn ricow` 并喂 stdin 管道, 用一个不含任何 ricow 代码的 20 行 Rust 程序即可复现同一错误, 故为环境对管道创建的拦截, 非代码缺陷(032 基线在真机终端为全绿)。另在**高负载轮次**偶见 `ai::tools` 部署类用例 `SQLITE_BUSY(database is locked)` 抖动 —— **该抖动已于 035 根治**(见上条"当前基线")。
 - **前基线 (2026-10-02, Windows, 033 密钥管理页落地后实跑)**: `cargo test --workspace` = **608 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 589: **+19 通过 / ignored 不变**; ricow bin 用例 **279 → 300(+21)**, 增量全部来自 033 —— `commands/config_file.rs` 密钥环 12 例 + `web/keyring.rs` 密钥端点 9 例。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0。
 - **前基线 (2026-09-29, Windows, 032 Web UI 工作台化落地后实跑)**: `cargo test --workspace` = **589 passed / 0 failed / 22 ignored**; 较上次 538: **+51 通过 / ignored 不变**; 增量全部来自 032-web-ui-console(web 模块: 配置/密钥端点、策略保存与源码/AI 编辑/回测 job、运行面 ensure_daemon 与 start/stop/risk 门禁、401 矩阵与前端资产密钥扫描等单测)。三门禁全绿(fmt 0 差异 / clippy --all-targets -D warnings 0 / test 0 failed); 端到端以浏览器实测 + testnet 真实调用取证(场景 1/3/5 走查 + demo 实发下单 + live 拒绝路径), 见 `specs/changes/032-web-ui-console/quickstart.md` 执行记录。
 - **前基线 (2026-09-25, Linux, 031 策略目录重构 + 清单 + 统一注册落地后实跑)**: `cargo test --workspace` = **538 passed / 0 failed / 22 ignored**; 较上次 529: **+9 通过 / ignored 不变**; 增量 = catalog.rs 清单解析/校验单测 8 例 + architecture_guard「清单键 == Lua 读取键」一致性 1 例。三门禁全绿(fmt 0 差异 / clippy -D warnings 0 / test 0 failed); 真实回测逐位一致验证通过: `--strategy {paired_grid,shannon_spot_grid}` 与迁移前(51ccb46 二进制)固定窗口报告逐位一致, 旧实例 TOML(`type=内置id`)加载行为不变。
@@ -54,7 +57,7 @@
   ignored 全部为需真实外部环境的用例 (BN demo 现货 / 合约 / 用户流、Nasdaq 冒烟、019 AI 真机与 demo 联调), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
   220 → 204 的差额 = 009 移除 `locus_hl`(16 个内联测试); 204 → 216 = 008 新增 supervisor / CLI 命令面用例; 216 → 233 = 004 风控用例(频率窗口/两级熔断/装配与参数校验/接线); 233 → 270 = 011 用例(下单参数对齐 / 时钟预检判定 / 归属与停机清理编排 / 门禁 / proto 往返 / 现货事件解析 / 交易所过滤器解析 / 归属前缀长度约束)。
 - 验证方式: `cargo test --workspace`(纯逻辑) + 带 env key 的 `#[ignore]` 真实联调 (见 `specs/testnet.md`)。
-- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → 589(032 Web UI 工作台) → 608(033 密钥管理页) → **611(034 UI 主题+折叠, 当前)**。
+- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → 589(032 Web UI 工作台) → 608(033 密钥管理页) → 611(034 UI 主题+折叠) → 642(035 工程底座加固) → **650(036 回测敏感性 + Web 工程债加固, 当前)**。
 
 ## 变更档案状态 (specs/changes/)
 
@@ -113,6 +116,49 @@
 > 点术语先展开所在块, 选文字(复制)不触发手势。测试 608 → **611 passed / 22 ignored**(+3),
 > 三门禁全绿(除 2 例环境性失败); 三主题与折叠以真实浏览器截图取证。
 > 见 `specs/changes/034-ui-themes-fold/`。
+
+> **035-engineering-hardening(2026-10-03, 已实施)**: **工程底座加固** —— 对标 Vibe-Trading 的工程做法, 只补底座、不扩产品面
+> (依据 `tmp/analysis/ricow-optimization-vs-vibe-trading-2026-10-03.md` 第二/三节)。
+> ① **2.1 币安 REST 统一重试/退避/限流**: 新建 `ricow_binance/src/retry.rs`, 现货/合约/fapi 三处客户端共用;
+> 重试按**请求语义**分档 —— 读操作可重试传输错误 + 429/418/408/5xx, **写操作仅连接层失败可重试**(安全红线:
+> 超时/5xx 可能"其实已成交", 重放 = 重复下单); 429/418 尊重 `Retry-After`(≤30s); 指数退避 + ±20% 抖动;
+> `CoreError::RateLimit` 由**死变体**接上。
+> ② **2.2 回测优先读本地 K 线缓存**: `klines` 主键加 `market` 维度(现货/合约同 pair 不互相污染),
+> 取数改"先读本地 → 未命中直连交易所 → 回填", **仅当窗口已全部收盘**才允许命中(防实时尾 bar 未收盘被固化),
+> 生效数据源写进 run card。
+> ③ **2.3 回测 run card**: 落 `run/backtest/<ts>-<策略>-<pair>.json` —— 策略源码 sha256 + 参数快照 +
+> 数据窗口(pair/interval/market/position_mode/根数/首末 open_time/数据源)+ 全部报告指标, 服务 P4 dogfood 证据留档与"逐位一致"机器化比对; 落盘失败只 warn。
+> ④ **2.4 数据库编号迁移**: 引入 `PRAGMA user_version` 驱动迁移, `migrate()` 拆"幂等基线建表 + 版本迁移",
+> **版本已最新时零写事务**; v0→v1 重建 `klines` 加 `market`(旧数据标 `spot`, 单事务幂等);
+> 并**根治**本机高频 `SQLITE_BUSY` 抖动(`Database::open` 加锁错误退避重试 + async sleep)。
+> ⑤ **2.5 CI 门禁补齐**: 新增 `deny.toml` + `cargo-deny` job(许可证/漏洞/重复版本/来源)、
+> `scripts/ci_grep_gates.sh` + `gates` job(四条安全红线: AI 工具层零落盘 / 明文密钥不进日志 / 无调试残留 /
+> `execute_strategy` 调用点白名单; 按 `#[cfg(test)]` 配平跳过测试代码)、`test` 矩阵加 **macOS**、
+> `dist-workspace.toml` 加 `pr-run-mode = "skip"` 并去掉 `release.yml` 的 PR 触发; 顺带修真实漏洞 **RUSTSEC-2026-0285**(rustls → 0.23.45);
+> 内部依赖收敛到 `[workspace.dependencies]` 以过 `wildcards = "deny"`。
+> ⑥ **3.1+3.2**: 锁毒化容忍(`lock_or_recover`)+ 新增 `CoreError::Db` 变体与 `SqlxResultExt::core()` 边界归一(约 16 处不再手工猜错误种类)。
+> ⑦ **3.3 结构化运行事件流**: 新增 `ricow_strategy/src/events.rs`, 实例运行写 `run/<name>/events.jsonl`
+> (一行一事件、写完即 flush、坏行跳过、**永不返回错误**不反压交易); 埋点启动/停止/下单/拒单/撤单。
+> ⑧ **3.4 AI 健壮性**: LLM 调用 3 次退避重试(**仅瞬时错误**, 状态码按数字边界匹配; 流式"已吐字即不重试")
+> + 对话历史字符预算(24k)超限按**整轮**折叠 + 确定性摘记(刻意不调 LLM 做摘要)。
+> ⑨ **3.5 配置 schema 版本**: `ricow.toml` 加顶层 `schema_version`(缺省=当前版本, 老文件**内存迁移不落盘**,
+> 未来版本拒绝并给解法), 默认值收敛到 `pub mod defaults` 单一来源。
+> 测试 611 → **642 passed / 22 ignored**(+31), 三门禁(fmt / clippy -D warnings / deny)全绿;
+> 见 `specs/changes/035-engineering-hardening/`。
+> **未做(显式记录)**: walk-forward / 滑点敏感性(分析文档第四节, 属**决策项**, 用户未回应);
+> Web 前端工程债(第五节, 低优先); `cargo-audit` 独立 job / 覆盖率 / `cargo-udeps` / bench(Vibe-Trading 有, ricow 当前不需要)。
+
+> **036-backtest-sensitivity-web-hardening(2026-10-03, 已实施)**: 用户拍板补上 035 显式记录的两项。
+> ① **回测滑点/费用敏感性(分析文档第四节)**: `--sensitivity` / `--sensitivity-fee` 沿单一成本轴跑多档
+> 完整回测(默认阶梯 0,5,10 / 5,10,20, 可显式给档, ≥2 档硬校验), 定宽表 + 每轴"净盈亏符号在哪一档翻转"
+> 结论段; 抽 `BacktestOutcome` 结构化内核让报告/run card/扫描三共用, **不动撮合引擎**(YAGNI);
+> 扫描不落 run card。② **Web 工程债(第五节)**: 日志 SSE 断线续传(事件 id = 文件 offset,
+> `Last-Event-ID` 头优先 + `last_event_id` 查询参数兜底, 不重发已给过的行); 前端统一 SSE 打开器
+> `R.sse`(指数退避 1s→8s + ±20% 抖动, 连续 5 次放弃; `new EventSource` 收敛到一处);
+> 写方法 Origin/Referer 来源门(回环白名单, 非回环 403 空体, 与 token 同一道中间件);
+> **mod.rs 2178 → ~700 行**按端点族拆 7 个模块 + 共享测试脚手架 `test_support.rs`,
+> `strategy_io`/`runs` 目录化下沉测试体 —— `web::` 全组 102 用例未改断言全绿即零行为变化取证。
+> 测试 642 → **650 passed / 22 ignored**(+8); 见 `specs/changes/036-backtest-sensitivity-web-hardening/`。
 
 > SDD 产物规范: 计划与任务分解应存于 `specs/changes/<feature>/{spec,plan,tasks}.md`。
 > 005/006/007 的计划当时落在 `.hermes/plans/`(临时区, 已 git 忽略), 未回填档案 —— 后续变更须归档到位。

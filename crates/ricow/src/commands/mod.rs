@@ -242,16 +242,27 @@ pub(crate) fn default_db_path() -> std::path::PathBuf {
     db_path_in(&project_root())
 }
 
+/// 打开回测 K 线缓存库 (035)。打开失败返回 `None` —— 缓存是 best-effort 加速,
+/// 绝不因"库不可用"而阻塞回测 (回测总能退回直连交易所取数)。
+pub(crate) async fn open_cache_db(root: &std::path::Path) -> Option<ricow_strategy::Database> {
+    ricow_strategy::Database::open(&db_path_in(root)).await.ok()
+}
+
+/// 数据库路径决策 (纯函数, 便于单测): `RICOW_DB` 覆盖最优先, 否则 `<root>/ricow.db`。
+fn db_path_with(
+    override_db: Option<std::path::PathBuf>,
+    root: &std::path::Path,
+) -> std::path::PathBuf {
+    override_db.unwrap_or_else(|| root.join("ricow.db"))
+}
+
 /// 数据库路径 (以**调用方给定的 root** 为基准, `RICOW_DB` 全局覆盖仍最优先)。
 ///
 /// 与 [`default_db_path`] 的区别只在基准目录: 会话/daemon 手里已经有 root, 直接用它的
 /// 即可, 且必须与 `create`/`approve`/`deploy` 取同一个库 —— 否则设了 `RICOW_DB` 时
 /// 会出现"预览写在一个库里、确认去另一个库里找"的静默不一致。
 pub(crate) fn db_path_in(root: &std::path::Path) -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("RICOW_DB") {
-        return std::path::PathBuf::from(p);
-    }
-    root.join("ricow.db")
+    db_path_with(std::env::var("RICOW_DB").ok().map(std::path::PathBuf::from), root)
 }
 
 /// 策略目录 (<项目根>/strategies/)。
@@ -583,11 +594,23 @@ mod tests {
                 default_db_path(),
                 std::path::PathBuf::from("/tmp/ricow-root-test/ricow.db")
             );
-            // RICOW_DB 单独覆盖优先。
-            std::env::set_var("RICOW_DB", "/tmp/custom.db");
-            assert_eq!(default_db_path(), std::path::PathBuf::from("/tmp/custom.db"));
-            std::env::remove_var("RICOW_DB");
         });
+        // RICOW_DB 单独覆盖优先 —— 用**纯函数**断言, 不经进程 env。
+        // 教训 (2026-10-03): 此前此处直接 `set_var("RICOW_DB", ...)`, 而 `db_path_in` 会读
+        // 该 env → 并行的其它测试 (用显式 root 的 ai::tools 等) 被静默重定向到同一个库,
+        // 全量并行跑时偶发 `database is locked`。改为测纯函数即消除该污染。
+        assert_eq!(
+            db_path_with(None, std::path::Path::new("/tmp/ricow-root-test")),
+            std::path::PathBuf::from("/tmp/ricow-root-test/ricow.db")
+        );
+        assert_eq!(
+            db_path_with(
+                Some(std::path::PathBuf::from("/tmp/custom.db")),
+                std::path::Path::new("/tmp/ricow-root-test")
+            ),
+            std::path::PathBuf::from("/tmp/custom.db"),
+            "RICOW_DB 覆盖须最优先"
+        );
     }
 
     #[test]

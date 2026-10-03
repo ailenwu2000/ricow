@@ -12,6 +12,9 @@ use rust_decimal::Decimal;
 
 use crate::align::{ownership_prefix, prepare_live_order};
 use crate::config::StrategyConfig;
+use crate::events::{
+    EventWriter, RunEvent, KIND_ORDER_CANCELED, KIND_ORDER_PLACED, KIND_ORDER_REJECTED,
+};
 use crate::fee::FeeModel;
 use crate::multiframe::{tf_key, TfCache};
 use crate::order_guard::OrderGuard;
@@ -125,6 +128,11 @@ pub struct LiveContext {
     tf_cache: RwLock<HashMap<String, Arc<TfCache>>>,
     /// 策略数据需求声明 (need_klines 写入, 引擎装配阶段读取)。
     declarations: Vec<Declaration>,
+    /// 运行事件流 (035 / 3.3): `None` = 未开启(默认, 也是回测/单测的形态)。
+    /// 开启后每次下单 / 拒单 / 撤单都会往 `run/<name>/events.jsonl` 记一条。
+    events: Option<Arc<EventWriter>>,
+    /// 事件里如实标注的运行模式 (`dry_run` / `demo` / `live`); 未开启事件流时无意义。
+    run_mode: String,
     rt: tokio::runtime::Handle,
 }
 
@@ -160,6 +168,8 @@ impl LiveContext {
             klines_cache: RwLock::new(HashMap::new()),
             tf_cache: RwLock::new(HashMap::new()),
             declarations: Vec::new(),
+            events: None,
+            run_mode: String::new(),
             rt,
         }
     }
@@ -167,6 +177,29 @@ impl LiveContext {
     /// 本实例订单号归属前缀 (`<策略名>-`)。
     pub fn order_prefix(&self) -> &str {
         &self.order_prefix
+    }
+
+    /// 打开运行事件流 (035 / 3.3): 装配层在实例启动时注入。
+    ///
+    /// `mode` 会**原样**写进每条事件 —— 事件流必须能自证"这是实盘还是试跑", 不能事后靠文件路径猜。
+    pub fn set_events(&mut self, writer: Arc<EventWriter>, mode: impl Into<String>) {
+        self.events = Some(writer);
+        self.run_mode = mode.into();
+    }
+
+    /// 记一条运行事件。未开启事件流时**完全 no-op**(连时间戳都不取)。
+    fn emit_event(&self, kind: &str, build: impl FnOnce(&mut RunEvent)) {
+        let Some(writer) = &self.events else {
+            return;
+        };
+        let mut ev = RunEvent::new(
+            kind,
+            &self.config.name,
+            &self.run_mode,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        build(&mut ev);
+        writer.emit(&ev);
     }
 
     /// 注入交易所过滤器 (启动装配: `get_markets` 结果) —— 下单参数对齐的依据。
@@ -198,6 +231,14 @@ impl LiveContext {
                     side = ?req.side,
                     "工程护栏拒单(下单频率超限): {e}"
                 );
+                // 拒单必须进事件流: "策略为什么没按预期下单" 最常见的答案就在这里。
+                let (pair, side, size) = (req.pair.clone(), format!("{:?}", req.side), req.size);
+                self.emit_event(KIND_ORDER_REJECTED, |ev| {
+                    ev.pair = Some(pair);
+                    ev.side = Some(side);
+                    ev.size = Some(size.to_string());
+                    ev.reason = Some(format!("工程护栏拒单(下单频率超限): {e}"));
+                });
                 Some(crate::order_guard::rejected_ack(req))
             }
         }
@@ -264,7 +305,7 @@ impl LiveContext {
         let exchange = self.resolve_exchange(prefix)?;
         let base = base.to_string();
         let owned = self.order_prefix.clone();
-        self.run_async(async move {
+        let result = self.run_async(async move {
             let orders = exchange.get_open_orders(&base).await?;
             let mut cancelled = 0usize;
             let mut failed = 0usize;
@@ -284,16 +325,25 @@ impl LiveContext {
                 }
             }
             tracing::info!(target: "strategy.live", pair = %base, cancelled, failed, "撤单指令执行");
-            Ok(OrderAck {
-                exchange_order_id: String::new(),
-                client_order_id: String::new(),
-                pair: base,
-                side: OrderSide::Buy,
-                price: Decimal::ZERO,
-                size: Decimal::ZERO,
-                filled_size: Decimal::ZERO,
-                status: OrderStatus::Cancelled,
-            })
+            Ok::<_, CoreError>((base, cancelled, failed))
+        })?;
+        // 撤单回执入流: 这次撤掉几张、几张没撤掉 —— 停机清理时的关键证据。
+        let (ev_pair, cancelled, failed) = result;
+        self.emit_event(KIND_ORDER_CANCELED, |ev| {
+            ev.pair = Some(ev_pair.clone());
+            ev.size = Some(cancelled.to_string());
+            ev.filled_size = Some(failed.to_string());
+            ev.reason = Some(format!("撤本实例挂单: 成功 {cancelled} 张, 失败 {failed} 张"));
+        });
+        Ok(OrderAck {
+            exchange_order_id: String::new(),
+            client_order_id: String::new(),
+            pair: ev_pair,
+            side: OrderSide::Buy,
+            price: Decimal::ZERO,
+            size: Decimal::ZERO,
+            filled_size: Decimal::ZERO,
+            status: OrderStatus::Cancelled,
         })
     }
 
@@ -501,6 +551,13 @@ impl Context for LiveContext {
                     target: "align", name = %self.config.name, pair = %base,
                     "对齐拒单: {e}"
                 );
+                let (pair, side) = (rejected_ack.pair.clone(), format!("{:?}", rejected_ack.side));
+                self.emit_event(KIND_ORDER_REJECTED, |ev| {
+                    ev.pair = Some(pair);
+                    ev.side = Some(side);
+                    ev.size = Some(rejected_ack.size.to_string());
+                    ev.reason = Some(format!("对齐拒单: {e}"));
+                });
                 return Ok(rejected_ack);
             }
         };
@@ -509,7 +566,29 @@ impl Context for LiveContext {
             return Ok(rejected);
         }
         let exchange = self.resolve_exchange(&prefix)?;
-        self.run_async(async move { exchange.place_order(req).await })
+        match self.run_async(async move { exchange.place_order(req).await }) {
+            Ok(ack) => {
+                // 提交结果(含交易所侧拒单)都记一条: 策略侧最需要知道的是"我下了什么、结果是什么"。
+                self.emit_event(KIND_ORDER_PLACED, |ev| {
+                    ev.pair = Some(ack.pair.clone());
+                    ev.side = Some(format!("{:?}", ack.side));
+                    ev.price = Some(ack.price.to_string());
+                    ev.size = Some(ack.size.to_string());
+                    ev.filled_size = Some(ack.filled_size.to_string());
+                    ev.order_id = Some(ack.exchange_order_id.clone());
+                    ev.client_order_id = Some(ack.client_order_id.clone());
+                    ev.status = Some(format!("{:?}", ack.status));
+                });
+                Ok(ack)
+            }
+            // 传输层失败(网络/鉴权): 同样如实入流, 否则事件流会"少一单"而看不出原因。
+            Err(e) => {
+                self.emit_event(KIND_ORDER_REJECTED, |ev| {
+                    ev.reason = Some(format!("下单请求失败: {e}"));
+                });
+                Err(e)
+            }
+        }
     }
 
     fn cancel_order(&mut self, pair: &str, order_id: &str) -> CoreResult<()> {
@@ -517,7 +596,16 @@ impl Context for LiveContext {
         let exchange = self.resolve_exchange(prefix)?;
         let base = base.to_string();
         let order_id = order_id.to_string();
-        self.run_async(async move { exchange.cancel_order(&base, &order_id).await })
+        // 事件里要回填这两个值, 但 async 块会把它们移走 —— 先留一份。
+        let (ev_pair, ev_oid) = (pair.to_string(), order_id.clone());
+        let result = self.run_async(async move { exchange.cancel_order(&base, &order_id).await });
+        if result.is_ok() {
+            self.emit_event(KIND_ORDER_CANCELED, |ev| {
+                ev.pair = Some(ev_pair);
+                ev.order_id = Some(ev_oid);
+            });
+        }
+        result
     }
 
     fn log(&self, msg: &str) {
@@ -683,6 +771,10 @@ pub struct DryRunContext {
     declarations: Vec<Declaration>,
     pending_orders: Vec<(String, OrderRequest)>,
     fill_queue: Vec<OrderFill>,
+    /// 运行事件流 (035 / 3.3): `None` = 未开启(默认, 也是回测/单测的形态)。
+    events: Option<Arc<EventWriter>>,
+    /// 事件里如实标注的运行模式 (`dry_run`); 未开启事件流时无意义。
+    run_mode: String,
 }
 
 impl DryRunContext {
@@ -721,7 +813,30 @@ impl DryRunContext {
             declarations: Vec::new(),
             pending_orders: Vec::new(),
             fill_queue: Vec::new(),
+            events: None,
+            run_mode: String::new(),
         }
+    }
+
+    /// 打开运行事件流 (035 / 3.3): 装配层在实例启动时注入。
+    pub fn set_events(&mut self, writer: Arc<EventWriter>, mode: impl Into<String>) {
+        self.events = Some(writer);
+        self.run_mode = mode.into();
+    }
+
+    /// 记一条运行事件。未开启事件流时**完全 no-op**。
+    fn emit_event(&self, kind: &str, build: impl FnOnce(&mut RunEvent)) {
+        let Some(writer) = &self.events else {
+            return;
+        };
+        let mut ev = RunEvent::new(
+            kind,
+            &self.config.name,
+            &self.run_mode,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        build(&mut ev);
+        writer.emit(&ev);
     }
 
     /// 工程护栏前置检查 (019-R5): 超频 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
@@ -737,6 +852,14 @@ impl DryRunContext {
                     side = ?req.side,
                     "工程护栏拒单(下单频率超限): {e}"
                 );
+                // 拒单必须进事件流: "策略为什么没按预期下单" 最常见的答案就在这里。
+                let (pair, side, size) = (req.pair.clone(), format!("{:?}", req.side), req.size);
+                self.emit_event(KIND_ORDER_REJECTED, |ev| {
+                    ev.pair = Some(pair);
+                    ev.side = Some(side);
+                    ev.size = Some(size.to_string());
+                    ev.reason = Some(format!("工程护栏拒单(下单频率超限): {e}"));
+                });
                 Some(crate::order_guard::rejected_ack(req))
             }
         }
@@ -992,6 +1115,11 @@ impl Context for DryRunContext {
             self.pending_orders.retain(|(id, _)| !ids.contains(id));
             let cancelled = before - self.pending_orders.len();
             tracing::info!(target: "strategy.dryrun", pair = %key, cancelled, "撤单指令: 清挂单");
+            self.emit_event(KIND_ORDER_CANCELED, |ev| {
+                ev.pair = Some(req.pair.clone());
+                ev.size = Some(cancelled.to_string());
+                ev.reason = Some(format!("Dry Run 撤本实例挂单 {cancelled} 张"));
+            });
             return Ok(OrderAck {
                 exchange_order_id: String::new(),
                 client_order_id: String::new(),
@@ -1013,7 +1141,7 @@ impl Context for DryRunContext {
             match self.reduce_only_size(&req) {
                 Some(sz) => req.size = sz,
                 None => {
-                    return Ok(OrderAck {
+                    let ack = OrderAck {
                         exchange_order_id,
                         client_order_id: req.client_order_id.clone(),
                         pair: req.pair.clone(),
@@ -1022,7 +1150,15 @@ impl Context for DryRunContext {
                         size: req.size,
                         filled_size: Decimal::ZERO,
                         status: OrderStatus::Rejected,
+                    };
+                    let (pair, side) = (ack.pair.clone(), format!("{:?}", ack.side));
+                    self.emit_event(KIND_ORDER_REJECTED, |ev| {
+                        ev.pair = Some(pair);
+                        ev.side = Some(side);
+                        ev.size = Some(ack.size.to_string());
+                        ev.reason = Some("reduce_only 无反向虚拟持仓可减".to_string());
                     });
+                    return Ok(ack);
                 }
             }
         }
@@ -1066,6 +1202,16 @@ impl Context for DryRunContext {
             status = ?ack.status,
             "dry run order placed"
         );
+        self.emit_event(KIND_ORDER_PLACED, |ev| {
+            ev.pair = Some(ack.pair.clone());
+            ev.side = Some(format!("{:?}", ack.side));
+            ev.price = Some(ack.price.to_string());
+            ev.size = Some(ack.size.to_string());
+            ev.filled_size = Some(ack.filled_size.to_string());
+            ev.order_id = Some(ack.exchange_order_id.clone());
+            ev.client_order_id = Some(ack.client_order_id.clone());
+            ev.status = Some(format!("{:?}", ack.status));
+        });
         Ok(ack)
     }
 
@@ -1073,6 +1219,9 @@ impl Context for DryRunContext {
         let before = self.pending_orders.len();
         self.pending_orders.retain(|(id, _)| id != order_id);
         if self.pending_orders.len() < before {
+            self.emit_event(KIND_ORDER_CANCELED, |ev| {
+                ev.order_id = Some(order_id.to_string());
+            });
             Ok(())
         } else {
             Err(CoreError::OrderNotFound(order_id.to_string()))
@@ -1284,7 +1433,188 @@ impl DryRunContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{read_events, EventWriter, KIND_ORDER_CANCELED, KIND_ORDER_PLACED};
+    use ricow_core::{OrderBookUpdate, OrderInfo, UserEvent};
     use rust_decimal_macros::dec;
+
+    /// 事件流测试的最小 Exchange 替身: 只实现会被走到的几条; 其余 `unimplemented!()`
+    /// (`DryRunContext` 的虚拟撮合**根本不碰交易所**, 实盘路径只走 `place_order`)。
+    struct StubExchange {
+        place: Result<OrderAck, String>,
+    }
+
+    fn stub_ack() -> OrderAck {
+        OrderAck {
+            exchange_order_id: "EX-1".into(),
+            client_order_id: "grid01-1".into(),
+            pair: "ETHUSDT".into(),
+            side: OrderSide::Buy,
+            price: dec!(3000.5),
+            size: dec!(0.1),
+            filled_size: Decimal::ZERO,
+            status: OrderStatus::Open,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Exchange for StubExchange {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        async fn get_markets(&self) -> CoreResult<Vec<Market>> {
+            Ok(Vec::new())
+        }
+        async fn get_klines(&self, _: &str, _: &str, _: u32) -> CoreResult<Vec<Kline>> {
+            Ok(Vec::new())
+        }
+        async fn get_orderbook(&self, _: &str, _: u32) -> CoreResult<OrderBook> {
+            unimplemented!("本替身不提供盘口")
+        }
+        async fn place_order(&self, _req: OrderRequest) -> CoreResult<OrderAck> {
+            match &self.place {
+                Ok(a) => Ok(a.clone()),
+                Err(m) => Err(CoreError::Exchange(m.clone())),
+            }
+        }
+        async fn cancel_order(&self, _: &str, _: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn get_open_orders(&self, _: &str) -> CoreResult<Vec<OrderInfo>> {
+            Ok(Vec::new())
+        }
+        async fn get_balance(&self, _: &str) -> CoreResult<Balance> {
+            unimplemented!("本替身不提供余额")
+        }
+        async fn get_position(&self, _: &str) -> CoreResult<Option<Position>> {
+            Ok(None)
+        }
+        async fn subscribe_orderbook(
+            &self,
+            _: &str,
+        ) -> CoreResult<std::pin::Pin<Box<dyn futures::Stream<Item = OrderBookUpdate> + Send>>>
+        {
+            unimplemented!("本替身不订阅盘口")
+        }
+        async fn subscribe_user_events(
+            &self,
+        ) -> CoreResult<std::pin::Pin<Box<dyn futures::Stream<Item = UserEvent> + Send>>> {
+            unimplemented!("本替身不订阅用户事件")
+        }
+    }
+
+    fn test_config(name: &str) -> StrategyConfig {
+        StrategyConfig::from_toml(&format!(
+            r#"
+[strategy]
+type = "simple"
+name = "{name}"
+exchange = "binance"
+
+[strategy.params]
+pair = "ETHUSDT"
+"#
+        ))
+        .expect("测试配置")
+    }
+
+    fn event_tmp_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ricow-ctx-events-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 035 / 3.3: 实盘上下文里**下单结果**必须落进事件流(带订单号与状态)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_live_place_order_emits_event() {
+        let root = event_tmp_root("live-placed");
+        let writer = Arc::new(EventWriter::create(&root, "grid01").unwrap());
+        let exchange: Arc<dyn Exchange> = Arc::new(StubExchange { place: Ok(stub_ack()) });
+        let mut ctx =
+            LiveContext::new(exchange, test_config("grid01"), tokio::runtime::Handle::current());
+        ctx.set_events(writer.clone(), "live");
+
+        let req = OrderRequest::new_limit("ETHUSDT", OrderSide::Buy, dec!(3000.5), dec!(0.1));
+        let ack = ctx.place_order(req).expect("实盘下单");
+        assert_eq!(ack.exchange_order_id, "EX-1");
+
+        let evs = read_events(writer.path());
+        assert_eq!(evs.len(), 1, "一次下单恰好一条事件: {evs:?}");
+        let e = &evs[0];
+        assert_eq!(e.kind, KIND_ORDER_PLACED);
+        assert_eq!(e.strategy, "grid01");
+        assert_eq!(e.mode, "live", "事件必须自证实盘/试跑");
+        assert_eq!(e.order_id.as_deref(), Some("EX-1"));
+        assert_eq!(e.pair.as_deref(), Some("ETHUSDT"));
+        assert_eq!(e.price.as_deref(), Some("3000.5"), "价格以字符串原样保存");
+        assert_eq!(e.status.as_deref(), Some("Open"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 035 / 3.3: 传输层失败也要入流 —— 否则事件流会"少一单"且看不出原因。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_live_place_order_failure_emits_rejection() {
+        let root = event_tmp_root("live-fail");
+        let writer = Arc::new(EventWriter::create(&root, "grid01").unwrap());
+        let exchange: Arc<dyn Exchange> =
+            Arc::new(StubExchange { place: Err("网络超时".into()) });
+        let mut ctx =
+            LiveContext::new(exchange, test_config("grid01"), tokio::runtime::Handle::current());
+        ctx.set_events(writer.clone(), "live");
+
+        let req = OrderRequest::new_limit("ETHUSDT", OrderSide::Buy, dec!(3000.5), dec!(0.1));
+        assert!(ctx.place_order(req).is_err());
+
+        let evs = read_events(writer.path());
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].kind, KIND_ORDER_REJECTED);
+        assert!(evs[0].reason.as_deref().unwrap_or_default().contains("网络超时"), "{evs:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 035 / 3.3: 未开启事件流时**完全 no-op**(不得因为"没注入 writer"就 panic 或多写文件)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_place_order_without_event_writer_is_noop() {
+        let exchange: Arc<dyn Exchange> = Arc::new(StubExchange { place: Ok(stub_ack()) });
+        let mut ctx =
+            LiveContext::new(exchange, test_config("grid01"), tokio::runtime::Handle::current());
+        let req = OrderRequest::new_limit("ETHUSDT", OrderSide::Buy, dec!(3000.5), dec!(0.1));
+        assert!(ctx.place_order(req).is_ok());
+    }
+
+    /// 035 / 3.3: Dry Run 的虚拟撮合同样入流(挂单 → Open; 撤单 → canceled)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dry_run_place_and_cancel_emit_events() {
+        let root = event_tmp_root("dry");
+        let writer = Arc::new(EventWriter::create(&root, "grid02").unwrap());
+        let exchange: Arc<dyn Exchange> = Arc::new(StubExchange { place: Ok(stub_ack()) });
+        let mut ctx = DryRunContext::new(
+            exchange,
+            test_config("grid02"),
+            Balance { asset: "USDT".into(), free: dec!(100000), locked: Decimal::ZERO },
+        );
+        ctx.set_events(writer.clone(), "dry_run");
+
+        // 无盘口 → 限价单挂入 pending, 回 Open
+        let req = OrderRequest::new_limit("ETHUSDT", OrderSide::Buy, dec!(3000.5), dec!(0.1));
+        let ack = ctx.place_order(req).expect("虚拟下单");
+        assert_eq!(ack.status, OrderStatus::Open);
+
+        let mut cancel =
+            OrderRequest::new_limit("ETHUSDT", OrderSide::Buy, dec!(3000.5), dec!(0.1));
+        cancel.action = OrderAction::CancelPending;
+        ctx.place_order(cancel).expect("撤单指令");
+
+        let kinds: Vec<String> = read_events(writer.path()).into_iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec![KIND_ORDER_PLACED.to_string(), KIND_ORDER_CANCELED.to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn pos(side: OrderSide, size: Decimal) -> Position {
         Position {

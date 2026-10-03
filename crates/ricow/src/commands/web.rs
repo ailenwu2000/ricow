@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Args;
-use ricow_core::{CoreError, CoreResult};
-use ricow_strategy::Database;
+use ricow_core::CoreResult;
+use ricow_strategy::{Database, SqlxResultExt};
 
 use crate::ai::session::{ChatSession, Options, SessionSink, Severity};
 use crate::commands::chat::repl;
@@ -46,9 +46,7 @@ pub async fn run(args: WebArgs) -> CoreResult<()> {
     }
 
     // 会话存储: 复用同一份本地库(D9); `SessionStore` 内部是连接池, 克隆给各 handler 很廉价。
-    let db = Database::open(&crate::commands::db_path_in(&root))
-        .await
-        .map_err(|e| CoreError::Exchange(format!("打开本地库失败: {e}")))?;
+    let db = Database::open(&crate::commands::db_path_in(&root)).await.core()?;
 
     let (listener, port) = web::bind(args.port).await?;
     let token = web::new_token();

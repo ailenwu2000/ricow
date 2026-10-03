@@ -13,6 +13,7 @@ mod futures;
 mod futures_client;
 mod futures_data;
 mod futures_ws;
+mod retry;
 mod spot;
 mod ws;
 

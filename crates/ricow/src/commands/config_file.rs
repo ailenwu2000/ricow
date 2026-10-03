@@ -34,6 +34,44 @@ pub const ENV_DEMO: &str = "demo";
 /// 24 足够写下"工作号 DeepSeek 备用"这类描述, 又不至于把左列列表撑变形。
 pub const MAX_ALIAS_CHARS: usize = 24;
 
+/// 配置文件的 schema 版本(落盘为**顶层键** `schema_version`)。
+///
+/// 与 `risk_ack.json` 同款做法: 给未来**结构性变更**留一个锚点, 免得真到要迁移时,
+/// 老文件和新文件在代码眼里完全一样, 只能靠猜。规则:
+/// - 键缺失(本键出现之前写的老文件) = 0, 按当前版本处理 —— v0→v1 没有任何**结构**变化,
+///   所以**不改写用户文件**(改写会动注释, 得不偿失);
+/// - 等于本值 → 正常;
+/// - **大于**本值 → 硬失败(该文件由更新版本的 ricow 写过, 旧版继续跑会静默丢弃新字段);
+/// - 小于本值 → 走 [`migrate_to_current`] 补齐。
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// 顶层 schema 版本键名。
+pub const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+/// 配置默认值**唯一来源**。
+///
+/// 模板正文、`Default` 实现、解析时的空值兜底全部取自这里。过去同一个默认值会同时硬写在
+/// 模板字符串和代码里("模板写 deepseek 推荐值、代码另有一个默认"), 改一处忘一处就是
+/// "文档与行为不一致" 这类最难查的 bug。
+pub mod defaults {
+    /// 默认 AI 服务商 (= 预设表首项)。
+    pub fn ai_provider() -> &'static str {
+        crate::ai::config::default_preset().id
+    }
+    /// 默认 AI 模型 (= 预设表首项推荐模型)。
+    pub fn ai_model() -> &'static str {
+        crate::ai::config::default_preset().model
+    }
+    /// 默认每轮工具调用上限。
+    pub const AI_MAX_TURNS: usize = crate::ai::config::DEFAULT_MAX_TURNS;
+    /// 默认市场视野: `false` = 只显示 bStock 美股代币。
+    pub const MARKET_SHOW_ALL_PAIRS: bool = false;
+    /// 默认界面语言。
+    pub const UI_LANG: &str = "zh";
+    /// 默认 Web 主题(与前端兜底一致)。
+    pub const UI_THEME: &str = "dark";
+}
+
 /// 别名规范化 + 校验(033 FR-009), 返回去空白后的别名。
 ///
 /// 纯函数、不碰磁盘: 终端与 Web 共用同一条规则, 免得两处各判一套。
@@ -76,7 +114,7 @@ pub struct AiSection {
 impl Default for AiSection {
     fn default() -> Self {
         Self {
-            provider: crate::ai::config::DEFAULT_PROVIDER.to_string(),
+            provider: defaults::ai_provider().to_string(),
             model: None,
             base_url: None,
             max_turns: None,
@@ -141,8 +179,11 @@ pub struct ExchangeKeyEntry {
 }
 
 /// 整个配置文件的内存表示。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
+    /// 文件声明的 schema 版本(缺省 = 0, 表示"本键出现之前写的文件")。
+    /// 解析后总是被推进到 [`SCHEMA_VERSION`], 见 [`migrate_to_current`]。
+    pub schema_version: i64,
     pub ai: AiSection,
     pub exchange: ExchangeSection,
     pub market: MarketSection,
@@ -151,6 +192,22 @@ pub struct File {
     pub ai_keys: Vec<AiKeyEntry>,
     /// 密钥环: 备用币安凭据(033)。
     pub exchange_keys: Vec<ExchangeKeyEntry>,
+}
+
+impl Default for File {
+    fn default() -> Self {
+        Self {
+            // 手写(而非 derive)是必须的: 版本不能靠 `i64::default()` 的 0 —— "没有文件" 与
+            // "文件里没写版本" 是两回事, 前者应视作当前版本, 后者才需要迁移判定。
+            schema_version: SCHEMA_VERSION,
+            ai: AiSection::default(),
+            exchange: ExchangeSection::default(),
+            market: MarketSection::default(),
+            ui: UiSection::default(),
+            ai_keys: Vec::new(),
+            exchange_keys: Vec::new(),
+        }
+    }
 }
 
 /// `ensure_template` 的结果。
@@ -163,10 +220,21 @@ pub enum TemplateOutcome {
 /// 模板正文(带注释; 写清每个字段去哪拿)。合法 TOML, 值为空 = 未填写。
 pub fn template_text() -> String {
     let presets = crate::ai::config::preset_menu();
+    // 默认值一律从 `defaults` 取: 模板里写死的字面量与代码默认值从此不可能分叉。
+    let schema_version = SCHEMA_VERSION;
+    let ai_provider = defaults::ai_provider();
+    let ai_model = defaults::ai_model();
+    let ai_max_turns = defaults::AI_MAX_TURNS;
+    let market_show_all_pairs = defaults::MARKET_SHOW_ALL_PAIRS;
+    let ui_lang = defaults::UI_LANG;
+    let ui_theme = defaults::UI_THEME;
     format!(
         "# ricow 配置文件(本机私有, 含密钥 —— 不要外传/提交; 已在 .gitignore)。\n\
          # 可直接用编辑器改本文件; 首次启动向导与对话内 /keys、/market 也会更新这里(只改对应行, 注释保留)。\n\
          # 键名/段名拼错会被拒绝(不会静默失效); 值为空 = 未填写。\n\
+         \n\
+         # schema_version: 本文件的格式版本, **不要手改** —— 由 ricow 维护, 供将来结构迁移用。\n\
+         schema_version = {schema_version}\n\
          \n\
          # ── ① AI 助手通道 ──────────────────────────────────────────────\n\
          # provider: 可写内置预设名, 也可写任意自定义名(自建/中转端点, 此时必须写 base_url)。\n\
@@ -175,10 +243,10 @@ pub fn template_text() -> String {
          # api_key : 上面 provider 的密钥(谁家的 key 就贴在这儿, 两者挨着, 不会搞混)。\n\
          #   本机端点(ollama)免密钥。也支持环境变量 RICOW_AI_API_KEY 临时覆盖。\n\
          [ai]\n\
-         provider = \"deepseek\"\n\
-         model = \"deepseek-flash\"\n\
+         provider = \"{ai_provider}\"\n\
+         model = \"{ai_model}\"\n\
          api_key = \"\"\n\
-         max_turns = 8\n\
+         max_turns = {ai_max_turns}\n\
          # base_url = \"https://api.deepseek.com/v1\"   # 仅自定义/自建端点才需要\n\
          \n\
          # ── ② 交易所凭据(用哪个环境就填哪个) ────────────────────────────\n\
@@ -196,14 +264,14 @@ pub fn template_text() -> String {
          # true: 显示币安全部 TRADING 交易对。\n\
          # 对话内可直接用 /market 切换, 无需手改本文件。\n\
          [market]\n\
-         show_all_pairs = false\n\
+         show_all_pairs = {market_show_all_pairs}\n\
          \n\
          # ── ④ 界面语言 / UI language ────────────────────────────────────\n\
          # zh = 中文(默认) · en = English。对话内可用 /lang 切换。\n\
          [ui]\n\
-         lang = \"zh\"\n\
+         lang = \"{ui_lang}\"\n\
          # Web 界面主题(034): dark = 深色(默认) · light = 白色浅色 · red = 红色。\n\
-         # theme = \"dark\"\n\
+         # theme = \"{ui_theme}\"\n\
          \n\
          # ── ⑤ 密钥环 / Key vault (可选, 033) ──────────────────────────────\n\
          # 上面 [ai] / [exchange] 段是**当前生效**的凭据;\n\
@@ -341,10 +409,13 @@ pub fn load(root: &Path) -> CoreResult<File> {
     let table: toml::Table = toml::from_str(&text)
         .map_err(|e| CoreError::Auth(format!("配置文件 {} 不是合法 TOML: {e}", p.display())))?;
 
-    let mut out = File::default();
+    // 文件存在 → 版本以"未声明"(0) 起步, 由文件里的 `schema_version` 决定; 缺省的老文件
+    // 因此会被识别成 v0 并走迁移, 而不是被当成"新文件"。
+    let mut out = File { schema_version: 0, ..File::default() };
     for (section, value) in &table {
         // 密钥环(033)是**数组表**(`[[ai_key]]`), 不是普通段 —— 先分流, 免得掉进下面的
         // "不是段(table)" 报错里, 让用户拿着一句看不懂的话去猜。
+        // `schema_version` 是**顶层标量**, 同理先分流。
         match section.as_str() {
             AI_KEY_TABLE => {
                 out.ai_keys = parse_ai_keys(&p, value)?;
@@ -352,6 +423,10 @@ pub fn load(root: &Path) -> CoreResult<File> {
             }
             EXCHANGE_KEY_TABLE => {
                 out.exchange_keys = parse_exchange_keys(&p, value)?;
+                continue;
+            }
+            SCHEMA_VERSION_KEY => {
+                out.schema_version = parse_schema_version(&p, value)?;
                 continue;
             }
             _ => {}
@@ -424,9 +499,58 @@ pub fn load(root: &Path) -> CoreResult<File> {
         }
     }
     if out.ai.provider.trim().is_empty() {
-        out.ai.provider = crate::ai::config::DEFAULT_PROVIDER.to_string();
+        out.ai.provider = defaults::ai_provider().to_string();
     }
+    migrate_to_current(&mut out, &p)?;
     Ok(out)
+}
+
+/// 校验顶层 `schema_version` 取值。
+///
+/// **大于当前版本 = 硬失败**: 那种文件里有本版代码不认识的字段, 继续跑会静默丢掉它们,
+/// 用户改完再保存就把新版字段抹掉了 —— 这种数据损失比"启动失败"严重得多。
+fn parse_schema_version(p: &Path, value: &toml::Value) -> CoreResult<i64> {
+    let v = value.as_integer().ok_or_else(|| {
+        CoreError::Auth(format!(
+            "配置文件 {} 的 `{SCHEMA_VERSION_KEY}` 必须是整数(当前版本 {SCHEMA_VERSION}), \
+             例如 `{SCHEMA_VERSION_KEY} = {SCHEMA_VERSION}`",
+            p.display()
+        ))
+    })?;
+    if v < 0 {
+        return Err(CoreError::Auth(format!(
+            "配置文件 {} 的 `{SCHEMA_VERSION_KEY}` 不能为负数(实际 {v})",
+            p.display()
+        )));
+    }
+    if v > SCHEMA_VERSION {
+        return Err(CoreError::Auth(format!(
+            "配置文件 {} 的 `{SCHEMA_VERSION_KEY}` = {v}, 高于本版 ricow 支持的 {SCHEMA_VERSION}: \
+             该文件由更新版本的 ricow 写过, 用当前版本继续会**静默丢弃**新字段。\
+             请升级 ricow; 确实要降级使用, 请先备份该文件再手工把 {SCHEMA_VERSION_KEY} 改为 \
+             {SCHEMA_VERSION}。",
+            p.display()
+        )));
+    }
+    Ok(v)
+}
+
+/// 把老版本配置在**内存里**推进到当前 [`SCHEMA_VERSION`]。
+///
+/// v0 → v1 没有任何**结构**变化(v1 只把"版本"这件事显式落盘), 所以这里只推进版本号,
+/// **不改写用户文件** —— 改写会动到用户手写的注释, 收益为零。保留成独立函数是为了下一次
+/// 真结构性变更时有一个明确的落点(那时才需要落盘改写)。
+fn migrate_to_current(out: &mut File, p: &Path) -> CoreResult<()> {
+    if out.schema_version < SCHEMA_VERSION {
+        tracing::debug!(
+            path = %p.display(),
+            from = out.schema_version,
+            to = SCHEMA_VERSION,
+            "配置 schema 版本已推进(无结构变化, 不落盘改写)"
+        );
+        out.schema_version = SCHEMA_VERSION;
+    }
+    Ok(())
 }
 
 /// 解析 `[[ai_key]]` 数组表(033)。**报错不回落**: 缺别名 / 缺服务商 / 类型不对一律硬失败,
@@ -988,6 +1112,84 @@ mod tests {
         assert_eq!(f.ai.max_turns, Some(8));
         assert_eq!(f.ai.api_key, None, "模板里 api_key 为空 = 未填写");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 3.5: 模板显式写出 `schema_version`, 解析后推进到当前版本。
+    #[test]
+    fn test_schema_version_in_template_and_parsed() {
+        let t: toml::Table = toml::from_str(&template_text()).expect("模板必须合法");
+        assert_eq!(
+            t.get(SCHEMA_VERSION_KEY).and_then(|v| v.as_integer()),
+            Some(SCHEMA_VERSION),
+            "模板必须写出版本, 否则将来做迁移时新老文件无法区分"
+        );
+        let root = tmp_root("schema");
+        write(&root, &template_text());
+        assert_eq!(load(&root).unwrap().schema_version, SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 3.5: 老文件(无 `schema_version`)按 v0 处理并推进, **不改写用户文件**(v0→v1 无结构变化)。
+    #[test]
+    fn test_legacy_file_without_schema_version_migrates_in_memory_only() {
+        let root = tmp_root("schemav0");
+        let body = "[ai]\nprovider = \"deepseek\"\n";
+        write(&root, body);
+        let f = load(&root).unwrap();
+        assert_eq!(f.schema_version, SCHEMA_VERSION, "缺省应视作 v0 并推进到当前");
+        assert_eq!(
+            std::fs::read_to_string(path(&root)).unwrap(),
+            body,
+            "无结构变化时不得改写用户文件 —— 改写会动到用户手写的注释"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 3.5: 来自**更新版本**的配置硬失败, 而不是静默丢字段(那会造成不可逆的数据损失)。
+    #[test]
+    fn test_future_schema_version_is_rejected_not_silently_dropped() {
+        let root = tmp_root("schemafuture");
+        write(&root, &format!("{SCHEMA_VERSION_KEY} = 99\n[ai]\nprovider = \"deepseek\"\n"));
+        let err = load(&root).unwrap_err().to_string();
+        assert!(err.contains("99"), "{err}");
+        assert!(err.contains(SCHEMA_VERSION_KEY), "{err}");
+        assert!(err.contains("升级"), "必须告诉用户怎么办: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 3.5: 版本键类型/取值非法 → 硬失败, 与其它字段同一纪律(不静默回退)。
+    #[test]
+    fn test_schema_version_bad_value_is_rejected() {
+        for body in [
+            format!("{SCHEMA_VERSION_KEY} = \"one\"\n[ai]\nprovider = \"deepseek\"\n"),
+            format!("{SCHEMA_VERSION_KEY} = -1\n[ai]\nprovider = \"deepseek\"\n"),
+        ] {
+            let root = tmp_root("schemabad");
+            write(&root, &body);
+            let err = load(&root).unwrap_err().to_string();
+            assert!(err.contains(SCHEMA_VERSION_KEY), "{err}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// 3.5: 模板里的默认值全部来自 [`defaults`] 单一来源 —— 模板与代码默认不可能再分叉。
+    #[test]
+    fn test_template_defaults_come_from_single_source() {
+        let t: toml::Table = toml::from_str(&template_text()).expect("模板必须合法");
+        let ai = t.get("ai").and_then(|v| v.as_table()).expect("[ai] 段");
+        assert_eq!(ai.get("provider").and_then(|v| v.as_str()), Some(defaults::ai_provider()));
+        assert_eq!(ai.get("model").and_then(|v| v.as_str()), Some(defaults::ai_model()));
+        assert_eq!(
+            ai.get("max_turns").and_then(|v| v.as_integer()),
+            Some(defaults::AI_MAX_TURNS as i64)
+        );
+        let market = t.get("market").and_then(|v| v.as_table()).expect("[market] 段");
+        assert_eq!(
+            market.get("show_all_pairs").and_then(|v| v.as_bool()),
+            Some(defaults::MARKET_SHOW_ALL_PAIRS)
+        );
+        let ui = t.get("ui").and_then(|v| v.as_table()).expect("[ui] 段");
+        assert_eq!(ui.get("lang").and_then(|v| v.as_str()), Some(defaults::UI_LANG));
     }
 
     #[test]

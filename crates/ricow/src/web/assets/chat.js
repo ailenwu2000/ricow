@@ -400,19 +400,20 @@
     if (state.source) state.source.close();
     const url =
       "/api/sessions/" + encodeURIComponent(id) + "/events?token=" + encodeURIComponent(R.TOKEN);
-    const es = new EventSource(url);
-    state.source = es;
-    es.onmessage = (ev) => {
-      if (state.source !== es) return; // 切会话后旧连接可能还有余帧, 丢
-      let frame;
-      try {
-        frame = JSON.parse(ev.data);
-      } catch (_) {
-        return;
-      }
-      onFrame(frame, es);
-    };
-    // 断线由浏览器自动重连; 服务真的停了会一直失败, 届时靠发送失败提示用户。
+    const handle = R.sse(url, {
+      onmessage: (ev) => {
+        if (state.source !== handle) return; // 切会话后旧连接可能还有余帧, 丢
+        let frame;
+        try {
+          frame = JSON.parse(ev.data);
+        } catch (_) {
+          return;
+        }
+        onFrame(frame, handle);
+      },
+      // 放弃重连时不另起提示: 服务真停了, 下一次发送失败会如实告诉用户(与既往一致)。
+    });
+    state.source = handle;
   }
 
   function onFrame(frame, es) {
@@ -899,18 +900,19 @@
       LOG_TAIL_LINES +
       "&token=" +
       encodeURIComponent(R.TOKEN);
-    const es = new EventSource(url);
-    state.logStream = es;
-    es.onmessage = (ev) => {
-      if (state.logStream !== es) return; // 切策略后旧流可能还有余帧, 丢
-      let event;
-      try {
-        event = JSON.parse(ev.data);
-      } catch (_) {
-        return;
-      }
-      appendLog(event);
-    };
+    const handle = R.sse(url, {
+      onmessage: (ev) => {
+        if (state.logStream !== handle) return; // 切策略后旧流可能还有余帧, 丢
+        let event;
+        try {
+          event = JSON.parse(ev.data);
+        } catch (_) {
+          return;
+        }
+        appendLog(event);
+      },
+    });
+    state.logStream = handle;
   }
 
   function closeLog() {

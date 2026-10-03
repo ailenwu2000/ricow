@@ -12,6 +12,12 @@ installers = ["shell", "powershell", "homebrew", "msi"]
 # No self-updater (constitution principle 1 / 019 SC-011): the app never
 # rewrites itself from the network; upgrades are an explicit user action.
 install-updater = false
+# Don't run the release workflow on pull requests: every PR was spending a full
+# `dist plan` matrix just to re-derive what CI already validated, and the plan
+# job needs repo-wide write-ish secrets context it has no business touching on
+# an unreviewed branch. 这是**持久**开关 —— 手改 release.yml 会在下次
+# `cargo dist init` 时被重新生成覆盖, 所以真相在这里。
+pr-run-mode = "skip"
 # Ship the launcher entries (019 FR-039 / T035) inside every archive (.tar.xz /
 # .zip) so they sit next to the binary: 启动-ricow-AI助手.cmd on Windows,
 # 启动-ricow-AI助手.sh on Linux/macOS, and 启动-ricow-AI助手.command for the macOS
