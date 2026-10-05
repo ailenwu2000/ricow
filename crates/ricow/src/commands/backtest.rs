@@ -7,6 +7,7 @@ use chrono::Utc;
 use clap::Args;
 use ricow_core::{Balance, CoreError, CoreResult};
 use ricow_engine::Engine;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 
@@ -112,6 +113,73 @@ pub(crate) fn parse_param(s: &str) -> Option<(String, ConfigValue)> {
         },
     };
     Some((key, cv))
+}
+
+/// Web 指标卡结构化摘要 (P0-2/P1-6): 与文本报告同一份 [`ricow_strategy::BacktestReport`],
+/// 只做标量投影 —— 前端不再解析报告文本。Decimal 一律转 f64 (展示用, 非清算口径)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct MetricsSummary {
+    pub pair: String,
+    pub interval: String,
+    pub days: u32,
+    pub is_futures: bool,
+    pub total_bars: usize,
+    pub total_trades: u64,
+    pub rejected_count: u64,
+    pub net_pnl: f64,
+    pub total_fees: f64,
+    pub win_rate: f64,
+    pub max_drawdown_pct: f64,
+    pub equity_change_pct: f64,
+    pub benchmark_return_pct: Option<f64>,
+    pub benchmark_max_drawdown_pct: Option<f64>,
+    pub annual_return_pct: Option<f64>,
+    pub annual_volatility_pct: Option<f64>,
+    pub sharpe: Option<f64>,
+    pub sortino: Option<f64>,
+    pub calmar: Option<f64>,
+    pub profit_factor: Option<f64>,
+    pub turnover_ratio: f64,
+    pub final_equity: f64,
+    pub initial_cash: f64,
+    pub data_source: String,
+    pub fee_ratio_pct: f64,
+}
+
+impl BacktestOutcome {
+    pub(crate) fn metrics(&self) -> MetricsSummary {
+        let r = &self.report;
+        MetricsSummary {
+            pair: self.pair.clone(),
+            interval: self.interval.clone(),
+            days: self.days,
+            is_futures: self.is_futures,
+            total_bars: r.total_bars,
+            total_trades: r.total_trades,
+            rejected_count: r.rejected_count,
+            net_pnl: r.net_pnl.to_f64().unwrap_or(0.0),
+            total_fees: r.total_fees.to_f64().unwrap_or(0.0),
+            win_rate: r.win_rate,
+            max_drawdown_pct: r.max_drawdown.to_f64().unwrap_or(0.0) * 100.0,
+            equity_change_pct: r.equity_change_pct,
+            benchmark_return_pct: r.benchmark_return_pct,
+            benchmark_max_drawdown_pct: r
+                .benchmark_max_drawdown
+                .and_then(|v| v.to_f64())
+                .map(|v| v * 100.0),
+            annual_return_pct: r.annual_return.map(|v| v * 100.0),
+            annual_volatility_pct: r.annual_volatility.map(|v| v * 100.0),
+            sharpe: r.sharpe,
+            sortino: r.sortino,
+            calmar: r.calmar,
+            profit_factor: r.profit_factor,
+            turnover_ratio: r.turnover_ratio,
+            final_equity: r.final_equity.to_f64().unwrap_or(0.0),
+            initial_cash: self.initial_cash.to_f64().unwrap_or(0.0),
+            data_source: self.data_source.clone(),
+            fee_ratio_pct: r.fee_ratio.to_f64().unwrap_or(0.0) * 100.0,
+        }
+    }
 }
 
 /// 回测的「解析后执行输入」(032 US3 T025): CLI `ricow backtest` 与 Web 异步回测作业
@@ -370,11 +438,135 @@ pub(crate) struct BacktestOutcome {
     pub(crate) data_source: String,
     /// 证据卡 (未落盘; 由调用方决定写不写 —— 敏感性扫描不为每档都落一张卡)。
     card: RunCard,
+    // ---- Web 可视化数据 (P0-2): 与净值曲线同窗对齐, 供回测作业回结构化图表 ----
+    /// 每根 bar 的收盘价 (f64; 与 `close_times_ms` 一一对应)。
+    pub(crate) closes: Vec<f64>,
+    /// 每根 bar 的 close_time 毫秒 (epoch; 价格轴时间戳)。
+    pub(crate) close_times_ms: Vec<i64>,
 }
 
+/// Web 回测图表的单笔成交标记 (P0-2)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ChartFill {
+    /// 成交时刻 epoch 毫秒。
+    pub t: i64,
+    pub price: f64,
+    pub size: f64,
+    /// "buy" / "sell"。
+    pub side: String,
+}
+
+/// Web 回测图表数据 (P0-2): 价格轴 = 评测窗口内每根 bar 的收盘价, 权益轴 = 同一批 bar 的
+/// 收盘估值 (**不含**曲线初始现金点)。三条序列 (times/price/equity) 等长且逐点同刻 —— 前端
+/// 可直接按下标配对绘制。时间轴统一 epoch 毫秒; 点数超限时按同一步长抽稀 (三条同步, 保对齐)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct BacktestChart {
+    pub times: Vec<i64>,
+    pub price: Vec<f64>,
+    pub equity: Vec<f64>,
+    pub fills: Vec<ChartFill>,
+}
+
+/// 曲线抽稀上限 (点): 超过按整步抽稀, 覆盖 3650 天 1m 的极端窗口也不至于拖垮前端。
+const CHART_MAX_POINTS: usize = 2000;
+/// 成交标记上限: 超长回测的成交清单只保前 N 笔 (表格另见报告文本)。
+const CHART_MAX_FILLS: usize = 1000;
+
 impl BacktestOutcome {
+    /// 抽稀一维序列 (保首尾): `stride` = 1 时原样返回。
+    fn downsample(v: &[f64], stride: usize) -> Vec<f64> {
+        if stride <= 1 {
+            return v.to_vec();
+        }
+        let mut out: Vec<f64> = v.iter().step_by(stride).copied().collect();
+        // 末点强制保留 (与另一条曲线的末点对齐语义一致)。
+        if !(v.len() - 1).is_multiple_of(stride) {
+            out.push(v[v.len() - 1]);
+        }
+        out
+    }
+
+    /// 组装 Web 可视化数据 (纯转换, 不重跑回测)。
+    ///
+    /// 对齐口径 (2026-10-05 实测修正): 引擎的 `klines` 是 `[前端预热段] + [评测窗口]` ——
+    /// 预热段 (实测 1h×30d = 24 根) 只用于初始化指标, **不产生估值点**; `report.total_bars`
+    /// = 评测窗口 bar 数。因此价格/时间必须从**尾部**取 `total_bars` 根, 再与净值曲线逐点对齐;
+    /// 若从首部取, 价格会比权益早 24 根 (曲线画出来是错的)。
+    pub(crate) fn chart(&self) -> BacktestChart {
+        let (times, price, equity) = Self::align_window(
+            self.report.total_bars,
+            &self.closes,
+            &self.close_times_ms,
+            &self.report.equity_curve,
+        );
+        let n = times.len();
+        let stride = if n == 0 { 1 } else { n.div_ceil(CHART_MAX_POINTS) };
+        let fills = self
+            .report
+            .fills
+            .iter()
+            .take(CHART_MAX_FILLS)
+            .filter_map(|f| {
+                Some(ChartFill {
+                    t: f.timestamp.timestamp_millis(),
+                    price: f.fill_price.to_f64()?,
+                    size: f.fill_size.to_f64()?,
+                    side: match f.side {
+                        ricow_core::OrderSide::Buy => "buy".into(),
+                        ricow_core::OrderSide::Sell => "sell".into(),
+                    },
+                })
+            })
+            .collect();
+        BacktestChart {
+            times: Self::downsample_i64(&times, stride),
+            price: Self::downsample(&price, stride),
+            equity: Self::downsample(&equity, stride),
+            fills,
+        }
+    }
+
+    /// 把引擎原始序列对齐成「同刻等长」三序列 (纯函数, 便于单测)。
+    ///
+    /// 口径: 引擎给出 `[前端预热段] + [评测窗口]` 的 `closes/times`, 而 `equity_curve`
+    /// 只覆盖评测窗口且**含首点初始现金** (`= [初始] + 逐 bar 估值`)。于是:
+    /// - 窗口 bar 数 `n = min(total_bars, 可画点数, equity.len()-1)`;
+    /// - 跳前端预热段 `skip = n_price - n`;
+    /// - `equity` 丢初始点, 取 `[1..=n]`, 与价格窗口逐点同刻。
+    ///
+    /// 返回 `(times, price, equity)`, 三者恒等长 `n` (退化时可为 0)。
+    fn align_window(
+        total_bars: usize,
+        closes: &[f64],
+        close_times_ms: &[i64],
+        equity_curve: &[Decimal],
+    ) -> (Vec<i64>, Vec<f64>, Vec<f64>) {
+        let n_price = closes.len().min(close_times_ms.len());
+        let n = total_bars.min(n_price).min(equity_curve.len().saturating_sub(1));
+        if n == 0 {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        let skip = n_price - n; // 跳过前端预热段
+        let times = close_times_ms[skip..skip + n].to_vec();
+        let price = closes[skip..skip + n].to_vec();
+        let equity = equity_curve[1..=n].iter().map(|v| v.to_f64().unwrap_or(0.0)).collect();
+        (times, price, equity)
+    }
+
+    /// i64 版抽稀 (与 [`Self::downsample`] 同规则, 保首尾)。
+    fn downsample_i64(v: &[i64], stride: usize) -> Vec<i64> {
+        if stride <= 1 {
+            return v.to_vec();
+        }
+        let mut out: Vec<i64> = v.iter().step_by(stride).copied().collect();
+        if !(v.len() - 1).is_multiple_of(stride) {
+            out.push(v[v.len() - 1]);
+        }
+        out
+    }
+
     /// 报告标题 (单一口径: 回测正文与敏感性表头都从这里取)。
-    fn header(&self, strategy: &str) -> String {
+    pub(crate) fn header(&self, strategy: &str) -> String {
         format!(
             "回测报告: {} {} ({} 天, {} K 线, {})",
             strategy,
@@ -634,6 +826,9 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
     };
     let card_params = params_json(&config);
     let card_window_meta = (config.market.clone(), config.position_mode.clone());
+    // Web 可视化数据 (P0-2): bar 收盘价与收盘时刻 (与净值曲线同窗对齐)。
+    let closes: Vec<f64> = klines.iter().map(|k| k.close.to_f64().unwrap_or(0.0)).collect();
+    let close_times_ms: Vec<i64> = klines.iter().map(|k| k.close_time.timestamp_millis()).collect();
     let report = Engine::new().backtest(config, initial_balance, &klines)?;
 
     // 035: 可复现 run card —— 策略源码指纹 + 数据窗口 + 参数 + 指标, 供归档/diff/复现。
@@ -687,21 +882,31 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
         params,
         data_source: data_source.to_string(),
         card,
+        closes,
+        close_times_ms,
     })
 }
 
-/// 单次回测的文本入口 (CLI `ricow backtest` / AI 工具 / Web 作业共用): 跑内核 → 落 run card
-/// → 出**唯一口径**文本报告。
-pub(crate) async fn run_backtest_core(spec: BacktestRunSpec) -> CoreResult<String> {
+/// 单次回测的完整入口 (Web 可视化用): 跑内核 → 落 run card → 返回**结构化**结果,
+/// 文本报告由调用方按需 [`format_backtest_report`] 生成 (P0-2: Web 作业还要图表/指标数据)。
+pub(crate) async fn run_backtest_full(spec: BacktestRunSpec) -> CoreResult<BacktestOutcome> {
     let out = run_backtest_inner(&spec).await?;
     // 035: run card 落盘失败只 warn (回测结果本身仍有效, 不因辅助产物回滚一次成功的回测)。
     match write_run_card(&spec.root, &out.card) {
         Ok(p) => tracing::info!(path = %p.display(), "回测 run card 已落盘"),
         Err(e) => tracing::warn!(error = %e, "回测 run card 落盘失败 (不影响回测结果)"),
     }
+    Ok(out)
+}
+
+/// 单次回测的文本入口 (CLI `ricow backtest` / AI 工具 / Web 作业共用): 跑内核 → 落 run card
+/// → 出**唯一口径**文本报告。
+pub(crate) async fn run_backtest_core(spec: BacktestRunSpec) -> CoreResult<String> {
+    let strategy = spec.strategy.clone();
+    let out = run_backtest_full(spec).await?;
     Ok(format_backtest_report(
         &out.report,
-        &out.header(&spec.strategy),
+        &out.header(&strategy),
         out.initial_cash,
         out.is_futures,
     ))
@@ -710,6 +915,12 @@ pub(crate) async fn run_backtest_core(spec: BacktestRunSpec) -> CoreResult<Strin
 /// CLI/AI 工具入口包装: 把 [`BacktestArgs`] 组装成 [`BacktestRunSpec`] (数据目录=全局 project_root)
 /// 后跑同一内核; 未给敏感性开关时返回的报告文本与 T025 前逐字一致。
 pub(crate) async fn run_backtest(args: BacktestArgs) -> CoreResult<String> {
+    // 运行门禁(终端 / 对话渠道): 目录审计不通过的 id(未声明的内置副本、清单解析失败的策略…)
+    // 一律拒绝 —— 与 Web 端点同一份判定 [`crate::strategies::catalog::run_block`], 免得
+    // "网页不让跑但命令行能跑"这种两个口径(2026-10-05)。
+    if let Some(why) = crate::strategies::catalog::run_block(&args.strategy) {
+        return Err(CoreError::InvalidArgument(why));
+    }
     let slippage_ladder = parse_ladder(args.sensitivity.as_deref(), DEFAULT_SLIPPAGE_LADDER)?;
     let fee_ladder = parse_ladder(args.sensitivity_fee.as_deref(), DEFAULT_FEE_LADDER)?;
     let spec = BacktestRunSpec::from_cli_args(crate::commands::project_root(), args);
@@ -1129,6 +1340,67 @@ fn write_run_card(root: &Path, card: &RunCard) -> CoreResult<PathBuf> {
 mod tests {
     use super::*;
     use crate::commands::test_util::ENV_LOCK;
+
+    /// P0-2 回归(2026-10-05): 复刻实测口径 —— 744 根 klines(前 24 根预热) + 720 评测 bar。
+    /// 价格必须取**尾部** 720 根与权益逐点对齐, 且丢掉曲线初始现金点。
+    #[test]
+    fn test_align_window_skips_front_warmup_and_drops_initial_equity() {
+        let n_price = 744usize;
+        let total_bars = 720usize;
+        let closes: Vec<f64> = (0..n_price).map(|i| 100.0 + i as f64).collect();
+        let times: Vec<i64> = (0..n_price).map(|i| 1_000_000 + i as i64 * 3_600_000).collect();
+        // equity = [初始现金] + 720 个 per-bar 估值。
+        let mut eq: Vec<Decimal> = vec![Decimal::from(10_000i64)];
+        for i in 0..total_bars {
+            eq.push(Decimal::from(10_000i64 + i as i64));
+        }
+        let (t, p, e) = BacktestOutcome::align_window(total_bars, &closes, &times, &eq);
+        assert_eq!((t.len(), p.len(), e.len()), (total_bars, total_bars, total_bars));
+        // 价格窗口 = 尾部 720 根(首个 = closes[24] 而非 closes[0])。
+        assert_eq!(p[0], closes[24]);
+        assert_eq!(t[0], times[24]);
+        assert_eq!(p[p.len() - 1], closes[743]);
+        assert_eq!(t[t.len() - 1], times[743]);
+        // 权益丢初始点: 首值 = eq[1] = 初始现金; 末值 = 第 720 个 per-bar 估值。
+        assert_eq!(e[0], 10_000.0);
+        assert_eq!(e[e.len() - 1], 10_719.0);
+    }
+
+    /// 无预热段: 窗口 = 全部, 三序列等长且逐点同刻。
+    #[test]
+    fn test_align_window_no_warmup() {
+        let closes: Vec<f64> = (0..5).map(|i| i as f64).collect();
+        let times: Vec<i64> = (0..5).map(|i| i as i64).collect();
+        let mut eq = vec![Decimal::from(0i64)];
+        for i in 0..5 {
+            eq.push(Decimal::from(i as i64));
+        }
+        let (t, p, e) = BacktestOutcome::align_window(5, &closes, &times, &eq);
+        assert_eq!((t.len(), p.len(), e.len()), (5, 5, 5));
+        assert_eq!(p[0], closes[0]);
+        assert_eq!(t[0], times[0]);
+        assert_eq!(e[0], 0.0);
+    }
+
+    /// 退化输入一律回空(前端据此不画图), 不 panic、不越界。
+    #[test]
+    fn test_align_window_degenerate_is_empty() {
+        let (t, p, e) = BacktestOutcome::align_window(0, &[], &[], &[]);
+        assert!(t.is_empty() && p.is_empty() && e.is_empty());
+        // 只有初始点、无 per-bar 估值 → 0 点。
+        let (t2, p2, e2) =
+            BacktestOutcome::align_window(5, &[1.0, 2.0], &[1, 2], &[Decimal::from(1i64)]);
+        assert!(t2.is_empty() && p2.is_empty() && e2.is_empty());
+        // total_bars 大于价格序列 → 被夹到可用长度, 不越界。
+        let (t3, p3, e3) = BacktestOutcome::align_window(
+            999,
+            &[1.0, 2.0, 3.0],
+            &[10, 20, 30],
+            &[Decimal::from(0i64), Decimal::from(1i64), Decimal::from(2i64), Decimal::from(3i64)],
+        );
+        assert_eq!((t3.len(), p3.len(), e3.len()), (3, 3, 3));
+        assert_eq!(t3, vec![10i64, 20, 30]);
+    }
 
     #[test]
     fn test_parse_param_bool_and_number() {

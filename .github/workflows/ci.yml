@@ -19,6 +19,16 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # 结构性红线 (写操作不得绕过确认门 / 密钥不得进日志 …)。零依赖、秒级完成, 放最前面先给反馈。
+  gates:
+    name: gates (安全 / 架构红线)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # 单测覆盖"行为", 本门禁覆盖"形状" —— 违反这些红线的代码功能照常, 单测不会红。
+      - name: 安全 / 架构红线
+        run: bash scripts/ci_grep_gates.sh
+
   lint:
     name: lint (clippy + fmt)
     runs-on: ubuntu-latest
@@ -35,12 +45,25 @@ jobs:
         # 存量告警已于 021 清零(2026-09-15); 门禁为硬失败, 新告警一律挡住
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # 依赖合规: 许可证白名单 + 已知漏洞 + 来源(只认 crates.io)。配置见仓库根 deny.toml。
+  deny:
+    name: deny (依赖许可证 / 漏洞 / 来源)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check
+
   test:
     name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # macOS 是**已发布**的平台(见 dist-workspace.toml targets), 发布了就必须有测试背书,
+        # 否则 arm64/x64 上的路径分隔/临时目录/信号语义差异只能等用户来报。
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7

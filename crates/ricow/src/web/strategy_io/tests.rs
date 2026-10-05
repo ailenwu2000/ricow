@@ -182,6 +182,31 @@ async fn test_strategy_endpoints_require_token_offline() {
         assert!(!res.contains(MARK), "401 不得回显修改指令: {res}");
     }
 
+    // AI 从零生成(P0-3)同样在 token 门禁之后。
+    let gen_body =
+        format!(r#"{{"name":"auth-probe","market":"spot","pair":"ETHUSDT","idea":"{MARK}"}}"#);
+    for probe in [
+        "/api/strategies/ai-generate".to_string(),
+        "/api/strategies/ai-generate?token=wrong".to_string(),
+    ] {
+        let res = raw(port, "POST", &probe, Some(&gen_body)).await;
+        assert!(res.starts_with("HTTP/1.1 401"), "{probe} 应 401, 实际: {res}");
+        assert!(body_of(&res).is_empty(), "401 响应体必须为空: {probe}");
+        assert!(!res.contains(MARK), "401 不得回显生成意图: {res}");
+    }
+
+    // 用户策略清单保存 (P2-8) 同样在 token 门禁之后。
+    let mf_body = format!(r#"{{"name":"{MARK}","params":[]}}"#);
+    for probe in [
+        "/api/strategies/paired_grid/manifest".to_string(),
+        "/api/strategies/paired_grid/manifest?token=wrong".to_string(),
+    ] {
+        let res = raw(port, "POST", &probe, Some(&mf_body)).await;
+        assert!(res.starts_with("HTTP/1.1 401"), "{probe} 应 401, 实际: {res}");
+        assert!(body_of(&res).is_empty(), "401 响应体必须为空: {probe}");
+        assert!(!res.contains(MARK), "401 不得回显清单内容: {res}");
+    }
+
     // 对 token 取得到内置源码(证明拦的不是"路由不存在")。
     let res = raw(port, "GET", "/api/strategies/paired_grid/source?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 200);
@@ -527,6 +552,294 @@ async fn test_get_detail_carries_instance_current_values() {
     assert!(!body.contains(r#""script_path""#), "current 须剔除 script_path: {body}");
     std::env::remove_var("RICOW_ROOT");
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 静态检查(P1-5)纯函数: 已知高频踩坑逐条命中; 干净代码零提示。
+#[test]
+fn test_lint_lua_flags_known_pitfalls() {
+    // 干净代码: 无任何提示。
+    assert!(super::lint_lua("local x = 1\nreturn {}\n").is_empty());
+
+    let cases = [
+        ("  a = fill.price", "fill_price"),
+        ("  a = fill.size", "fill_size"),
+        ("  local n = ctx:config_f64(\"x\") or 5", "or 缺省"),
+        ("  os.time()", "沙箱"),
+        ("  local o = { type = \"limit\", pair = p }", "order_type"),
+        ("  while true do x = x + 1 end", "退出条件"),
+    ];
+    for (src, needle) in cases {
+        let w = super::lint_lua(src);
+        assert!(w.iter().any(|m| m.contains(needle)), "应命中 '{needle}', 实际: {w:?}");
+    }
+    // fill_size 是正解, 不该被 fill.size 误报。
+    assert!(super::lint_lua("a = fill.fill_size\n").is_empty());
+    // order_type 正解不误报。
+    assert!(super::lint_lua("o = { order_type = \"limit\" }\n").is_empty());
+}
+
+/// AI 从零生成(P0-3)的同步校验: 校验全部发生在任何 AI 调用之前(全程离线)。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_ai_generate_validation_offline() {
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let saved = ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"]
+        .map(std::env::var)
+        .map(|r| r.ok());
+    for k in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"] {
+        std::env::remove_var(k);
+    }
+
+    let root = tmp_root("aigen");
+    let port = boot(root.clone()).await;
+    let post = |json: String| async move {
+        raw(port, "POST", "/api/strategies/ai-generate?token=tok-ok", Some(&json)).await
+    };
+
+    // ① 非法名 → 400 code=invalid_name。
+    let res =
+        post(r#"{"name":"../evil","market":"spot","pair":"ETHUSDT","idea":"随便"}"#.to_string())
+            .await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains(r#""code":"invalid_name""#), "{res}");
+
+    // ② 内置保留名 → 409 code=reserved。
+    let res = post(
+        r#"{"name":"shannon_spot_grid","market":"spot","pair":"ETHUSDT","idea":"随便"}"#
+            .to_string(),
+    )
+    .await;
+    assert_eq!(status_of(&res), 409, "{res}");
+    assert!(body_of(&res).contains(r#""code":"reserved""#), "{res}");
+
+    // ③ market 非法 → 400。
+    let res =
+        post(r#"{"name":"gen-x","market":"fx","pair":"ETHUSDT","idea":"随便"}"#.to_string()).await;
+    assert_eq!(status_of(&res), 400, "{res}");
+
+    // ④ pair 空 → 400。
+    let res =
+        post(r#"{"name":"gen-x","market":"spot","pair":"  ","idea":"随便"}"#.to_string()).await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains("pair"), "{res}");
+
+    // ⑤ idea 空 → 400(且先于任何 AI 调用)。
+    let res =
+        post(r#"{"name":"gen-x","market":"spot","pair":"ETHUSDT","idea":"   "}"#.to_string()).await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains("idea"), "{res}");
+
+    // ⑥ 非 JSON → 400。
+    let res = post("{oops".to_string()).await;
+    assert_eq!(status_of(&res), 400, "{res}");
+
+    // ⑦ 合法意图 + 空配置(临时 root, 无 api_key, 默认远程端点)→ 403 need_keys,
+    //    发生在网络请求之前; 且不回显 idea 原文。
+    let idea = "UNIQUE-IDEA-双均线金叉做多";
+    let body = format!(
+        r#"{{"name":"gen-x","market":"spot","pair":"ETHUSDT","interval":"1h","idea":"{idea}"}}"#
+    );
+    let res = post(body).await;
+    assert_eq!(status_of(&res), 403, "缺密钥应 403: {res}");
+    let b = body_of(&res);
+    assert!(b.contains(r#""code":"need_keys""#), "{b}");
+    assert!(b.contains("密钥"), "403 要中文可读并引导配置: {b}");
+    assert!(!b.contains("UNIQUE-IDEA"), "错误体不得回显 idea/prompt: {b}");
+
+    for (k, v) in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].iter().zip(saved) {
+        if let Some(val) = v {
+            std::env::set_var(k, val);
+        } else {
+            std::env::remove_var(k);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 清单构造/校验 (P2-8, 纯函数): id/market 由调用方注入, 参数 schema 逐项校验。
+#[test]
+fn test_build_manifest_validation() {
+    let ok = |params: serde_json::Value| ManifestRequest {
+        name: "我的策略".into(),
+        summary: "说明".into(),
+        description: String::new(),
+        suitable: String::new(),
+        unsuitable: String::new(),
+        params: serde_json::from_value(params).unwrap(),
+    };
+
+    // 合法: f64 必填 + enum(默认在 options 内) + bool。
+    let m = build_manifest(
+        "my-grid",
+        "spot",
+        ok(serde_json::json!([
+            {"key": "start_price", "name": "开始价格", "type": "f64", "desc": "低于它激活", "required": true},
+            {"key": "mode", "name": "模式", "type": "enum", "desc": "成交模式", "default": "u", "options": ["u", "coin"]},
+            {"key": "dry", "name": "演练", "type": "bool", "desc": "只演练", "default": true}
+        ])),
+    )
+    .unwrap();
+    assert_eq!(m.id, "my-grid");
+    assert_eq!(m.market, "spot");
+    assert_eq!(m.params.len(), 3);
+    // 空 description → None (不写该字段)。
+    assert!(m.description.is_none());
+    assert!(m.params[0].required);
+
+    // 非法矩阵: 每项都带可读中文原因。
+    let cases: Vec<(serde_json::Value, &str)> = vec![
+        (
+            serde_json::json!([{"key": "9bad key", "name": "n", "type": "f64", "desc": "d"}]),
+            "9bad key",
+        ),
+        (serde_json::json!([{"key": "script", "name": "n", "type": "f64", "desc": "d"}]), "保留键"),
+        (serde_json::json!([{"key": "a", "name": "", "type": "f64", "desc": "d"}]), "缺中文名"),
+        (serde_json::json!([{"key": "a", "name": "n", "type": "f64", "desc": "  "}]), "缺说明"),
+        (
+            serde_json::json!([
+                {"key": "a", "name": "n", "type": "f64", "desc": "d"},
+                {"key": "a", "name": "m", "type": "i64", "desc": "d"}
+            ]),
+            "重复",
+        ),
+        (serde_json::json!([{"key": "e", "name": "n", "type": "enum", "desc": "d"}]), "options"),
+        (
+            serde_json::json!([{"key": "e", "name": "n", "type": "enum", "desc": "d", "options": ["u"], "default": "z"}]),
+            "不在 options",
+        ),
+        (
+            serde_json::json!([{"key": "n", "name": "n", "type": "f64", "desc": "d", "default": "abc"}]),
+            "默认值类型",
+        ),
+        (
+            serde_json::json!([{"key": "n", "name": "n", "type": "i64", "desc": "d", "default": 1.5}]),
+            "默认值类型",
+        ),
+    ];
+    for (params, needle) in cases {
+        let err = build_manifest("my-grid", "spot", ok(params)).unwrap_err();
+        assert!(err.contains(needle), "应命中 '{needle}', 实际: {err}");
+    }
+
+    // name 空 → 拒绝。
+    let mut bad = ok(serde_json::json!([]));
+    bad.name = "   ".into();
+    assert!(build_manifest("my-grid", "spot", bad).unwrap_err().contains("中文名"));
+}
+
+/// 清单保存 (P2-8) 端到端: 落盘 strategies/{market}/{id}.toml → 详情 params 点亮;
+/// 内置 → 409 builtin; 未知 → 404; 覆盖 → 备份。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_manifest_save_roundtrip_and_guards() {
+    // catalog 扫描走 project_root(读 RICOW_ROOT), 与 state.root 指向同一临时目录。
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let root = tmp_root("manifest");
+    std::env::set_var("RICOW_ROOT", &root);
+    let port = boot(root.clone()).await;
+
+    let code = "function on_tick(ctx)\n    return {}\nend\n";
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies?token=tok-ok",
+        Some(
+            &serde_json::json!({"name": "mf-user", "market": "spot", "pair": "ETHUSDT", "code": code})
+                .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "{res}");
+
+    let manifest = serde_json::json!({
+        "name": "我的网格",
+        "summary": "一句话说明",
+        "suitable": "震荡市",
+        "params": [
+            {"key": "start_price", "name": "开始价格", "type": "f64", "desc": "低于它激活", "required": true},
+            {"key": "mode", "name": "模式", "type": "enum", "desc": "成交模式", "default": "u", "options": ["u", "coin"]}
+        ]
+    });
+
+    // ① 首次保存 → 200, 无 backup 字段; 落盘在 strategies/spot/mf-user.toml。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/mf-user/manifest?token=tok-ok",
+        Some(&manifest.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    let body = body_of(&res);
+    assert!(body.contains(r#""id":"mf-user""#) && body.contains(r#""market":"spot""#), "{body}");
+    assert!(!body.contains(r#""backup""#), "首次创建无备份: {body}");
+    let path = root.join("strategies").join("spot").join("mf-user.toml");
+    assert!(path.is_file(), "清单须落盘到 {} ", path.display());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("start_price") && text.contains("options"), "{text}");
+    // 落盘清单能被 catalog 解析(否则详情会静默丢失)。
+    assert!(catalog::find("mf-user").is_some(), "保存后 catalog 应能扫到该策略");
+
+    // ② 详情 params 点亮(参数表单据此渲染)。
+    let res = raw(port, "GET", "/api/strategies/mf-user?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    let body = body_of(&res);
+    assert!(body.contains(r#""key":"start_price""#), "详情应带清单参数: {body}");
+    assert!(body.contains("低于它激活"), "{body}");
+
+    // ③ 覆盖保存 → 出现 backup 字段, 且磁盘有 .bak。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/mf-user/manifest?token=tok-ok",
+        Some(&manifest.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    assert!(body_of(&res).contains(r#""backup":"#), "覆盖应给备份: {res}");
+    assert!(
+        walkdir(&root.join("strategies").join("spot"))
+            .iter()
+            .any(|p| p.extension().and_then(|s| s.to_str()) == Some("bak")),
+        "覆盖前须备份旧清单"
+    );
+
+    // ④ 内置策略 → 409 builtin(清单随代码发布)。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/paired_grid/manifest?token=tok-ok",
+        Some(&manifest.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 409, "{res}");
+    assert!(body_of(&res).contains(r#""code":"builtin""#), "{res}");
+
+    // ⑤ 未知 id → 404。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/no-such/manifest?token=tok-ok",
+        Some(&manifest.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 404, "{res}");
+
+    // ⑥ 参数校验失败 → 400 且带问题键名, 不落盘(文件内容不变)。
+    let before = std::fs::read_to_string(&path).unwrap();
+    let bad = serde_json::json!({
+        "name": "x",
+        "params": [{"key": "9bad key", "name": "n", "type": "f64", "desc": "d"}]
+    });
+    let res =
+        raw(port, "POST", "/api/strategies/mf-user/manifest?token=tok-ok", Some(&bad.to_string()))
+            .await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains("9bad key"), "{res}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "校验失败不得改写清单");
+
+    std::env::remove_var("RICOW_ROOT");
     let _ = std::fs::remove_dir_all(&root);
 }
 

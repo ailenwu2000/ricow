@@ -52,6 +52,54 @@ pub fn validate_lua(code: &str) -> Result<(), String> {
 }
 
 // ============================================================================
+// 策略日志缓冲 — `ctx:log` 的有界汇聚槽
+// ============================================================================
+
+/// 日志缓冲**头部**保留条数(策略启动自检、缺参停机这类一次性信息都在开头)。
+const LOG_HEAD_CAP: usize = 2000;
+/// 日志缓冲**尾部**保留条数(停机/异常原因通常在最后一条)。
+const LOG_TAIL_CAP: usize = 1000;
+
+/// `ctx:log` 的**有界**汇聚缓冲(2026-10-05)。
+///
+/// 逐 tick 打日志的策略(每根 K 线一行)在长周期回测里能刷出百万级字符串; 之前的实现是
+/// 无界 `Vec<String>`, 只在回测结束后才由 Web 层裁剪, 峰值内存不受控。这里在**写入侧**就封顶:
+/// 头 [`LOG_HEAD_CAP`] 条 + 尾 [`LOG_TAIL_CAP`] 条(滑动窗口), 中间丢弃的条数记进 `dropped`
+/// 并在取走时留一行截断标记 —— 头尾都留, 开头自检与结尾停机原因都不会被冲掉。
+#[derive(Default)]
+struct LogBuffer {
+    head: Vec<String>,
+    tail: std::collections::VecDeque<String>,
+    dropped: u64,
+}
+
+impl LogBuffer {
+    fn push(&mut self, msg: String) {
+        if self.head.len() < LOG_HEAD_CAP {
+            self.head.push(msg);
+        } else if self.tail.len() < LOG_TAIL_CAP {
+            self.tail.push_back(msg);
+        } else {
+            self.tail.pop_front();
+            self.tail.push_back(msg);
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// take 语义: 取走全部内容并清空缓冲(含截断标记), 不重复上报。
+    fn drain(&mut self) -> Vec<String> {
+        let mut out = std::mem::take(&mut self.head);
+        let dropped = std::mem::take(&mut self.dropped);
+        let tail: Vec<String> = std::mem::take(&mut self.tail).into_iter().collect();
+        if dropped > 0 {
+            out.push(format!("[... 日志过多, 中间省略 {dropped} 条 ...]"));
+        }
+        out.extend(tail);
+        out
+    }
+}
+
+// ============================================================================
 // LuaCtxData — 只读快照容器 (userdata)
 // ============================================================================
 
@@ -89,6 +137,10 @@ pub(crate) struct LuaCtxData {
     /// (引擎已截断至执行日, ≥253 根供 IBD RS/EMA200 打分), 不套单标的 100 根 cap;
     /// false (默认) → 单标的路径维持 cap 100 (行为边界, 回归约束)。
     full_klines: bool,
+    /// 策略日志汇聚槽 (2026-10-05): `ctx:log` 写入此处, 与 `LuaStrategy.log_sink` 共享同一
+    /// `Arc` —— 每个 tick 的 `LuaCtxData` 是新建的, 但槽指向同一缓冲区, 故跨 tick 累积。
+    /// None = 未接日志捕获 (退回 tracing, 保持旧行为)。
+    log_sink: Option<Arc<std::sync::Mutex<LogBuffer>>>,
 }
 
 impl LuaCtxData {
@@ -112,6 +164,7 @@ impl LuaCtxData {
             klines_map: HashMap::new(),
             tf_cache: HashMap::new(),
             full_klines: false,
+            log_sink: None,
         }
     }
 
@@ -204,7 +257,14 @@ impl UserData for LuaCtxData {
         methods.add_method("config_i64", |_, data, key: String| Ok(data.config_i64(&key)));
         methods.add_method("config_str", |_, data, key: String| Ok(data.config_str(&key)));
         methods.add_method("config_bool", |_, data, key: String| Ok(data.config_bool(&key)));
-        methods.add_method("log", |_, _data, msg: String| {
+        methods.add_method("log", |_, data, msg: String| {
+            // 日志双写 (2026-10-05): 有捕获槽 → 进**有界**缓冲区 (供回测详情透出, 写入侧封顶,
+            // 见 LogBuffer); 始终保留 tracing (CLI/实盘实时观察不受影响)。
+            if let Some(sink) = &data.log_sink {
+                if let Ok(mut buf) = sink.lock() {
+                    buf.push(msg.clone());
+                }
+            }
             tracing::info!(target: "lua_strategy", "{msg}");
             Ok(())
         });
@@ -370,6 +430,9 @@ pub struct LuaStrategy {
     lua: Lua,
     budget: crate::lua_sandbox::SandboxBudget,
     instance_id: String,
+    /// 策略日志汇聚槽 (`ctx:log` 的落点): `LuaStrategy` 跨 tick 存活, 缓冲区随之累积。
+    /// 有界(见 [`LogBuffer`]), `take_logs` 取走内容 (take 语义), 供回测详情透出。
+    log_sink: Arc<std::sync::Mutex<LogBuffer>>,
 }
 
 impl std::fmt::Debug for LuaStrategy {
@@ -412,10 +475,18 @@ impl LuaStrategy {
         crate::exec::register(&lua).map_err(|e| format!("exec 组件注册失败: {e}"))?;
         lua.load(code).exec().map_err(|e| format!("脚本错误 (编译或顶层执行):\n{e}"))?;
         let instance_id = uuid::Uuid::new_v4().to_string();
-        Ok(Self { config, lua, budget, instance_id })
+        Ok(Self {
+            config,
+            lua,
+            budget,
+            instance_id,
+            log_sink: Arc::new(std::sync::Mutex::new(LogBuffer::default())),
+        })
     }
 
     fn fill_snapshot(&self, ctx: &dyn Context, data: &mut LuaCtxData) {
+        // 日志槽挂到本 tick 的快照上: ctx:log 写入的正是这条跨 tick 累积的缓冲区。
+        data.log_sink = Some(Arc::clone(&self.log_sink));
         // 组合信号模式判据 (纯 config 判断, 零 trait 扩展, Y3): config.params 有
         // universe 键 (逗号串, bs_momentum 装配层注入) → 遍历池逐只填价格/持仓/信号线
         // 快照 + full_klines=true (klines 全段 ≥253, 引擎已按执行日截断无前视);
@@ -766,6 +837,15 @@ impl Strategy for LuaStrategy {
         let globals = self.lua.globals();
         globals.get::<Function>("on_stop").is_ok()
     }
+
+    /// 取走运行期 `ctx:log` 累积的日志 (take 语义: 取走后缓冲区清空, 不重复上报)。
+    fn take_logs(&mut self) -> Vec<String> {
+        match self.log_sink.lock() {
+            Ok(mut buf) => buf.drain(),
+            // 锁中毒 (某次写日志 panic) → 尽力取回仍可读的内容, 不 panic 传播。
+            Err(poisoned) => poisoned.into_inner().drain(),
+        }
+    }
 }
 
 // ============================================================================
@@ -835,6 +915,61 @@ mod tests {
         assert_eq!(orders[0].side, OrderSide::Buy);
         assert_eq!(orders[0].size, dec!(1));
         assert_eq!(orders[0].order_type, OrderType::Market);
+    }
+
+    /// `ctx:log` 捕获 (2026-10-05): 日志进策略缓冲, `take_logs` 取走并清空 —— 供回测详情
+    /// 透出策略自检 (如缺必填参数的 `[FATAL]` 停机原因), 不再是只进 tracing 的黑洞。
+    #[test]
+    fn test_ctx_log_is_captured_and_drained() {
+        let script = r#"
+            function on_tick(ctx)
+                ctx:log("hello-from-lua")
+                ctx:log("[FATAL] 停机演示")
+                return {}
+            end
+        "#;
+        let config = test_config(script);
+        let mut strategy = LuaStrategy::from_source(script, config).expect("编译应通过");
+        let mut ctx = BacktestContext::new(
+            strategy.config.clone(),
+            Balance { asset: "USDC".into(), free: dec!(100000), locked: Decimal::ZERO },
+        );
+        ctx.step_bar(sample_kline());
+        strategy.on_tick(&mut ctx);
+        let logs = strategy.take_logs();
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert!(logs[0].contains("hello-from-lua"), "{logs:?}");
+        assert!(logs[1].contains("[FATAL]"), "{logs:?}");
+        // take 语义: 再取为空 (不重复上报)。
+        assert!(strategy.take_logs().is_empty());
+    }
+
+    /// 日志缓冲**有界** (2026-10-05): 逐 tick 刷屏(长周期回测里百万级)不得撑爆内存 ——
+    /// 写入侧就封顶 头 2000 + 尾 1000, 中间丢弃并留一行截断标记; 首尾两端必须都还在。
+    #[test]
+    fn test_log_buffer_is_bounded_head_and_tail() {
+        let mut buf = LogBuffer::default();
+        let total = LOG_HEAD_CAP + LOG_TAIL_CAP + 500;
+        for i in 0..total {
+            buf.push(format!("line-{i}"));
+        }
+        // 封顶: 缓冲容量不再随 total 线性增长(这正是"峰值内存不受控"的修复点)。
+        assert_eq!(buf.head.len(), LOG_HEAD_CAP);
+        assert_eq!(buf.tail.len(), LOG_TAIL_CAP);
+        assert_eq!(buf.dropped, 500);
+
+        let out = buf.drain();
+        assert_eq!(out.len(), LOG_HEAD_CAP + LOG_TAIL_CAP + 1, "头 + 尾 + 一行截断标记");
+        assert_eq!(out[0], "line-0", "开头自检信息必须保留");
+        assert_eq!(out[LOG_HEAD_CAP - 1], format!("line-{}", LOG_HEAD_CAP - 1));
+        assert!(out[LOG_HEAD_CAP].contains("省略 500 条"), "截断标记: {}", out[LOG_HEAD_CAP]);
+        assert_eq!(
+            out.last().unwrap(),
+            &format!("line-{}", total - 1),
+            "结尾的停机/异常原因必须保留"
+        );
+        // drain 后清空, 不重复上报。
+        assert!(buf.drain().is_empty());
     }
 
     /// String 数字参数 (CLI 直跑按 Decimal 字符串注入, 防精度噪声) 对 config_f64 可读 —

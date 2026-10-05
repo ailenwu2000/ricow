@@ -1450,6 +1450,11 @@ body {
   color: var(--muted);
   font-size: 0.74rem;
 }
+/* 诚实性徽章(2026-10-05): 未声明参数清单 / 与内置脚本重复 —— 用告警色区分于中性徽章。 */
+.sg-badge-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
 .sg-hint {
   margin-bottom: 10px;
   padding: 8px 10px;
@@ -1667,6 +1672,49 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* 策略日志块 (2026-10-05): 逐 tick 日志较长 → 限高滚动; [FATAL]/停机 行红字突出。 */
+.sg-logs-body {
+  max-height: 320px;
+  font-size: 0.74rem;
+}
+.sg-log-fatal {
+  color: var(--error);
+  font-weight: 600;
+}
+/* 参数清单编辑器 (P2-8): 表头与参数行共用同一套 6 列网格, 保证对齐。 */
+.sg-mf-head,
+.sg-mf-line {
+  display: grid;
+  grid-template-columns: 1.1fr 1.1fr 0.7fr 0.9fr auto auto;
+  gap: 6px;
+  align-items: center;
+}
+.sg-mf-head {
+  margin: 10px 0 4px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.sg-mf-row {
+  padding: 6px 0;
+  border-top: 1px dashed var(--border);
+}
+.sg-mf-line2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 6px;
+}
+.sg-mf-reqwrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
+.sg-mf-del {
+  white-space: nowrap;
+}
 @keyframes sg-spin {
   to {
     transform: rotate(360deg);
@@ -1749,6 +1797,226 @@ body {
     grid-column: auto;
   }
   .sg-bt-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- 策略编辑器增强 (P1-4/P1-5): Lua 高亮覆盖层 + API 速查 + 静态检查提示 ----
+   经典「双层 overlay」编辑器: textarea 文本透明、只留光标; 后面的 <pre> 层出彩色。
+   两层字号/行高/padding/tab-size 必须逐字一致, 否则字会错位 —— 改一处要同步另一处。 */
+.sg-editor-wrap {
+  position: relative;
+  margin-top: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.sg-editor-wrap:focus-within {
+  border-color: var(--accent-dim);
+}
+.sg-hl {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 10px 12px;
+  border: 0;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.55;
+  tab-size: 2;
+  white-space: pre;
+  word-wrap: normal;
+}
+.sg-editor-wrap .sg-code {
+  position: relative;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--fg);
+  outline: none;
+}
+.sg-editor-wrap .sg-code::selection {
+  background: var(--accent-soft-2);
+}
+/* token 配色: 取中间调, 深色底/浅色底都可读 */
+.hl-com { color: var(--muted); font-style: italic; }
+.hl-str { color: #c98a00; }
+.hl-num { color: #3572b0; }
+.hl-kw { color: #c0392b; }
+.hl-api { color: var(--accent); font-weight: 600; }
+
+/* API 速查表(specs/lua-api 摘要) */
+.sg-apiref {
+  margin-top: 8px;
+}
+.sg-apiref-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 6px;
+  font-size: 0.78rem;
+}
+.sg-apiref-table th,
+.sg-apiref-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.sg-apiref-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.sg-apiref-table td code,
+.sg-apiref-table code {
+  color: var(--accent);
+  font-family: var(--mono);
+}
+
+/* 静态检查提示(P1-5): 黄框列表, 只提示不拦截 */
+.sg-warnlist {
+  margin: 8px 0;
+  padding: 8px 10px;
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.8rem;
+}
+.sg-warnlist-title {
+  color: var(--warn, #d29922);
+  font-weight: 600;
+}
+.sg-warnlist-ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--fg);
+}
+.sg-warnlist-ul li {
+  margin: 2px 0;
+}
+
+/* 回测指标卡(P0-2): 涨红跌绿(中国行情惯例) */
+.sg-mcards-title,
+.sg-hist-title {
+  margin: 12px 0 6px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+.sg-mcards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.sg-mcard {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.sg-mcard-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.sg-mcard-value {
+  font-family: var(--mono);
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+.sg-mcard-value.up { color: var(--error); }
+.sg-mcard-value.down { color: var(--accent); }
+.sg-mcard-value.flat { color: var(--fg); }
+.sg-mcard-sub {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+/* 权益曲线容器(P0-2, Lightweight Charts 自适应父容器高度) */
+.sg-bt-chart-wrap {
+  margin: 10px 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.sg-bt-chart {
+  width: 100%;
+  height: 320px;
+}
+
+/* 回测历史对比表(P1-6) 与 寻优对比表(P2-7) 共用样式 */
+#sg-bt-history,
+.sg-sweep-box .sg-sw-result {
+  overflow-x: auto;
+}
+.sg-hist-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+.sg-hist-table th,
+.sg-hist-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+  white-space: nowrap;
+}
+.sg-hist-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.sg-hist-table th:first-child,
+.sg-hist-table td:first-child {
+  text-align: left;
+}
+.sg-hist-table td.up { color: var(--error); }
+.sg-hist-table td.down { color: var(--accent); }
+.sg-hist-table tr.sg-best {
+  background: var(--accent-soft);
+}
+.sg-hist-table tr.sg-best td {
+  font-weight: 600;
+}
+
+/* 弹窗内的模板参数区(P0-1) 与 AI 生成行布局(P0-3) */
+.sg-modal-params {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sg-gen-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+}
+
+/* AI 指令多行框 */
+.sg-ai-instr {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 0.82rem;
+  resize: vertical;
+}
+.sg-ai-instr:focus {
+  border-color: var(--accent-dim);
+  outline: none;
+}
+
+@media (max-width: 860px) {
+  .sg-gen-row {
     grid-template-columns: 1fr;
   }
 }

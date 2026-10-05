@@ -114,6 +114,10 @@ pub struct BacktestReport {
     pub turnover_ratio: f64,
     /// 组合持仓快照序列: 每收盘估值点的 (pair, size>0); 单标的路径为空。
     pub holdings_snapshots: Vec<Vec<(String, Decimal)>>,
+    /// 策略运行期日志 (`ctx:log`, 按发生顺序)。默认空 —— 由 `run_backtest` 在收尾
+    /// (`on_stop` 之后) 从策略 `take_logs()` 取走填入 (2026-10-05: 供回测详情透出策略自检,
+    /// 如缺必填参数 `start_price` 的 `[FATAL]` 停机原因)。
+    pub strategy_logs: Vec<String>,
 }
 
 /// 组合信号模式 ctx:klines 返回段的最大长度 (007 v2, R1 十年回测性能前提)。
@@ -1092,6 +1096,8 @@ impl BacktestContext {
             benchmark_return_pct: None,
             benchmark_max_drawdown: None,
             benchmark_annual_volatility: None,
+            // 策略日志由引擎收尾 (on_stop 之后) take_logs() 填入; 报告构造期为空。
+            strategy_logs: Vec::new(),
         }
     }
 
@@ -1295,6 +1301,8 @@ impl BacktestContext {
             benchmark_return_pct: bm_ret,
             benchmark_max_drawdown: bm_dd,
             benchmark_annual_volatility: bm_vol,
+            // 策略日志由引擎收尾 (on_stop 之后) take_logs() 填入; 报告构造期为空。
+            strategy_logs: Vec::new(),
         }
     }
 

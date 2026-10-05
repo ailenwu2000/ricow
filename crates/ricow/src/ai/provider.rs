@@ -26,6 +26,18 @@ const AI_EDIT_PREAMBLE: &str = "你是 ricow 的 Lua 交易策略编辑助手。
     不做行情分析、不调用任何工具; 严格使用 ricow 既有 ctx API(不发明接口), \
      与修改指令无关的原有逻辑必须逐字保留; 最终只输出一份完整 Lua 代码, 不加任何解释或 Markdown 围栏。";
 
+/// Lua 策略 API 规范全文(编译期嵌入, P0-3): AI 从零生成策略的唯一接口依据 ——
+/// 与 specs/lua-api.md 同一来源, 不另造第二份 API 清单。
+const LUA_API_DOC: &str = include_str!("../../../../specs/lua-api.md");
+
+/// P0-3: Web「AI 生成新策略」的系统提示 —— 与 AI_EDIT_PREAMBLE 同纪律(只输出完整 Lua),
+/// 但任务是从零编写, 且必须先读规范再写代码。
+const AI_GEN_PREAMBLE: &str =
+    "你是 ricow 的 Lua 交易策略编写助手。你只负责编写一份全新的策略代码, \
+    不做行情分析、不调用任何工具; 编写前先通读用户消息里给出的 ricow Lua API 规范, \
+    严格只使用规范列出的 ctx/exec API(不发明接口); 最终只输出一份完整 Lua 代码, \
+    不加任何解释或 Markdown 围栏。";
+
 /// 构造 OpenAI 兼容客户端(自定义 base_url + 密钥)。
 pub fn build_client(resolved: &Resolved, api_key: &str) -> CoreResult<openai::CompletionsClient> {
     let client = openai::Client::builder()
@@ -450,7 +462,7 @@ pub(crate) fn build_edit_prompt(
     )
 }
 
-/// 032 US3 (FR-018): Web「AI 改 Lua」的一次性非流式问答薄封装。
+/// 一次性非流式问答的公共底座(P0-3 抽出): 配置解析 → 密钥 → 客户端 → 单轮问答。
 ///
 /// 与对话会话([`super::session::ChatSession`])取**同一套**配置: provider/model/base_url
 /// 只来自 `ricow.toml` 的 `[ai]` 段 + `RICOW_AI_*` 环境变量, Web 侧不提供任何覆盖入口;
@@ -461,14 +473,7 @@ pub(crate) fn build_edit_prompt(
 /// - 调用超时 / 上游错误 → [`CoreError::Exchange`](`Llm::ask` 已做中文包装)—— Web 映射 400;
 /// - 其余配置/IO 错误原样透传(Auth/InvalidArgument 等);
 /// - 本机端点(如本地 Ollama)沿用 [`resolve_key`] 例外: 缺密钥时以占位值放行, 不判 need_keys。
-///
-/// 单轮不挂工具(`tools` 传空), `max_tokens` 跟随 rig/agent 默认 —— 不单独暴露。
-pub(crate) async fn quick_ask(
-    root: &Path,
-    instruction: &str,
-    lua_code: &str,
-    manifest_summary: &str,
-) -> CoreResult<String> {
+async fn one_shot(root: &Path, preamble: &str, prompt: &str) -> CoreResult<String> {
     // 唯一配置文件: ricow.toml(缺文件时生成模板; 与 ChatSession::open 逐字同路径)。
     let file = crate::commands::config_file::load(root)?;
     let cfg = config::AiConfig {
@@ -490,10 +495,63 @@ pub(crate) async fn quick_ask(
     // 缺密钥(远程端点)在此即返回 CoreError::Auth, 发生在任何网络请求之前。
     let api_key = resolve_key(&resolved.base_url, config::api_key(root, &resolved.provider))?;
 
-    let prompt = build_edit_prompt(instruction, lua_code, manifest_summary);
-    let llm = connect(resolved, &api_key, AI_EDIT_PREAMBLE, Vec::new())?;
-    let answer = llm.ask(&prompt).await?;
+    let llm = connect(resolved, &api_key, preamble, Vec::new())?;
+    let answer = llm.ask(prompt).await?;
     Ok(answer.text)
+}
+
+/// 032 US3 (FR-018): Web「AI 改 Lua」的一次性非流式问答薄封装。
+pub(crate) async fn quick_ask(
+    root: &Path,
+    instruction: &str,
+    lua_code: &str,
+    manifest_summary: &str,
+) -> CoreResult<String> {
+    one_shot(root, AI_EDIT_PREAMBLE, &build_edit_prompt(instruction, lua_code, manifest_summary))
+        .await
+}
+
+/// P0-3: Web「AI 生成新策略」的一次性非流式问答薄封装 —— 提示词里带**全文** Lua API 规范。
+pub(crate) async fn quick_generate(root: &Path, prompt: &str) -> CoreResult<String> {
+    one_shot(root, AI_GEN_PREAMBLE, prompt).await
+}
+
+/// P0-3 构造「AI 生成新策略」的用户提示词(纯函数便于离线单测)。
+///
+/// 结构: ① 规范全文(LUA_API_DOC, 唯一 API 依据); ② 结构化的策略意图(市场/标的/主时钟/
+/// 思路/风控约束); ③ 输出要求(回调结构、need_klines 声明、参数读取辅助、订单字段)。
+pub(crate) fn build_generate_prompt(
+    market: &str,
+    pair: &str,
+    interval: &str,
+    idea: &str,
+    constraints: &str,
+) -> String {
+    format!(
+        "请根据下面的策略意图, 从零编写一份 ricow Lua 交易策略。\n\
+         \n\
+         ## ricow Lua API 规范(唯一接口依据, 必须先通读)\n\
+         {LUA_API_DOC}\n\
+         \n\
+         ## 策略意图\n\
+         - 市场: {market}\n\
+         - 交易对: {pair}\n\
+         - 主时钟周期: {interval}\n\
+         - 策略思路: {idea}\n\
+         - 风控与约束: {constraints}\n\
+         \n\
+         ## 输出要求(必须严格遵守)\n\
+         1. 只输出**一份**完整 Lua 代码(包含 on_tick; 需要 on_init/on_fill/on_stop 就一并给出);\n\
+         2. 不要输出 ```lua 之类的代码围栏, 不要输出任何解释、前后缀、寒暄或 Markdown;\n\
+         3. 在 on_init 里用 ctx:need_klines 声明数据需求(primary 为主时钟, aux 为高周期指标);\n\
+         4. 读参数一律用 num(ctx, key, 缺省) / cfg_str(ctx, key, 缺省) 辅助函数(先定义后用), \
+         不要直接 ctx:config_f64(...) or 缺省(Lua or 陷阱: 未配置时读到 0 而非缺省);\n\
+         5. 订单表字段为 pair/side/size/price/order_type/reduce_only/position_side, \
+         price 省略即市价单; on_fill 里用 fill_price/fill_size(不是 price/size);\n\
+         6. 交易对用参数 pair(不要写死), 数量/价格要做有限性与正数校验;\n\
+         7. 代码要能在震荡与趋势两种行情下都安全: 单边行情不许无限加仓, \
+         需要有止损或仓位上限等保护(依据上面的风控约束)。"
+    )
 }
 
 #[cfg(test)]

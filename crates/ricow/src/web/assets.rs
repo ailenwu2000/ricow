@@ -109,23 +109,54 @@ fn render_index(token: &str) -> String {
 mod tests {
     use super::*;
 
+    /// **全部**前端脚本 `(文件名, 源码)`: 下面三处纪律扫描只认这一份清单。
+    ///
+    /// 单一清单是为了根治一类静默漏洞: 之前三处各写一份数组, 033 新增 `keys.js` 时没往任何
+    /// 一处追加 —— 存储红线 / 只读红线 / 首页资源清单三项断言集体漏扫该文件, 且全绿(2026-10-05
+    /// 审查发现)。新增脚本**必须**进这里, 加漏了 `test_all_js_assets_are_listed_on_index` 会红。
+    const ALL_JS: &[(&str, &str)] = &[
+        ("lightweight-charts.js", LWC_JS),
+        ("common.js", COMMON_JS),
+        ("router.js", ROUTER_JS),
+        ("chat.js", CHAT_JS),
+        ("settings.js", SETTINGS_JS),
+        ("keys.js", KEYS_JS),
+        ("markets.js", MARKETS_JS),
+        ("strategies.js", STRATEGIES_JS),
+        ("runs.js", RUNS_JS),
+        ("app.js", APP_JS),
+    ];
+
+    /// `ALL_JS` 与首页资源引用必须双向对齐: 少一个 → 有脚本没被扫描; 多一个 → 首页漏引用。
+    #[test]
+    fn test_all_js_assets_are_listed_on_index() {
+        for (name, js) in ALL_JS {
+            assert!(!js.is_empty(), "{name} 不得为空");
+            assert!(
+                INDEX_HTML.contains(&format!("/{name}?token=")),
+                "首页须引用带 token 的 /{name}"
+            );
+        }
+        // 首页里引用的每份 .js 也都要在 ALL_JS 里(只加首页不更清单 = 该文件漏扫)。
+        for chunk in INDEX_HTML.split("src=\"/").skip(1) {
+            let url = chunk.split('"').next().unwrap_or("");
+            let file = url.split('?').next().unwrap_or("");
+            if !file.ends_with(".js") {
+                continue;
+            }
+            assert!(
+                ALL_JS.iter().any(|(n, _)| *n == file),
+                "/{file} 被首页引用但不在 ALL_JS 清单里(纪律扫描会漏掉它)"
+            );
+        }
+    }
+
     /// 静态资源与首页(D4): 032 拆分后的各份资产都非空; 首页里每个资源 URL 必须带上本次 token ——
     /// 浏览器取 `<link>` / `<script>` 带不上请求头, 只能靠这里填进去。
     #[test]
     fn test_index_fills_token_into_asset_urls() {
-        assert!(
-            !INDEX_HTML.is_empty()
-                && !STYLE_CSS.is_empty()
-                && !LWC_JS.is_empty()
-                && !COMMON_JS.is_empty()
-                && !ROUTER_JS.is_empty()
-                && !CHAT_JS.is_empty()
-                && !SETTINGS_JS.is_empty()
-                && !MARKETS_JS.is_empty()
-                && !STRATEGIES_JS.is_empty()
-                && !RUNS_JS.is_empty()
-                && !APP_JS.is_empty()
-        );
+        assert!(!INDEX_HTML.is_empty(), "首页不得为空");
+        assert!(!STYLE_CSS.is_empty(), "样式表不得为空");
         for asset in [
             "/style.css",
             "/lightweight-charts.js",
@@ -133,6 +164,7 @@ mod tests {
             "/router.js",
             "/chat.js",
             "/settings.js",
+            "/keys.js",
             "/markets.js",
             "/strategies.js",
             "/runs.js",
@@ -156,21 +188,10 @@ mod tests {
     /// 并把 `openSession` / `submitText` 打断(2026-09-19 实机走查发现)。
     #[test]
     fn test_frontend_stores_nothing_and_masks_secret_input() {
-        // 032 脚本拆分后, 扫描覆盖**全部**前端脚本(含第三方图表库 UMD): 一份都不许碰浏览器存储。
-        let js_assets = [
-            LWC_JS,
-            COMMON_JS,
-            ROUTER_JS,
-            CHAT_JS,
-            SETTINGS_JS,
-            MARKETS_JS,
-            STRATEGIES_JS,
-            RUNS_JS,
-            APP_JS,
-        ];
+        // 扫描覆盖**全部**前端脚本(含第三方图表库 UMD 与 033 的 keys.js): 一份都不许碰浏览器存储。
         for store in ["localStorage", "sessionStorage"] {
-            for js in js_assets {
-                assert!(!js.contains(store), "前端不得使用 {store}(SC-011)");
+            for (name, js) in ALL_JS {
+                assert!(!js.contains(store), "{name} 不得使用 {store}(SC-011)");
             }
         }
         assert!(CHAT_JS.contains(r#"case "secret_prompt""#), "前端要处理密钥提示帧(FR-012)");
@@ -178,10 +199,10 @@ mod tests {
             CHAT_JS.contains(r#"els.input.classList.toggle("masked""#),
             "密钥录入期间输入框须遮蔽回显(SC-011)"
         );
-        for js in js_assets {
+        for (name, js) in ALL_JS {
             assert!(
                 !js.contains("input.type =") && !js.contains("input.type="),
-                "`<textarea>` 的 type 只读, 赋值会抛 TypeError"
+                "{name}: `<textarea>` 的 type 只读, 赋值会抛 TypeError"
             );
         }
         assert!(STYLE_CSS.contains("#input.masked"), "遮蔽样式须随前端一并内嵌(D4)");
@@ -217,20 +238,13 @@ mod tests {
         {
             assert!(!line.contains("method:"), "交易 / 日志端点只读, 不得带写方法: {line}");
         }
-        // 前端**全部脚本**(含第三方图表库)里不出现交易所写动作的入口。
-        for js in [
-            LWC_JS,
-            COMMON_JS,
-            ROUTER_JS,
-            CHAT_JS,
-            SETTINGS_JS,
-            MARKETS_JS,
-            STRATEGIES_JS,
-            RUNS_JS,
-            APP_JS,
-        ] {
+        // 前端**全部脚本**(含第三方图表库与 keys.js)里不出现交易所写动作的入口。
+        for (name, js) in ALL_JS {
             for banned in ["cancel_order", "cancelOrder", "close_position", "place_order"] {
-                assert!(!js.contains(banned), "前端不得出现交易所写动作 `{banned}`(D17 / FR-013)");
+                assert!(
+                    !js.contains(banned),
+                    "{name}: 前端不得出现交易所写动作 `{banned}`(D17 / FR-013)"
+                );
             }
         }
     }

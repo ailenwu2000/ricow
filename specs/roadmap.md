@@ -35,7 +35,11 @@
 
 ## 测试基线
 
-- **当前基线 (2026-10-03, Windows, 036 回测敏感性 + Web 工程债加固落地后实跑)**: `cargo test --workspace --no-fail-fast` = **650 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 642: **+8 通过 / ignored 不变(22)**。增量构成: 敏感性阶梯与报告 4(`commands/backtest.rs`) + 来源门变体矩阵 2(`web/auth.rs`) + SSE 断线续传 1(`web/logs.rs`) + 会话入站 1(`web/sessions.rs`)。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 零代码告警 / 安全红线门禁 4 条全绿; `web::` 全组 102 用例未改断言全绿(拆文件零行为变化取证); 逐条见 `specs/changes/036-backtest-sensitivity-web-hardening/`。
+- **当前基线 (2026-10-05, Windows, Web 策略创建/回测可视化 + 策略日志透出 + 目录诚实性护栏 落地后实跑)**: `cargo test --workspace --no-fail-fast` = **670 passed / 0 failed / 22 ignored** —— **全目标零失败**(此前每轮都带 `ai_live_smoke` 2 例环境性失败)。较同口径上次 667: **+3 通过 / ignored 不变(22)**。增量构成: ricow bin **325 → 341**(+16: 策略创建/回测可视化 6 + 策略日志透出与 P2-8 清单编辑 3 + Web 审查修复 1 + 目录诚实性护栏 6) + ricow_strategy lib **181 → 182**(+1, `LogBuffer` 有界头/尾单测) + `ai_live_smoke` 目标由 `FAILED` 转 `ok`(1 passed/2 failed → **3 passed/0 failed**, 见下条); 其余 target 一字未变: ricow_binance 48 / ricow_core 16 / ricow_engine 77 / `architecture_guard` 3。
+  **`ai_live_smoke` 2 例已修 (2026-10-05)**: 两个门禁用例(`approve_requires_interactive_tty` / `piped_confirm_phrases_never_reach_the_host`)原先靠 `spawn` + **stdin 管道**, 在 agent 进程树内撞 `ERROR_PIPE_BUSY(231)`; 现改用**文件句柄**作 stdin(`spawn_with_non_tty_stdin`, 内容预写进临时文件)。D5 门禁判的是 `std::io::stdin().is_terminal()` —— **管道与文件都非终端**、走同一分支, 语义等价, 断言强度不变(仍要求进程非 0 退出 / 文案命中 / 零落盘)。
+  **2026-10-05 归因复核(两处更正)**: 拦截方 **①不是 WorkBuddy agent 沙箱**(关沙箱错误一字不变, 且与目标程序无关: 系统 `cmd.exe` 同复现), 也 **②不是"系统级/全机器"** —— 用户在自己终端跑**零 ricow 代码**的探针 `pipe_probe.exe`, **四行全 OK(含 `stdin piped`)**; 此前"360 系统级注入、连 `explorer.exe` 都中招、用户终端同样如此"的推论**已被推翻**, 作用范围实为**仅 agent 进程树**。触发条件精确为"**stdin 走 `Stdio::piped()`**": stdout/stderr piped 或 stdin 用文件/null 全部正常。机制: Rust 1.96 的 `std::process` 不再走 Win32 `CreatePipe`, 改用 NT 层 `NtCreateNamedPipeFile` + `NtOpenFile`(`library/std/src/sys/process/windows/child_pipe.rs`), 故 Python(`CreatePipe`)/.NET(命名管道, 含可继承)同构造均正常、只有 Rust 撞墙; agent 进程内同时可见 WorkBuddy 沙箱 DLL `tsbx.dll` 与 360 `SafeWrapper.dll`, **无法进一步区分真凶**(`schtasks` 被黑名单挡住, 拿不到"脱离进程树"的对照组)。**产品代码不改**: `supervisor/procs.rs:80` 的 `stdin(Stdio::piped())` 是**写入**通道(给子进程发 `stop`), 文件句柄替不了, 且它在用户终端本就正常 —— 属环境差异; 故此前"本机 `ricow start` 大概率失败"的推论**一并撤回**(用户普通终端里它正常)。
+  **门禁**: `clippy --workspace --all-targets -- -D warnings` **exit 0、零代码告警**(仅刷 Windows incremental 锁文件 `os error 5` 环境告警); `cargo fmt --all -- --check` **已通过(exit 0 / 0 处 diff)** —— 首跑曾报 28 处 diff / 7 文件(`ai/provider.rs`、`commands/backtest.rs`、`strategies/catalog.rs`、`web/backtest_jobs.rs`、`web/mod.rs`、`web/strategy_io/{mod,tests}.rs`), 已于 2026-10-05 用 `cargo fmt --all` 修好(**纯格式, 不改语义**); 修测试文件后又复跑一轮: **fmt --check 0 差异 / clippy -D warnings exit 0 / 全量 test 670 passed / 0 failed** —— 三门禁齐备, 提交不会红。本基线取自在建工作区(该轮改动尚未提交)。
+- **前基线 (2026-10-03, Windows, 036 回测敏感性 + Web 工程债加固落地后实跑)**: `cargo test --workspace --no-fail-fast` = **650 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 642: **+8 通过 / ignored 不变(22)**。增量构成: 敏感性阶梯与报告 4(`commands/backtest.rs`) + 来源门变体矩阵 2(`web/auth.rs`) + SSE 断线续传 1(`web/logs.rs`) + 会话入站 1(`web/sessions.rs`)。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 零代码告警 / 安全红线门禁 4 条全绿; `web::` 全组 102 用例未改断言全绿(拆文件零行为变化取证); 逐条见 `specs/changes/036-backtest-sensitivity-web-hardening/`。
 - **前基线 (2026-10-03, Windows, 035 工程底座加固落地后实跑)**: `cargo test --workspace --no-fail-fast` = **642 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 611: **+31 通过 / ignored 不变(22)**。增量构成: 2.1 币安 REST 重试 4(`ricow_binance/src/retry.rs`) + 2.2 K 线缓存 1 + 2.3 回测 run card 2(`commands/backtest.rs`) + 2.4 编号迁移与锁抖动 3(`ricow_strategy/src/db.rs`) + 3.3 运行事件流 9(`ricow_strategy/src/{events,context}.rs`) + 3.4 LLM 重试与历史预算 6(`ai/provider.rs`) + 3.5 配置 schema 版本 6(`commands/config_file.rs` + `ai/config.rs`)。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0 / `cargo deny --locked check` = advisories/bans/licenses/sources **全 ok**; 逐条见 `specs/changes/035-engineering-hardening/`。
   **如实**: 2.4 顺带根治了本机**高频抖动**的 `ai::tools` 部署类用例 `SQLITE_BUSY(database is locked)` —— 根因是 `Database::open` 每次跑全量建表写事务, 而 `PRAGMA journal_mode=WAL` 建池需独占锁、SQLite 对"另一连接正在用"**不调用 busy handler** 直接返回 `SQLITE_BUSY`, 竞争者只活几十毫秒。修法双管: ① 迁移改为 `PRAGMA user_version` 驱动、版本已最新时**零写事务**; ② `open` 加 10 次线性退避重试(仅锁错误, `tokio::time::sleep` 以免卡死 current_thread 运行时)。连续 3 次 `cargo test -p ricow --bin ricow` 全绿(`317 passed / 0 failed / 1 ignored`)。
 - **前基线 (2026-10-03, Windows, 034 UI 主题+折叠落地后实跑)**: `cargo test --workspace` = **611 passed / 22 ignored**(另有 2 例环境性失败, 见下); 较上次 608: **+3 通过 / ignored 不变**; ricow bin 用例 **300 → 303(+3)**, 增量全部来自 034 —— `[ui].theme` 配置解析 2 例 + `/api/theme` 端点 1 例。`fmt --check` 0 差异 / `clippy --all-targets -D warnings` 0。三主题(深/白/红)与历史消息两行折叠以真实浏览器截图取证, 见 `specs/changes/034-ui-themes-fold/converge.md`。
@@ -57,7 +61,7 @@
   ignored 全部为需真实外部环境的用例 (BN demo 现货 / 合约 / 用户流、Nasdaq 冒烟、019 AI 真机与 demo 联调), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
   220 → 204 的差额 = 009 移除 `locus_hl`(16 个内联测试); 204 → 216 = 008 新增 supervisor / CLI 命令面用例; 216 → 233 = 004 风控用例(频率窗口/两级熔断/装配与参数校验/接线); 233 → 270 = 011 用例(下单参数对齐 / 时钟预检判定 / 归属与停机清理编排 / 门禁 / proto 往返 / 现货事件解析 / 交易所过滤器解析 / 归属前缀长度约束)。
 - 验证方式: `cargo test --workspace`(纯逻辑) + 带 env key 的 `#[ignore]` 真实联调 (见 `specs/testnet.md`)。
-- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → 589(032 Web UI 工作台) → 608(033 密钥管理页) → 611(034 UI 主题+折叠) → 642(035 工程底座加固) → **650(036 回测敏感性 + Web 工程债加固, 当前)**。
+- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → 589(032 Web UI 工作台) → 608(033 密钥管理页) → 611(034 UI 主题+折叠) → 642(035 工程底座加固) → 650(036 回测敏感性 + Web 工程债加固) → **670(2026-10-05 Web 策略创建/回测可视化 + 策略日志透出 + 目录诚实性护栏; 含 `ai_live_smoke` 2 例环境性失败修复, 全目标 0 failed, 当前)**。
 
 ## 变更档案状态 (specs/changes/)
 
@@ -217,6 +221,23 @@
 6. ~~**AI 对话流程仍需简化**(2026-09-17 用户反馈, 原话: 「AI对话流程还需要简化。目前有点过于复杂」)~~ → **已立项 023-ai-chat-ux(2026-09-18)**: 向导首问语言、对话内确认改为随语言的**口语词**、去术语化表述、菜单选项式交互, 三项"用户要记的东西"都被收掉。
    - 现象(当时自查): 用户要理解的东西偏多 —— 首次向导 4 步(供应商 / 模型 / 密钥 / 可选连通校验, 外加可跳过的 demo 凭据)、对话内七类**逐字**确认短语、以及"裸入口 / `ai` 子命令 / 一堆 CLI 子命令"多档入口并存。(023 收敛了前两项; 入口档次未动。)
    - **约束(仍然有效)**: 逐字短语在**终端**是**安全机制**(不是可删的复杂度) —— 023 的解法是**分渠道**: 对话用当前语言口语词, 终端保持逐字长短语一行不改, 不削弱"写实必须本人确认"。
+
+7. **策略门禁覆盖面收口 + 运行态可见性**(2026-10-05 审计, 待用户定方案)
+   - **已核实的结论**: "门禁只挂启动/回测层、已在跑的实例不受影响"是**正确**的边界 ——
+     实例启动时 `load_strategy` 只调用一次、运行期不重读 `.lua`(`ricow_engine/src/command.rs` 的 640/1019/1529),
+     daemon 也不 respawn 崩溃子进程(`supervisor/server.rs:367` 只落台账), 故"运行中实例刚变可疑"在时序上不存在;
+     唯一的"持续门禁"手段是热停正在跑的实盘实例, 与 FR-024 纪律相悖。详见
+     [`specs/research/strategy-gate-coverage-audit-2026-10.md`](research/strategy-gate-coverage-audit-2026-10.md)。
+   - **缺口 1(可见性)**: `GET /api/runs` / `.../status` 不带 `declared` / `duplicate_of`, 用户看不到运行中实例用的
+     是不是未声明副本 → "会自己停止再重启"的前提在 UI 上不成立。建议加只读标记 + 前端徽章(纯展示、不触 daemon)。
+   - **缺口 2(覆盖面)**: `catalog::run_block` 目前只有 4 个调用点(CLI 回测 + Web 回测/寻优/启动),
+     而启动路径的公共汇聚点 `ctrl::start_daemon`(`ctrl.rs:202`)自身**无闸**, 被 7 处调用
+     (CLI start/restart + AI 五处 + Web start) → `commands/backtest.rs:919` 声称的"免得网页不让跑但命令行能跑"
+     对**启动**这条线尚未成立(对话里让 AI "启动 X" 照样能起未声明副本)。建议收口到 `start_daemon` 一处盖全。
+   - **收口的顺序陷阱**: `ctrl::restart` 是"先 stop 后 start", 若闸只加在 `start_daemon`, 会出现
+     "实例被停掉、没起来"(还可能带未平仓敞口) → 收口则**必须**配 restart **先判后停**;
+     不收口则维持现状(restart 不判)。两者绑定, 不允许只做一半。
+   - **状态**: 截至 2026-10-05 **均未落码**, 待用户拍板是否实施。
 
 ## 文档-实现缺口 (2026-09-11 审计)
 

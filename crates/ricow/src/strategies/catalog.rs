@@ -38,13 +38,14 @@ pub struct ManifestParam {
     /// 说明。
     pub desc: String,
     /// 默认值(UI 预填; 与 Lua 兜底默认一致, 由一致性单测兜底)。
-    #[serde(default)]
+    /// `skip_serializing_if`: 无默认值时不出现在序列化结果里 (TOML 无 null; JSON 也保持精简)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<ConfigValue>,
     /// 是否必填。
     #[serde(default)]
     pub required: bool,
     /// 枚举项(仅 ty == Enum)。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
 }
 
@@ -60,13 +61,13 @@ pub struct StrategyManifest {
     /// 一句话说明。
     pub summary: String,
     /// 长说明(可选)。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// 适用场景(可选)。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suitable: Option<String>,
     /// 不适用场景(可选)。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsuitable: Option<String>,
     /// 参数列表(声明顺序即表单顺序)。
     #[serde(default)]
@@ -113,12 +114,32 @@ pub enum Source {
     User,
 }
 
-/// 目录里的一条策略: 清单 + Lua 源码 + 来源。
+/// 目录里的一条策略: 清单 + Lua 源码 + 来源 + 诚实性标记。
 #[derive(Debug, Clone)]
 pub struct CatalogEntry {
     pub manifest: StrategyManifest,
     pub code: String,
     pub source: Source,
+    /// 该条目是否由磁盘上的**清单 TOML** 声明(内置恒 `true`)。
+    ///
+    /// `false` = 只有一份裸 `.lua` 落盘(`ricow deploy` / Web 保存但未走过 P2-8 声明)——
+    /// 参数 schema 为空, 前端表单只画得出交易对; 必填参数(如香农的 `start_price`)不在表单里,
+    /// 启动即 `[FATAL] 缺少必填参数 -> 停机`, 0 成交(2026-10-05 事件)。标记出来, 别让用户猜。
+    pub declared: bool,
+    /// 脚本与某个内置脚本**逐字相同**(归一化换行后)时, 那个内置的 id —— 冗余副本。
+    ///
+    /// 同一策略逻辑以两个 id 各跑一份、又指向同一交易对时, 两个实例会各自下单(互不知情地
+    /// 重复建仓)。2026-10-05 现场: `strategies/spot/shannon_spot_grid-1.lua` 与内置逐字节相同。
+    pub duplicate_of: Option<String>,
+}
+
+impl CatalogEntry {
+    /// 是否应拒绝运行(回测 / 启动): **未声明清单**的裸 `.lua` 且与内置脚本逐字相同。
+    ///
+    /// 已声明的副本只标记不拦——用户明确为它写过清单, 拦截权还给他。
+    pub fn blocks_run(&self) -> bool {
+        !self.declared && self.duplicate_of.is_some()
+    }
 }
 
 /// 内置示例(编译期嵌入): (策略 id, 清单 TOML, Lua 源码)。
@@ -142,6 +163,33 @@ pub(crate) fn is_builtin_id(id: &str) -> bool {
     BUILTIN.iter().any(|(bid, _, _)| *bid == id)
 }
 
+/// 归一化 Lua 源码, 只用于"是不是同一份脚本"的比对: **去掉所有 `\r`** + 去首尾空白。
+///
+/// 逐字节比对会漏掉行尾差异 —— 2026-10-05 那份 `strategies/spot/shannon_spot_grid-1.lua`
+/// 与内置正是"内容相同, 只差行尾"。去 `\r`(而不是只把 CRLF 折成 LF)才能同时覆盖
+/// CRLF / LF / 混排三种形态: 本仓的 `strategies/spot/*.lua` 本身就是 CRLF 落盘,
+/// 若只折一次换行, 对已含 CRLF 的原文再加 CRLF 会留下孤立的 `\r` 而判定失配。
+fn normalize_lua(src: &str) -> String {
+    src.replace('\r', "").trim().to_string()
+}
+
+/// 该脚本是否与某个内置脚本是同一份(归一化后相同) → 返回那个内置 id。
+fn builtin_duplicate_of(code: &str) -> Option<&'static str> {
+    let norm = normalize_lua(code);
+    BUILTIN.iter().find(|(_, _, bcode)| normalize_lua(bcode) == norm).map(|(bid, _, _)| *bid)
+}
+
+/// "未声明清单的内置副本"的拒绝原因 —— 扫描期问题清单与 [`run_block`] **共用同一段文案**,
+/// 免得两处口径漂移(用户从不同入口拿到不同解释)。
+fn duplicate_copy_reason(id: &str, builtin: &str) -> String {
+    format!(
+        "策略 {id} 的脚本与内置 {builtin} 逐字相同, 且未声明参数清单 → 视为冗余副本, 拒绝运行: \
+         同一策略以两个 id 各跑一份、又指向同一交易对, 会重复下单(重复建仓)。三个改法任选: \
+         ① 直接给实例 TOML 配 type = \"{builtin}\"(不必复制脚本); \
+         ② 在策略详情页 →「策略清单」里为它声明参数; ③ 修改脚本使其与内置不同。"
+    )
+}
+
 /// 统一策略目录 = 内置示例 ∪ 用户自写(磁盘扫描, 按 id 去重, 内置 id 为保留名)。
 pub fn all() -> Vec<CatalogEntry> {
     let mut out = Vec::new();
@@ -149,7 +197,13 @@ pub fn all() -> Vec<CatalogEntry> {
         let manifest = StrategyManifest::parse(manifest_toml)
             .expect("内置清单解析失败(编译期资产, 应恒可解析)");
         debug_assert_eq!(manifest.id, *id, "内置清单 id 与注册 id 不一致");
-        out.push(CatalogEntry { manifest, code: code.to_string(), source: Source::Builtin });
+        out.push(CatalogEntry {
+            manifest,
+            code: code.to_string(),
+            source: Source::Builtin,
+            declared: true,
+            duplicate_of: None,
+        });
     }
     for e in scan_user() {
         // 按 id 去重(计划 §4.3): 同名后者跳过并警告(内置 id 在前, 用户占用已在扫描期拒)。
@@ -171,16 +225,21 @@ pub fn find(id: &str) -> Option<CatalogEntry> {
 /// 单个文件的问题(解析失败 / market 与目录不一致 / 占用内置 id / 缺同名 .lua)记录进
 /// 问题清单并跳过 —— 加载路径命中该 id 时经 [`problem_for`] 报错, 不静默。
 fn scan_user() -> Vec<CatalogEntry> {
-    let (entries, _) = scan_user_with_problems();
-    entries
+    scan_user_in(&crate::commands::strategies_dir()).0
 }
 
 /// 同 [`scan_user`], 但同时返回被跳过条目的问题清单(按 id 可查)。
 fn scan_user_with_problems() -> (Vec<CatalogEntry>, Vec<(String, String)>) {
+    scan_user_in(&crate::commands::strategies_dir())
+}
+
+/// 扫描实现体: `strategies_dir` 是 `strategies/` 根(生产 = [`crate::commands::strategies_dir`],
+/// 单测注入临时目录 —— 否则测试会读到真实工作区的策略目录, 结果随环境漂移)。
+fn scan_user_in(strategies_dir: &std::path::Path) -> (Vec<CatalogEntry>, Vec<(String, String)>) {
     let mut out = Vec::new();
     let mut problems: Vec<(String, String)> = Vec::new();
     for market in ["spot", "futures"] {
-        let dir = crate::commands::strategies_dir().join(market);
+        let dir = strategies_dir.join(market);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -233,8 +292,22 @@ fn scan_user_with_problems() -> (Vec<CatalogEntry>, Vec<(String, String)>) {
                     continue;
                 }
             };
+            // 声明过清单 = declared; 脚本若与内置逐字相同仍**注册**(用户明确写过清单, 只标记不拦)。
+            let duplicate_of = builtin_duplicate_of(&code).map(str::to_string);
+            if let Some(bid) = &duplicate_of {
+                eprintln!(
+                    "[catalog] 策略 {} 的脚本与内置 {bid} 逐字相同(冗余副本, 标记不拦——已声明清单)",
+                    manifest.id
+                );
+            }
             with_manifest.push(file_stem.clone());
-            out.push(CatalogEntry { manifest, code, source: Source::User });
+            out.push(CatalogEntry {
+                manifest,
+                code,
+                source: Source::User,
+                declared: true,
+                duplicate_of,
+            });
         }
         // 第二遍(031 §4.2): 无清单的 .lua(如 `ricow deploy` 落盘的策略)→ 合成最小清单,
         // 保证部署后的策略仍出现在统一目录/UI(缺省生成最小清单)。
@@ -251,6 +324,14 @@ fn scan_user_with_problems() -> (Vec<CatalogEntry>, Vec<(String, String)>) {
                 continue;
             }
             let Ok(code) = std::fs::read_to_string(&path) else { continue };
+            let duplicate_of = builtin_duplicate_of(&code).map(str::to_string);
+            if let Some(bid) = &duplicate_of {
+                // 裸 .lua 且与内置逐字相同 = 与内置并列再来一份, 没有任何声明说明它是谁 ——
+                // 记为问题(加载路径也能看到原因), 并由 [`run_block`] 在回测/启动前拒掉。
+                let msg = duplicate_copy_reason(&stem, bid);
+                eprintln!("[catalog] {msg}");
+                problems.push((stem.clone(), msg));
+            }
             out.push(CatalogEntry {
                 manifest: StrategyManifest {
                     id: stem,
@@ -264,6 +345,8 @@ fn scan_user_with_problems() -> (Vec<CatalogEntry>, Vec<(String, String)>) {
                 },
                 code,
                 source: Source::User,
+                declared: false,
+                duplicate_of,
             });
         }
     }
@@ -273,6 +356,37 @@ fn scan_user_with_problems() -> (Vec<CatalogEntry>, Vec<(String, String)>) {
 /// 查询某策略 id 在扫描期被跳过/拒绝的原因(若有)。供加载路径把"静默缺失"升级为明确报错。
 pub fn problem_for(id: &str) -> Option<String> {
     scan_user_with_problems().1.into_iter().find(|(pid, _)| pid == id).map(|(_, m)| m)
+}
+
+/// **运行前门禁**(回测 / 启动共用): 返回 `Some(中文原因)` = 该 id 不可运行。
+///
+/// 关掉两类"目录里明知有问题, 却仍能被实例 TOML 放行"的漏洞 —— 实例 TOML 的存在性判定
+/// 绕过 catalog, 所以只看 `strategies/<id>.toml` 是不是文件是不够的:
+/// 1. 扫描期被拒的 id(清单解析失败 / market 与目录不符 / 占用内置保留名 / 缺同名 .lua);
+/// 2. **未声明清单**的裸 `.lua` 且与内置脚本逐字相同 —— 冗余副本(与内置并列再跑一份会重复下单)。
+///
+/// 内置 id 恒放行(内置资产由编译期 `include_str!` 保证, 不存在磁盘漂移)。
+pub fn run_block(id: &str) -> Option<String> {
+    run_block_in(&crate::commands::strategies_dir(), id)
+}
+
+/// [`run_block`] 的实现体(可注入目录, 便于单测)。
+fn run_block_in(strategies_dir: &std::path::Path, id: &str) -> Option<String> {
+    if is_builtin_id(id) {
+        return None;
+    }
+    // 只扫一次: 条目与问题清单都来自同一次扫描, 避免"查一次扫三遍"。
+    let (entries, problems) = scan_user_in(strategies_dir);
+    // 标记优先(与问题清单同文案): 未声明清单的裸 .lua 且与内置脚本逐字相同。
+    if let Some(e) = entries.iter().find(|e| e.manifest.id == id) {
+        if e.blocks_run() {
+            return Some(duplicate_copy_reason(
+                id,
+                e.duplicate_of.as_deref().unwrap_or("内置策略"),
+            ));
+        }
+    }
+    problems.into_iter().find(|(pid, _)| pid == id).map(|(_, why)| why)
 }
 
 #[cfg(test)]
@@ -392,5 +506,118 @@ options = ["u", "coin"]
         assert!(find("shannon_spot_grid").is_some());
         assert!(find("paired_grid").is_some());
         assert!(find("no-such-strategy").is_none());
+    }
+
+    // ---- 诚实性标记: declared / duplicate_of / run_block(2026-10-05) ----
+
+    /// 临时目录: 每个用例一个独占目录, 避免并行互踩。
+    fn tmp_strategies_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("ricow-catalog-{tag}-{}-{nanos}", std::process::id()))
+            .join("strategies");
+        std::fs::create_dir_all(dir.join("spot")).expect("建临时 strategies/spot");
+        dir
+    }
+
+    fn write(dir: &std::path::Path, rel: &str, body: &str) {
+        std::fs::write(dir.join(rel), body).expect("写临时文件");
+    }
+
+    /// 换行归一化: 逐字节比对会漏掉 Windows 另存为引入的 CRLF(现场那个副本正是这种形态)。
+    #[test]
+    fn normalize_lua_ignores_line_endings_and_trailing_space() {
+        assert_eq!(normalize_lua("a\r\nb\r\n"), normalize_lua("a\nb"));
+        assert_eq!(normalize_lua("  x\n"), "x");
+    }
+
+    /// 与内置逐字相同(含 CRLF 变体)→ 认出重复; 改一个字符 → 不再算重复。
+    #[test]
+    fn builtin_duplicate_of_detects_copy_but_not_edit() {
+        let (bid, _, bcode) = BUILTIN[0];
+        assert_eq!(builtin_duplicate_of(bcode), Some(bid), "原样必须是重复");
+        let crlf = bcode.replace('\n', "\r\n");
+        assert_eq!(builtin_duplicate_of(&crlf), Some(bid), "CRLF 变体也算重复");
+        let edited = format!("{bcode}\n-- 改一行\n");
+        assert_eq!(builtin_duplicate_of(&edited), None, "有改动就不算重复");
+    }
+
+    /// 内置条目恒为"已声明 + 非副本"。
+    #[test]
+    fn builtin_entries_are_declared_without_duplicate() {
+        for e in all().iter().filter(|e| e.source == Source::Builtin) {
+            assert!(e.declared, "内置 {} 必须 declared", e.manifest.id);
+            assert!(e.duplicate_of.is_none(), "内置 {} 不应是副本", e.manifest.id);
+            assert!(!e.blocks_run(), "内置 {} 不得被运行门禁拦下", e.manifest.id);
+        }
+    }
+
+    /// 三种落盘形态的标记: 裸 .lua(未声明) / 声明过清单的 / 裸 .lua 且是内置副本。
+    #[test]
+    fn scan_marks_declared_and_duplicate() {
+        let dir = tmp_strategies_dir("marks");
+        let builtin_code = BUILTIN[0].2;
+
+        // ① 裸 .lua(自己的代码, 没清单)→ 未声明
+        write(&dir, "spot/own.lua", "function on_tick(ctx) return {} end\n");
+        // ② 声明过清单 + 自己的代码 → 已声明
+        write(
+            &dir,
+            "spot/decl.toml",
+            "id = \"decl\"\nname = \"声明过的\"\nmarket = \"spot\"\nsummary = \"\"\n",
+        );
+        write(&dir, "spot/decl.lua", "function on_tick(ctx) return {} end\n");
+        // ③ 裸 .lua 且与内置逐字相同(CRLF 形态)→ 未声明 + 副本
+        write(&dir, "spot/copy.lua", &builtin_code.replace('\n', "\r\n"));
+
+        let (entries, problems) = scan_user_in(&dir);
+        let get = |id: &str| entries.iter().find(|e| e.manifest.id == id).expect("条目应在");
+
+        let own = get("own");
+        assert!(!own.declared, "裸 .lua 必须是未声明");
+        assert!(own.duplicate_of.is_none());
+        assert!(!own.blocks_run(), "自己写的代码不该被拦");
+
+        let decl = get("decl");
+        assert!(decl.declared, "有同名清单 TOML 即已声明");
+        assert!(decl.duplicate_of.is_none());
+
+        let copy = get("copy");
+        assert!(!copy.declared);
+        assert_eq!(copy.duplicate_of.as_deref(), Some(BUILTIN[0].0));
+        assert!(copy.blocks_run(), "未声明的内置副本必须被运行门禁拦下");
+
+        // 副本同时进问题清单(供加载路径把"静默缺失"升级为明确报错)。
+        assert!(problems.iter().any(|(pid, _)| pid == "copy"), "副本应记入问题清单: {problems:?}");
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    /// 运行门禁: 未声明副本 → 拒并给出中文原因(含内置 id 与改法); 已声明副本 → 放行;
+    /// 未知 id / 内置 id → 放行(未知交由调用方按 404 处理)。
+    #[test]
+    fn run_block_rejects_only_undeclared_builtin_copy() {
+        let dir = tmp_strategies_dir("runblock");
+        let builtin_code = BUILTIN[0].2;
+        write(&dir, "spot/copy.lua", builtin_code);
+        write(
+            &dir,
+            "spot/decl.toml",
+            "id = \"decl\"\nname = \"声明过的\"\nmarket = \"spot\"\nsummary = \"\"\n",
+        );
+        write(&dir, "spot/decl.lua", builtin_code);
+
+        let why = run_block_in(&dir, "copy").expect("未声明副本必须被拒");
+        assert!(why.contains(BUILTIN[0].0), "原因须点名内置 id: {why}");
+        assert!(why.contains("重复下单"), "原因须说清危害: {why}");
+
+        assert!(run_block_in(&dir, "decl").is_none(), "已声明的副本只标记不拦");
+        assert!(run_block_in(&dir, "no-such").is_none(), "未知 id 交给调用方按 404 处理");
+        assert!(run_block_in(&dir, BUILTIN[0].0).is_none(), "内置 id 恒放行");
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 }

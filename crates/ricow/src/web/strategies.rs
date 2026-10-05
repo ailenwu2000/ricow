@@ -20,6 +20,11 @@ struct StrategyRow {
     summary: String,
     source: String,
     param_count: usize,
+    /// 参数清单是否已由磁盘清单 TOML 声明(裸 `.lua` = false → 表单只有交易对)。
+    declared: bool,
+    /// 与某内置策略脚本逐字相同时为其 id(冗余副本, 未声明者会被运行门禁拒)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duplicate_of: Option<String>,
 }
 
 /// 策略列表(只读): 内置示例 + 用户自写, 按注册顺序。
@@ -36,6 +41,8 @@ async fn list_strategies() -> Json<Vec<StrategyRow>> {
                 crate::strategies::catalog::Source::User => "user".to_string(),
             },
             param_count: e.manifest.params.len(),
+            declared: e.declared,
+            duplicate_of: e.duplicate_of,
         })
         .collect();
     Json(rows)
@@ -52,6 +59,11 @@ struct StrategyDetailReply {
     pair: Option<String>,
     /// 已部署实例的当前参数值(已剔除 pair/script/script_path; 无实例 → null)。
     current: Option<std::collections::HashMap<String, ricow_strategy::ConfigValue>>,
+    /// 参数清单是否已声明(详见 [`StrategyRow::declared`])。
+    declared: bool,
+    /// 脚本与某内置策略逐字相同时为其 id(详见 [`StrategyRow::duplicate_of`])。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duplicate_of: Option<String>,
 }
 
 /// 单个策略详情(只读): 完整清单(含参数 schema) + 用户实例当前值, 供前端参数表单渲染。
@@ -59,8 +71,9 @@ async fn get_strategy(
     State(state): State<WebState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<StrategyDetailReply>, WebError> {
+    // 未知 id → 404(与 `/source`、`/manifest`、回测端点同口径; 此前误用 400, 2026-10-05 统一)。
     let entry = crate::strategies::catalog::find(&id)
-        .ok_or_else(|| WebError::bad_request(format!("没有策略 {id}")))?;
+        .ok_or_else(|| WebError::not_found(format!("没有策略 {id}")))?;
     // 内置策略只有编译期嵌入清单, 无用户实例; 用户策略读 strategies/<id>.toml 解析当前值。
     let values = if entry.source == crate::strategies::catalog::Source::Builtin {
         None
@@ -68,6 +81,8 @@ async fn get_strategy(
         strategy_io::load_instance_values(&state.root, &id)?
     };
     Ok(Json(StrategyDetailReply {
+        declared: entry.declared,
+        duplicate_of: entry.duplicate_of,
         manifest: entry.manifest,
         pair: values.as_ref().and_then(|v| v.pair.clone()),
         current: values.map(|v| v.current),

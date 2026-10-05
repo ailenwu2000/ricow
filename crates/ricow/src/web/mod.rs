@@ -270,7 +270,19 @@ pub fn router(state: WebState) -> Router {
         .route("/api/strategies", axum::routing::post(strategy_io::save_strategy))
         .route("/api/strategies/{id}/source", get(strategy_io::get_strategy_source))
         .route("/api/strategies/{id}/ai-edit", axum::routing::post(strategy_io::ai_edit_strategy))
+        // 用户策略清单(manifest)编辑(P2-8): 声明/维护参数 schema, 点亮参数表单。
+        .route(
+            "/api/strategies/{id}/manifest",
+            axum::routing::post(strategy_io::save_strategy_manifest),
+        )
+        // AI 从零生成策略(P0-3): 结构化意图 → AI 参照 lua-api 规范生成 → 编译门禁, 不落盘。
+        .route(
+            "/api/strategies/ai-generate",
+            axum::routing::post(strategy_io::ai_generate_strategy),
+        )
         // 回测异步作业 (032 US3 / FR-019): POST 202 拿 job_id 后台跑 CLI 同一内核, GET 轮询结果。
+        // 参数寻优 (P2-7): 单参数网格扫描, 作业生命周期与轮询端点复用。
+        .route("/api/backtest/sweep", axum::routing::post(backtest_jobs::start_sweep))
         .route("/api/backtest", axum::routing::post(backtest_jobs::start_backtest))
         .route("/api/backtest/{job_id}", get(backtest_jobs::get_backtest))
         // 交易面板数据(026 FR-010 / FR-012): 全部**只读**, 数据来自与引擎同一份本地库(D1)。

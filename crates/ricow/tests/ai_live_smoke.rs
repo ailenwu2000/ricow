@@ -3,10 +3,13 @@
 //! # 两类测试
 //!
 //! ## A. 确定性门禁测试(默认运行, 不需要 LLM/key/网络)
-//! - `approve_requires_interactive_tty`: 管道喂入的确认短语必须被交互门禁拒(D5 安全边界)
+//! - `approve_requires_interactive_tty`: 非 tty stdin 喂入的确认短语必须被交互门禁拒(D5 安全边界)
 //! - `run_demo_without_credentials_fails_fast`: 已部署策略缺 demo 凭据时, 在任何网络请求之前报错
-//! - `piped_confirm_phrases_never_reach_the_host`: 配置齐全(不撞首次向导)时, 从管道喂七个动作的
-//!   逐字短语仍进不了读行循环 → 宿主一个写实动作都不执行(零 risk_ack.json / 零 strategies/)
+//! - `piped_confirm_phrases_never_reach_the_host`: 配置齐全(不撞首次向导)时, 从非 tty stdin 喂七个
+//!   动作的逐字短语仍进不了读行循环 → 宿主一个写实动作都不执行(零 risk_ack.json / 零 strategies/)
+//!
+//! 注: A 段两处 `stdin` 走**文件句柄**而非管道, 见 `spawn_with_non_tty_stdin` 的注释
+//! (同一门禁分支, 语义等价; 规避本机 agent 进程树对 Rust 匿名管道构造的 231 拦截)。
 //!
 //! ## B. 真机 LLM 场景(全部 `#[ignore]`, 纪律: 不 mock, 真实 HTTP)
 //!
@@ -113,30 +116,54 @@ fn require_ai_key() -> String {
     )
 }
 
-// ── A. 确定性门禁(默认运行)──────────────────────────────────────────────────
-
-#[test]
-fn approve_requires_interactive_tty() {
-    // D5: 管道 stdin 不是终端 → approve 必须在任何 DB/写实动作之前硬拒。
-    let root = temp_root("tty");
-    let mut child = Command::new(bin())
-        .args(["approve", "pv-nonexistent"])
-        .env("RICOW_ROOT", &root)
-        .stdin(Stdio::piped())
+/// 起一个"stdin **非终端**"的子进程; 返回 (child, stdin 夹具文件路径, 调用方自行删夹具)。
+///
+/// 为什么用**文件**而不是 `Stdio::piped()`:
+/// - D5 门禁只判 `std::io::stdin().is_terminal()`(`commands::mod::require_interactive_terminal`
+///   与 `commands::chat` 的读行循环), **管道与文件都非终端**, 走的是同一分支, 语义等价;
+/// - 但 Rust `std` 给子进程 stdin 建**匿名管道**走 NT 层 `NtCreateNamedPipeFile`+`NtOpenFile`,
+///   在本机 agent 进程树里返回 `ERROR_PIPE_BUSY(231)` 导致 `spawn` 直接失败
+///   (系统自带 `cmd.exe` + 20 行探针即可复现, 与 ricow 代码无关)。
+///   文件句柄不经过该路径 —— agent 环境与用户普通终端都能起, 测试不再被环境卡红。
+fn spawn_with_non_tty_stdin(
+    cmd: &mut Command,
+    stdin_content: &str,
+) -> (std::process::Child, std::path::PathBuf) {
+    let fixture = std::env::temp_dir().join(format!(
+        "ricow-ai-live-stdin-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::write(&fixture, stdin_content).expect("写 stdin 夹具");
+    let child = cmd
+        .stdin(Stdio::from(std::fs::File::open(&fixture).expect("打开 stdin 夹具")))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn ricow");
-    // 立即关闭 stdin(模拟管道 EOF, 而非 tty)
-    drop(child.stdin.take());
+    (child, fixture)
+}
+
+// ── A. 确定性门禁(默认运行)──────────────────────────────────────────────────
+
+#[test]
+fn approve_requires_interactive_tty() {
+    // D5: 非 tty stdin(此处文件句柄, 见 spawn_with_non_tty_stdin) → approve 必须在任何
+    // DB/写实动作之前硬拒。
+    let root = temp_root("tty");
+    let mut cmd = Command::new(bin());
+    cmd.args(["approve", "pv-nonexistent"]).env("RICOW_ROOT", &root);
+    // 空文件 = 读到即 EOF(等价于原"管道关闭后无输入"), 且非终端 → 门禁必拒。
+    let (child, fixture) = spawn_with_non_tty_stdin(&mut cmd, "");
     let out = child.wait_with_output().expect("wait");
     let merged = format!(
         "{}\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!out.status.success(), "管道喂入必须被拒绝: {merged}");
+    assert!(!out.status.success(), "非 tty stdin 喂入必须被拒绝: {merged}");
     assert!(merged.contains("交互终端"), "门禁文案缺失: {merged}");
+    let _ = std::fs::remove_file(&fixture);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -194,24 +221,14 @@ fn piped_confirm_phrases_never_reach_the_host() {
     )
     .expect("写配置夹具");
 
-    let mut child = Command::new(bin())
-        // 裸入口 = `ricow`(无子命令); 用夹具里的占位 key, 不依赖开发机环境
-        .env("RICOW_ROOT", &root)
-        .env_remove("RICOW_AI_API_KEY")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ricow");
-    {
-        use std::io::Write as _;
-        let mut si = child.stdin.take().expect("取 stdin");
-        si.write_all(
-            "确认风险\n确认实盘 demofix01\n确认平仓停止 demofix01\n确认部署 demofix01\n".as_bytes(),
-        )
-        .expect("把短语喂进管道");
-        // 作用域结束 → 管道关闭(EOF); 模拟"把确认短语直接喂给进程"
-    }
+    // 裸入口 = `ricow`(无子命令); 用夹具里的占位 key, 不依赖开发机环境。
+    let mut cmd = Command::new(bin());
+    cmd.env("RICOW_ROOT", &root).env_remove("RICOW_AI_API_KEY");
+    // 把四个动作的逐字短语预置进非 tty stdin(文件句柄): 它们照样没有承接者。
+    let (child, fixture) = spawn_with_non_tty_stdin(
+        &mut cmd,
+        "确认风险\n确认实盘 demofix01\n确认平仓停止 demofix01\n确认部署 demofix01\n",
+    );
     let out = child.wait_with_output().expect("wait");
     let merged = format!(
         "{}\n{}",
@@ -220,10 +237,11 @@ fn piped_confirm_phrases_never_reach_the_host() {
     );
 
     assert!(out.status.success(), "非 tty 应正常退出: {merged}");
-    assert!(merged.contains("非交互式输入"), "管道 stdin 必须在读行循环之前退出: {merged}");
+    assert!(merged.contains("非交互式输入"), "非 tty stdin 必须在读行循环之前退出: {merged}");
     // 硬证据: 四个写实动作一个都没发生
-    assert!(!root.join("risk_ack.json").exists(), "管道不得完成风险确认");
-    assert!(!root.join("strategies").exists(), "管道不得落盘策略");
+    assert!(!root.join("risk_ack.json").exists(), "非 tty stdin 不得完成风险确认");
+    assert!(!root.join("strategies").exists(), "非 tty stdin 不得落盘策略");
+    let _ = std::fs::remove_file(&fixture);
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -97,7 +97,10 @@ pub fn run_backtest(
     // 回测里看到, 否则"跳过占比"这类验收数字无处可取。语义是"收尾回调", 与实盘停机清理
     // 无关(回测没有交易所资源可清); 当前无内置策略在 on_stop 里下单。
     strategy.on_stop(&mut ctx);
-    ctx.report()
+    let mut report = ctx.report();
+    // 2026-10-05: 收尾日志 (on_stop 的"收益分解"等) 也要带上, 故在 on_stop 之后取。
+    report.strategy_logs = strategy.take_logs();
+    report
 }
 
 /// 主时钟周期推断: 策略未声明 primary 时(异常), 用相邻 bar 时间差兜底; 无法推断则 1h。
@@ -218,7 +221,9 @@ pub fn run_portfolio_backtest(
         }
     }
 
-    ctx.report_portfolio()
+    let mut report = ctx.report_portfolio();
+    report.strategy_logs = strategy.take_logs();
+    report
 }
 
 #[cfg(test)]

@@ -273,8 +273,8 @@ pub(super) async fn get_status(
 /// `POST /api/strategies/{id}/start` (FR-024): dry_run / demo / live 三模式拉起。
 ///
 /// 门禁顺序(全部在触碰 daemon 之前, 任一不过即零副作用):
-/// ①名合法 → ②mode 白名单 → ③(live)逐字短语 → ④(live)首次风险确认 → ⑤(live)TOML
-/// live_enabled → ⑥(demo)凭据 → ⑦daemon 自举(幂等) → ⑧已运行 409 → ⑨(live)共享预检
+/// ①名合法 → ①′目录审计(catalog::run_block) → ②mode 白名单 → ③(live)逐字短语 → ④(live)首次风险确认
+/// → ⑤(live)TOML live_enabled → ⑥(demo)凭据 → ⑦daemon 自举(幂等) → ⑧已运行 409 → ⑨(live)共享预检
 /// → ⑩拉起(confirmed=live, 与 CLI `ricow start --live` 完全同参)。
 pub(super) async fn start_strategy(
     State(state): State<WebState>,
@@ -289,6 +289,12 @@ pub(super) async fn start_strategy(
     // ① 名字合法(防路径穿越; 与保存同口径)。
     if ricow_strategy::validate_strategy_name(&id).is_err() {
         return Err(WebError::bad_request_code(format!("策略名非法: {id}"), "invalid_name"));
+    }
+
+    // ①′ 目录审计门禁(与回测同口径): 扫描期被拒的 id / 未声明的内置副本 → 不拉起,
+    // 明确报错而不是让 daemon 起一个"重复下单"的实例(2026-10-05)。
+    if let Some(why) = crate::strategies::catalog::run_block(&id) {
+        return Err(WebError::bad_request_code(why, "strategy_unavailable"));
     }
 
     // ② mode 白名单 → (live, demo) 组合。

@@ -35,4 +35,13 @@ pub trait Strategy: Send + Sync {
     fn has_on_stop(&self) -> bool {
         false
     }
+
+    /// 取走策略运行期产生的日志 (`ctx:log` / `print`), 供调用方在回测结果里透出。
+    ///
+    /// 动机 (2026-10-05): 策略自检 (如缺必填参数 `start_price` 的 `[FATAL]` 停机) 此前只写进
+    /// tracing, Web 回测详情完全看不到 —— 用户拿到"0 成交"却不知为何。取走后引擎清零缓冲区
+    /// (take 语义, 不重复上报)。默认空 —— 无日志的策略 (Rust 实现) 无需覆盖。
+    fn take_logs(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
