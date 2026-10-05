@@ -94,6 +94,16 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
 
     let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();
 
+    // #025: 交易路径(Dry Run/demo/实盘)同样受交易对视野约束 —— 与回测/查询**同源判定**
+    // (ensure_pair_in_scope → build_view), 避免"列表里看不见却下得出去"。
+    // 快照拉取失败时 warn 放行(不阻断交易主流程), 与回测路径同一降级语义。
+    crate::commands::pairs::ensure_pair_in_scope(
+        &crate::commands::project_root(),
+        &pair,
+        &config.market,
+    )
+    .await?;
+
     let db = Database::open(&crate::commands::default_db_path()).await.core()?;
 
     // 运行事件流 (035 / 3.3): 每个实例一份 `run/<name>/events.jsonl`, 一行一事件。

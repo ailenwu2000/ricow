@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 use commands::{
     agentkit, approve, backtest, chat, create, ctrl, daemon, db, deploy, instances, logs, market,
-    pairs, run,
+    new, pairs, run,
 };
 
 #[derive(Parser)]
@@ -59,6 +59,8 @@ enum Command {
     Approve(approve::ApproveArgs),
     /// 提交 Lua 策略: 编译门禁 → 真实 K 线沙箱回测 → 生成待确认 preview (不落盘)
     Create(create::CreateArgs),
+    /// 从内置模板生成策略骨架 (零网络): <name>.lua + 同名 .toml (回测默认固化进 [backtest] 段)
+    New(new::NewArgs),
     /// 落盘已批准的建策略 preview (需 `ricow approve` 得到的一次性 token)
     Deploy(deploy::DeployArgs),
     /// AI 助手对话 (019): 自然语言提问; 省略 prompt 进入交互模式
@@ -110,6 +112,7 @@ async fn main() {
         Some(Command::Logs(args)) => logs::run(args),
         Some(Command::Approve(args)) => approve::run(args).await,
         Some(Command::Create(args)) => create::run(args).await,
+        Some(Command::New(args)) => commands::new::run(args),
         Some(Command::Deploy(args)) => deploy::run(args).await,
         Some(Command::Ai(args)) => commands::ai::run(args).await,
         Some(Command::AgentKit(args)) => commands::agentkit::run(args),

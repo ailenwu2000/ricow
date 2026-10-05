@@ -162,6 +162,15 @@ impl Server {
         };
         let pair = config.get_str("pair").unwrap_or("").to_string();
         let market = config.market.clone();
+        // #025: 交易路径(dry_run/demo/实盘)同样受交易对视野约束 —— 与回测/查询同源判定,
+        // 避免"列表里看不见却下得出去"。快照拉取失败时 warn 放行, 与其它入口同一降级语义。
+        if !pair.is_empty() {
+            if let Err(e) =
+                crate::commands::pairs::ensure_pair_in_scope(&root, &pair, &market).await
+            {
+                return Response::err(format!("{e}"));
+            }
+        }
         // 如实记录实际运行器 (011): 仅当命令行要求实盘 **且** 配置声明实盘时才写 live;
         // 子进程侧仍会走同一门禁复核 (缺一即回落 Dry Run), 台账与子进程行为不会不一致
         // 实盘二次分离(019 T030): 未携带用户确认的实盘请求一律拒绝(**不静默降级** —— 用户已明确要实盘)

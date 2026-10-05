@@ -21,6 +21,7 @@ pub mod deploy;
 pub mod instances;
 pub mod logs;
 pub mod market;
+pub mod new;
 pub mod onboard;
 pub mod pairs;
 pub mod run;
