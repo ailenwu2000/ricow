@@ -112,6 +112,43 @@ pub async fn lookup(root: &Path, market: Option<&str>, q: Option<&str>) -> CoreR
     Ok(filter_view(&view, market, q))
 }
 
+/// 交易对范围校验 (#010): `pair` 是否落在当前视野内(默认仅股票类, `[market] show_all_pairs` 放开)。
+///
+/// 判定走与 `ricow pairs` 同一份视野组装([`build_view`]), 不另造第二套白名单。
+/// 越界(含拼错的不存在交易对)→ Err, 报错带拼写对照与放开方法;
+/// 视野快照拉取失败(网络抖动)→ **warn 后放行**: 范围校验是辅助检查, 不该把一次
+/// exchangeInfo 抖动升级成主功能不可用 —— 主调用随后会如实报它自己的错。
+pub async fn ensure_pair_in_scope(root: &Path, pair: &str, market: &str) -> CoreResult<()> {
+    let snap = match snapshot().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "pairs", pair = %pair, error = %e,
+                "交易对视野校验不可用(快照拉取失败), 放行交由后续调用如实报错"
+            );
+            return Ok(());
+        }
+    };
+    let show_all = crate::commands::config_file::load(root)?.market.show_all_pairs;
+    let view = build_view(&snap.spots, &snap.futures, &snap.equity_bases, show_all);
+    let in_scope = match market.trim().to_ascii_lowercase().as_str() {
+        "spot" => view.spot.iter().any(|s| s.eq_ignore_ascii_case(pair)),
+        "futures" => view.futures.iter().any(|s| s.eq_ignore_ascii_case(pair)),
+        _ => {
+            view.spot.iter().any(|s| s.eq_ignore_ascii_case(pair))
+                || view.futures.iter().any(|s| s.eq_ignore_ascii_case(pair))
+        }
+    };
+    if in_scope {
+        return Ok(());
+    }
+    Err(CoreError::InvalidArgument(format!(
+        "交易对 {pair} 不在当前视野({}): 请核对拼写(现货形如 ETHUSDT / 美股代币现货形如 AAPLBUSDT / 美股永续形如 TSLAUSDT); \
+         确要使用视野外交易对时, 把 ricow.toml 的 [market] show_all_pairs 改为 true(可用 `ricow pairs --all` 先预览全量)",
+        scope_text(view.filtered)
+    )))
+}
+
 /// 视野正文: 视野说明 + 计数 + 两组符号(每行 6 个, 便于人读; 交由调用方决定截断)。
 pub fn render(view: &PairsView, q: Option<&str>) -> String {
     let mut out = String::new();

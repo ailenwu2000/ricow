@@ -22,6 +22,8 @@
 curl -LsSf https://github.com/ailenwu2000/ricow/releases/latest/download/ricow-installer.sh | sh
 ```
 
+装完请**新开一个终端**再使用 `ricow` —— 新终端才会读到刷新后的 `PATH`; 若提示找不到命令, 先确认安装目录(默认 `~/.cargo/bin`)是否在 `PATH` 里。PowerShell 安装器同理。
+
 **Windows —— PowerShell 安装脚本**
 
 ```powershell
@@ -43,7 +45,7 @@ brew install ./ricow.rb
 
 **任意平台 —— 手动解压**
 
-下载对应平台的压缩包, 解压后运行 `./ricow`(Windows 是 `ricow.exe`)。每个压缩包都带内置助手的启动脚本: Windows 双击 `启动-ricow-AI助手.cmd`(它替你切到 UTF-8 —— 中文不乱码就是靠这一步); Linux/macOS 执行 `./启动-ricow-AI助手.sh`; macOS 上也可直接双击 `启动-ricow-AI助手.command`, 它只是同一个脚本的双击外壳。启动脚本走的是 ricow 的裸入口, 所以第一次启动会在**对话里**问你要供应商与 API Key(输入不回显), 写进 `ricow.toml` 之后直接进入会话 —— 事先不需要设任何环境变量。想用网页版就双击同目录的 `启动-ricow-Web.cmd` / `启动-ricow-Web.command`(Linux/macOS 执行 `./启动-ricow-Web.sh`): 它会起本机网页并自动打开浏览器, 见 §5。
+下载对应平台的压缩包, 解压后运行 `./ricow`(Windows 是 `ricow.exe`)。注意: 二进制在**以压缩包名命名的嵌套目录**里(cargo-dist 的标准布局), 这不是打错了包。从零开始的预编译包用户指南(二进制放哪、怎么开始)见 [INSTALL.md](INSTALL.md)。每个压缩包都带内置助手的启动脚本: Windows 双击 `启动-ricow-AI助手.cmd`(它替你切到 UTF-8 —— 中文不乱码就是靠这一步); Linux/macOS 执行 `./启动-ricow-AI助手.sh`; macOS 上也可直接双击 `启动-ricow-AI助手.command`, 它只是同一个脚本的双击外壳。启动脚本走的是 ricow 的裸入口, 所以第一次启动会在**对话里**问你要供应商与 API Key(输入不回显), 写进 `ricow.toml` 之后直接进入会话 —— 事先不需要设任何环境变量。想用网页版就双击同目录的 `启动-ricow-Web.cmd` / `启动-ricow-Web.command`(Linux/macOS 执行 `./启动-ricow-Web.sh`): 它会起本机网页并自动打开浏览器, 见 §5。
 
 **升级方式。** 我们发布的产物里**不含自动更新组件**: 程序不会从网络改写自己, 升级是你主动的动作 —— 下载新的压缩包/msi, 或重跑安装脚本。**不提供** winget / scoop 包; 请用 PowerShell 脚本、msi 或 `.zip`。
 
@@ -90,6 +92,8 @@ binance_secret=***
 demo 与实盘都真实调用交易所接口, 差别只在域名(`demo-api`/`demo-fapi` vs 主网)与凭据, 两套凭据**互不回落**; demo 不适用实盘的两道门(风险确认 / 时长门禁), 因为那两道门保护的是真实资金。
 
 查看状态: `ricow list` / `ricow info <名字>`; 停机: `ricow stop <名字> [--close-all]`(按交易所侧实际结果提示残留挂单/持仓)。
+
+回测常用参数: `--days`(默认 90) / `--interval`(默认 1h) / `--cash`(初始现金, 默认 100000 USDT); 合约类参数 `--leverage` / `--max-leverage` / `--mmr-pct` / `--funding-rate` / `--market` / `--position-mode` 及全部取值见 `ricow backtest --help`。
 
 ### 4. AI 助手(可选)
 

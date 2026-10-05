@@ -23,8 +23,10 @@ pub fn run(args: LogsArgs) -> CoreResult<()> {
     let root = crate::commands::project_root();
     let path = ledger::log_path(&root, &args.name);
     if !path.exists() {
+        // 009: 前台 `ricow run` 的输出只走 stderr, 不落这份文件 —— 报错里如实说明,
+        // 免得用户对着"尚未启动过?"的猜测去找一个永远不会出现的前台日志。
         return Err(CoreError::InvalidArgument(format!(
-            "日志不存在: {} (该策略尚未启动过?)",
+            "日志不存在: {} (daemon 托管(`ricow start`)才落此文件; 前台 `ricow run` 的输出直接在终端, 不落盘)",
             path.display()
         )));
     }

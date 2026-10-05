@@ -67,12 +67,28 @@ pub async fn run(args: DbArgs) -> CoreResult<()> {
         DbCmd::Sync { pair, interval, market } => {
             let interval = interval.unwrap_or_else(|| "1h".into());
             let market = parse_market(market)?;
+            // #010: 与 ticker/backtest 同一份视野校验(默认仅股票类), 不放行越界交易对。
+            crate::commands::pairs::ensure_pair_in_scope(
+                &crate::commands::project_root(),
+                &pair,
+                &market,
+            )
+            .await?;
             let klines = fetch_klines(&market, &pair, &interval, 2000).await?;
             let inserted = db.insert_klines(&market, &pair, &interval, &klines).await.core()?;
             println!(
                 "已同步 {market} {pair} {interval} K 线 {} 根 (新增 {inserted}) → {}",
                 klines.len(),
                 db_path.display()
+            );
+            // #022: 只报根数用户无从判断"是不是全部" —— 如实说明取数口径与更早历史的拉法
+            // (回测按窗口自动向前翻页取数并回填本地缓存, 见 backtest.rs 的分页取数)。
+            println!(
+                "口径: 单次 sync 只拉**最近 {} 根**(单次上限), 不是全部可得历史; 本地库根数直接决定可回测的窗口大小。",
+                klines.len()
+            );
+            println!(
+                "增量: 重复执行按时间戳去重、只补新增; 需要更早的历史时, 用 `ricow backtest --start <日期>` 按窗口自动向前翻页取数(会回填本地缓存, 下次回测即命中)。"
             );
         }
         DbCmd::Stats => {

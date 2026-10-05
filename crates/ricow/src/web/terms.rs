@@ -147,6 +147,11 @@ pub const REPORT_TERMS: &[Term] = &[
         zh: "把策略与「同本金满仓买入持有」并列对照, 从首次成交价同时点同本金起算(建仓前空仓不计)。",
         en: "Places the strategy next to buy-and-hold at the same capital, measured from the first fill price, same moment and same principal (no position before entry).",
     },
+    Term {
+        key: "窗口口径",
+        zh: "回测窗口是「截至运行时刻的最近 N 天」(或显式 start/end)的滑动窗口: 不同时刻重跑, 数字会随窗口滑动而变化, 不可直接比较; 固定 start/end 后结果才可复现。",
+        en: "The backtest window is a sliding one — the most recent N days up to the moment you ran it (or an explicit start/end). Reruns at different times slide the window, so numbers are not directly comparable; fix start/end to make results reproducible.",
+    },
 ];
 
 /// 报告里没有打印、但对话与配置里常出现的术语 (FR-024 点名的那几个)。

@@ -134,7 +134,19 @@ pub(crate) async fn format_table() -> CoreResult<String> {
 
     if names.is_empty() {
         line!(out, "无策略: strategies/ 下无 TOML, 也无实例台账");
-        line!(out, "提示: 部署策略后执行 ricow start <name>, 或先 ricow daemon start");
+        // 018: 空态给「零配置第一步」的入口 —— 新用户拿不到"先跑一次回测"的指引就不知道从哪开始
+        line!(
+            out,
+            "提示: 零配置第一步是回测, 例: ricow backtest --strategy <模板id> --pair <交易对> --days 30"
+        );
+        line!(out, "      (内置模板与中文名见 Web 策略面板或 `ricow ai` 的 list_templates; 交易对视野见 `ricow pairs`)");
+        line!(out, "提示: 回测满意后把策略落成 strategies/<name>.toml (对话内 `ricow create` 或让 AI 写), 再 ricow start <name>");
+        // 017: 前几个命令(list/backtest/ticker)不读也不生成 ricow.toml —— 空态把数据目录如实告知
+        line!(
+            out,
+            "数据目录: {} (密钥配置 ricow.toml 在首次需要时生成)",
+            root.display()
+        );
         return Ok(out);
     }
 
@@ -361,7 +373,18 @@ pub async fn format_info(args: InfoArgs) -> CoreResult<String> {
             Err(e) => line!(out, "资金费: 查询失败 ({e})"),
         }
     }
-    line!(out, "日志: {}", ledger::log_path(&root, &args.name).display());
+    // 009: 只在日志文件真实存在时报路径 —— 前台 `ricow run` 的输出直接在终端, 不落此文件;
+    // 把不存在的路径当成"日志在这"打印出去, 用户会拿着它去 cat 一个空目标。
+    let log_path = ledger::log_path(&root, &args.name);
+    if log_path.exists() {
+        line!(out, "日志: {}", log_path.display());
+    } else {
+        line!(
+            out,
+            "日志: {} (尚无此文件 —— 前台 `ricow run` 的输出直接在终端, 不落盘; 需要 daemon 托管日志请用 `ricow start`)",
+            log_path.display()
+        );
+    }
 
     // 账户快照 (FR-011): 声明实盘的策略(主网) 或 正在 demo 运行的实例(测试网) 从交易所实时查询;
     // 端点与凭据按**模式**取 —— 绝不把 demo key 用到主网、反之亦然; 查询失败如实标注, 不显示陈旧值。

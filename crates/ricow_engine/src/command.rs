@@ -1059,10 +1059,21 @@ impl Engine {
         }
 
         let mut quote_stream = market::subscribe_orderbook(&exchange, &pair).await?;
-        let mut user_stream = exchange
-            .subscribe_user_events()
-            .await
-            .map_err(|e| CoreError::Exchange(format!("实盘启动失败: 订阅用户数据流失败: {e}")))?;
+        // #014: 订阅失败退避重试一次 —— 首启常撞瞬时 DNS/代理抖动(约 30s 内自愈),
+        // 失败即退是正确的安全行为, 但零重试 + glibc 原文报错让一次抖动变成一次假故障。
+        let mut user_stream = match exchange.subscribe_user_events().await {
+            Ok(s) => s,
+            Err(first) => {
+                tracing::warn!(target: "engine", error = %first, "订阅用户数据流失败, 2 秒后重试一次");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                exchange.subscribe_user_events().await.map_err(|e| {
+                    CoreError::Exchange(format!(
+                        "实盘启动失败: 订阅用户数据流失败(已自动重试 1 次, 仍失败): {e} \
+                         —— 多为 DNS 解析失败或网络/代理抖动, 可稍后重试; 持续失败请检查网络与代理(README §6)"
+                    ))
+                })?
+            }
+        };
         // 资金费补拉 (014 FR-003): 启动先补齐历史, 运行期再按 30 分钟增量拉取
         if is_futures {
             if let Some(db) = db {

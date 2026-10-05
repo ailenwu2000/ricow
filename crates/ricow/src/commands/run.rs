@@ -50,6 +50,14 @@ fn daemon_confirmation_accepted(flag: bool, daemon_marked: bool) -> bool {
 }
 
 pub async fn run(args: RunArgs) -> CoreResult<()> {
+    // #015: 读密钥的路径(demo/实盘)与 AI 路径同一份权限提示 —— 只提示不自动改。
+    if args.demo || args.live {
+        if let Some(w) =
+            crate::commands::config_file::permission_warning(&crate::commands::project_root())
+        {
+            eprintln!("提示: {w}");
+        }
+    }
     // daemon 派生链的内部通道: 标志 + daemon 注入的环境变量**两者齐备**才认账。
     // 只认标志的话, 任何人在 shell 里敲 `ricow run <名> --live --live-confirmed` 就能跳过逐字确认,
     // 等于把"每次实盘启动都必须用户逐字确认"这条规则变成一个可绕过的开关。
@@ -71,8 +79,17 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
     let strategies_dir = crate::commands::ensure_strategies_dir()?;
     let config = if strategies_dir.join(format!("{}.toml", args.strategy)).exists() {
         crate::commands::load_strategy_toml(&strategies_dir, &args.strategy)?
-    } else {
+    } else if args.strategy == "lua" || crate::commands::templates::find(&args.strategy).is_some() {
         inline_config(&args).await?
+    } else {
+        // #013: 先校验策略存在性再谈其它先决条件 —— 不存在的名字不能冒出
+        // "需要 --pair" / "daemon 未运行"这种答非所问的错, 要给出期望路径与下一步。
+        return Err(CoreError::InvalidArgument(format!(
+            "策略 {} 不存在: 期望 {} (无此文件), 也不是内置模板 id。\
+             下一步: 用 `ricow list` 查看已部署策略; 用 `ricow create`(或让 AI 写)新建; 内置模板清单见 Web 策略面板。",
+            args.strategy,
+            strategies_dir.join(format!("{}.toml", args.strategy)).display()
+        )));
     };
 
     let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();

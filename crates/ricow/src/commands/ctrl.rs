@@ -72,6 +72,17 @@ pub async fn start(args: StartArgs) -> CoreResult<()> {
             println!("{notice}");
         }
     }
+    // #028: demo 无实盘三判据, 但**凭据可加载**是硬要求 —— 在 CLI 进程内预检,
+    // 缺 [exchange].demo_* 时前台直接失败, 不等子进程秒退后去翻日志才发现。
+    // 配置文件权限提示与 AI 路径同一份 (#015)。
+    if args.demo {
+        if let Some(w) =
+            crate::commands::config_file::permission_warning(&crate::commands::project_root())
+        {
+            eprintln!("提示: {w}");
+        }
+        crate::commands::load_credentials(crate::commands::Mode::Demo)?;
+    }
 
     let (pid, mode) =
         start_daemon(&crate::commands::project_root(), &args.name, args.live, args.demo, args.live)
@@ -94,6 +105,17 @@ pub async fn start(args: StartArgs) -> CoreResult<()> {
     if mode == "live" {
         println!("实盘运行中 (真实资金): 停机用 ricow stop {} [--close-all]", args.name);
     } else if mode == "demo" {
+        // #028: 端点是首屏关键信息 —— 子进程把它打印进日志, 终端看不到; 在前台回显一份。
+        if let Some(cfg) = crate::commands::read_strategy_config(&args.name) {
+            println!(
+                "端点: {}",
+                if cfg.market.eq_ignore_ascii_case("futures") {
+                    crate::commands::DEMO_FAPI_URL
+                } else {
+                    crate::commands::DEMO_SPOT_URL
+                }
+            );
+        }
         println!("测试网模拟盘运行中 (无真实资金): 停机用 ricow stop {} [--close-all]", args.name);
     } else {
         println!("查看状态: ricow status {}", args.name);

@@ -117,7 +117,16 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("错误: {e}");
+        let msg = e.to_string();
+        eprintln!("错误: {msg}");
+        // #016: README §6 承诺的排障路径 —— network error 分支补可复制的连通性检查与代理提示
+        // (国内用户撞到的第一个错通常正是它)。
+        if msg.contains("network error") {
+            eprintln!(
+                "提示: 网络错误时先确认代理是否生效: `curl https://api.binance.com/api/v3/time` 应返回 JSON; \
+                 国内网络通常需设置 HTTPS_PROXY / HTTP_PROXY 环境变量后重试 (见 README §6)。"
+            );
+        }
         std::process::exit(1);
     }
 }

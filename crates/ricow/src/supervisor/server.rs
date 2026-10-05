@@ -147,7 +147,15 @@ impl Server {
         // 策略 TOML 校验 (enabled=false / 解析失败 / 缺脚本在此拒绝), 并取运行元数据
         // 目录与台账/子进程同源(daemon 的 root), 不用进程全局 `strategies_dir()` ——
         // 否则 `RICOW_STATE_ROOT` 之类把 data root 指到别处时, 会拿另一个目录的 TOML 去启动。
+        // #013: 不存在的策略先给出期望路径与下一步, 不冒"读取策略 xxx 失败"的 IO 原文。
         let dir = root.join("strategies");
+        let toml_path = dir.join(format!("{name}.toml"));
+        if !toml_path.exists() {
+            return Response::err(format!(
+                "策略 {name} 不存在: 期望 {} (无此文件)。下一步: `ricow list` 查看已部署策略; 用 `ricow create`(或让 AI 写)新建。",
+                toml_path.display()
+            ));
+        }
         let config = match crate::commands::load_strategy_toml(&dir, name) {
             Ok(c) => c,
             Err(e) => return Response::err(format!("{e}")),
@@ -187,6 +195,29 @@ impl Server {
             Ok(Err(e)) => return Response::err(format!("启动失败: {e}")),
             Err(e) => return Response::err(format!("启动任务失败: {e}")),
         };
+
+        // #028: spawn 后**短等并确认子进程存活**再回报"已启动" —— 缺凭据/坏配置的子进程
+        // 会秒退(stdout/stderr 已重定向到日志, 终端看不见), 不做这一步就会出现
+        // "报成功但进程已死"的假成功, 在实盘语境下是危险信号。
+        // 失败即退出本身是安全行为, 这里只负责让它**前台可见地失败**。
+        let probe = tokio::task::spawn_blocking(move || {
+            let mut h = handle;
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let early_exit = h.child.try_wait().ok().flatten();
+            (h, early_exit)
+        })
+        .await;
+        let (handle, early_exit) = match probe {
+            Ok(v) => v,
+            Err(e) => return Response::err(format!("启动存活校验失败: {e}")),
+        };
+        if let Some(status) = early_exit {
+            return Response::err(format!(
+                "策略 {name} 进程启动后立即退出 (exit={}): 多为凭据缺失或配置错误。\
+                 详情见 logs/{name}.log; demo/实盘需先在 ricow.toml 配好对应凭据。",
+                status.code().map(|c| c.to_string()).unwrap_or_else(|| "非零(信号)".into())
+            ));
+        }
 
         let rec = ledger::InstanceRecord {
             name: name.to_string(),

@@ -28,6 +28,7 @@ pr-run-mode = "skip"
 # crates/ricow/wix/main.wxs and README "Windows — msi"). Paths are relative to
 # this file; no glob support.
 include = [
+    "INSTALL.md",
     "packaging/启动-ricow-AI助手.cmd",
     "packaging/启动-ricow-AI助手.sh",
     "packaging/启动-ricow-AI助手.command",

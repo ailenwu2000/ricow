@@ -62,7 +62,7 @@ pub struct BacktestArgs {
     /// 市价滑点 (bps)
     #[arg(long = "slippage-bps")]
     pub slippage_bps: Option<f64>,
-    /// 初始现金 (quote)
+    /// 初始现金 (quote; 默认 100000, 见内核 BacktestParams::default)
     #[arg(long)]
     pub cash: Option<f64>,
     /// 合约杠杆 (逐仓, 1-10; 超 10x 需 --max-leverage 显式放宽)
@@ -339,6 +339,19 @@ fn load_run_config(
         let mut config = crate::commands::load_strategy_toml(&strategies_dir, strategy)?;
         config.params.extend(overrides);
         return Ok(config);
+    }
+
+    // #020: 错策略名不冒"unsupported strategy" —— 未命中 TOML 且不是可直跑 id(lua/目录内策略)
+    // 时, 如实报不存在并列出可用策略名 (与 --strategy 帮助同源: strategies::catalog)。
+    if strategy != "lua" && crate::commands::templates::find(strategy).is_none() {
+        let mut names = crate::commands::templates::names();
+        names.sort();
+        return Err(CoreError::InvalidArgument(format!(
+            "策略 {strategy} 不存在: strategies/{strategy}.toml 不存在, 也不是内置模板 id。\
+             可用策略({}): {} (说明与参数见 Web 策略面板或 `ricow ai` 的 list_templates)",
+            names.len(),
+            names.join(", ")
+        )));
     }
 
     // 直跑模式: 只传运行环境信息(pair)与 lua 脚本; 参数全部由 Lua 自己的 fallback 默认决定。
@@ -691,6 +704,9 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
         config.params.insert("pair".into(), ConfigValue::String(pair));
     }
     let pair = config.get_str("pair").unwrap().to_string();
+    // #010: 默认只接受视野内交易对(默认仅股票类, [market] show_all_pairs 放开)。
+    // 越界与拼错都在拉 K 线**之前**拒绝 —— 不给交易所原始 400 报文 (#20 的 pair 分支)。
+    crate::commands::pairs::ensure_pair_in_scope(&spec.root, &pair, &config.market).await?;
     // 数据源分支 (三层配置的 market 决定, specs/backtest.md §五): 合约用 fapi 公共数据源,
     // 现货沿用交易所客户端。K 线 JSON 同构, 直接喂同一回测引擎。
     // 分页取数 (2026-09-22, 030): 币安 K 线**单次请求上限 1000 根** —— 超过必须向前翻页拼接,

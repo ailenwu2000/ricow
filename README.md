@@ -20,6 +20,8 @@ Prebuilt self-contained archives are published on the [releases page](https://gi
 curl -LsSf https://github.com/ailenwu2000/ricow/releases/latest/download/ricow-installer.sh | sh
 ```
 
+Open a **new terminal** after installing so the refreshed `PATH` is picked up; if `ricow` is still not found, check that the install directory (default `~/.cargo/bin`) is on your `PATH`. The same applies to the PowerShell installer.
+
 **Windows — PowerShell installer**
 
 ```powershell
@@ -41,7 +43,7 @@ There is **no tap** yet, so `brew install ricow` does not work: the formula itse
 
 **Any platform — manual archive**
 
-Download the archive matching your platform, extract it, and run `./ricow` (Windows: `ricow.exe`). Every archive also carries a launcher for the built-in assistant: `启动-ricow-AI助手.cmd` on Windows (double-click it; it switches the console to UTF-8, which is what keeps the Chinese output readable), `启动-ricow-AI助手.sh` on Linux/macOS (`./启动-ricow-AI助手.sh`), and `启动-ricow-AI助手.command` on macOS, which is the same thing in a double-clickable wrapper. The launchers go through ricow's bare entry point, so the first run asks you *in the conversation* for the provider and the API key (typed silently, never echoed) and writes them into `ricow.toml` — no environment variable to set beforehand. For the web version, double-click `启动-ricow-Web.cmd` / `启动-ricow-Web.command` (`./启动-ricow-Web.sh` on Linux/macOS) instead: it starts the local web page and opens your browser — see §5.
+Download the archive matching your platform, extract it, and run `./ricow` (Windows: `ricow.exe`). Note: the binary sits **inside a nested directory** named after the archive (the standard `cargo-dist` layout) — that is expected. See [INSTALL.md](INSTALL.md) for a from-zero, prebuilt-user-oriented guide (where to put the binary and how to start). Every archive also carries a launcher for the built-in assistant: `启动-ricow-AI助手.cmd` on Windows (double-click it; it switches the console to UTF-8, which is what keeps the Chinese output readable), `启动-ricow-AI助手.sh` on Linux/macOS (`./启动-ricow-AI助手.sh`), and `启动-ricow-AI助手.command` on macOS, which is the same thing in a double-clickable wrapper. The launchers go through ricow's bare entry point, so the first run asks you *in the conversation* for the provider and the API key (typed silently, never echoed) and writes them into `ricow.toml` — no environment variable to set beforehand. For the web version, double-click `启动-ricow-Web.cmd` / `启动-ricow-Web.command` (`./启动-ricow-Web.sh` on Linux/macOS) instead: it starts the local web page and opens your browser — see §5.
 
 **Updates.** Nothing we ship contains an auto-updater: the app never rewrites itself from the network, so upgrading is your explicit action — download the newer archive/msi or re-run the installer. `winget` and `scoop` packages are **not** provided; use the PowerShell installer, the msi, or the `.zip`.
 
@@ -88,6 +90,8 @@ binance_secret=***
 demo and live both hit the real exchange API — they differ only in domain (`demo-api`/`demo-fapi` vs mainnet) and credentials, and the two credential sets **never fall back to each other**. The two live-only gates (risk acknowledgement / minimum Dry Run duration) do not apply to demo, because they protect real money.
 
 Inspect: `ricow list` / `ricow info <name>`; stop: `ricow stop <name> [--close-all]` (residual open orders / positions are reported from the exchange's actual state).
+
+Common backtest flags: `--days` (default 90) / `--interval` (default 1h) / `--cash` (initial cash, default 100000 USDT). Futures-specific flags (`--leverage` / `--max-leverage` / `--mmr-pct` / `--funding-rate` / `--market` / `--position-mode`) and all accepted values: see `ricow backtest --help`.
 
 ### 4. Built-in AI assistant (optional)
 
