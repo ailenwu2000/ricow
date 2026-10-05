@@ -71,20 +71,16 @@ pub fn run(args: NewArgs) -> CoreResult<()> {
         }
         overrides.insert(k, v);
     }
-    let pair = match overrides.remove("pair").or_else(|| {
-        args.pair
-            .clone()
-            .map(ConfigValue::String)
-            .or_else(|| template_default(&entry, "pair"))
-    }) {
-        Some(ConfigValue::String(s)) if !s.is_empty() => s,
-        _ => {
-            return Err(CoreError::InvalidArgument(
+    let pair =
+        match overrides.remove("pair").or_else(|| {
+            args.pair.clone().map(ConfigValue::String).or_else(|| template_default(&entry, "pair"))
+        }) {
+            Some(ConfigValue::String(s)) if !s.is_empty() => s,
+            _ => return Err(CoreError::InvalidArgument(
                 "缺少交易对: 请用 --pair <pair> 指定 (现货形如 TSLABUSDT, 视野见 `ricow pairs`)"
                     .into(),
-            ))
-        }
-    };
+            )),
+        };
 
     let mut missing: Vec<String> = Vec::new();
     let mut params: HashMap<String, ConfigValue> = HashMap::new();
@@ -93,15 +89,12 @@ pub fn run(args: NewArgs) -> CoreResult<()> {
         if p.key == "pair" {
             continue; // 已由上面合并, 不重复放默认值盖掉用户选择
         }
-        let value = overrides
-            .remove(&p.key)
-            .or_else(|| p.default.clone())
-            .or_else(|| {
-                if p.required {
-                    missing.push(p.key.clone());
-                }
-                None
-            });
+        let value = overrides.remove(&p.key).or_else(|| p.default.clone()).or_else(|| {
+            if p.required {
+                missing.push(p.key.clone());
+            }
+            None
+        });
         if let Some(v) = value {
             params.insert(p.key.clone(), v);
         }
@@ -166,7 +159,10 @@ pub fn run(args: NewArgs) -> CoreResult<()> {
     println!("  {}", out.toml_path.display());
     println!("  {}", out.lua_path.display());
     println!("  {} (参数清单)", manifest_path.display());
-    println!("[backtest] 段已固化该策略的回测默认 ({} 口径), 按需修改只影响这一个策略。", entry.manifest.market);
+    println!(
+        "[backtest] 段已固化该策略的回测默认 ({} 口径), 按需修改只影响这一个策略。",
+        entry.manifest.market
+    );
     println!("下一步:");
     println!(
         "  1) 回测验证: ricow backtest --strategy {} --days 30 (TOML 里已带 pair 与回测参数)",
@@ -181,12 +177,7 @@ fn template_default(
     entry: &crate::strategies::catalog::CatalogEntry,
     key: &str,
 ) -> Option<ConfigValue> {
-    entry
-        .manifest
-        .params
-        .iter()
-        .find(|p| p.key == key)
-        .and_then(|p| p.default.clone())
+    entry.manifest.params.iter().find(|p| p.key == key).and_then(|p| p.default.clone())
 }
 
 #[cfg(test)]

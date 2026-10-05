@@ -94,6 +94,17 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
 
     let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();
 
+    // demo 凭据先校验(快速失败): 视野快照要走网络, 凭据缺失不该先打网络 ——
+    // ai_live_smoke::run_demo_without_credentials_fails_fast 固化的契约。
+    if args.demo {
+        if args.live {
+            return Err(CoreError::InvalidArgument(
+                "--demo 与 --live 不能同时使用: demo 是测试网模拟盘, --live 是主网真实资金".into(),
+            ));
+        }
+        crate::commands::load_credentials(crate::commands::Mode::Demo)?;
+    }
+
     // #025: 交易路径(Dry Run/demo/实盘)同样受交易对视野约束 —— 与回测/查询**同源判定**
     // (ensure_pair_in_scope → build_view), 避免"列表里看不见却下得出去"。
     // 快照拉取失败时 warn 放行(不阻断交易主流程), 与回测路径同一降级语义。
@@ -131,13 +142,7 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
     // 因此实盘三判据里的 018 风险确认与 002 Dry Run 时长门禁**不适用**(它们保护的是真实资金);
     // demo 凭据与时钟预检仍是硬要求, 且打印时绝不把它说成实盘。
     if args.demo {
-        if args.live {
-            return Err(CoreError::InvalidArgument(
-                "--demo 与 --live 不能同时使用: demo 是测试网模拟盘, --live 是主网真实资金".into(),
-            ));
-        }
-        // 凭据先校验(快速失败): 缺 demo key 时不应先打印"启动策略"
-        crate::commands::load_credentials(crate::commands::Mode::Demo)?;
+        // 凭据已在视野校验前快速失败(见上); 这里只做时钟预检
         // FR-008 时钟预检走共享内核 (与实盘同一份判定, 只换服务器: demo 端点)
         let skew_ms =
             crate::commands::ctrl::clock_gate_shared(&config.market, crate::commands::Mode::Demo)

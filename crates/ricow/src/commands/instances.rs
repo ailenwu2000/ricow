@@ -142,11 +142,7 @@ pub(crate) async fn format_table() -> CoreResult<String> {
         line!(out, "      (内置模板与中文名见 Web 策略面板或 `ricow ai` 的 list_templates; 交易对视野见 `ricow pairs`)");
         line!(out, "提示: 回测满意后把策略落成 strategies/<name>.toml (对话内 `ricow create` 或让 AI 写), 再 ricow start <name>");
         // 017: 前几个命令(list/backtest/ticker)不读也不生成 ricow.toml —— 空态把数据目录如实告知
-        line!(
-            out,
-            "数据目录: {} (密钥配置 ricow.toml 在首次需要时生成)",
-            root.display()
-        );
+        line!(out, "数据目录: {} (密钥配置 ricow.toml 在首次需要时生成)", root.display());
         return Ok(out);
     }
 
