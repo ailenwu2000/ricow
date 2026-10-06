@@ -160,9 +160,31 @@ fn is_state_changing(method: &Method) -> bool {
 /// 为什么"两者都没有也放行": 浏览器对 `POST` 一定会带 `Origin`(表单 / fetch / XHR 皆然),
 /// 所以缺失就意味着请求**不是浏览器发的** —— 那是 `curl` / 脚本 / 本仓库自己的测试,
 /// 它们没有"被第三方页面借用身份"的风险。真正要拦的是**带外站 Origin 的浏览器请求**。
+///
+/// 审计 中危 #14 加的两道纵深 (在 Origin 门之外, **只对写方法生效**, 保持 `curl`/脚本可用):
+/// - `Sec-Fetch-Site` 若非 `same-origin`/`none` → 拒。浏览器保证这个头**页面无法伪造**,
+///   是比 Origin 更硬的一道; 缺失(非浏览器)不拦。
+/// - `Host` 校验 → 见 [`host_allowed`]: 挡 DNS rebinding —— 攻击者把域名解析到 127.0.0.1
+///   时, 页面是外站、但请求打在本机端口上; 此前只剩 token 一道防线。
 fn origin_allowed(req: &Request) -> bool {
     if !is_state_changing(req.method()) {
         return true;
+    }
+    // 纵深 1: 浏览器自己标注的跨站来源。`Sec-Fetch-Site` 由浏览器写入且页面 JS 改不了,
+    // 值只可能是 same-origin / same-site / cross-site / none。none = 用户直接输入地址等,
+    // 不是被第三方页面借来的; cross-site / same-site(同站不同源, 例如其它端口的兄弟站点)
+    // 一律拒。
+    if let Some(site) = req.headers().get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        let site = site.trim().to_ascii_lowercase();
+        if !matches!(site.as_str(), "same-origin" | "none") {
+            return false;
+        }
+    }
+    // 纵深 2: Host 必须是回环权威(DNS rebinding 防线); 缺失(HTTP/1.0 风格脚本)不拦。
+    if let Some(host) = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()) {
+        if !host_allowed(host) {
+            return false;
+        }
     }
     for name in [header::ORIGIN, header::REFERER] {
         if let Some(value) = req.headers().get(&name).and_then(|v| v.to_str().ok()) {
@@ -172,6 +194,23 @@ fn origin_allowed(req: &Request) -> bool {
         }
     }
     true
+}
+
+/// `Host` 头是否指向回环: `127.0.0.1[:port]` / `localhost[:port]` / `[::1][:port]`。
+///
+/// DNS rebinding 的攻击面: 攻击者控制的域名解析到 127.0.0.1, 用户浏览器因此**同源**地
+/// 请求本机服务 —— 此时 `Host` 会是那个域名(浏览器按 URL 填), Origin 也是外站(已被
+/// [`is_loopback_origin`] 拦下)。Host 校验是同一事实的第二处独立确认: 本服务只监听回环,
+/// 正常访问的 Host 必然也是回环, 所以拒绝非回环 Host 不会误伤任何合法用法。
+fn host_allowed(host: &str) -> bool {
+    let host = host.trim();
+    // 去掉端口: IPv6 是 `[::1]:port`, 其余按最后一个 `:` 切(空串也算无端口)。
+    let bare = if let Some(tail) = host.strip_prefix('[') {
+        tail.split(']').next().unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    matches!(bare.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1")
 }
 
 /// `http(s)://<loopback>[:port][/...]` → true; 其余(含 `Origin: null` 的不透明来源) → false。
@@ -346,5 +385,56 @@ mod tests {
             "/api/x",
             &[("origin", "http://evil.example"), ("referer", "http://127.0.0.1:8787/")]
         )));
+    }
+
+    /// 审计 中危 #14 纵深 1: `Sec-Fetch-Site` 由浏览器写入、页面 JS 改不了,
+    /// 非 `same-origin`/`none` 的写请求一律拒。
+    #[test]
+    fn test_sec_fetch_site_blocks_cross_site_writes() {
+        // cross-site / same-site → 拒(即便 Origin 伪装成回环也拦得住)。
+        for bad in ["cross-site", "same-site", "CROSS-SITE"] {
+            assert!(
+                !origin_allowed(&req(
+                    "POST",
+                    "/api/x",
+                    &[("sec-fetch-site", bad), ("origin", "http://127.0.0.1:8787")]
+                )),
+                "sec-fetch-site: {bad} 的写请求必须拒"
+            );
+        }
+        // same-origin / none → 放行(none = 用户直接访问, 不是被页面借来的)。
+        for ok in ["same-origin", "none"] {
+            assert!(
+                origin_allowed(&req(
+                    "POST",
+                    "/api/x",
+                    &[("sec-fetch-site", ok), ("origin", "http://127.0.0.1:8787")]
+                )),
+                "sec-fetch-site: {ok} 应放行"
+            );
+        }
+        // 缺失(非浏览器: curl / 脚本) → 不拦; 读方法也不受这道门约束。
+        assert!(origin_allowed(&req("POST", "/api/x", &[])));
+        assert!(origin_allowed(&req("GET", "/api/x", &[("sec-fetch-site", "cross-site")])));
+    }
+
+    /// 审计 中危 #14 纵深 2: Host 校验挡 DNS rebinding。
+    #[test]
+    fn test_host_header_must_be_loopback() {
+        for ok in
+            ["127.0.0.1", "127.0.0.1:8787", "localhost", "localhost:8787", "[::1]:8787", "[::1]"]
+        {
+            assert!(host_allowed(ok), "Host: {ok} 应判为回环");
+        }
+        for bad in
+            ["evil.example", "127.0.0.1.evil.example", "example.com:8787", "10.0.0.5:8787", ""]
+        {
+            assert!(!host_allowed(bad), "Host: {bad} 不得判为回环");
+        }
+        // 写方法 + 外站 Host → 拒(rebinding); 读方法不设限。
+        assert!(!origin_allowed(&req("POST", "/api/x", &[("host", "evil.example")])));
+        assert!(origin_allowed(&req("GET", "/api/x", &[("host", "evil.example")])));
+        // 无 Host(HTTP/1.0 风格) → 不拦, 保持脚本可用。
+        assert!(origin_allowed(&req("POST", "/api/x", &[])));
     }
 }

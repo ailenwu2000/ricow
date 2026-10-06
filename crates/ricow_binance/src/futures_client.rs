@@ -64,7 +64,7 @@ impl fmt::Debug for FuturesClient {
 impl FuturesClient {
     /// 主网无凭据客户端 (只读账户类端点不可用; 主要用于对称测试/未来扩展)。
     pub fn new() -> CoreResult<Self> {
-        let http = build_http()?;
+        let http = crate::client::shared_http().map_or_else(build_http, Ok)?;
         // 域名可配置 (代理/测试环境): RICOW_FAPI_BASE_URL 覆盖, 缺省主网。
         let env = std::env::var("RICOW_FAPI_BASE_URL").ok();
         let base_url = env.clone().unwrap_or_else(|| FAPI_MAINNET_REST.to_string());
@@ -81,7 +81,7 @@ impl FuturesClient {
         secret_key: String,
         base_url: Option<String>,
     ) -> CoreResult<Self> {
-        let http = build_http()?;
+        let http = crate::client::shared_http().map_or_else(build_http, Ok)?;
         let base_url = match base_url {
             Some(u) => u,
             None => {

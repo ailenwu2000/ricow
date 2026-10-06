@@ -642,6 +642,29 @@ impl Database {
         Ok(count)
     }
 
+    /// 清理过期的 K 线缓存 (审计 资源-4): 删除 `open_time` 早于 `cutoff_ms` 的行, 返回删除行数。
+    ///
+    /// K 线表只增不删, 长期磁盘缓慢膨胀; 它是**只读缓存**(数据随时可从交易所重新拉),
+    /// 因此可以安全过期。保留期由调用方给(见 `commands` 侧常量), 在启动/回测取数时顺手清理。
+    /// 用 `open_time < cutoff` 而非按行数截断: 保留期语义与"多旧的数据没用了"直接对应,
+    /// 且逐 interval 独立成立(15m 与 1d 的保留期一致, 不因粒度不同而互相挤掉)。
+    pub async fn prune_klines(&self, cutoff_ms: i64) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query("DELETE FROM klines WHERE open_time < ?")
+            .bind(cutoff_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 清理过期的美股日线缓存 (审计 资源-4): 同 [`Self::prune_klines`] 口径。
+    pub async fn prune_us_klines(&self, cutoff_ms: i64) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query("DELETE FROM us_klines WHERE open_time < ?")
+            .bind(cutoff_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
     // ---- 美股日线 (us_klines, Nasdaq 信号数据源) ----
 
     /// 插入或忽略一条美股日线 (主键 = ticker+interval+open_time, 增量去重)。
@@ -1570,6 +1593,42 @@ mod tests {
         let fut = db.get_klines("futures", "ETH", "1m", 10).await.unwrap();
         assert_eq!(fut.len(), 1, "合约与现货互不覆盖");
         assert_eq!(db.kline_count().await.unwrap(), 3);
+    }
+
+    /// 审计 资源-4: 过期 K 线被清理, 未过期的保留; 返回删除行数。
+    #[tokio::test]
+    async fn test_prune_klines_removes_only_expired() {
+        let db = Database::open_in_memory().await.unwrap();
+        // 旧数据 (open_time = 1000 / 2000) 与 新数据 (open_time = 1_000_000)。
+        db.insert_kline("spot", "ETH", "1m", &sample_kline(1000)).await.unwrap();
+        db.insert_kline("spot", "ETH", "1m", &sample_kline(2000)).await.unwrap();
+        db.insert_kline("spot", "ETH", "1m", &sample_kline(1_000_000)).await.unwrap();
+        assert_eq!(db.kline_count().await.unwrap(), 3);
+
+        // cutoff 落在旧新之间 → 只删旧的 2 行。
+        let removed = db.prune_klines(500_000).await.unwrap();
+        assert_eq!(removed, 2, "只删早于 cutoff 的行");
+        assert_eq!(db.kline_count().await.unwrap(), 1);
+
+        // 新数据仍在, 且数据完整可读。
+        let left = db.get_klines("spot", "ETH", "1m", 10).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].open_time.timestamp_millis(), 1_000_000);
+
+        // cutoff 更早 → 一条都不删 (幂等/不误伤)。
+        assert_eq!(db.prune_klines(0).await.unwrap(), 0);
+    }
+
+    /// 审计 资源-4: 美股日线缓存同样可按时间过期。
+    #[tokio::test]
+    async fn test_prune_us_klines_removes_only_expired() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.insert_us_kline("AAPL", &sample_kline(1000)).await.unwrap();
+        db.insert_us_kline("AAPL", &sample_kline(1_000_000)).await.unwrap();
+
+        let removed = db.prune_us_klines(500_000).await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(db.get_us_klines("AAPL", 10).await.unwrap().len(), 1);
     }
 
     /// 035 回归: 「开池 → 关池 → 立刻再开」是预览/确认链路的标准节奏, 不得因

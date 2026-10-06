@@ -171,6 +171,10 @@ impl LogTail {
         let mut out = Vec::new();
         if got.rotated {
             // D13: 轮转/截断后不许静默跳读 —— 先如实说一句, 再给重读到的内容。
+            //
+            // 注意: `supervisor::procs::rotate_large_log` 用的是"保留末尾窗口"而不是
+            // 直接截空, 所以它**不会**让文件变短、不会把这里推成 rotated; 走到这里的是
+            // 真·截断/清空(人工操作或异常)。
             out.push(LogEvent {
                 kind: "rotated",
                 text: t(

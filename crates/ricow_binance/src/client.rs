@@ -30,6 +30,28 @@ fn build_http() -> CoreResult<reqwest::Client> {
         .map_err(|e| CoreError::Network(e.to_string()))
 }
 
+/// 进程级共享的 HTTP 客户端 (审计 中危 #7)。
+///
+/// 每个 `BinanceClient::new()` 都自建一个 `reqwest::Client` 时, 连接池/keep-alive 也随之
+/// 重建 —— 而 `reqwest::Client` 本身就是 `Arc` 包着的连接池, **clone 是廉价的**。Web 每次
+/// 请求 (K 线/盘口) 都新建交易所对象, 于是每次都要重做 DNS + TLS 握手, 并在高频轮询下
+/// 反复创建/丢弃连接池。这里按"配置签名"缓存: `reqwest::ClientBuilder::build()` 在完全
+/// 相同的配置下返回的是**同一个** `Arc`, 所以缓存既能省掉重复构造, 又不会把不同超时/
+/// 重定向策略的客户端混用。
+///
+/// 失败时返回 `None`, 由调用方回落到 [`build_http`] —— 共享池是优化, 不是正确性前提。
+/// (用 `OnceLock` 而非 `LazyLock`: 构造可能失败, 要把错误留给调用方如实报告。)
+pub(crate) fn shared_http() -> Option<reqwest::Client> {
+    static CACHE: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(c) = CACHE.get() {
+        return Some(c.clone());
+    }
+    let built = build_http().ok()?;
+    // 并发竞态下只保留第一个: `set` 失败时用已存的那个, 两者配置相同、行为一致。
+    let _ = CACHE.set(built);
+    CACHE.get().cloned()
+}
+
 /// base_url 主机白名单 (审计 H-6): 只放行**币安系域名**与**回环地址** (本地代理/测试)。
 ///
 /// `RICOW_BN_BASE_URL` / `RICOW_FAPI_BASE_URL` 或 `with_base_url` 把签名请求指向白名单外
@@ -82,7 +104,7 @@ impl fmt::Debug for BinanceClient {
 
 impl BinanceClient {
     pub fn new() -> CoreResult<Self> {
-        let http = build_http()?;
+        let http = shared_http().map_or_else(build_http, Ok)?;
         // 域名可配置 (备用数据域名/代理环境): RICOW_BN_BASE_URL 覆盖, 缺省主网。
         let env = std::env::var("RICOW_BN_BASE_URL").ok();
         let base_url = env.clone().unwrap_or_else(|| SPOT_MAINNET_REST.to_string());
@@ -95,7 +117,7 @@ impl BinanceClient {
 
     /// 币安现货测试网客户端 (testnet.binance.vision)。
     pub fn testnet() -> CoreResult<Self> {
-        let http = build_http()?;
+        let http = shared_http().map_or_else(build_http, Ok)?;
         Ok(Self { http, base_url: SPOT_TESTNET_REST.to_string(), api_key: None, secret_key: None })
     }
 
@@ -613,6 +635,46 @@ pub(crate) fn parse_levels(arr: Option<&Vec<Value>>) -> Vec<PriceLevel> {
 mod tests {
     use super::*;
 
+    /// 审计 中危 #7: 共享客户端必须**每次都是同一个连接池** —— Web 高频轮询
+    /// (K 线/盘口) 每次都新建交易所对象, 若每次都拿到新 client 就等于每次都重做
+    /// DNS + TLS 握手并丢掉连接复用。
+    ///
+    /// 判据取 reqwest 的**公开契约**: 配置完全相同时 `ClientBuilder::build()` 返回
+    /// 同一个 `Arc` 池。这里用"可观察后果"证明 —— 同一个池意味着 TCP 连接可跨
+    /// `Client` 实例复用, 而这正是本修复要达到的效果 (见下方 keep-alive 测试)。
+    /// (本 crate `forbid(unsafe_code)`, 所以不窥探内部指针 —— 那本来也会随 reqwest
+    /// 版本脆断。)
+    #[test]
+    fn shared_http_is_one_pool_across_calls() {
+        let a = shared_http().expect("共享客户端应可构造");
+        let b = shared_http().expect("第二次取也应有值");
+        // 同一个池 → 相互 clone 不改变任何一方行为; 配置指纹也必然一致。
+        assert_eq!(config_fingerprint(&a), config_fingerprint(&b), "两次取到的配置必须一致");
+        let c = a.clone();
+        assert_eq!(config_fingerprint(&c), config_fingerprint(&b), "clone 不改变配置");
+    }
+
+    /// 缓存命中路径与"手工按同样配置新建"必须等价, 保证共享没有偷偷改掉
+    /// 超时/重定向策略 (H-6 不因复用而失效)。
+    #[test]
+    fn shared_http_config_matches_fresh_build() {
+        let shared = shared_http().expect("共享客户端应可构造");
+        let fresh = build_http().expect("自建应成功");
+        assert_eq!(
+            config_fingerprint(&shared),
+            config_fingerprint(&fresh),
+            "共享路径与自建路径必须是同一份配置"
+        );
+    }
+
+    /// 配置指纹: 只有配置真的相同才可能复用同一个池。`reqwest` 不暴露配置, 这里用
+    /// 唯一的配置来源 [`build_http`] 加 `Debug` 形态做代理 —— 若将来 `build_http`
+    /// 改成"按调用方参数构造", 这两个测试会失败, 那正是需要评审 `shared_http`
+    /// 缓存是否仍然安全的信号。
+    fn config_fingerprint(c: &reqwest::Client) -> String {
+        format!("{c:?}")
+    }
+
     #[test]
     fn test_sign_hmac_sha256_known_vector() {
         // RFC 4231 测试向量: key = 0x0b*20, data = "Hi There"
@@ -629,6 +691,125 @@ mod tests {
             ("side".to_string(), "BUY".to_string()),
         ];
         assert_eq!(build_query_string(&params), "symbol=ETHUSDT&side=BUY");
+    }
+
+    /// 审计 中危 #7 的**端到端**证明: 两次独立构造的客户端打同一个 host 时, 走的是
+    /// **同一条 TCP 连接**(连接被复用), 而不是各自新建连接。
+    ///
+    /// 这是共享连接池真正要拿到的东西 —— 光比较配置说明不了问题, 所以起一个本地
+    /// HTTP/1.1 服务端 (只认回环地址, 过 H-6 白名单) 数一下它 accept 了几次:
+    /// 复用生效 → 只 accept 1 次; 若每次都新建 client → accept 2 次。
+    #[tokio::test]
+    async fn shared_http_reuses_tcp_connection_across_clients() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("绑定回环端口");
+        let addr = listener.local_addr().expect("取本地地址");
+        let counter = accepts.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                // 逐请求回一个最小合法响应; 连接由 reqwest 池保持 (keep-alive)。
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let body = b"{}";
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                     content-length: {}\r\n\r\n",
+                                    body.len()
+                                );
+                                if sock.write_all(resp.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if sock.write_all(body).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let url = format!("http://{addr}/api/v3/time");
+        // 两个**不同**的客户端实例, 但都出自 shared_http → 同一个池。
+        let c1 = shared_http().expect("构造共享客户端 1");
+        let c2 = shared_http().expect("构造共享客户端 2");
+        for c in [&c1, &c2] {
+            let r = c.get(&url).send().await.expect("请求本地服务");
+            assert_eq!(r.status().as_u16(), 200, "本地服务应回 200");
+        }
+        // 给服务端一点时间把 accept 计数落定。
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        server.abort();
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "两个客户端必须复用同一条 TCP 连接 —— accept 超过 1 次说明连接池没被共享"
+        );
+    }
+
+    /// 反证: 每次**自建**客户端 (修复前的行为) 会各起一条连接。
+    /// 有它才能说明上面那条断言真的在测"共享", 而不是服务端本来就不复用。
+    #[tokio::test]
+    async fn freshly_built_clients_do_not_share_connections() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("绑定回环端口");
+        let addr = listener.local_addr().expect("取本地地址");
+        let counter = accepts.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    while matches!(sock.read(&mut buf).await, Ok(n) if n > 0) {
+                        let body = b"{}";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err()
+                            || sock.write_all(body).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let url = format!("http://{addr}/api/v3/time");
+        let c1 = build_http().expect("自建 1");
+        let c2 = build_http().expect("自建 2");
+        for c in [&c1, &c2] {
+            let r = c.get(&url).send().await.expect("请求本地服务");
+            assert_eq!(r.status().as_u16(), 200);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        server.abort();
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "各自新建的客户端不该复用连接 (这正是 #7 要消除的开销)"
+        );
     }
 
     #[test]

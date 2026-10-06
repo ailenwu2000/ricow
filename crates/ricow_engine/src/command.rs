@@ -155,24 +155,38 @@ enum LiveEvent {
 /// 拉取资金费流水并落库 (014 FR-003): 水位 = db `MAX(funding_time)`(无记录则回溯 `FUNDING_LOOKBACK_MS`)。
 ///
 /// 资金费是**事后对账**, 不参与下单决策 —— 失败只 warn, 绝不中断交易循环。返回新插入条数。
+///
+/// 审计 中危 #16: 失败上报口径与 `persist_order_ack` / `persist_fill_facts` **对齐** ——
+/// `error` 级日志 + `outcome.persist_errors` 计数 + `outcome.last_error`。
+/// 原来三处失败都只 `warn` + `return 0`, 结果是**持续失败没有任何升级、用户侧不可见**:
+/// 资金费流水静默缺失, 而 PnL 归因(净盈亏/费用)看着照常"成功"。资金费漏记正是"看着盈利、
+/// 实际被资金费吃掉"的经典成因, 因此必须让它在 `RunOutcome` 里留痕(退出时可如实报告),
+/// 而不是只躺在日志里。
 async fn poll_funding_income(
     exchange: &Arc<dyn Exchange>,
     db: &Database,
     strategy_name: &str,
+    outcome: &mut RunOutcome,
 ) -> u64 {
     let start = match db.latest_funding_time().await {
         // 减 1ms 避免与已入库的同一条重复请求 (落库本身幂等, 这里只是省一次往返)
         Ok(Some(t)) => t.saturating_sub(1),
         Ok(None) => Utc::now().timestamp_millis() - FUNDING_LOOKBACK_MS,
         Err(e) => {
-            tracing::warn!(target: "engine", name = %strategy_name, "资金费水位查询失败: {e}");
+            outcome.persist_errors += 1;
+            let msg = e.to_string();
+            tracing::error!(target: "engine", name = %strategy_name, "资金费水位查询失败: {msg}");
+            outcome.last_error = Some(format!("资金费水位查询失败: {msg}"));
             return 0;
         }
     };
     let rows = match exchange.funding_income(start, 1000).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(target: "engine", name = %strategy_name, "资金费拉取失败: {e}");
+            outcome.persist_errors += 1;
+            let msg = e.to_string();
+            tracing::error!(target: "engine", name = %strategy_name, "资金费拉取失败: {msg}");
+            outcome.last_error = Some(format!("资金费拉取失败: {msg}"));
             return 0;
         }
     };
@@ -182,7 +196,10 @@ async fn poll_funding_income(
             Ok(true) => inserted += 1,
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(target: "engine", name = %strategy_name, "资金费落库失败: {e}")
+                outcome.persist_errors += 1;
+                let msg = e.to_string();
+                tracing::error!(target: "engine", name = %strategy_name, "资金费落库失败: {msg}");
+                outcome.last_error = Some(format!("资金费落库失败: {msg}"));
             }
         }
     }
@@ -1086,7 +1103,7 @@ impl Engine {
         // 资金费补拉 (014 FR-003): 启动先补齐历史, 运行期再按 30 分钟增量拉取
         if is_futures {
             if let Some(db) = db {
-                let n = poll_funding_income(&exchange, db, &strategy_name).await;
+                let n = poll_funding_income(&exchange, db, &strategy_name, &mut outcome).await;
                 if n > 0 {
                     tracing::info!(target: "engine", name = %strategy_name, inserted = n, "启动补拉资金费流水");
                 }
@@ -1144,7 +1161,9 @@ impl Engine {
                 LiveEvent::Funding => {
                     if is_futures {
                         if let Some(db) = db {
-                            let n = poll_funding_income(&exchange, db, &strategy_name).await;
+                            let n =
+                                poll_funding_income(&exchange, db, &strategy_name, &mut outcome)
+                                    .await;
                             if n > 0 {
                                 tracing::info!(target: "engine", name = %strategy_name, inserted = n, "资金费流水增量入库");
                             }
@@ -1359,7 +1378,7 @@ impl Engine {
         // 停机前再拉一次资金费 (014 FR-003): 覆盖停机瞬间前的最后一笔结算
         if is_futures {
             if let Some(db) = db {
-                let n = poll_funding_income(&exchange, db, &strategy_name).await;
+                let n = poll_funding_income(&exchange, db, &strategy_name, &mut outcome).await;
                 if n > 0 {
                     tracing::info!(target: "engine", name = %strategy_name, inserted = n, "停机前补拉资金费流水");
                 }
@@ -1652,6 +1671,91 @@ mod tests {
     use super::*;
     use ricow_core::Kline;
     use rust_decimal_macros::dec;
+
+    /// 审计 中危 #16 回归用的最小替身交易所: 只覆盖 `funding_income` 一个行为 ——
+    /// 按 `fail` 开关返回 Err 或空表, 其余方法一律 `unimplemented!`(本用例不会触达)。
+    ///
+    /// (这是**纯逻辑**单测: 校验的是"失败如何计数/上报"这段本地分支, 不涉任何交易流程,
+    /// 因此不违反"交易流程禁 mock"的纪律 —— 那条纪律针对真实调用路径。)
+    struct FundingStubExchange {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Exchange for FundingStubExchange {
+        fn name(&self) -> &'static str {
+            "funding-stub"
+        }
+        async fn funding_income(
+            &self,
+            _start_ms: i64,
+            _limit: u32,
+        ) -> CoreResult<Vec<ricow_core::FundingIncome>> {
+            if self.fail {
+                Err(CoreError::Network("stub: 资金费端点不可用".into()))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        async fn get_markets(&self) -> CoreResult<Vec<ricow_core::Market>> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+        async fn get_klines(&self, _p: &str, _i: &str, _l: u32) -> CoreResult<Vec<Kline>> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+        async fn get_orderbook(&self, _p: &str, _d: u32) -> CoreResult<ricow_core::OrderBook> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+        async fn place_order(&self, _req: ricow_core::OrderRequest) -> CoreResult<OrderAck> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+        async fn cancel_order(&self, _p: &str, _id: &str) -> CoreResult<()> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+        async fn get_open_orders(&self, _p: &str) -> CoreResult<Vec<ricow_core::OrderInfo>> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+        async fn get_balance(&self, _asset: &str) -> CoreResult<Balance> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+        async fn get_position(&self, _p: &str) -> CoreResult<Option<Position>> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+        async fn subscribe_orderbook(
+            &self,
+            _p: &str,
+        ) -> CoreResult<Pin<Box<dyn Stream<Item = ricow_core::OrderBookUpdate> + Send>>> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+        async fn subscribe_user_events(
+            &self,
+        ) -> CoreResult<Pin<Box<dyn Stream<Item = UserEvent> + Send>>> {
+            unimplemented!("本替身只服务资金费分支")
+        }
+    }
+
+    /// 审计 中危 #16: 资金费拉取失败必须在 `RunOutcome` 里留痕(error 计数 + `last_error`),
+    /// 而不是像原来那样只 warn + return 0 —— 否则资金费流水静默缺失, PnL 归因看着照常成功。
+    #[tokio::test]
+    async fn test_funding_fetch_failure_is_counted_and_recorded() {
+        let db = Database::open_in_memory().await.expect("开内存库");
+        let mut outcome = RunOutcome::default();
+
+        let failing: Arc<dyn Exchange> = Arc::new(FundingStubExchange { fail: true });
+        let n = poll_funding_income(&failing, &db, "t-funding", &mut outcome).await;
+        assert_eq!(n, 0, "失败时不插入任何记录");
+        assert_eq!(outcome.persist_errors, 1, "拉取失败必须计入 persist_errors");
+        let err = outcome.last_error.as_deref().unwrap_or_default();
+        assert!(err.contains("资金费拉取失败"), "last_error 要如实点名失败环节: {err}");
+
+        // 成功(空表)时不得留下任何失败痕迹。
+        let mut ok_outcome = RunOutcome::default();
+        let healthy: Arc<dyn Exchange> = Arc::new(FundingStubExchange { fail: false });
+        let n = poll_funding_income(&healthy, &db, "t-funding", &mut ok_outcome).await;
+        assert_eq!(n, 0);
+        assert_eq!(ok_outcome.persist_errors, 0, "成功路径不得虚报错误");
+        assert!(ok_outcome.last_error.is_none(), "成功路径不得留下 last_error");
+    }
 
     fn make_klines(n: u32) -> Vec<Kline> {
         (0..n)

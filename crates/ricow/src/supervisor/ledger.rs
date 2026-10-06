@@ -102,13 +102,20 @@ pub fn write_daemon_info(root: &Path, info: &DaemonInfo) -> std::io::Result<()> 
     {
         // Windows 上 `write_atomic` 只能继承父目录 ACL → 同机其它账户可能读到 token。
         // 复用配置文件那条收紧路径 (icacls 断继承 + 只授当前用户)。
-        // **尽力而为**: 失败不阻断 daemon 启动, 但如实警告, 不静默假装已保护。
+        //
+        // 审计 中危 #13 (fail-closed): 失败即**拒收** —— 删掉刚写出的 token 文件并返回错误。
+        // token 是本机控制通道的凭据, 留在未收紧权限的文件里等于同机任意账户都能接管 daemon。
+        // 调用方把这里的错误当作启动失败处理 (daemon 不该在凭据暴露的状态下跑起来)。
         if let Err(msg) = crate::commands::config_file::harden_secret_file(&path) {
-            tracing::warn!(
-                target: "supervisor",
-                path = %path.display(),
-                "未能收紧 daemon.json 的访问权限: {msg}; 该文件含控制通道 token, 请确认其所在目录非共享目录"
-            );
+            let _ = std::fs::remove_file(&path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "已写入 {} 但未能收紧其访问权限({msg}) —— 该文件含控制通道 token, \
+                     为避免同机其它账户读取, 已删除该文件; daemon 启动中止",
+                    path.display()
+                ),
+            ));
         }
     }
     Ok(())

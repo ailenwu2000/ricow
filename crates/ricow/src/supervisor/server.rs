@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ricow_core::CoreResult;
 use tokio::net::TcpListener;
@@ -454,11 +454,16 @@ async fn serve_conn(socket: tokio::net::TcpStream, server: Server) {
     }
 }
 
-/// 子进程监控: 发现自行退出 (崩溃/行情流中断) → 落台账, 供 `list` 如实展示退出码。
+/// 子进程监控: 发现自行退出 (崩溃/行情流中断) → 落台账, 供 `list` 如实展示退出码;
+/// 并按 [`procs::LOG_ROTATE_INTERVAL`] 周期检查日志体积 (只在启动时查会让长运行策略的
+/// 日志无限增长 —— 10MB 阈值形同虚设)。
 async fn monitor_loop(state: Arc<Mutex<State>>) {
+    let mut last_rotate = Instant::now() - procs::LOG_ROTATE_INTERVAL;
     loop {
         tokio::time::sleep(Duration::from_millis(1000)).await;
+
         let mut exited: Vec<(String, Option<i32>, InstanceView, PathBuf)> = Vec::new();
+        let mut rotate_targets: Vec<PathBuf> = Vec::new();
         {
             let mut guard = lock_state(&state);
             let root = guard.root.clone();
@@ -473,9 +478,25 @@ async fn monitor_loop(state: Arc<Mutex<State>>) {
             for (name, _, _, _) in exited.iter() {
                 guard.children.remove(name);
             }
+            // 只给**还在运行**的策略轮转日志 (已退出的进程不再写, 没有增长压力)。
+            if last_rotate.elapsed() >= procs::LOG_ROTATE_INTERVAL {
+                for name in guard.children.keys() {
+                    rotate_targets.push(ledger::log_path(&root, name));
+                }
+            }
         }
+
+        for path in rotate_targets {
+            // 轮转要读写文件, 放到阻塞线程池: 别让每 60s 的一次 I/O 卡住整个监控循环。
+            let _ = tokio::task::spawn_blocking(move || procs::rotate_large_log(&path)).await;
+        }
+
         for (name, code, view, root) in exited {
             write_exit_record(&root, &name, &view, code, "进程自行退出");
+        }
+
+        if last_rotate.elapsed() >= procs::LOG_ROTATE_INTERVAL {
+            last_rotate = Instant::now();
         }
     }
 }

@@ -30,6 +30,14 @@ fn tf(lang: Lang, zh: impl Into<String>, en: impl Into<String>) -> String {
 /// `/history` 单条往返的字符上限(超出即截断并标注, FR-008)。
 const HISTORY_ENTRY_MAX_CHARS: usize = 2_000;
 
+/// `transcript` 总字符预算(审计 资源-3): 长会话每轮 push 完整原文, 不设上限会一路
+/// 涨到几十 MB(进程退出才释放)。与 `provider::HISTORY_BUDGET_CHARS`(送模型的上下文
+/// 预算)同口径但**更宽** —— 这里只占内存、不受模型上下文窗口约束, 只为拦无界增长。
+const TRANSCRIPT_BUDGET_CHARS: usize = 200_000;
+
+/// 裁剪后至少保留的最近往返数: 用户刚问完的总要能回看, 哪怕单轮特别长。
+const TRANSCRIPT_KEEP_ROUNDS: usize = 20;
+
 /// 宿主输出级别(025 / FR-013): **由宿主显式标注**, 前端只按级别着色, 不做关键字猜测。
 ///
 /// 终端 sink 忽略级别(输出与 019 逐字一致); 网页端按级别给不同颜色。
@@ -142,10 +150,22 @@ pub struct ChatSession {
     /// 已完成的问答轮次(FR-009: 斜杠命令与空行不计入)。
     turn: u64,
     /// 本会话问答往返(仅 [`ChatSession::reply`] 写入), 供 `/history` 回看(FR-008)。
+    ///
+    /// 有字符预算([`TRANSCRIPT_BUDGET_CHARS`]): 超预算时丢最旧的往返(见 [`Self::push_transcript`]),
+    /// 否则长会话能累积几十 MB。
     transcript: Vec<(String, String)>,
+    /// 因超预算被丢弃的最早往返条数(审计 资源-3): `/history` 要如实告诉用户"前面还有 N 条看不了",
+    /// 不能静默少渲 —— 与 [`clip_for_history`] 的"截断并标注"同口径。
+    transcript_dropped: usize,
 }
 
 impl ChatSession {
+    /// 记一条往返进 `transcript`, 并按 [`TRANSCRIPT_BUDGET_CHARS`] 裁掉最旧的(审计 资源-3)。
+    fn push_transcript(&mut self, q: String, a: String) {
+        self.transcript.push((q, a));
+        trim_transcript(&mut self.transcript, &mut self.transcript_dropped);
+    }
+
     /// 装载配置 + 建会话。任何配置问题都在这里**报错并给解法**(不静默回落)。
     pub async fn open(root: PathBuf, opts: Options) -> CoreResult<Self> {
         // 唯一配置文件: ricow.toml(缺文件时生成模板); [ai] 段同时含 provider 与 api_key
@@ -206,6 +226,7 @@ impl ChatSession {
             lang,
             turn: 0,
             transcript: Vec::new(),
+            transcript_dropped: 0,
         })
     }
 
@@ -226,7 +247,7 @@ impl ChatSession {
         for (q, a) in rounds {
             self.history.push(Message::user(clip_for_history(q, self.lang)));
             self.history.push(Message::assistant(clip_for_history(a, self.lang)));
-            self.transcript.push((q.clone(), a.clone()));
+            self.push_transcript(q.clone(), a.clone());
         }
         self.turn = turn;
     }
@@ -441,10 +462,29 @@ impl ChatSession {
             ));
             return;
         }
+        // 超预算丢过最旧的往返 → 明确交代(审计 资源-3), 别让用户以为"就这么几轮"。
+        if self.transcript_dropped > 0 {
+            sink.notice(&tf(
+                self.lang,
+                format!(
+                    "更早的 {} 轮因会话过长已不再保留(只留最近 {} 轮); 需要完整记录请查看终端输出。",
+                    self.transcript_dropped,
+                    self.transcript.len()
+                ),
+                format!(
+                    "The earliest {} exchange(s) were dropped to bound memory (only the latest {} kept); \
+                     see the terminal output for the full record.",
+                    self.transcript_dropped,
+                    self.transcript.len()
+                ),
+            ));
+        }
         let (you, ai) = (t(self.lang, "你", "You"), t(self.lang, "助手", "AI"));
+        // 轮次号接着已丢弃的条数往下排, 与实际发生过的轮次对齐(与 `reply` 的 `turn` 口径一致)。
+        let base = self.transcript_dropped as u64;
         for (i, (q, a)) in self.transcript.iter().enumerate() {
             sink.line("");
-            sink.line(&turn_divider(self.lang, i as u64 + 1));
+            sink.line(&turn_divider(self.lang, base + i as u64 + 1));
             sink.line(&format!("{you}: {}", clip_for_history(q, self.lang)));
             sink.line(&format!("{ai}: {}", clip_for_history(a, self.lang)));
         }
@@ -716,7 +756,7 @@ impl ChatSession {
                 if let Some(u) = &ans.usage {
                     sink.notice(&format!("[用量] {u}"));
                 }
-                self.transcript.push((q.to_string(), ans.text.clone()));
+                self.push_transcript(q.to_string(), ans.text.clone());
                 self.history.push(Message::user(q.to_string()));
                 self.history.push(Message::assistant(ans.text));
             }
@@ -724,7 +764,7 @@ impl ChatSession {
             Err(e) => {
                 let shown = format!("错误: {e}");
                 sink.error(&shown);
-                self.transcript.push((q.to_string(), shown));
+                self.push_transcript(q.to_string(), shown);
             }
         }
         sink.line("");
@@ -928,6 +968,21 @@ fn near_miss_confirmation_hint(lang: Lang) -> String {
              This line was treated as a normal question; the pending action is still open."
         ),
     )
+}
+
+/// `transcript` 的超预算裁剪(审计 资源-3, 纯函数便于单测)。
+///
+/// 规则: 总字符数未超 [`TRANSCRIPT_BUDGET_CHARS`] → 原样保留;**超了**才从最旧的丢起,
+/// 但**至少留下最近 [`TRANSCRIPT_KEEP_ROUNDS`] 轮**(用户刚问完的必须能回看)。
+/// 丢弃条数累加进 `dropped`, 由 `/history` 在开头交代 —— 不静默少渲。
+fn trim_transcript(transcript: &mut Vec<(String, String)>, dropped: &mut usize) {
+    let mut total: usize =
+        transcript.iter().map(|(q, a)| q.chars().count() + a.chars().count()).sum();
+    while total > TRANSCRIPT_BUDGET_CHARS && transcript.len() > TRANSCRIPT_KEEP_ROUNDS {
+        let (q, a) = transcript.remove(0);
+        total = total.saturating_sub(q.chars().count() + a.chars().count());
+        *dropped += 1;
+    }
 }
 
 /// `/history` 单条往返的渲染(FR-008): 超上限时**截断并标注**, 不静默丢内容。
@@ -1597,6 +1652,67 @@ mod tests {
         // 英文界面走英文标注(FR-031)
         let en = clip_for_history(&long, Lang::En);
         assert!(en.contains("truncated") && en.contains(&total.to_string()), "英文标注缺失: {en}");
+    }
+
+    /// 审计 资源-3: transcript 超预算时丢最旧的, 但至少留最近 N 轮, 且如实记录丢弃条数。
+    #[test]
+    fn test_trim_transcript_bounds_memory_and_keeps_recent() {
+        let mut t: Vec<(String, String)> = Vec::new();
+        let mut dropped = 0usize;
+
+        // 未超预算: 一条不丢。
+        t.push(("问".into(), "答".into()));
+        trim_transcript(&mut t, &mut dropped);
+        assert_eq!(t.len(), 1);
+        assert_eq!(dropped, 0);
+
+        // 塞爆预算: 每轮 2 万字符 × 30 轮 = 60 万 >> 20 万预算。
+        let big = "x".repeat(10_000);
+        let mut t2: Vec<(String, String)> = Vec::new();
+        let mut dropped2 = 0usize;
+        for i in 0..30 {
+            t2.push((format!("{big}-round{i}-"), big.clone()));
+            trim_transcript(&mut t2, &mut dropped2);
+        }
+        assert!(dropped2 > 0, "超预算必须丢最旧的");
+        assert_eq!(dropped2 + t2.len(), 30, "丢弃数 + 保留数 = 总数");
+        assert!(t2.len() >= TRANSCRIPT_KEEP_ROUNDS, "至少要留最近 {TRANSCRIPT_KEEP_ROUNDS} 轮");
+        // 单轮粗大时压不到预算内, 保留下限优先 —— 但总量已被**轮数**钳住, 不再无界。
+        assert_eq!(t2.len(), TRANSCRIPT_KEEP_ROUNDS, "粗内容时停在轮数下限");
+        // 留下的是**最近**的: 最后一条在, 最早的不在。
+        assert!(t2.last().unwrap().0.contains("-round29-"), "最近的轮次必须在");
+        assert!(!t2.iter().any(|(q, _)| q.contains("-round0-")), "最早的轮次应被丢弃");
+    }
+
+    /// 中等体量: 预算本身真的起作用(不是只靠轮数下限兜底)。
+    #[test]
+    fn test_trim_transcript_respects_budget_with_moderate_rounds() {
+        let per = "z".repeat(1_000); // 每轮 ≈ 2000 字符
+        let rounds = (TRANSCRIPT_BUDGET_CHARS / 1_500) * 2; // 明显超预算, 但轮数远多于下限
+        let mut t: Vec<(String, String)> = Vec::new();
+        let mut dropped = 0usize;
+        for i in 0..rounds {
+            t.push((format!("{per}{i}"), per.clone()));
+            trim_transcript(&mut t, &mut dropped);
+        }
+        let total: usize = t.iter().map(|(q, a)| q.chars().count() + a.chars().count()).sum();
+        assert!(total <= TRANSCRIPT_BUDGET_CHARS, "预算生效后应在范围内: {total}");
+        assert!(t.len() > TRANSCRIPT_KEEP_ROUNDS, "不该被压到下限: {}", t.len());
+        assert!(dropped > 0);
+    }
+
+    /// 单轮就超预算时, 也不能把它裁空 —— 保留最近轮优先于压到预算内。
+    #[test]
+    fn test_trim_transcript_never_empties_below_keep_floor() {
+        let mut t: Vec<(String, String)> = Vec::new();
+        let mut dropped = 0usize;
+        let huge = "y".repeat(TRANSCRIPT_BUDGET_CHARS);
+        for i in 0..TRANSCRIPT_KEEP_ROUNDS {
+            t.push((format!("{huge}-{i}"), huge.clone()));
+            trim_transcript(&mut t, &mut dropped);
+        }
+        assert_eq!(t.len(), TRANSCRIPT_KEEP_ROUNDS, "到保留下限就停手");
+        assert_eq!(dropped, 0, "还没超下限, 一条都不该丢");
     }
 
     fn temp_root(tag: &str) -> std::path::PathBuf {

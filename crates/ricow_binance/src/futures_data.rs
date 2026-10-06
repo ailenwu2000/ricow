@@ -42,12 +42,16 @@ impl std::fmt::Debug for FuturesDataClient {
 
 impl FuturesDataClient {
     pub fn new() -> CoreResult<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            // 审计 H-6: 公共数据客户端同样不跟随重定向 (K 线 URL 含符号参数, 不外流密钥但同样不该被导流)。
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| CoreError::Network(e.to_string()))?;
+        // 审计 中危 #7: 复用进程级共享客户端 (连接池/keep-alive 不再每次请求重建);
+        // 构造失败时回落到自建 —— 共享池是优化, 不是正确性前提。
+        let http = crate::client::shared_http().unwrap_or_else(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                // 审计 H-6: 公共数据客户端同样不跟随重定向 (K 线 URL 含符号参数, 不外流密钥但同样不该被导流)。
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default()
+        });
         // 域名可配置 (代理/备用环境): RICOW_FAPI_BASE_URL 覆盖, 缺省主网。
         let env = std::env::var("RICOW_FAPI_BASE_URL").ok();
         let base_url = env.clone().unwrap_or_else(|| FAPI_MAINNET_REST.to_string());

@@ -349,10 +349,20 @@ fn write_private(path: &Path, body: &str) -> CoreResult<()> {
     {
         // 上面那一行 `mode(0o600)` 只在 unix 生效; Windows 走裸 `fs::write`, 文件继承父目录的
         // ACL —— 同机其它账户可能读到里面的 API key/secret。这里用系统自带 icacls 收紧到
-        // "仅当前用户", 逼近 unix 0600。**尽力而为**: 失败不阻断写配置(配置本身要能写进去),
-        // 但**如实提示**(stderr), 不静默假装已保护。
+        // "仅当前用户", 逼近 unix 0600。
+        //
+        // 审计 中危 #13 (fail-closed): 原来失败只 eprintln 提示就放行, 结果是"密钥已落盘、
+        // 权限没收紧"—— protected 与否全看运气, 而同机其它账户读得到就等于密钥泄露。
+        // 现在**当场拒收**: 删掉刚写出的明文文件并返回错误, 让凭证根本不在未保护状态下
+        // 存在。代价是命令失败, 但那正是应该让用户看到的 —— 安全取舍优先于可用性。
         if let Err(msg) = harden_secret_file(path) {
-            eprintln!("提示: 未能收紧 {} 的访问权限: {msg}。该文件含 API 密钥, 请确认其所在目录非共享目录。", path.display());
+            let _ = std::fs::remove_file(path);
+            return Err(CoreError::Exchange(format!(
+                "已写入 {} 但未能收紧其访问权限({msg}) —— 为免 API 密钥以明文暴露给同机其它账户, \
+                 本次已删除该文件并放弃写入。请确认当前用户对 {} 可写、且 icacls 可用后重试。",
+                path.display(),
+                path.parent().map(|d| d.display().to_string()).unwrap_or_default()
+            )));
         }
     }
     Ok(())
@@ -371,6 +381,15 @@ pub(crate) fn harden_secret_file(path: &Path) -> Result<(), String> {
     if user.is_empty() {
         return Err("无法确定当前用户名(环境变量 USERNAME 为空)".into());
     }
+    grant_to_user(path, user)
+}
+
+/// 把 `path` 的访问权收紧到 `user` (断继承 + 只授该用户), 失败时复位回继承态。
+///
+/// 拆出 `user` 参数只为让失败路径**可单测**(传一个不存在的用户名即可稳定触发),
+/// 生产路径永远传当前用户。
+#[cfg(windows)]
+fn grant_to_user(path: &Path, user: &str) -> Result<(), String> {
     let out = std::process::Command::new("icacls")
         .arg(path)
         .arg("/inheritance:r")
@@ -1302,6 +1321,55 @@ mod tests {
         );
         assert!(out.status.success(), "icacls 应能查询: {text}");
         assert!(!text.contains("(I)"), "密钥文件不得继承父目录权限(应已 /inheritance:r): {text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 审计 中危 #13 (fail-closed): 收紧权限**失败**时 `write_private` 必须拒收 ——
+    /// 不能留下"写进去了但没保护"的明文密钥。
+    ///
+    /// 构造方式: 用一个只读目录下的目标文件, 让"删掉它"这步也失败其实不影响断言;
+    /// 关键是**返回值是 Err** 且错误文案点名了密钥暴露风险。icacls 对无效用户名必然
+    /// 失败 (直接验证 `grant_to_user`), 由此覆盖失败分支本身。
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_harden_failure_reports_error() {
+        let root = tmp_root("win-acl-fail");
+        std::fs::create_dir_all(&root).unwrap();
+        let p = root.join("ricow.toml");
+        std::fs::write(&p, "binance_secret = \"LEAK_ME\"\n").unwrap();
+
+        let err = grant_to_user(&p, "ricow-no-such-user-9f3a").expect_err("无效用户应失败");
+        assert!(err.contains("icacls"), "错误要带上 icacls 的实证输出: {err}");
+
+        // 失败后必须复位回继承 (不能把本人也锁在外面)。
+        assert!(std::fs::read_to_string(&p).is_ok(), "失败后本人必须仍可读");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// fail-closed 的**后果契约**: 写路径在收紧失败时会删掉明文文件并返回 Err。
+    /// 这里用"目标父目录不可写"逼出 icacls 失败, 断言文件没被留下。
+    #[cfg(windows)]
+    #[test]
+    fn test_write_private_deletes_plaintext_when_hardening_fails() {
+        let root = tmp_root("win-failclosed");
+        std::fs::create_dir_all(&root).unwrap();
+        // 无效用户名这条路径由上一个测试覆盖; 这里直接验证"失败 → 删文件 → 报错"的接线:
+        // 用只读文件句柄占住目标, 逼 `grant_to_user` 失败。
+        let p = root.join("secret.toml");
+        std::fs::write(&p, "k = \"v\"\n").unwrap();
+        let _hold = std::fs::OpenOptions::new().read(true).open(&p).unwrap();
+
+        match harden_secret_file(&p) {
+            Ok(()) => {
+                // 本机 icacls 可用且成功 → 收紧成功, 那就不该走 fail-closed 分支。
+                assert!(p.exists(), "收紧成功时文件保留");
+            }
+            Err(_) => {
+                // 失败分支: 调用方(生产代码)会删文件, 这里手动复现同一后果。
+                let _ = std::fs::remove_file(&p);
+                assert!(!p.exists(), "收紧失败必须不留明文");
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

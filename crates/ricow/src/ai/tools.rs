@@ -1912,13 +1912,29 @@ async fn prepare_stop(
              Effect (**irreversible**): first market-close every position held by this strategy, then stop and exit; \
              the fill price is set by the market, so slippage and losses are possible."
         ),
-        _ => unreachable!("prepare_stop 只服务 stop_dry_run / stop_demo / stop_live / close_live"),
+        // 审计 中危 #15: 原来这里是 `_ => unreachable!()`, 而 10 行后的 action match 用
+        // `_ => new_close_live` 兜底 —— 两者口径不一致: 将来新增 ActionKind 变体时, 动作会被
+        // 静默路由成"先市价平仓"(真实资金副作用!), 随后文案却 panic。现在改为显式列全 4 个
+        // 受支持动作, 其余如实报错(不 panic), 且**下面 action match 也用同一份枚举** ——
+        // 漏了任何一类都会走到同一个错误分支, 不会再出现"动作与文案不一致"。
+        _ => {
+            return Err(ToolExecutionError::other(format!(
+                "prepare_stop 只服务停机类动作 (stop_dry_run / stop_demo / stop_live / close_live), \
+                 收到 {kind:?} —— 该动作不适用于停机路径, 已拒绝执行。"
+            )));
+        }
     };
     let action = match kind {
         ActionKind::StopDryRun => PendingAction::new_stop_dry_run(name),
         ActionKind::StopDemo => PendingAction::new_stop_demo(name),
         ActionKind::StopLive => PendingAction::new_stop_live(name),
-        _ => PendingAction::new_close_live(name),
+        ActionKind::CloseLive => PendingAction::new_close_live(name),
+        // 与上面的确认块同一判据: 不认识的动作用户可见地失败, 不猜、不兜底成平仓。
+        _ => {
+            return Err(ToolExecutionError::other(format!(
+                "停机路径不支持动作 {kind:?}, 已拒绝执行 (不会退化成市价平仓)。"
+            )));
+        }
     };
     Ok(PreparedAction { action, block })
 }
@@ -2345,18 +2361,25 @@ mod tests {
     /// 还会真发一条 `List` 请求并**等响应** —— 所以替身必须应答, 只 bind 不 accept 会把调用方挂住。
     /// 这里不校验 token: 用例关心的是"daemon 是否可达", 鉴权另有 server 侧单测覆盖。
     async fn seed_fake_daemon(root: &Path) {
+        seed_fake_daemon_with_instances(root, Vec::new()).await;
+    }
+
+    /// 同上, 但让假 daemon 的 `List` 回报指定实例 —— 用于需要"实例确实在运行"的用例
+    /// (台账退回视图恒为 `running: false`, 所以"在跑"只能由 daemon 侧给出)。
+    async fn seed_fake_daemon_with_instances(root: &Path, instances: Vec<Value>) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         write_daemon_json(root, port);
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
+                let instances = instances.clone();
                 tokio::spawn(async move {
                     let (reader, mut writer) = sock.into_split();
                     // 读掉请求行(内容不关心), 按协议回一行 JSON 即可
                     let _ = BufReader::new(reader).lines().next_line().await;
                     let resp = crate::supervisor::proto::Response::ok(Some(json!({
-                        "instances": []
+                        "instances": instances
                     })));
                     let _ =
                         writer.write_all(crate::supervisor::proto::encode(&resp).as_bytes()).await;
@@ -2744,6 +2767,56 @@ mod tests {
             );
         }
         assert!(slot.lock().await.is_none(), "daemon 不在时不得登记任何待确认动作");
+    }
+
+    /// 审计 中危 #15 (回归): 非停机类动作传给 `prepare_stop` 必须**如实报错**,
+    /// 不得 panic, 也不得退化成"市价平仓"(那是真实资金副作用)。
+    ///
+    /// 注意前置检查的**顺序**: 名字不存在 / 未运行 / 模式不匹配都会先返回各自的错误,
+    /// 所以这里必须给一个**真的在跑**的 demo 实例, 才能把动作判据那一步走到。
+    /// 这条用例的价值在于: 将来给 `ActionKind` 加新变体时它会立刻提醒"这里要不要支持",
+    /// 而不是等 `unreachable!` 在用户面前炸掉、或动作被静默路由成平仓。
+    #[tokio::test]
+    async fn prepare_stop_rejects_non_stop_kinds_without_panicking() {
+        let root = r3_temp_root("stop-kind-guard");
+        let name = "aidep015x";
+        // 实例必须由 **daemon 侧**报告为"正在跑": 台账退回视图的 `running` 恒为 false
+        // (它只表示"台账无运行记录", 不具权威性), 所以这里让假 daemon 的 List 回报该实例。
+        // 这样停机类动作本来会发出确认块 —— 正因为如此, 非停机类动作才必须被拦在这里。
+        seed_fake_daemon_with_instances(
+            &root,
+            vec![json!({
+                "name": name, "running": true, "pid": 4242,
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "mode": "demo", "pair": "BTCUSDT", "market": "spot"
+            })],
+        )
+        .await;
+
+        let slot = crate::ai::confirm::new_slot();
+        let ctx = test_ctx(&root, slot.clone());
+
+        // 挑几个**明确不属于**停机路径的动作。
+        for kind in [ActionKind::Deploy, ActionKind::AckRisk, ActionKind::RestartLive] {
+            let err = prepare_stop(&ctx, kind, &json!({ "name": name }))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{kind:?}: 非停机动作必须被拒绝"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("stop_dry_run") && msg.contains("close_live"),
+                "{kind:?}: 错误要讲清支持的四种动作: {msg}"
+            );
+            assert!(!msg.contains("市价平仓"), "{kind:?}: 拒绝文案不得暗示会去平仓: {msg}");
+        }
+        assert!(slot.lock().await.is_none(), "被拒绝的动作不得登记任何待确认动作");
+
+        // 反证: 同一个实例下, 合法的停机动作确实能发出确认块 ——
+        // 说明上面拦的是"动作不对", 不是"实例状态不对"。
+        let ok = prepare_stop(&ctx, ActionKind::StopDemo, &json!({ "name": name }))
+            .await
+            .expect("合法的停机动作应发出确认块");
+        assert!(ok.block.contains("停止测试网实例"), "{}", ok.block);
     }
 
     /// 027 T016 / FR-013: 停机类动作的名字判定必须与终端 `ricow stop` **同源** ——

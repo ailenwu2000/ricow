@@ -485,6 +485,13 @@ const CHART_MAX_POINTS: usize = 2000;
 /// 成交标记上限: 超长回测的成交清单只保前 N 笔 (表格另见报告文本)。
 const CHART_MAX_FILLS: usize = 1000;
 
+/// 本地 K 线缓存的保留期 (天, 审计 资源-4): 早于该天数的缓存行在回填后清理。
+///
+/// K 线表只增不删会缓慢膨胀磁盘; 它是**只读缓存**(随时可从交易所重拉), 故可安全过期。
+/// 取 400 天: 覆盖一年整的回测窗口还留余量, 又足够把长期积累的陈数据清出去。
+/// 过期只删本地副本 —— 需要更早的历史时, 回测会按窗口自动向前翻页重新取数(见上方分页逻辑)。
+const KLINE_RETENTION_DAYS: i64 = 400;
+
 impl BacktestOutcome {
     /// 抽稀一维序列 (保首尾): `stride` = 1 时原样返回。
     fn downsample(v: &[f64], stride: usize) -> Vec<f64> {
@@ -779,6 +786,14 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
         if let Some(db) = &cache_db {
             if let Err(e) = db.insert_klines(&market_key, &pair, &interval, &klines).await {
                 tracing::warn!(error = %e, "K 线回填缓存失败 (不影响回测)");
+            }
+            // 顺手清理过期缓存 (审计 资源-4): 只增不删会让磁盘缓慢膨胀。best-effort, 失败不影响回测。
+            let cutoff =
+                (Utc::now() - chrono::Duration::days(KLINE_RETENTION_DAYS)).timestamp_millis();
+            match db.prune_klines(cutoff).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(removed = n, "已清理过期 K 线缓存"),
+                Err(e) => tracing::warn!(error = %e, "K 线缓存清理失败 (不影响回测)"),
             }
         }
     }
@@ -1333,6 +1348,12 @@ struct RunCard {
     metrics: RunCardMetrics,
 }
 
+/// run card 保留份数上限 (审计 资源-5): 每次回测写一个时间戳 JSON, 文件数无限增长。
+///
+/// 保留最近 N 份(按文件名里的时间戳前缀排序, 即写入时间序), 更早的随写入顺手删掉。
+/// 取 200: 足够回看近期对比(证据卡单文件很小), 又给目录一个明确上界。
+const RUN_CARD_KEEP: usize = 200;
+
 /// 把 run card 写到 `<root>/run/backtest/<ts>-<strategy>-<pair>.json`, 返回落盘路径。
 fn write_run_card(root: &Path, card: &RunCard) -> CoreResult<PathBuf> {
     let dir = root.join("run").join("backtest");
@@ -1349,7 +1370,48 @@ fn write_run_card(root: &Path, card: &RunCard) -> CoreResult<PathBuf> {
         .map_err(|e| CoreError::Parse(format!("run card 序列化失败: {e}")))?;
     std::fs::write(&path, json)
         .map_err(|e| CoreError::InvalidArgument(format!("写 run card 失败: {e}")))?;
+    // 顺手清理超量旧卡 (best-effort): 不影响本次写入结果, 失败只记日志。
+    prune_run_cards(&dir);
     Ok(path)
+}
+
+/// 只保留最近 [`RUN_CARD_KEEP`] 份 run card, 更早的删除 (审计 资源-5)。返回删除数。
+///
+/// 文件名以 `timestamp_millis-` 开头 → 按名字**字符串排序**即等价于按写入时间排序
+/// (同位数毫秒时间戳字典序 = 数值序), 无需解析时间。只认 `.json` 且以数字前缀命名的
+/// 文件 —— 别的一概不碰(目录里若混入用户手放的东西不能误删)。
+fn prune_run_cards(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut cards: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .filter(|p| {
+            // 只认 `<数字>-...json` 形态(本函数自己写的卡), 别的 json 不碰。
+            std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|n| {
+                        n.split('-')
+                            .next()
+                            .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_digit()))
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    if cards.len() <= RUN_CARD_KEEP {
+        return 0;
+    }
+    cards.sort();
+    let mut removed = 0;
+    for p in &cards[..cards.len() - RUN_CARD_KEEP] {
+        if std::fs::remove_file(p).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -1510,6 +1572,55 @@ exchange = "binance"
         );
         assert_eq!(sanitize_ident("shannon_spot_grid"), "shannon_spot_grid");
         assert_eq!(sanitize_ident("ETH/USDT:x"), "ETH_USDT_x", "非法字符应替换为 _");
+    }
+
+    /// 审计 资源-5: run card 只保留最近 N 份, 更早的删掉; 非本函数产物不碰。
+    #[test]
+    fn test_prune_run_cards_keeps_latest_and_ignores_foreign_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "ricow-runcard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 造 RUN_CARD_KEEP + 10 份合法卡 (时间戳递增) + 2 份"外来文件"。
+        let total = RUN_CARD_KEEP + 10;
+        for i in 0..total {
+            let ts = 1_700_000_000_000i64 + i as i64;
+            std::fs::write(dir.join(format!("{ts}-s-ETHUSDT.json")), "{}").unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), "keep me").unwrap();
+        std::fs::write(dir.join("manual.json"), "{}").unwrap();
+
+        let removed = prune_run_cards(&dir);
+        assert_eq!(removed, 10, "应删掉超量的 10 份");
+
+        let cards: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        assert_eq!(cards.iter().filter(|n| n.ends_with("-s-ETHUSDT.json")).count(), RUN_CARD_KEEP);
+        // 最早的 10 份被删, 最新的仍在。
+        assert!(
+            !cards.contains(&format!("{}-s-ETHUSDT.json", 1_700_000_000_000i64)),
+            "最早的应被删"
+        );
+        assert!(
+            cards.contains(&format!("{}-s-ETHUSDT.json", 1_700_000_000_000i64 + total as i64 - 1)),
+            "最新的必须留下"
+        );
+        // 外来文件不动。
+        assert!(cards.contains(&"notes.txt".to_string()), "非 json 不该碰");
+        assert!(cards.contains(&"manual.json".to_string()), "非时间戳命名的 json 不该碰");
+
+        // 未超量时一条不删。
+        assert_eq!(prune_run_cards(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
