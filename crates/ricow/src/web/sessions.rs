@@ -97,14 +97,33 @@ async fn session_events(
     UrlPath(id): UrlPath<String>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, WebError> {
     let rx = state.hub.attach(&id)?;
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(frame) => return Some((Ok(Event::default().data(frame.encode())), rx)),
-                // 追不上就跳过这些帧: 实时视图宁缺勿错, 补全靠 `messages`。
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                // 会话线程收摊(sink 被丢弃 = 最后一帧 Closed 已发出)。
-                Err(broadcast::error::RecvError::Closed) => return None,
+    // 日志用的会话 id: 闭包按 `FnMut` 反复调用, 而 `id`(String) 会被 `async move` 块移走。
+    // 用 `Arc<str>` 承载 —— 每次记日志 `clone` 的只是一个引用计数, 不会被 move 出闭包。
+    let log_id: std::sync::Arc<str> = std::sync::Arc::from(id.as_str());
+    let stream = futures::stream::unfold(rx, move |mut rx| {
+        let log_id = std::sync::Arc::clone(&log_id);
+        async move {
+            loop {
+                match rx.recv().await {
+                    Ok(frame) => return Some((Ok(Event::default().data(frame.encode())), rx)),
+                    // 追不上就跳过这些帧: 实时视图宁缺勿错, 补全靠 `messages`。
+                    //
+                    // 审计 低危 #7: 原来 `Lagged(_)` 被静默吞掉 —— 前端只会"少了些输出",
+                    // 没人知道发生了滞后。这里落一条计数 + 级别日志 (warn), 便于事后定位
+                    // "为什么这段输出缺了几行"。**只记录, 不改行为**: 仍然 `continue`,
+                    // 不补发、不重连 (补全靠 `messages` 接口)。
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            target: "web",
+                            session = %log_id.as_ref(),
+                            skipped,
+                            "SSE 帧滞后, 已跳过 {skipped} 帧 (实时视图宁缺勿错; 补全靠 messages 接口)"
+                        );
+                        continue;
+                    }
+                    // 会话线程收摊(sink 被丢弃 = 最后一帧 Closed 已发出)。
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
             }
         }
     });
@@ -274,5 +293,40 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         hub.stop(&sid);
         assert_eq!(*lock(&seen), vec!["你好".to_string()], "补送的那行不该丢");
+    }
+
+    /// 审计 低危 #7: 慢消费者触发 `Lagged` 时, SSE 流必须**继续产出后续帧**(只记日志, 不改行为)。
+    ///
+    /// 直接驱动 `broadcast::Receiver`: 先灌满 `FRAME_CAPACITY + N` 帧让订阅者落后, 再发一
+    /// 个"哨兵"帧, 然后断言 `recv()` 能跳过 `Lagged` 拿到哨兵 —— 这正是 `session_events`
+    /// 里那个循环的语义(跳过滞后帧继续, 而不是终止流)。
+    #[tokio::test]
+    async fn test_lagged_subscriber_keeps_receiving_after_gap() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<u32>(8);
+        let mut subscribed = tx.subscribe();
+        // 灌满 8 帧后订阅者还没读过 → 后续写入会让它 Lagged。
+        for i in 0..8u32 {
+            tx.send(i).expect("send");
+        }
+        // 再发若干帧 + 一个哨兵, 落后的订阅者必然先遇到 Lagged。
+        for i in 8..20u32 {
+            tx.send(i).expect("send");
+        }
+        // 复刻 `session_events` 的循环: Lagged → continue, 直到拿到哨兵(用 19 当哨兵)。
+        let mut got = None;
+        for _ in 0..64 {
+            match subscribed.recv().await {
+                Ok(v) => {
+                    got = Some(v);
+                    if v == 19 {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        assert_eq!(got, Some(19), "Lagged 之后必须仍能拿到最新帧(流未终止)");
+        let _ = &mut rx;
     }
 }

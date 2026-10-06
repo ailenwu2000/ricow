@@ -98,8 +98,10 @@ impl FuturesDataClient {
         while (all.len() as u32) < limit {
             let page = (limit - all.len() as u32).min(MAX_PAGE);
             let mut url = format!(
-                "{}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={page}",
-                self.base_url
+                "{}/fapi/v1/klines?symbol={}&interval={}&limit={page}",
+                self.base_url,
+                crate::client::encode_query_component(symbol),
+                crate::client::encode_query_component(interval)
             );
             if let Some(st) = start_time {
                 url.push_str(&format!("&startTime={st}"));

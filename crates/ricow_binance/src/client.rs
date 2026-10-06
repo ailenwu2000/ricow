@@ -223,6 +223,7 @@ impl BinanceClient {
     }
 
     pub async fn get_depth(&self, symbol: &str, limit: u32) -> CoreResult<OrderBook> {
+        let symbol = encode_query_component(symbol);
         let url = format!("{}/api/v3/depth?symbol={symbol}&limit={limit}", self.base_url);
         let v: Value = self.get_json(&url).await?;
         let bids = parse_levels(v["bids"].as_array());
@@ -242,7 +243,7 @@ impl BinanceClient {
         let url = format!(
             "{}/api/v3/depth?symbol={}&limit={limit}",
             self.base_url,
-            symbol.to_uppercase()
+            encode_query_component(&symbol.to_uppercase())
         );
         let v: Value = self.get_json(&url).await?;
         let bids = parse_levels(v["bids"].as_array());
@@ -396,6 +397,33 @@ pub(crate) fn build_query_string(params: &[(String, String)]) -> String {
     params.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
 }
 
+/// 把字符串按 **query 分量** 规则百分号编码 (审计 低危 #3)。
+///
+/// 拼进 URL 的 symbol 直接 `format!("symbol={symbol}")` 时, 若含 `&`/`=`/`#`/空格 等字符,
+/// 会**改变 query 语义** —— 例如 `symbol=BTC&limit=1` 会被拆成两个参数, `#` 之后被当片段丢弃。
+/// 虽然 symbol 常规来自内部枚举、且上游 `validate` 已过滤, 但"拼 URL 一律转义"是纵深防线:
+/// 新增调用点(如按用户输入拼 symbol)时不会再重现这个洞。
+///
+/// 用全 ASCII 白名单编码: 字母数字 + `-_.~` 原样, 其余字节 `%XX`(大写十六进制)。
+/// 与 `application/x-www-form-urlencoded` 不同 —— 空格编成 `%20` 而非 `+`, 更安全。
+pub(crate) fn encode_query_component(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn sign_hmac_sha256(data: &str, secret: &str) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
@@ -476,7 +504,11 @@ pub(crate) async fn fetch_klines_paged(
     let mut start_time: Option<i64> = Some(end_ms - (limit as i64) * step);
     while (all.len() as u32) < limit {
         let page = (limit - all.len() as u32).min(MAX_PAGE);
-        let mut url = format!("{base_url}{path}?symbol={symbol}&interval={interval}&limit={page}");
+        let mut url = format!(
+            "{base_url}{path}?symbol={}&interval={}&limit={page}",
+            encode_query_component(symbol),
+            encode_query_component(interval)
+        );
         if let Some(st) = start_time {
             url.push_str(&format!("&startTime={st}"));
         }
@@ -691,6 +723,34 @@ mod tests {
             ("side".to_string(), "BUY".to_string()),
         ];
         assert_eq!(build_query_string(&params), "symbol=ETHUSDT&side=BUY");
+    }
+
+    /// 审计 低危 #3: 拼进 URL 的 symbol/interval 必须百分号编码, 否则含 `&`/`#`/`=`/空格
+    /// 的输入会**改变 query 语义**(`&` 拆出新参数、`#` 之后整段被当片段丢弃)。
+    #[test]
+    fn test_encode_query_component_escapes_delimiters() {
+        // 常规 symbol 原样通过 (不引入无谓转义)。
+        assert_eq!(encode_query_component("ETHUSDT"), "ETHUSDT");
+        assert_eq!(encode_query_component("1h"), "1h");
+        assert_eq!(encode_query_component("BTC-USDT_1.0~x"), "BTC-USDT_1.0~x");
+        // 分隔符被转义 —— 这是本函数存在的意义。
+        assert_eq!(encode_query_component("A&B"), "A%26B");
+        assert_eq!(encode_query_component("a=b"), "a%3Db");
+        assert_eq!(encode_query_component("a#frag"), "a%23frag");
+        assert_eq!(encode_query_component("a b"), "a%20b");
+        assert_eq!(encode_query_component("100%"), "100%25");
+        // 非 ASCII 按 UTF-8 逐字节编码。
+        assert_eq!(encode_query_component("中"), "%E4%B8%AD");
+    }
+
+    /// 端到端: 转义后的 symbol 不会被拆成额外参数 —— 直接盯"注入一个 `&limit=999` 后,
+    /// 请求路径里 `limit` 仍只有交易所自己那一个"(旧实现会多出伪造的 limit)。
+    #[test]
+    fn test_depth_url_keeps_single_limit_after_symbol_escape() {
+        let symbol = encode_query_component("BTC&limit=999");
+        let url = format!("https://api.binance.com/api/v3/depth?symbol={symbol}&limit=5");
+        assert_eq!(url.matches("limit=").count(), 1, "伪造的 limit 必须被转义吞掉: {url}");
+        assert!(url.contains("symbol=BTC%26limit%3D999"), "{url}");
     }
 
     /// 审计 中危 #7 的**端到端**证明: 两次独立构造的客户端打同一个 host 时, 走的是

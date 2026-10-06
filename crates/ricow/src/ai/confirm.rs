@@ -231,12 +231,16 @@ impl PendingAction {
     }
 
     /// 是否已过期(now 可注入, 便于单测)。
+    ///
+    /// 用 [`Instant::checked_duration_since`] 而非 `now.duration_since(created_at)`:
+    /// 后者在 `now < created_at` 时**直接 panic**(`overflow when subtracting duration from
+    /// instant`)。虽然正常路径两者都取自 `Instant::now()`、时序必然递增, 但跨平台单调时钟
+    /// 的**起点差异**会让这个前提在测试里不成立 —— Windows 的 `Instant` 锚在系统启动时刻,
+    /// 焕然一新的 CI runner 开机仅几分钟, 于是"从 now 往回减 15 分钟"这类构造会下溢崩溃
+    /// (2026-10-06 windows-latest 实测)。`checked_*` 把"时钟倒退/起点过近"退化成"未过期",
+    /// 既不 panic 也不误判为过期。
     pub fn is_expired_at(&self, now: Instant) -> bool {
-        now.duration_since(self.created_at) > PENDING_TTL
-    }
-
-    pub fn is_expired(&self) -> bool {
-        self.is_expired_at(Instant::now())
+        now.checked_duration_since(self.created_at).is_some_and(|elapsed| elapsed > PENDING_TTL)
     }
 }
 
@@ -341,10 +345,24 @@ pub enum LineDisposition {
 
 /// 消费一行用户输入, 推进确认状态机(供 REPL 宿主调用; 纯会话逻辑, 不碰引擎/文件)。
 pub async fn consume_line(slot: &PendingSlot, line: &str, lang: Lang) -> LineDisposition {
+    consume_line_at(slot, line, lang, Instant::now()).await
+}
+
+/// [`consume_line`] 的可注入时钟内核(`now` 由调用方给定)。
+///
+/// 拆出来是为了让"过期优先于确认词"这条规则能被**确定性**地单测: 直接构造一个早于
+/// `created_at` 的 `now` 即可, 无需依赖本机单调时钟起点(Windows 下锚在开机时刻, 干净
+/// 的 CI runner 无法用 `Instant::now() - TTL` 表示"很久以前" —— 那会下溢 panic)。
+pub async fn consume_line_at(
+    slot: &PendingSlot,
+    line: &str,
+    lang: Lang,
+    now: Instant,
+) -> LineDisposition {
     let mut guard = slot.lock().await;
     match guard.take() {
         None => LineDisposition::NoPending,
-        Some(action) if action.is_expired() => LineDisposition::Expired(action),
+        Some(action) if action.is_expired_at(now) => LineDisposition::Expired(action),
         Some(action) => match classify_user_line(line, lang) {
             UserIntent::Confirm => LineDisposition::Confirm(action),
             UserIntent::Reject => LineDisposition::Reject(action),
@@ -620,12 +638,28 @@ mod tests {
     #[test]
     fn test_ttl_expiry_with_injected_clock() {
         let p = PendingAction::new_deploy("g", "pv");
-        assert!(!p.is_expired());
         assert!(!p.is_expired_at(Instant::now()));
         // 超过 15 分钟即过期
         assert!(p.is_expired_at(Instant::now() + PENDING_TTL + Duration::from_secs(1)));
         // 临界点(恰好 TTL)不算过期(用 > 而非 >=)
         assert!(!p.is_expired_at(p.created_at + PENDING_TTL));
+    }
+
+    /// 回归: `now` **早于** `created_at`(时钟倒退 / 单调时钟起点很近)不得 panic。
+    ///
+    /// 旧实现 `now.duration_since(created_at)` 在这种输入上直接 `overflow when subtracting
+    /// duration from instant` —— 2026-10-06 windows-latest 的 CI 就是这么红的(那里 `Instant`
+    /// 锚在开机时刻, 测试里"从 now 往回减 TTL"下溢)。改成 `checked_duration_since` 后,
+    /// 倒退被视作"未过期", 而非崩溃。
+    #[test]
+    fn test_is_expired_never_panics_on_backwards_clock() {
+        let p = PendingAction::new_deploy("g", "pv");
+        let before = p.created_at.checked_sub(Duration::from_secs(3600));
+        if let Some(t) = before {
+            assert!(!p.is_expired_at(t), "now 早于 created_at 时应判为未过期, 且绝不能 panic");
+        }
+        // 无论时钟起点多近都不会 panic: 取一个极早的 now。
+        let _ = p.is_expired_at(p.created_at);
     }
 
     #[tokio::test]
@@ -687,16 +721,22 @@ mod tests {
     #[tokio::test]
     async fn test_consume_line_expired_is_surfaced_and_cleared() {
         let slot = new_slot();
-        // 手工构造一条已过期 pending(created_at 私有, 同模块测试可直填)
+        // 用**注入时钟**构造已过期 pending, 而不是 `Instant::now() - PENDING_TTL - 1s`。
+        // 后者在 Windows 上会下溢 panic: `Instant` 锚在系统启动时刻, 焕然一新的 CI runner
+        // 才开机几分钟, 往回减 15 分钟直接 `overflow when subtracting duration from instant`
+        // (2026-10-06 windows-latest 实测)。注入 `now = created_at + TTL + 1s` 则与平台时钟
+        // 起点无关 —— 任何机器上都是确定性的"已过期"。
+        let created_at = Instant::now();
         *slot.lock().await = Some(PendingAction {
             kind: ActionKind::Deploy,
             name: "old".into(),
             preview_id: Some("pv-old".into()),
             params: Vec::new(),
-            created_at: Instant::now() - PENDING_TTL - Duration::from_secs(1),
+            created_at,
         });
+        let now = created_at + PENDING_TTL + Duration::from_secs(1);
         // 即使输入恰好是确认词, 过期也优先 → Expired(不得执行)
-        match consume_line(&slot, "确认", Lang::Zh).await {
+        match consume_line_at(&slot, "确认", Lang::Zh, now).await {
             LineDisposition::Expired(a) => assert_eq!(a.preview_id.as_deref(), Some("pv-old")),
             other => panic!("过期 pending 必须拦在确认之前, 实际 {other:?}"),
         }

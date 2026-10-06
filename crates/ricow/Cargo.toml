@@ -44,6 +44,8 @@ axum.workspace = true
 rpassword = "7"
 # 035: 回测 run card 的策略源码指纹 (SHA-256)
 sha2 = "0.10"
+# 低危#1: 密钥材料离开作用域时擦除内存 (见 `commands/config_file.rs` 的 Secret 包装)
+zeroize.workspace = true
 
 [dev-dependencies]
 rust_decimal_macros = "1"

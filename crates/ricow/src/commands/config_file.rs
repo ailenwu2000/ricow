@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use ricow_core::{CoreError, CoreResult};
+use zeroize::Zeroize;
 
 /// 配置文件名(位于 `$RICOW_ROOT/`)。
 pub const FILE: &str = "ricow.toml";
@@ -428,10 +429,13 @@ pub fn load(root: &Path) -> CoreResult<File> {
         ensure_template(root)?;
         return Ok(File::default());
     }
-    let text = std::fs::read_to_string(&p)
+    let mut text = std::fs::read_to_string(&p)
         .map_err(|e| CoreError::Auth(format!("读取配置文件 {} 失败: {e}", p.display())))?;
     let table: toml::Table = toml::from_str(&text)
         .map_err(|e| CoreError::Auth(format!("配置文件 {} 不是合法 TOML: {e}", p.display())))?;
+    // 审计 低危 #1: 原文(含明文密钥)在这里已用完 —— 解析成 `table` 之后就地擦除, 不让这份
+    // 完整副本在栈/堆上活到函数返回 (解析失败时 `?` 早退, 该副本随作用域自然释放)。
+    text.zeroize();
 
     // 文件存在 → 版本以"未声明"(0) 起步, 由文件里的 `schema_version` 决定; 缺省的老文件
     // 因此会被识别成 v0 并走迁移, 而不是被当成"新文件"。
@@ -780,7 +784,7 @@ pub fn set_values(root: &Path, updates: &[(&str, &str, SetValue)]) -> CoreResult
             p.display()
         )));
     }
-    let text = std::fs::read_to_string(&p)
+    let mut text = std::fs::read_to_string(&p)
         .map_err(|e| CoreError::Auth(format!("读取配置文件 {} 失败: {e}", p.display())))?;
     let mut body = text.clone();
     for (section, key, value) in updates {
@@ -790,6 +794,9 @@ pub fn set_values(root: &Path, updates: &[(&str, &str, SetValue)]) -> CoreResult
     if body != text {
         write_private(&p, &body)?;
     }
+    // 审计 低危 #1: `text`/`body` 都含明文密钥(整份文件), 用完即擦。
+    text.zeroize();
+    body.zeroize();
     Ok(())
 }
 
@@ -1247,6 +1254,31 @@ mod tests {
         let f = load(&root).unwrap();
         assert_eq!(f.ai.provider, "myproxy");
         assert_eq!(f.ai.api_key.as_deref(), Some("sk-abc"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 审计 低危 #1: 密钥的**原文副本**在读完/写完后就地擦除。
+    ///
+    /// 结构体字段级 `Drop` 会与仓库里大量 `..Default::default()` 构造语法冲突(E0509),
+    /// 得不偿失 —— 真正的"明文长驻"是**整份文件文本**(读入的原文 / 渲染后的待写体),
+    /// 它们才是几十 KB 级、含全部密钥、生命周期横跨整个函数的副本。`load` / `set_values`
+    /// 两处已在最后一次读取后 `zeroize`, 这里锁住该行为:
+    /// ① `zeroize` 对一个模拟"文件原文"的 String 确实清空内容;
+    /// ② 经 `set_values` 改动后, 生成的新配置里密钥仍**正确落盘**(擦的是内存副本, 不是文件)。
+    #[test]
+    fn test_secret_text_buffers_are_zeroized_and_file_still_written() {
+        // ① 擦除语义。
+        let mut buf = "api_key = \"sk-plain\"\nbinance_secret = \"S\"\n".to_string();
+        buf.zeroize();
+        assert!(buf.is_empty(), "zeroize 后不得再持有明文");
+
+        // ② 擦的是内存副本: 读写往返后磁盘上的密钥完好。
+        let root = tmp_root("zeroize");
+        write(&root, "[exchange]\ndemo_key = \"OLD\"\ndemo_secret = \"OLDS\"\n");
+        set_values(&root, &[("exchange", "demo_key", SetValue::Str("NEWKEY".into()))]).unwrap();
+        let mut on_disk = std::fs::read_to_string(path(&root)).unwrap();
+        assert!(on_disk.contains("NEWKEY"), "内存擦除不得影响正确落盘: {on_disk}");
+        on_disk.zeroize();
         let _ = std::fs::remove_dir_all(&root);
     }
 

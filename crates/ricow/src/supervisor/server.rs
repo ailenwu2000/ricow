@@ -458,7 +458,13 @@ async fn serve_conn(socket: tokio::net::TcpStream, server: Server) {
 /// 并按 [`procs::LOG_ROTATE_INTERVAL`] 周期检查日志体积 (只在启动时查会让长运行策略的
 /// 日志无限增长 —— 10MB 阈值形同虚设)。
 async fn monitor_loop(state: Arc<Mutex<State>>) {
-    let mut last_rotate = Instant::now() - procs::LOG_ROTATE_INTERVAL;
+    // `None` = 尚未轮转过 → 首轮即视为到期 (等价于旧写法的 `now - INTERVAL`, 但**不下溢**)。
+    //
+    // 旧写法 `Instant::now() - LOG_ROTATE_INTERVAL` 在系统开机不足 INTERVAL(60s)时会 panic
+    // (`overflow when subtracting duration from instant`): Windows 的 `Instant` 锚在启动
+    // 时刻, 干净 CI runner / 刚重启的机器都可能触发。用 `Option` 表达"还没到点"既保住
+    // "启动即检查一次"的语义, 又与时钟起点无关。
+    let mut last_rotate: Option<Instant> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -479,7 +485,7 @@ async fn monitor_loop(state: Arc<Mutex<State>>) {
                 guard.children.remove(name);
             }
             // 只给**还在运行**的策略轮转日志 (已退出的进程不再写, 没有增长压力)。
-            if last_rotate.elapsed() >= procs::LOG_ROTATE_INTERVAL {
+            if rotate_due(last_rotate) {
                 for name in guard.children.keys() {
                     rotate_targets.push(ledger::log_path(&root, name));
                 }
@@ -495,9 +501,17 @@ async fn monitor_loop(state: Arc<Mutex<State>>) {
             write_exit_record(&root, &name, &view, code, "进程自行退出");
         }
 
-        if last_rotate.elapsed() >= procs::LOG_ROTATE_INTERVAL {
-            last_rotate = Instant::now();
+        if rotate_due(last_rotate) {
+            last_rotate = Some(Instant::now());
         }
+    }
+}
+
+/// 是否到达下一次日志轮转时刻: 从未轮转过(首轮) 或已满 [`procs::LOG_ROTATE_INTERVAL`]。
+fn rotate_due(last: Option<Instant>) -> bool {
+    match last {
+        None => true,
+        Some(t) => t.elapsed() >= procs::LOG_ROTATE_INTERVAL,
     }
 }
 

@@ -54,6 +54,9 @@ ta = "0.5"
 rig = "0.42"
 # 025: Web UI 服务端 (内置 axum 只绑 127.0.0.1, 走 SSE 推流)
 axum = "0.8"
+# 019/低危#1: 密钥材料在内存中即时擦除 (Drop 时 overwrite 再释放) —— 进程 dump / swap / 崩溃
+# core 里不留明文残留。已在依赖树中 (rig/windows 系传递引入), 提为直接依赖不新增 crate。
+zeroize = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

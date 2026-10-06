@@ -21,6 +21,12 @@ use serde_json::json;
 /// 投递超时 (FR-005): 通知慢不能拖住任何东西。
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 连接建立超时 (审计 低危 #6): `SEND_TIMEOUT` 已经兜住"总耗时", 但那是**任务级**的超时 —
+/// 单个 TCP 连接在握手阶段卡住时, 连接会一直占着一个 `spawn` 出来的任务 + 一个 socket,
+/// 直到 5s 任务超时被丢弃。显式给 reqwest 一个更短的连接超时, 让"连不上"尽早失败而不是
+/// 拖满整个 SEND_TIMEOUT 窗口 (对端只接受 TCP 却从不应答时尤其明显)。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// 事件类别 (配置白名单的最小单位)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
@@ -186,7 +192,9 @@ impl Throttle {
         now: Instant,
     ) -> Result<u32, u32> {
         let due = match self.last.get(&kind) {
-            Some(t) => now.duration_since(*t) >= min_interval,
+            // `checked_duration_since` 而非 `duration_since`: 后者在 `now < t`(时钟倒退, 或测试
+            // 注入了一个早于已记录时刻的 now)时 panic。倒退时保守地**放行**(视作已到期)而不是崩溃。
+            Some(t) => now.checked_duration_since(*t).is_none_or(|d| d >= min_interval),
             None => true,
         };
         if due {
@@ -215,10 +223,18 @@ impl Notifier {
     /// 从策略配置构造; 未配置 webhook → None。
     pub fn from_config(cfg: &StrategyConfig) -> Option<Self> {
         let notify = NotifyConfig::from_config(cfg)?;
+        // 审计 低危 #6: webhook 客户端内置连接超时。`reqwest::Client::new()` 是**裸默认**
+        // (无 timeout) —— 只靠外层 `tokio::time::timeout(SEND_TIMEOUT, ..)` 兜底时, 对端
+        // 若只接受连接却从不应答, 一个 socket 会被占满整个 SEND_TIMEOUT 才被丢弃。
+        // 这里再叠一层连接超时, 让"连不上"快速失败; 总超时的兜底仍然保留。
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Some(Notifier {
             cfg: notify,
             strategy: cfg.name.clone(),
-            http: reqwest::Client::new(),
+            http,
             throttle: Mutex::new(Throttle::default()),
             liq_sent: Mutex::new(HashSet::new()),
         })
@@ -388,6 +404,25 @@ mod tests {
         assert_eq!(th.allow(EventKind::Fill, Duration::ZERO, t0 + Duration::from_secs(6)), Ok(0));
     }
 
+    /// 回归: `now` 早于已记录时刻(时钟倒退 / 注入早于 last 的 now)不得 panic。
+    ///
+    /// 旧实现 `now.duration_since(*t)` 在此输入上直接 panic; 现改用 `checked_duration_since`,
+    /// 倒退一律保守放行(视作已到期)。
+    #[test]
+    fn test_throttle_backwards_clock_never_panics() {
+        let mut th = Throttle::default();
+        let iv = Duration::from_secs(5);
+        let t0 = Instant::now();
+        assert_eq!(th.allow(EventKind::Fill, iv, t0), Ok(0), "首条放行");
+        // 构造一个**早于** last(t0)的 now; 前提是本机时钟能回退(起点不够近则跳过该断言)。
+        if let Some(earlier) = t0.checked_sub(Duration::from_secs(3)) {
+            // 关键: 不 panic。倒退时 checked_duration_since 返回 None → 按已到期放行。
+            assert_eq!(th.allow(EventKind::Fill, iv, earlier), Ok(0), "时钟倒退应保守放行而非崩溃");
+        }
+        // 相同时刻(差 0 < iv)仍应被正常压制 —— 证明倒退分支没有破坏正常限速。
+        assert_eq!(th.allow(EventKind::Fill, iv, t0), Err(1), "同一时刻仍在窗口内, 应压制");
+    }
+
     #[test]
     fn test_notify_config_from_params() {
         let mut cfg = test_config("s");
@@ -446,5 +481,49 @@ mod tests {
         }
         n.notify_at(short, t + Duration::from_secs(120));
         assert_eq!(n.liq_sent.lock().unwrap().len(), 1);
+    }
+
+    /// 审计 低危 #6: webhook 客户端必须**内置连接超时**。
+    ///
+    /// 用"只接受 TCP 连接、从不回 HTTP 响应"的本地服务端模拟挂起的对端: 投递要么很快
+    /// 因为连接超时/总超时结束, 要么根本无法连上 —— 无论哪条, `notify_at` 都不得在调用线程
+    /// 上阻塞(投递是 `spawn` 出去的)。这里断言的是**调用方不受影响**这一契约, 顺带覆盖
+    /// "对端存在但不应答"这条最容易拖住 socket 的路径。
+    #[tokio::test]
+    async fn test_webhook_delivery_never_blocks_caller_and_has_timeout_built_in() {
+        // 只 accept、不回应: 让 reqwest 卡在"等响应"。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("占位监听");
+        let port = listener.local_addr().unwrap().port();
+        let _server = tokio::spawn(async move {
+            // 收下连接后就不管了(不写响应) —— 维持挂起状态。
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut [0u8; 1024]).await;
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+        });
+
+        let mut cfg = test_config("s");
+        cfg.params.insert(
+            "notify_webhook".into(),
+            ricow_strategy::ConfigValue::String(format!("http://127.0.0.1:{port}/hook")),
+        );
+        let n = Notifier::from_config(&cfg).expect("启用");
+        // 关键断言: 调用线程**立刻**返回(投递在 spawn 里), 不等对端应答。
+        let started = Instant::now();
+        n.notify_at(
+            NotifyEvent::Fill {
+                pair: "ETHUSDT".into(),
+                side: "buy".into(),
+                price: dec!(2500),
+                size: dec!(0.01),
+                fee: dec!(0),
+            },
+            Instant::now(),
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "notify_at 不得阻塞调用线程 (实际 {:?})",
+            started.elapsed()
+        );
     }
 }

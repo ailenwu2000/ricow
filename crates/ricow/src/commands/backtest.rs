@@ -492,6 +492,30 @@ const CHART_MAX_FILLS: usize = 1000;
 /// 过期只删本地副本 —— 需要更早的历史时, 回测会按窗口自动向前翻页重新取数(见上方分页逻辑)。
 const KLINE_RETENTION_DAYS: i64 = 400;
 
+/// 单次回测允许拉取的 **K 线根数上限** (审计 低危 #4)。
+///
+/// 回测把整段 K 线一次性读进 `Vec<Kline>` 并交给引擎逐 bar 回放 —— 内存随根数线性增长,
+/// 而根数 = `天数 × 24 / bar 小时数` 原样由调用方给: CLI `--days` 无上界, 一个笔误
+/// (`--days 100000 --interval 1m` = 1.44 亿根) 就能在拉数阶段把进程 OOM 掉, 而用户只看到
+/// "卡住/被杀"。这里在**拉数据之前**竖起上限, 报错说明按哪个口径超了, 让用户改窗口而不是等 OOM。
+///
+/// 取值 13,000,000 根: 约对应 1m × 90 天 (≈12.96M) / 1h × 1480 天;`Kline` 约 100 字节/根,
+/// 该量级下峰值约 1.3 GB(含预热与副本) —— 已是普通机器能承受、且远超实际策略回测所需的边界。
+const MAX_BACKTEST_BARS: u64 = 13_000_000;
+
+/// 审计 低危 #4: 纯函数形式的上限校验(便于单测, 不碰网络)。
+///
+/// `limit` 是**已换算好的根数**, `days`/`interval` 只用于报错文案。
+fn check_bar_budget(limit: u32, days: u32, interval: &str) -> CoreResult<()> {
+    if u64::from(limit) > MAX_BACKTEST_BARS {
+        return Err(CoreError::InvalidArgument(format!(
+            "回测窗口过大: {days} 天 × {interval} 约需 {limit} 根 K 线, 超过上限 {MAX_BACKTEST_BARS} 根 \
+             —— 一次性载入会耗尽内存。请缩小 --days / --start..--end 窗口, 或改用更大的 --interval。"
+        )));
+    }
+    Ok(())
+}
+
 impl BacktestOutcome {
     /// 抽稀一维序列 (保首尾): `stride` = 1 时原样返回。
     fn downsample(v: &[f64], stride: usize) -> Vec<f64> {
@@ -643,6 +667,10 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
         None => (days, end_ms),
     };
     let limit = ((days as f64) * 24.0 / hours_per_bar) as u32;
+    // 审计 低危 #4: 在拉数之前挡住"根数爆炸"。`limit` 由调用方的 `days` 直接换算, CLI
+    // 未设上界 —— 超大窗口会在 `Vec<Kline>` 累积阶段 OOM。这里提前报错并给出建议, 让用户
+    // 改窗口/粒度, 而不是等进程被杀。
+    check_bar_budget(limit, days, &interval)?;
 
     let exchange = crate::commands::bn_exchange()?;
     let mut config = load_run_config(
@@ -1418,6 +1446,23 @@ fn prune_run_cards(dir: &Path) -> usize {
 mod tests {
     use super::*;
     use crate::commands::test_util::ENV_LOCK;
+
+    /// 审计 低危 #4: 根数上限校验 —— 常规窗口放行, 越界窗口报错且文案点名建议。
+    #[test]
+    fn test_check_bar_budget_allows_reasonable_and_rejects_huge() {
+        // 90 天 1h ≈ 2160 根 → 放行。
+        assert!(check_bar_budget(2_160, 90, "1h").is_ok());
+        // 恰好在上限 → 放行(边界闭区间)。
+        assert!(check_bar_budget(MAX_BACKTEST_BARS as u32, 90, "1m").is_ok());
+        // 超上限一根 → 拒。
+        let err = check_bar_budget(MAX_BACKTEST_BARS as u32 + 1, 100_000, "1m").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("回测窗口过大"), "{msg}");
+        assert!(msg.contains("--days"), "报错应给出可执行的改法: {msg}");
+        // 极端笔误: 100000 天 1m (u32 内可表示) 也应被挡。
+        let huge = ((100_000f64) * 24.0 / (1.0 / 60.0)) as u32;
+        assert!(check_bar_budget(huge, 100_000, "1m").is_err());
+    }
 
     /// P0-2 回归(2026-10-05): 复刻实测口径 —— 744 根 klines(前 24 根预热) + 720 评测 bar。
     /// 价格必须取**尾部** 720 根与权益逐点对齐, 且丢掉曲线初始现金点。

@@ -31,7 +31,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -297,7 +297,40 @@ pub fn router(state: WebState) -> Router {
         .route("/api/strategies/{id}/stop", axum::routing::post(runs::stop_strategy))
         .route("/api/risk-ack", axum::routing::post(runs::post_risk_ack))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require_token))
+        // 安全响应头 (审计 低危 #2): 挂在**最外层**, 保证 401/403/404 等早退响应也带上加固头。
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// 安全响应头 (审计 低危 #2): 全部响应统一注入。
+///
+/// 这是纯纵深加固 —— 服务只绑回环、页面无第三方内容, 不是"堵某个已证实的洞":
+/// - `X-Content-Type-Options: nosniff` —— 禁内容嗅探, 静态资源不会被当成 HTML 执行;
+/// - `Referrer-Policy: no-referrer` —— 页面导航外跳时不带 Referer。**关键**: token 会出现在
+///   URL 查询串里, 若 Referer 外流, token 就跟着漏(与"导航 302 去 token"是同一威胁面);
+/// - `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'` —— 禁被 iframe 嵌套(点击劫持);
+/// - `Content-Security-Policy` —— 限死脚本/样式/连接来源为 `'self'`. 前端只加载同源脚本与
+///   `lightweight-charts.js`, SSE 走同源 `EventSource`, 故 `default-src 'self'` 足够;
+///   `style-src` 放宽到 `'unsafe-inline'` 是因为图表库与主题切换会写内联 style 属性
+///   (属性写法不受 `style-src` 的 `'unsafe-inline'` 约束, 但内联 `<style>` 需要它)。
+async fn security_headers(req: axum::extract::Request, next: middleware::Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    for (name, value) in [
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        // 标准头 + 旧名一并给(FrameOptions 已废弃但旧浏览器仍认)。
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; font-src 'self'; \
+             object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    ] {
+        h.insert(name, header::HeaderValue::from_static(value));
+    }
+    resp
 }
 
 /// 启动服务并阻塞; Ctrl-C 触发优雅停机(停机范式同 `commands/daemon.rs`)。
@@ -538,6 +571,53 @@ mod tests {
         let body_txt = body_of(&res);
         assert!(body_txt.contains(r#""configured":false"#), "空模板应全部未配置: {body_txt}");
         assert!(!body_txt.contains(FAKE_KEY), "读响应不得含密钥全文: {body_txt}");
+    }
+
+    /// 审计 低危 #2: 全部响应都带安全头, **包括早退的 401** —— 所以中间件必须挂在最外层。
+    #[tokio::test]
+    async fn test_security_headers_present_on_200_and_401() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn get(port: u16, path: &str) -> String {
+            let mut stream =
+                tokio::net::TcpStream::connect((BIND_ADDR, port)).await.expect("连上服务");
+            let req =
+                format!("GET {path} HTTP/1.1\r\nHost: {BIND_ADDR}\r\nConnection: close\r\n\r\n");
+            stream.write_all(req.as_bytes()).await.expect("发出请求");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("读回响应");
+            String::from_utf8_lossy(&buf).to_ascii_lowercase()
+        }
+
+        let root = std::env::temp_dir().join(format!("ricow-web-sechdr-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("建临时数据目录");
+        let db = Database::open_in_memory().await.expect("开内存库");
+        let store = SessionStore::new(db.clone());
+        let starter: Starter = Arc::new(|_id: &str, _sink: &mut WebSink| Ok(()));
+        let state = WebState::new("tok-sec".to_string(), root, db, store, starter);
+        let (listener, port) = bind(0).await.expect("绑定回环端口");
+        let _server = tokio::spawn(serve(listener, state));
+
+        // 200 与 401 两条路径都必须带齐四类加固头。
+        for (path, want_status) in [("/api/ping?token=tok-sec", "200"), ("/api/ping", "401")] {
+            let res = get(port, path).await;
+            // 注意: `get` 已把整段响应小写化(便于比头名), 状态行也要按小写比。
+            assert!(
+                res.starts_with(&format!("http/1.1 {want_status}")),
+                "{path}: 期望 {want_status}, 实际: {res}"
+            );
+            assert!(res.contains("x-content-type-options: nosniff"), "{path} 缺 nosniff: {res}");
+            assert!(
+                res.contains("referrer-policy: no-referrer"),
+                "{path} 缺 Referrer-Policy: {res}"
+            );
+            assert!(res.contains("x-frame-options: deny"), "{path} 缺 X-Frame-Options: {res}");
+            assert!(
+                res.contains("content-security-policy: default-src 'self'"),
+                "{path} 缺 CSP: {res}"
+            );
+            assert!(res.contains("frame-ancestors 'none'"), "{path} CSP 应禁嵌套: {res}");
+        }
     }
 
     /// 收一帧(最多 2 秒); 收不到即失败 —— 线程行为不符合预期时不让测试挂死。

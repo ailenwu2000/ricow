@@ -63,6 +63,12 @@ impl fmt::Debug for FuturesClient {
 
 impl FuturesClient {
     /// 主网无凭据客户端 (只读账户类端点不可用; 主要用于对称测试/未来扩展)。
+    ///
+    /// 审计 低危 #5: **故意不实现 `Default`**。构造要过 base_url 白名单 (`validate_base_url`),
+    /// 有真实失败面; 早先的 `impl Default { Self::new().expect(...) }` 把这条失败路径藏进
+    /// `expect` —— 一旦 `RICOW_FAPI_BASE_URL` 被设成白名单外的主机, **任何**触发 `Default`
+    /// 的泛型代码 (含 `unwrap_or_default()` / `#[derive(Default)]` 的字段) 都会直接 panic,
+    /// 绕过调用方本该处理的 `CoreResult`。需要默认实例请显式调 [`Self::new`] 并处理错误。
     pub fn new() -> CoreResult<Self> {
         let http = crate::client::shared_http().map_or_else(build_http, Ok)?;
         // 域名可配置 (代理/测试环境): RICOW_FAPI_BASE_URL 覆盖, 缺省主网。
@@ -127,6 +133,7 @@ impl FuturesClient {
 
     /// 最新标记价格与资金费率 (premiumIndex)。
     pub async fn get_premium_index(&self, symbol: &str) -> CoreResult<Value> {
+        let symbol = crate::client::encode_query_component(symbol);
         let url = format!("{}/fapi/v1/premiumIndex?symbol={symbol}", self.base_url);
         self.get_json(&url).await
     }
@@ -200,7 +207,7 @@ impl FuturesClient {
         let url = format!(
             "{}/fapi/v1/depth?symbol={}&limit={limit}",
             self.base_url,
-            symbol.to_uppercase()
+            crate::client::encode_query_component(&symbol.to_uppercase())
         );
         let v: Value = self.get_json(&url).await?;
         Ok(OrderBook {
@@ -219,7 +226,7 @@ impl FuturesClient {
         let url = format!(
             "{}/fapi/v1/depth?symbol={}&limit={limit}",
             self.base_url,
-            symbol.to_uppercase()
+            crate::client::encode_query_component(&symbol.to_uppercase())
         );
         let v: Value = self.get_json(&url).await?;
         let last_update_id = v["lastUpdateId"].as_u64().unwrap_or(0);
@@ -526,12 +533,6 @@ impl FuturesClient {
         let signature = sign_hmac_sha256(&qs, secret_key);
         params.push(("signature".into(), signature));
         Ok(())
-    }
-}
-
-impl Default for FuturesClient {
-    fn default() -> Self {
-        Self::new().expect("FuturesClient::new")
     }
 }
 

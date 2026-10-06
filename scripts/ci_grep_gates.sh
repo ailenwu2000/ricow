@@ -139,6 +139,28 @@ else
     pass "落盘入口唯一" "(execute_strategy: deploy.rs / ai/session.rs / 定义处)"
 fi
 
+# ---------------------------------------------------------------------------
+# 红线 5: 生产代码不得对 `Instant` 做裸减法 (`instant - duration`)。
+#
+# `Instant` 的零点 = 平台单调时钟起点 (Windows 锚在系统启动时刻)。任何 `instant - d`
+# 在"当前时刻距零点不足 d"时都会 **panic**: `overflow when subtracting duration from
+# instant`(std time.rs)。2026-10-06 windows-latest 的 CI 就是这么红的 —— runner 刚开机
+# 几分钟, `Instant::now() - 15min` 直接下溢。
+# 正确写法: `checked_sub` / `checked_duration_since` / `saturating_duration_since`,
+# 或改用 `Option<Instant>` 表达"还没到点"。
+# ---------------------------------------------------------------------------
+hits=$(non_test_lines $ALL_SRC \
+    | awk -F'\t' '{ code=$3; sub(/^[[:space:]]*/, "", code); if (substr(code,1,2) != "//") print }' \
+    | grep -E 'Instant::now\(\)[[:space:]]*-' \
+    || true)
+if [ -n "$hits" ]; then
+    fail "生产代码不得对 Instant 做裸减法 (会下溢 panic)" \
+        "改用 checked_sub / checked_duration_since / saturating_duration_since, 或用 Option<Instant> 表达'未到点'。" \
+        "$hits"
+else
+    pass "Instant 无裸减法" "(全仓 src, 排除 #[cfg(test)])"
+fi
+
 printf '%s\n' ""
 if [ "$FAILED" -eq 0 ]; then
     printf '%s安全红线门禁: 全绿%s\n' "$GREEN" "$RESET"

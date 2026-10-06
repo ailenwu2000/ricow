@@ -92,7 +92,7 @@ pub(crate) fn load_demo_credentials(
     let path = config_file::path(root);
     let pair = match env_pair {
         (Some(k), Some(s)) => (Some(k), Some(s)),
-        _ => (cfg.exchange.demo_key, cfg.exchange.demo_secret),
+        _ => (cfg.exchange.demo_key.clone(), cfg.exchange.demo_secret.clone()),
     };
     match pair {
         (Some(k), Some(s)) => Ok((k, s)),
@@ -181,7 +181,7 @@ pub(crate) fn load_live_credentials() -> ricow_core::CoreResult<(String, String)
     let root = project_root();
     let cfg = config_file::load(&root)?;
     let path = config_file::path(&root);
-    match (cfg.exchange.binance_key, cfg.exchange.binance_secret) {
+    match (cfg.exchange.binance_key.clone(), cfg.exchange.binance_secret.clone()) {
         (Some(k), Some(s)) => Ok((k, s)),
         _ => Err(ricow_core::CoreError::Auth(format!(
             "实盘凭据未填写: 请在 {} 的 [exchange] 段填入 binance_key / binance_secret\n             (或临时设环境变量 RICOW_BN_API_KEY / RICOW_BN_SECRET_KEY)",
