@@ -141,7 +141,16 @@ const QUOTE_STALE_SECS: u64 = 120;
 /// 看门狗巡检间隔 (秒)。
 const WATCHDOG_INTERVAL_SECS: u64 = 30;
 
-/// 实盘双流事件 (行情 / 用户数据流 / 停机信号 / 资金费对账)。
+/// 持仓/余额**周期性 REST 对账**间隔 (秒): 5 分钟 (审计 中危 #9)。
+///
+/// 用户数据流守护层对主循环**透明重连**(见 `futures_ws::run_user_data_ws` /
+/// `ws::run_user_stream`), 重连窗口内被动成交的用户流帧会永久丢失 —— 引擎不知道有这笔成交,
+/// 持仓/现金视图停在对账前的旧值, 策略可能据此重复开仓。限价单没有 `any_filled`
+/// 补偿路径(市价单有), 只能靠周期对账兜底: 每 5 分钟拉一次 REST 持仓/余额,
+/// 把漂移的视图拉回来 (不打印成"成交", 只对齐存量)。
+const RECONCILE_INTERVAL_SECS: u64 = 300;
+
+/// 实盘双流事件 (行情 / 用户数据流 / 停机信号 / 资金费对账 / 持仓对账)。
 enum LiveEvent {
     Stop(Option<StopRequest>),
     Quote(Option<ricow_core::OrderBookUpdate>),
@@ -150,6 +159,8 @@ enum LiveEvent {
     Funding,
     /// 行情健康巡检 (审计 H-4): 行情超过 [`QUOTE_STALE_SECS`] 无帧时 error 告警。
     Watchdog,
+    /// 持仓/余额周期性 REST 对账 (审计 中危 #9): 补齐用户流重连窗口内丢失的成交造成的视图漂移。
+    Reconcile,
 }
 
 /// 拉取资金费流水并落库 (014 FR-003): 水位 = db `MAX(funding_time)`(无记录则回溯 `FUNDING_LOOKBACK_MS`)。
@@ -622,6 +633,9 @@ pub struct RunOutcome {
     pub rejections: u64,
     /// 落库失败数 (成交 / 订单 / 持仓 / 盈亏快照)
     pub persist_errors: u64,
+    /// 周期对账修正的持仓漂移次数 (审计 中危 #9): 疑似用户流重连窗口内成交未送达,
+    /// 视图被 REST 对账拉回。>0 表示本次运行发生过对账修正, 供收尾如实提示。
+    pub reconciliation_fixes: u64,
     /// 最近一次错误信息 (如实反映, 不夸大)
     pub last_error: Option<String>,
     /// 策略是否实现了停机清理 (`on_stop`); false 时需提示用户手工处理
@@ -1113,9 +1127,16 @@ impl Engine {
         funding_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut watchdog_tick = tokio::time::interval(Duration::from_secs(WATCHDOG_INTERVAL_SECS));
         watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 持仓/余额周期对账 (审计 中危 #9): 补齐用户流重连窗口内丢失成交造成的视图漂移。
+        // 首拍立即触发一次(`interval` 语义), 正好在启动装配完成后做一次基线对齐。
+        let mut reconcile_tick =
+            tokio::time::interval(Duration::from_secs(RECONCILE_INTERVAL_SECS));
+        reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // 行情健康跟踪: 最近一帧的时刻 + 陈旧告警是否已发出 (恢复后重置, 避免告警风暴)
         let mut last_quote_at = std::time::Instant::now();
         let mut quote_stale_reported = false;
+        // 周期对账纠正过的漂移次数 (审计 中危 #9): 只累计用于收尾观测, 计入 outcome。
+        let mut reconciliation_drift_fixes: u64 = 0;
         tracing::info!(target: "engine", name = %strategy_name, pair = %pair, mode = %mode.label(), "live run started");
 
         let mut stop_rx = stop;
@@ -1138,12 +1159,14 @@ impl Engine {
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
                     _ = watchdog_tick.tick() => LiveEvent::Watchdog,
+                    _ = reconcile_tick.tick() => LiveEvent::Reconcile,
                 },
                 None => tokio::select! {
                     upd = quote_stream.next() => LiveEvent::Quote(upd),
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
                     _ = watchdog_tick.tick() => LiveEvent::Watchdog,
+                    _ = reconcile_tick.tick() => LiveEvent::Reconcile,
                 },
             };
 
@@ -1190,6 +1213,39 @@ impl Engine {
                     } else if quote_stale_reported {
                         quote_stale_reported = false;
                         tracing::info!(target: "engine", name = %strategy_name, pair = %pair, "行情已恢复");
+                    }
+                }
+                LiveEvent::Reconcile => {
+                    // 审计 中危 #9: 用户流守护层对主循环透明重连, 重连窗口内的被动成交
+                    // 用户流帧会永久丢失 (限价单无 `any_filled` 补偿路径)。每 5 分钟拉一次
+                    // REST 持仓/余额, 把漂移的本地视图拉回真实值 —— 不打印成"成交"
+                    // (那会污染 PnL/账本), 只对齐**存量**视图, 消除"按错误持仓重复开仓"的风险。
+                    let before = ctx.position(&pair).map(|p| p.size);
+                    let refreshed = refresh_positions(
+                        &exchange,
+                        &market,
+                        &pair,
+                        &ctx,
+                        is_futures,
+                        &strategy_name,
+                        liq_warn_threshold,
+                        notifier.as_ref(),
+                    )
+                    .await;
+                    if let Some(ps) = refreshed {
+                        let after = ps.first().map(|p| p.size).unwrap_or_default();
+                        if let Some(b) = before {
+                            if (after - b).abs() > Decimal::ZERO {
+                                // 漂移被对账纠正: 存量视图与用户流账本不一致, 说明有成交
+                                // 未经由用户流送达 (重连窗口丢失)。warn 留痕, 不改 fills 计数。
+                                tracing::warn!(
+                                    target: "engine", name = %strategy_name, pair = %pair,
+                                    before = %b, after = %after,
+                                    "持仓对账修正漂移 (疑似用户流重连窗口内成交未送达)"
+                                );
+                                reconciliation_drift_fixes += 1;
+                            }
+                        }
                     }
                 }
                 LiveEvent::Quote(None) => {
@@ -1373,6 +1429,16 @@ impl Engine {
                     }
                 },
             }
+        }
+
+        // 周期对账成果归集 (审计 中危 #9): 收尾如实反映本次运行发生过几次持仓漂移修正。
+        outcome.reconciliation_fixes = reconciliation_drift_fixes;
+        if reconciliation_drift_fixes > 0 {
+            tracing::warn!(
+                target: "engine", name = %strategy_name,
+                fixes = reconciliation_drift_fixes,
+                "本次运行发生 {} 次持仓对账修正 (用户流重连窗口内成交未送达)", reconciliation_drift_fixes
+            );
         }
 
         // 停机前再拉一次资金费 (014 FR-003): 覆盖停机瞬间前的最后一笔结算
@@ -1755,6 +1821,136 @@ mod tests {
         assert_eq!(n, 0);
         assert_eq!(ok_outcome.persist_errors, 0, "成功路径不得虚报错误");
         assert!(ok_outcome.last_error.is_none(), "成功路径不得留下 last_error");
+    }
+
+    /// 审计 中危 #9 回归用的最小替身交易所: 只覆盖现货对账需要的 `get_balance` ——
+    /// 按 `base_free` 报告真实余额(模拟"交易所那边其实已经成交了 1 个币"),
+    /// 其余方法一律 `unimplemented!`(本用例不会触达)。
+    ///
+    /// (纯逻辑单测: 校验的是"对账能否把漂移视图拉回真实值"这段本地分支, 不涉交易流程。)
+    struct ReconcileStubExchange {
+        base_free: Decimal,
+    }
+
+    #[async_trait::async_trait]
+    impl Exchange for ReconcileStubExchange {
+        fn name(&self) -> &'static str {
+            "reconcile-stub"
+        }
+        async fn get_balance(&self, asset: &str) -> CoreResult<Balance> {
+            // 只有 base 资产(ETH)有余额; quote(USDT)报 0。
+            if asset == "ETH" {
+                Ok(Balance {
+                    asset: asset.to_string(),
+                    free: self.base_free,
+                    locked: Decimal::ZERO,
+                })
+            } else {
+                Ok(Balance { asset: asset.to_string(), free: Decimal::ZERO, locked: Decimal::ZERO })
+            }
+        }
+        async fn get_markets(&self) -> CoreResult<Vec<ricow_core::Market>> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+        async fn get_klines(&self, _p: &str, _i: &str, _l: u32) -> CoreResult<Vec<Kline>> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+        async fn get_orderbook(&self, _p: &str, _d: u32) -> CoreResult<ricow_core::OrderBook> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+        async fn place_order(&self, _req: ricow_core::OrderRequest) -> CoreResult<OrderAck> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+        async fn cancel_order(&self, _p: &str, _id: &str) -> CoreResult<()> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+        async fn get_open_orders(&self, _p: &str) -> CoreResult<Vec<ricow_core::OrderInfo>> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+        async fn get_position(&self, _p: &str) -> CoreResult<Option<Position>> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+        async fn funding_income(
+            &self,
+            _s: i64,
+            _l: u32,
+        ) -> CoreResult<Vec<ricow_core::FundingIncome>> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+        async fn subscribe_orderbook(
+            &self,
+            _p: &str,
+        ) -> CoreResult<Pin<Box<dyn Stream<Item = ricow_core::OrderBookUpdate> + Send>>> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+        async fn subscribe_user_events(
+            &self,
+        ) -> CoreResult<Pin<Box<dyn Stream<Item = UserEvent> + Send>>> {
+            unimplemented!("本替身只服务现货对账分支")
+        }
+    }
+
+    /// 审计 中危 #9: 用户流重连窗口内丢失成交 → 本地持仓视图漂移; 周期对账必须把它
+    /// 拉回交易所真实值 (否则策略按错误持仓重复开仓)。
+    #[tokio::test]
+    async fn test_reconcile_pulls_drifted_view_back_to_exchange_truth() {
+        let rt = tokio::runtime::Handle::current();
+        let exchange: Arc<dyn Exchange> = Arc::new(ReconcileStubExchange { base_free: dec!(2.0) });
+        let config = lua_config("t-reconcile", "ETH");
+        let ctx = LiveContext::new(exchange.clone(), config, rt);
+
+        let market = ricow_core::Market {
+            symbol: "ETHUSDT".into(),
+            base_asset: "ETH".into(),
+            quote_asset: "USDT".into(),
+            is_perpetual: false,
+            min_size: dec!(0.001),
+            tick_size: dec!(0.01),
+            step_size: None,
+            min_notional: None,
+            max_leverage: None,
+            margin_mode: None,
+            is_delisted: false,
+        };
+
+        // 起始: 本地视图陈列为 1.0 (对账前的旧值; 真实交易所已有 2.0)。
+        ctx.set_positions(
+            "ETH",
+            &[Position {
+                pair: "ETH".into(),
+                side: OrderSide::Buy,
+                size: dec!(1.0),
+                entry_price: Decimal::ZERO,
+                mark_price: Decimal::ZERO,
+                liquidation_price: None,
+                unrealized_pnl: Decimal::ZERO,
+                leverage: None,
+            }],
+        );
+        assert_eq!(ctx.position("ETH").map(|p| p.size), Some(dec!(1.0)));
+
+        // 对账 (与 live 循环里的 `LiveEvent::Reconcile` 调的是同一个函数)。
+        let refreshed = refresh_positions(
+            &exchange,
+            &market,
+            "ETH",
+            &ctx,
+            false, // 现货
+            "t-reconcile",
+            0.0,
+            None,
+        )
+        .await;
+        let sizes: Vec<Decimal> =
+            refreshed.expect("现货对账应返回持仓").iter().map(|p| p.size).collect();
+        assert_eq!(sizes, vec![dec!(2.0)], "对账应报告交易所真实持仓");
+
+        // 关键: 本地视图被拉回真实值 (漂移修正)。
+        assert_eq!(
+            ctx.position("ETH").map(|p| p.size),
+            Some(dec!(2.0)),
+            "对账后本地持仓视图必须等于交易所真实值 (漂移已纠正)"
+        );
     }
 
     fn make_klines(n: u32) -> Vec<Kline> {

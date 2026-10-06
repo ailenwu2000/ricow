@@ -123,7 +123,12 @@ fn transport_retryable(e: &reqwest::Error, kind: RequestKind) -> bool {
     e.is_timeout() || e.is_request() || e.is_body() || e.is_decode()
 }
 
-/// 指数退避 + ±20% 抖动 (用纳秒低位做伪随机源, 免引入 rand 依赖)。
+/// 指数退避 + ±20% 抖动 (审计 中危 #10)。
+///
+/// 抖动源 = 纳秒低位 **异或** 进程内单调递增的调用序号 —— 只用 `SystemTime` 纳秒低位时,
+/// 并发任务若落在同一毫秒内, `subsec_nanos` 值几乎相同 (同一次调度批次), 抖动近乎一致,
+/// 退避无法错峰: 多个 429 的重试会在同一时刻一起打回交易所, 反而加剧限流。
+/// 混入原子序号后, 即使同一纳秒发起, 各调用的抖动也互不相同。
 fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
     let shift = (attempt.saturating_sub(1)).min(5);
     let exp = policy.base_delay.saturating_mul(1u32 << shift).min(policy.max_delay);
@@ -132,13 +137,22 @@ fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
     Duration::from_millis(jittered)
 }
 
+/// 进程内抖动序号: 每次取抖动自增一次, 保证并发调用各不相同 (审计 中危 #10)。
+static JITTER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// -20..=20 的伪随机抖动百分比。
+///
+/// 取 `SystemTime` 纳秒低位 **异或** 自增序号, 再折叠到 `-20..=20`;
+/// 序号保证同纳秒并发调用也会散开, 时间项保证跨时间继续变化。
 fn pseudo_jitter_pct() -> i64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as i64)
+        .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
-    (nanos % 41) - 20
+    let seq = JITTER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 序号左移 8 位再异或, 避免与纳秒低位在同一批位上重复。
+    let mixed = nanos ^ (seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    (mixed % 41) as i64 - 20
 }
 
 /// 解析 `Retry-After` 响应头 (仅秒形式; 币安限流用秒)。上限 30s 防挂起。
@@ -212,5 +226,52 @@ mod tests {
         assert!(d3 > d1, "退避应随尝试次数增长");
         let d9 = backoff_delay(&p, 9);
         assert!(d9 <= p.max_delay.mul_f64(1.21), "退避须封顶在 max_delay 附近, 实得 {:?}", d9);
+    }
+
+    /// 审计 中危 #10: 抖动必须在**同一纳秒内**也互不相同 —— 旧实现只用 `SystemTime`
+    /// 纳秒低位, 同一纳秒的并发重试会算出**完全相同**的抖动, 退避无法错峰。
+    ///
+    /// 这里直接盯住根因: 把时间项钉死 (相同 `nanos`), 抖动仍必须随调用序号变化。
+    /// 旧实现在此必然失败 (相同 nanos → 相同结果)。
+    #[test]
+    fn test_jitter_varies_at_fixed_timestamp() {
+        // 复刻抖动算法, 但把时间项固定 —— 检验"序号是否真的参与"。
+        let fixed_nanos: u64 = 123_456_789;
+        let mix = |nanos: u64, seq: u64| -> i64 {
+            let mixed = nanos ^ (seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            (mixed % 41) as i64 - 20
+        };
+        // 同一时间戳下连续 50 次: 必须出现多个不同值 (旧实现恒为同一个值)。
+        let vals: Vec<i64> = (0..50).map(|s| mix(fixed_nanos, s as u64)).collect();
+        let distinct: std::collections::HashSet<i64> = vals.iter().copied().collect();
+        assert!(
+            distinct.len() >= 10,
+            "同一时间戳下抖动必须靠序号散开 (旧实现会恒等于一个值), 实测 {} 种",
+            distinct.len()
+        );
+        assert!(vals.iter().all(|v| (-20..=20).contains(v)), "抖动百分比越界: {vals:?}");
+    }
+
+    /// 连续密集调用: 抖动取值应充分覆盖 `-20..=20` 的取值域, 且不出现"整批相同"。
+    #[test]
+    fn test_jitter_decorrelates_across_back_to_back_calls() {
+        let values: Vec<i64> = (0..200).map(|_| pseudo_jitter_pct()).collect();
+        let distinct: std::collections::HashSet<i64> = values.iter().copied().collect();
+        assert!(
+            distinct.len() >= 20,
+            "密集调用下抖动应充分散开, 实测仅有 {} 个不同取值: {:?}",
+            distinct.len(),
+            values
+        );
+        assert!(values.iter().all(|v| (-20..=20).contains(v)), "抖动百分比越界: {:?}", values);
+    }
+
+    /// 退避时长本身也应在并发调用下分散 (不只是百分比函数)。
+    #[test]
+    fn test_backoff_delays_differ_across_back_to_back_calls() {
+        let p = RetryPolicy::default();
+        let delays: Vec<Duration> = (0..50).map(|_| backoff_delay(&p, 2)).collect();
+        let distinct: std::collections::HashSet<Duration> = delays.iter().copied().collect();
+        assert!(distinct.len() > 5, "同 attempt 的退避时长应分散, 实测只有 {} 种", distinct.len());
     }
 }

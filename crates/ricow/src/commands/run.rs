@@ -364,6 +364,15 @@ fn print_run_outcome(o: &RunOutcome) {
     if let Some(e) = &o.last_error {
         println!("最近错误: {e}");
     }
+    // 审计 中危 #9: 用户流重连窗口内成交未送达 → 周期对账修正过持仓视图。
+    // 只在 >0 时提示 (健康运行不打印噪音), 提醒用户核对这段时间的成交明细。
+    if o.reconciliation_fixes > 0 {
+        println!(
+            "对账提示: 本次运行发生 {} 次持仓漂移修正 — 疑似用户数据流重连窗口内有成交未送达, \
+             本地持仓视图已被 REST 对账拉回; 请核对这段时间的成交与持仓明细",
+            o.reconciliation_fixes
+        );
+    }
     if let Some(c) = &o.cleanup {
         println!(
             "停机清理: 已撤挂单={} 撤单失败={} 平仓单={} 平仓失败={} 残留挂单={} 残留持仓={}",
