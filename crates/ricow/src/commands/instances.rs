@@ -662,8 +662,8 @@ pub(crate) async fn format_open_orders(
         .await
         .map_err(|e| CoreError::InvalidArgument(format!("查询订单失败: {e}")))?;
 
-    let open: Vec<_> =
-        rows.iter().filter(|r| matches!(r.status.as_str(), "open" | "partially_filled")).collect();
+    // 未终结判据与 `ricow exposure` 共用同一份实现 (漂移会让两个视图互相矛盾)。
+    let open: Vec<_> = rows.iter().filter(|r| ricow_engine::is_open_status(&r.status)).collect();
 
     if open.is_empty() {
         if rows.is_empty() {

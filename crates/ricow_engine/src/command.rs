@@ -21,10 +21,14 @@ use rust_decimal::Decimal;
 
 use crate::backtest_runner::run_backtest;
 use crate::confirm::create_preview;
-use crate::live::{plan_cleanup, residual_owned, CleanupOutcome, OnceGate};
+use crate::live::{
+    must_refuse_start, orphan_query_refuse_message, orphan_refuse_message, plan_cleanup,
+    residual_owned, split_owned, CleanupOutcome, OnceGate,
+};
 use crate::loader::load_strategy;
 use crate::market;
 use crate::notify::{Notifier, NotifyEvent};
+use crate::oms::{OmsCounts, OrderRegistry, RecordVerdict};
 
 /// 引擎入口 — 无状态命令分发。
 pub struct Engine;
@@ -280,6 +284,9 @@ async fn drain_user_events(
     strategy_name: &str,
     prefix: &str,
     outcome: &mut RunOutcome,
+    // 037 P0-B: 会话订单登记表 —— 停机清理窗口内的成交/回报**同样是本次会话的账**,
+    // 不喂给它的话, 刚撤的单/刚平的仓会在收尾账目里被误报成"仍挂单"。
+    registry: &mut OrderRegistry,
     window: Duration,
     notifier: Option<&Notifier>,
     mode: RunMode,
@@ -297,6 +304,12 @@ async fn drain_user_events(
                     continue;
                 }
                 n += 1;
+                // 037 P0-B: 增量口径, 与本笔 `fill_size` 一致
+                registry.apply_fill(
+                    &fill.client_order_id,
+                    fill.fill_size,
+                    Utc::now().timestamp_millis(),
+                );
                 ctx.record_fill(&fill);
                 outcome.fills += 1;
                 if let Some(db) = db {
@@ -325,6 +338,13 @@ async fn drain_user_events(
                 if !is_owned(&upd.client_order_id, prefix) {
                     continue;
                 }
+                // 037 P0-B: 累计口径, 与 `OrderUpdate.filled_size` 一致
+                registry.apply_user_order(
+                    &upd.client_order_id,
+                    upd.status,
+                    upd.filled_size,
+                    Utc::now().timestamp_millis(),
+                );
                 if let Some(db) = db {
                     persist_order_update(db, outcome, strategy_name, &upd, mode).await;
                 }
@@ -642,6 +662,12 @@ pub struct RunOutcome {
     pub on_stop_implemented: bool,
     /// 实盘停机清理结果 (撤单兜底/平仓/残留); Dry Run 无交易所挂单, 恒 None
     pub cleanup: Option<CleanupOutcome>,
+    /// 启动接管遗留挂单的结果 (037 P0-A); Dry Run 不执行接管 → 恒 None。
+    /// 非 None 时 `canceled` 即"上一轮非正常退出的痕迹"笔数。
+    pub orphan: Option<CleanupOutcome>,
+    /// 会话内订单登记账目 (037 P0-B): 提交/在途/成交/未知/重复。
+    /// 只有走交易所的路径 (demo/live) 才有意义; Dry Run 恒为零值。
+    pub oms: OmsCounts,
 }
 
 impl Engine {
@@ -1039,20 +1065,111 @@ impl Engine {
             position = %position_desc,
             "实盘账户快照"
         );
-        // 启动期挂单观测 (残留提示; 不在启动时擅自撤单)
-        match exchange.get_open_orders(&pair).await {
-            Ok(orders) if !orders.is_empty() => {
-                let mine = orders.iter().filter(|o| is_owned(&o.client_order_id, &prefix)).count();
-                tracing::warn!(
+        // ②b 启动接管遗留挂单 (037 P0-A / FR-1) —— 取代此前的"只 warn 不处置"。
+        //
+        // 为什么必须处置: 本实例归属(`clientOrderId` 带 `<策略名>-` 前缀)的挂单在**启动时**
+        // 存在, 只可能来自"上一次运行非正常退出"(崩溃/强杀/断电 —— 正常停机走 ④ 会撤尽)。
+        // 若不撤就继续, 策略 `on_init` 很可能对同一价位再下一张同样的单 → 敞口翻倍。
+        //
+        // 口径: 撤销归属单 / 非归属单只上报 / 复查残留; **live 残留或无法枚举 → 拒绝启动**
+        // (与时钟预检同口径: 安全前置不成立时不进实盘), demo 只警告继续。
+        {
+            let mut orphan = CleanupOutcome::default();
+            // `enumeration_ok`: 能否确认"有哪些挂单"。查不到就无法建立安全前置。
+            let mut enumeration_ok = true;
+            match exchange.get_open_orders(&pair).await {
+                Ok(orders) if !orders.is_empty() => {
+                    let (owned, foreign) = split_owned(&orders, &prefix);
+                    for o in &foreign {
+                        tracing::warn!(
+                            target: "engine", name = %strategy_name,
+                            "启动时发现非本实例挂单 (只上报, 不撤): {} size={} side={}",
+                            o.client_order_id, o.size, o.side
+                        );
+                    }
+                    if !owned.is_empty() {
+                        tracing::warn!(
+                            target: "engine", name = %strategy_name,
+                            total = orders.len(), owned = owned.len(),
+                            "启动接管: 发现上一轮遗留的本实例挂单, 逐个撤销"
+                        );
+                    }
+                    for o in &owned {
+                        let res = exchange
+                            .cancel_order(&pair, &o.client_order_id)
+                            .await
+                            .map_err(|e| e.to_string());
+                        let reason = match &res {
+                            Ok(()) => "启动接管: 撤销上一轮遗留挂单".to_string(),
+                            Err(e) => format!("启动接管撤单失败: {e}"),
+                        };
+                        orphan.record_cancel(&o.client_order_id, res);
+                        if let Some(w) = events.as_ref() {
+                            let mut ev = events::RunEvent::new(
+                                events::KIND_ORPHAN_CANCELED,
+                                &strategy_name,
+                                mode.as_str(),
+                                Utc::now().timestamp_millis(),
+                            );
+                            ev.pair = Some(pair.clone());
+                            ev.side = Some(format!("{:?}", o.side));
+                            ev.size = Some(o.size.to_string());
+                            ev.client_order_id = Some(o.client_order_id.clone());
+                            ev.reason = Some(reason);
+                            w.emit(&ev);
+                        }
+                    }
+                    // 复查 (与停机清理同口径: 查询失败如实记录, 绝不声称"已清干净")
+                    match exchange.get_open_orders(&pair).await {
+                        Ok(after) => orphan.residual = residual_owned(&after, &prefix),
+                        Err(e) => {
+                            enumeration_ok = false;
+                            orphan.cancel_failed.push(("<启动复查挂单失败>".into(), e.to_string()));
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    enumeration_ok = false;
+                    orphan.cancel_failed.push(("<启动查询挂单失败>".into(), e.to_string()));
+                    tracing::warn!(target: "engine", name = %strategy_name, "启动查询挂单失败: {e}");
+                }
+            }
+            // 安全前置不成立 → 拒绝启动 (仅 live; demo 只警告继续)
+            if must_refuse_start(matches!(mode, RunMode::Live), &orphan.residual, enumeration_ok) {
+                if enumeration_ok {
+                    return Err(CoreError::Exchange(orphan_refuse_message(
+                        &strategy_name,
+                        &pair,
+                        &orphan.residual,
+                    )));
+                }
+                let err = orphan
+                    .cancel_failed
+                    .first()
+                    .map(|(_, e)| e.clone())
+                    .unwrap_or_else(|| "未知原因".into());
+                return Err(CoreError::Exchange(orphan_query_refuse_message(
+                    &strategy_name,
+                    &pair,
+                    &err,
+                )));
+            }
+            if !orphan.canceled.is_empty() || !orphan.cancel_failed.is_empty() {
+                tracing::info!(
                     target: "engine", name = %strategy_name,
-                    total = orders.len(), owned = mine,
-                    "启动时该交易对已有挂单 (本实例归属 {mine} 笔, 停机时按前缀处理)"
+                    canceled = orphan.canceled.len(), failed = orphan.cancel_failed.len(),
+                    residual = orphan.residual.len(), "启动接管完成"
                 );
             }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(target: "engine", name = %strategy_name, "启动查询挂单失败: {e}")
+            if orphan.has_residual() {
+                tracing::error!(
+                    target: "engine", name = %strategy_name,
+                    residual = orphan.residual.len(),
+                    "启动接管后仍有本实例残留挂单 (非 live 模式: 已按警告继续, 实盘会拒绝启动)"
+                );
             }
+            outcome.orphan = Some(orphan);
         }
 
         // ③ 策略与双流 (行情 + 用户数据流)
@@ -1137,6 +1254,9 @@ impl Engine {
         let mut quote_stale_reported = false;
         // 周期对账纠正过的漂移次数 (审计 中危 #9): 只累计用于收尾观测, 计入 outcome。
         let mut reconciliation_drift_fixes: u64 = 0;
+        // 会话内订单登记 (037 P0-B): 引擎视角的订单生命周期账目。纯内存、无 IO、无 await
+        // —— 它是**旁路观测**, 绝不给交易路径增加阻塞面; 任何失败都只如实降级。
+        let mut registry = OrderRegistry::new();
         tracing::info!(target: "engine", name = %strategy_name, pair = %pair, mode = %mode.label(), "live run started");
 
         let mut stop_rx = stop;
@@ -1268,28 +1388,70 @@ impl Engine {
                     let mut any_filled = false;
                     for req in orders {
                         outcome.orders_submitted += 1;
+                        // 037 P0-B: 在 `place_order` 消耗 req 之前留一份"提交意图" —— 传输失败时
+                        // 拿不到任何 ack, 只有这份留底能告诉用户"当时想下的是什么单"。
+                        let (req_cid, req_pair, req_side, req_size) =
+                            (req.client_order_id.clone(), req.pair.clone(), req.side, req.size);
+                        let now_ms = Utc::now().timestamp_millis();
                         match ctx.place_order(req) {
-                            Ok(ack) if ack.status == OrderStatus::Rejected => {
-                                outcome.rejections += 1;
-                                strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
-                            }
                             Ok(ack) => {
-                                // 026 时点①: 委托价/委托量在提交时落库
-                                if ack.status == OrderStatus::Cancelled {
+                                if ack.client_order_id.is_empty()
+                                    && ack.status == OrderStatus::Cancelled
+                                {
+                                    // 撤单指令 (OrderAction::CancelPending): 语义 = 撤销本实例**全部**挂单,
+                                    // 但不回传单号 → 登记表整体归零, 免得收尾把它们误报成"仍在挂单"。
+                                    let n = registry.mark_all_canceled(now_ms);
+                                    if n > 0 {
+                                        tracing::info!(
+                                            target: "engine", name = %strategy_name,
+                                            "撤单指令: 登记表中 {} 笔在途订单标记为已撤", n
+                                        );
+                                    }
+                                } else if registry.record_ack(&ack, now_ms)
+                                    == Some(RecordVerdict::DuplicateLive)
+                                {
+                                    tracing::warn!(
+                                        target: "engine", name = %strategy_name,
+                                        client_order_id = %ack.client_order_id,
+                                        "重复单号: 该单号仍有未了结订单时被再次提交 (策略侧 bug 信号)"
+                                    );
+                                }
+                                if ack.status == OrderStatus::Rejected {
+                                    outcome.rejections += 1;
                                     strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
-                                }
-                                if let Some(db) = db {
-                                    persist_order_ack(db, &mut outcome, &strategy_name, &ack, mode)
+                                } else {
+                                    // 026 时点①: 委托价/委托量在提交时落库
+                                    if ack.status == OrderStatus::Cancelled {
+                                        strategy
+                                            .on_order_update(&mut ctx, ack.to_update(Utc::now()));
+                                    }
+                                    if let Some(db) = db {
+                                        persist_order_ack(
+                                            db,
+                                            &mut outcome,
+                                            &strategy_name,
+                                            &ack,
+                                            mode,
+                                        )
                                         .await;
-                                }
-                                if ack.filled_size > Decimal::ZERO {
-                                    any_filled = true;
+                                    }
+                                    if ack.filled_size > Decimal::ZERO {
+                                        any_filled = true;
+                                    }
                                 }
                             }
                             Err(e) => {
                                 outcome.order_errors += 1;
                                 let msg = e.to_string();
-                                tracing::error!(target: "engine", name = %strategy_name, "下单失败: {msg}");
+                                // 037 P0-B: 传输层失败 = **结果未知** —— 交易所可能已收到并挂单。
+                                // 如实登记并在收尾提示用户核对 (此前这里是静默的, 只能靠运气)。
+                                registry.record_unknown(
+                                    &req_cid, &req_pair, req_side, req_size, &msg, now_ms,
+                                );
+                                tracing::error!(
+                                    target: "engine", name = %strategy_name,
+                                    "下单失败(结果未知, 请核对交易所): {msg}"
+                                );
                                 outcome.last_error = Some(format!("下单失败: {msg}"));
                             }
                         }
@@ -1340,6 +1502,12 @@ impl Engine {
                         }
                         ctx.record_fill(&fill);
                         outcome.fills += 1;
+                        // 037 P0-B: 会话订单登记随成交推进 (增量口径, 与本笔 fill_size 一致)
+                        registry.apply_fill(
+                            &fill.client_order_id,
+                            fill.fill_size,
+                            Utc::now().timestamp_millis(),
+                        );
                         if let Some(db) = db {
                             if let Err(e) = db.insert_fill(&strategy_name, &fill).await {
                                 outcome.persist_errors += 1;
@@ -1422,6 +1590,13 @@ impl Engine {
                         if !is_owned(&upd.client_order_id, &prefix) {
                             continue;
                         }
+                        // 037 P0-B: 会话订单登记随订单状态回报推进 (累计口径, 与 filled_size 一致)
+                        registry.apply_user_order(
+                            &upd.client_order_id,
+                            upd.status,
+                            upd.filled_size,
+                            Utc::now().timestamp_millis(),
+                        );
                         if let Some(db) = db {
                             persist_order_update(db, &mut outcome, &strategy_name, &upd, mode)
                                 .await;
@@ -1528,12 +1703,20 @@ impl Engine {
                     .cancel_order(&pair, &o.client_order_id)
                     .await
                     .map_err(|e| e.to_string());
+                let ok = res.is_ok();
+                if ok {
+                    // 037 P0-B: 撤单成功同步登记表 (保持会话账目与交易所一致)
+                    registry.mark_canceled(&o.client_order_id, Utc::now().timestamp_millis());
+                }
                 cleanup.record_cancel(&o.client_order_id, res);
             }
             for req in plan.closes {
                 let cid = req.client_order_id.clone();
+                let (req_pair, req_side, req_size) = (req.pair.clone(), req.side, req.size);
                 match exchange.place_order(req).await {
                     Ok(ack) => {
+                        // 037 P0-B: 兜底平仓单同样是本实例的委托, 纳入会话登记
+                        registry.record_ack(&ack, Utc::now().timestamp_millis());
                         // 026 时点①: 兜底平仓同样是本实例的委托, 委托价/委托量在提交时落库。
                         // 拒单 ack 的 `exchange_order_id` 是空串(会撞主键) → 与非拒单同判据, 拒单不产生订单行
                         if ack.status != OrderStatus::Rejected {
@@ -1544,7 +1727,19 @@ impl Engine {
                         }
                         cleanup.close_done.push(ack.client_order_id)
                     }
-                    Err(e) => cleanup.close_error.push((cid, e.to_string())),
+                    Err(e) => {
+                        // 037 P0-B: 兜底平仓传输失败同样"结果未知" —— 必须留痕 (此前会静默漏掉)
+                        let msg = e.to_string();
+                        registry.record_unknown(
+                            &cid,
+                            &req_pair,
+                            req_side,
+                            req_size,
+                            &msg,
+                            Utc::now().timestamp_millis(),
+                        );
+                        cleanup.close_error.push((cid, msg))
+                    }
                 }
             }
             // 复查残留 (如实, 不修饰)
@@ -1592,6 +1787,7 @@ impl Engine {
                     &strategy_name,
                     &prefix,
                     &mut outcome,
+                    &mut registry,
                     CLEANUP_DRAIN_WINDOW,
                     notifier.as_ref(),
                     mode,
@@ -1607,6 +1803,49 @@ impl Engine {
         if outcome.stop_reason.is_none() {
             outcome.stop_reason = Some(StopReason::StreamEnded);
         }
+
+        // 037 P0-B: 会话订单账目归集 + **结果未知**醒目提示。
+        //
+        // 位置必须在**停机清理与吸干之后**(它俩也会改登记表: 撤单成功 → mark_canceled;
+        // 兜底平仓单 → record_ack; 平仓传输失败 → record_unknown)。放在循环结束时归集会让
+        // 收尾账目漏掉整个清理阶段 —— "刚撤的单被算成仍挂单"是小事, 但"平仓单传输失败
+        // (仓位可能还在)却不进未知清单"是**资金安全级**的漏报。
+        //
+        // "结果未知"是本次加固要消灭的静默黑洞: 提交时传输失败, 交易所可能已受理, 用户若不知道
+        // 就可能重复下单。所以只要存在未知项, 就逐条 error 打出来 (带单号/方向/数量), 让用户能核对。
+        outcome.oms = registry.counts();
+        if !registry.unknowns().is_empty() {
+            tracing::error!(
+                target: "engine", name = %strategy_name,
+                submitted = outcome.oms.submitted, unknown = outcome.oms.unknown,
+                "本次运行有 {} 笔下单结果未知 (提交时传输失败), 交易所可能已受理 —— 请立即核对",
+                outcome.oms.unknown
+            );
+            for u in registry.unknowns() {
+                tracing::error!(
+                    target: "engine", name = %strategy_name,
+                    client_order_id = %u.client_order_id_hint, pair = %u.pair,
+                    side = %u.side, size = %u.size,
+                    "结果未知的下单: 到交易所核对是否已挂单/成交 (原因: {})", u.error
+                );
+            }
+        }
+        if outcome.oms.duplicates > 0 {
+            tracing::warn!(
+                target: "engine", name = %strategy_name,
+                duplicates = outcome.oms.duplicates,
+                "本次运行出现 {} 次重复单号提交 (策略侧 bug 信号, 交易所通常已按 DUPLICATE_ORDER 拒掉)",
+                outcome.oms.duplicates
+            );
+        }
+        tracing::info!(
+            target: "engine", name = %strategy_name,
+            submitted = outcome.oms.submitted, live = outcome.oms.live,
+            filled = outcome.oms.filled, canceled = outcome.oms.canceled,
+            rejected = outcome.oms.rejected, unknown = outcome.oms.unknown,
+            duplicates = outcome.oms.duplicates,
+            "会话订单账目"
+        );
 
         let (canceled, cancel_failed, residual, residual_pos) = outcome
             .cleanup

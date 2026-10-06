@@ -300,13 +300,9 @@ pub fn plan_cleanup(
     hedge: bool,
 ) -> CleanupPlan {
     let mut plan = CleanupPlan::default();
-    for o in orders {
-        if is_owned(&o.client_order_id, prefix) {
-            plan.cancels.push(o.clone());
-        } else {
-            plan.foreign.push(o.clone());
-        }
-    }
+    let (owned, foreign) = split_owned(orders, prefix);
+    plan.cancels = owned;
+    plan.foreign = foreign;
 
     if !close_all {
         return plan;
@@ -404,6 +400,62 @@ pub fn residual_owned(after: &[OrderInfo], prefix: &str) -> Vec<String> {
         .filter(|o| is_owned(&o.client_order_id, prefix))
         .map(|o| o.client_order_id.clone())
         .collect()
+}
+
+// ---- 启动接管遗留挂单 (037 P0-A) ----
+
+/// 按归属前缀切分挂单: 返回 `(本实例归属, 非归属)`。
+///
+/// 归属判定的唯一实现是 `ricow_strategy::is_owned`(空前缀一律不归属 —— 宁可漏撤并上报,
+/// 也不误撤用户手工挂的单)。**启动接管(037)与停机清理(011)共用本函数**, 两处口径逐字一致。
+pub fn split_owned(orders: &[OrderInfo], prefix: &str) -> (Vec<OrderInfo>, Vec<OrderInfo>) {
+    let mut owned = Vec::new();
+    let mut foreign = Vec::new();
+    for o in orders {
+        if is_owned(&o.client_order_id, prefix) {
+            owned.push(o.clone());
+        } else {
+            foreign.push(o.clone());
+        }
+    }
+    (owned, foreign)
+}
+
+/// 启动接管后是否必须**拒绝启动** (037 FR-1.3 / D2)。
+///
+/// 拒绝的两种情况(仅 **live**):
+/// 1. 复查后仍有本实例归属挂单 —— 撤不干净就启动会让策略对同一价位**再下一张同样的单**;
+/// 2. `enumeration_ok = false` —— 连"有哪些挂单"都问不到, 安全前置**无法确认**。
+///
+/// 与 `check_clock_skew` 同口径: 安全前置不成立时不进实盘。demo 不涉真钱, 只警告继续
+/// (不因一次网络抖动阻断体验)。
+pub fn must_refuse_start(is_live: bool, residual_owned: &[String], enumeration_ok: bool) -> bool {
+    is_live && (!enumeration_ok || !residual_owned.is_empty())
+}
+
+/// 因**残留挂单**拒绝启动的错误文本(含逐条单号 + 可执行指引)。
+///
+/// 指引必须**可执行**: 用户要能照着把单撤掉再重启, 而不是只被告知"失败了"。
+pub fn orphan_refuse_message(name: &str, pair: &str, residual: &[String]) -> String {
+    let ids = residual.join(", ");
+    format!(
+        "实盘启动失败: 启动接管未能撤销上一轮遗留的本实例挂单, 复查仍残留 {n} 笔 —— 拒绝启动以避免重复下单。\n\
+         \u{0020} 策略: {name} · 交易对: {pair}\n\
+         \u{0020} 残留单号: {ids}\n\
+         \u{0020} 处置: ① 到交易所界面手工撤掉上述挂单 (或用交易所 API); ② 确认该交易对已无本实例挂单后重启。\n\
+         \u{0020} 说明: 这些单是上一次运行**非正常退出**(崩溃/强杀/断电)留下的; 未清干净就启动会让策略重复下单。",
+        n = residual.len()
+    )
+}
+
+/// 因**挂单枚举失败**拒绝启动的错误文本 (037 FR-1.3 第 2 条)。
+pub fn orphan_query_refuse_message(name: &str, pair: &str, error: &str) -> String {
+    format!(
+        "实盘启动失败: 无法查询交易对 {pair} 的挂单 ({error}) —— 拒绝启动。\n\
+         \u{0020} 策略: {name}\n\
+         \u{0020} 理由: 启动前必须先确认没有上一轮遗留的本实例挂单; 查不到就无法确认, 贸然启动会重复下单。\n\
+         \u{0020} 处置: 检查网络/代理后重试; 若持续失败, 到交易所界面确认该交易对无本实例挂单再试。"
+    )
 }
 
 #[cfg(test)]
@@ -804,5 +856,97 @@ mod tests {
         // 时间戳无法解析 → 拒绝且报出原值 (不猜)
         let e = dry_run_gate(Some("昨天"), now, 24.0).unwrap_err();
         assert!(e.contains("昨天"), "应报出原值: {e}");
+    }
+
+    // ---- 启动接管遗留挂单 (037 P0-A) ----
+
+    #[test]
+    fn test_split_owned_partitions_by_prefix() {
+        let prefix = ownership_prefix("grid");
+        let orders = vec![order("grid-1"), order("manual-2"), order("grid-3"), order("gridx-4")];
+        let (owned, foreign) = split_owned(&orders, &prefix);
+        assert_eq!(
+            owned.iter().map(|o| o.client_order_id.as_str()).collect::<Vec<_>>(),
+            vec!["grid-1", "grid-3"],
+            "只切出本实例归属"
+        );
+        assert_eq!(
+            foreign.iter().map(|o| o.client_order_id.as_str()).collect::<Vec<_>>(),
+            vec!["manual-2", "gridx-4"],
+            "同前缀不同策略名与手工单都算非归属"
+        );
+    }
+
+    #[test]
+    fn test_split_owned_empty_prefix_never_owns_and_empty_list() {
+        // 空前缀 = 一律不归属 (宁漏撤不误撤): 全部落 foreign
+        let orders = vec![order("grid-1"), order("manual-2")];
+        let (owned, foreign) = split_owned(&orders, "");
+        assert!(owned.is_empty(), "空前缀不得认领任何单");
+        assert_eq!(foreign.len(), 2);
+
+        // 空列表: 两侧皆空, 不 panic
+        let (o2, f2) = split_owned(&[], &ownership_prefix("grid"));
+        assert!(o2.is_empty() && f2.is_empty());
+    }
+
+    #[test]
+    fn test_split_owned_matches_plan_cleanup_partition() {
+        // 契约: split_owned 与 plan_cleanup 的归属切分必须逐条一致 (避免两处口径漂移)
+        let prefix = ownership_prefix("grid");
+        let orders = vec![order("grid-1"), order("manual-2"), order("grid-3")];
+        let (owned, foreign) = split_owned(&orders, &prefix);
+        let plan = plan_cleanup(
+            &orders,
+            &prefix,
+            &[],
+            "ETHUSDT",
+            false,
+            &market(dec!(0.001), Some(dec!(0.001))),
+            "c",
+            false,
+        );
+        assert_eq!(
+            owned.iter().map(|o| o.client_order_id.clone()).collect::<Vec<_>>(),
+            plan.cancels.iter().map(|o| o.client_order_id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            foreign.iter().map(|o| o.client_order_id.clone()).collect::<Vec<_>>(),
+            plan.foreign.iter().map(|o| o.client_order_id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_must_refuse_start_only_live_with_residual() {
+        let residual = vec!["grid-9".to_string()];
+        // live + 残留 → 拒绝
+        assert!(must_refuse_start(true, &residual, true), "live + 残留 → 拒绝启动");
+        // live + 枚举失败 (不论有无残留) → 拒绝 (安全前置无法确认)
+        assert!(must_refuse_start(true, &[], false), "live + 查询失败 → 拒绝启动");
+        assert!(must_refuse_start(true, &residual, false), "live + 查询失败 + 残留 → 拒绝启动");
+        // demo 一律不拒 (只警告继续)
+        assert!(!must_refuse_start(false, &residual, true), "demo + 残留 → 只警告, 不拒绝");
+        assert!(!must_refuse_start(false, &[], false), "demo + 查询失败 → 只警告, 不拒绝");
+        // live 干净且可确认 → 放行
+        assert!(!must_refuse_start(true, &[], true), "live 无残留且已确认 → 放行");
+    }
+
+    #[test]
+    fn test_orphan_refuse_message_is_actionable() {
+        let msg = orphan_refuse_message("grid", "ETHUSDT", &["grid-9".into(), "grid-10".into()]);
+        assert!(msg.contains("grid-9") && msg.contains("grid-10"), "须列出全部残留单号: {msg}");
+        assert!(msg.contains("ETHUSDT") && msg.contains("grid"), "须点明策略与交易对: {msg}");
+        assert!(msg.contains("2"), "须报出残留笔数: {msg}");
+        assert!(msg.contains("手工撤") && msg.contains("重启"), "须给出可执行处置: {msg}");
+        assert!(msg.contains("重复下单"), "须说明风险: {msg}");
+    }
+
+    #[test]
+    fn test_orphan_query_refuse_message_is_actionable() {
+        let msg = orphan_query_refuse_message("grid", "ETHUSDT", "connect timeout");
+        assert!(msg.contains("ETHUSDT"), "须点明交易对: {msg}");
+        assert!(msg.contains("connect timeout"), "须带原始错误: {msg}");
+        assert!(msg.contains("重试") || msg.contains("处置"), "须给出处置: {msg}");
+        assert!(msg.contains("重复下单"), "须说明风险: {msg}");
     }
 }

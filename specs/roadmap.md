@@ -35,7 +35,10 @@
 
 ## 测试基线
 
-- **当前基线 (2026-10-05, Windows, Web 策略创建/回测可视化 + 策略日志透出 + 目录诚实性护栏 落地后实跑)**: `cargo test --workspace --no-fail-fast` = **670 passed / 0 failed / 22 ignored** —— **全目标零失败**(此前每轮都带 `ai_live_smoke` 2 例环境性失败)。较同口径上次 667: **+3 通过 / ignored 不变(22)**。增量构成: ricow bin **325 → 341**(+16: 策略创建/回测可视化 6 + 策略日志透出与 P2-8 清单编辑 3 + Web 审查修复 1 + 目录诚实性护栏 6) + ricow_strategy lib **181 → 182**(+1, `LogBuffer` 有界头/尾单测) + `ai_live_smoke` 目标由 `FAILED` 转 `ok`(1 passed/2 failed → **3 passed/0 failed**, 见下条); 其余 target 一字未变: ricow_binance 48 / ricow_core 16 / ricow_engine 77 / `architecture_guard` 3。
+- **当前基线 (2026-10-06, Windows, 037 实盘资金安全加固 — 启动接管 / 引擎级订单登记 / 组合敞口只读视图 落地后实跑)**: `cargo test --workspace --no-fail-fast` = **761 passed / 0 failed / 22 ignored** —— **全目标零失败**。较同口径上次 736: **+25 通过 / ignored 不变(22)**。增量构成: ricow bin **370 → 382**(+12: `commands::exposure` 组合敞口视图的渲染 / 过滤 / 显示宽度对齐) + ricow_engine lib **99 → 112**(+13: `exposure.rs` 的只读聚合, 含跨策略对冲 / 模式隔离 / 名义低估标记 / 输出顺序稳定); 其余 target 一字未变(ricow_binance 59 / ricow_core 18 / ricow_strategy 184 / `architecture_guard` 3 / `ai_live_smoke` 3)。
+  **如实**: 本文件上次记的 670 是 2026-10-05; 670 → 736 的 +66 来自 **2026-10-06 的四笔审计加固提交**(安全 / 资源泄漏 / 稳定性三梯队 + 中危 ×2 + 低危收尾, `git log` 自 `8bbecd3` 起), 那几轮只写了提交说明、**未单独记基线**, 故 037 的起点按实跑 736 计。
+  门禁五件: `cargo fmt --all -- --check` **0 差异** / `cargo clippy --workspace --all-targets -- -D warnings` **exit 0、零代码告警** / `cargo deny --locked check` 全绿 / `bash scripts/ci_grep_gates.sh` **五条安全红线全绿** / `architecture_guard` 三条用例全绿。端到端以**临时数据目录 + 手工灌库**模拟验证(不涉 testnet; 本变更不新增下单语义), 见 `specs/changes/037-live-safety-hardening/converge.md`。
+- **前基线 (2026-10-05, Windows, Web 策略创建/回测可视化 + 策略日志透出 + 目录诚实性护栏 落地后实跑)**: `cargo test --workspace --no-fail-fast` = **670 passed / 0 failed / 22 ignored** —— **全目标零失败**(此前每轮都带 `ai_live_smoke` 2 例环境性失败)。较同口径上次 667: **+3 通过 / ignored 不变(22)**。增量构成: ricow bin **325 → 341**(+16: 策略创建/回测可视化 6 + 策略日志透出与 P2-8 清单编辑 3 + Web 审查修复 1 + 目录诚实性护栏 6) + ricow_strategy lib **181 → 182**(+1, `LogBuffer` 有界头/尾单测) + `ai_live_smoke` 目标由 `FAILED` 转 `ok`(1 passed/2 failed → **3 passed/0 failed**, 见下条); 其余 target 一字未变: ricow_binance 48 / ricow_core 16 / ricow_engine 77 / `architecture_guard` 3。
   **`ai_live_smoke` 2 例已修 (2026-10-05)**: 两个门禁用例(`approve_requires_interactive_tty` / `piped_confirm_phrases_never_reach_the_host`)原先靠 `spawn` + **stdin 管道**, 在 agent 进程树内撞 `ERROR_PIPE_BUSY(231)`; 现改用**文件句柄**作 stdin(`spawn_with_non_tty_stdin`, 内容预写进临时文件)。D5 门禁判的是 `std::io::stdin().is_terminal()` —— **管道与文件都非终端**、走同一分支, 语义等价, 断言强度不变(仍要求进程非 0 退出 / 文案命中 / 零落盘)。
   **2026-10-05 归因复核(两处更正)**: 拦截方 **①不是 WorkBuddy agent 沙箱**(关沙箱错误一字不变, 且与目标程序无关: 系统 `cmd.exe` 同复现), 也 **②不是"系统级/全机器"** —— 用户在自己终端跑**零 ricow 代码**的探针 `pipe_probe.exe`, **四行全 OK(含 `stdin piped`)**; 此前"360 系统级注入、连 `explorer.exe` 都中招、用户终端同样如此"的推论**已被推翻**, 作用范围实为**仅 agent 进程树**。触发条件精确为"**stdin 走 `Stdio::piped()`**": stdout/stderr piped 或 stdin 用文件/null 全部正常。机制: Rust 1.96 的 `std::process` 不再走 Win32 `CreatePipe`, 改用 NT 层 `NtCreateNamedPipeFile` + `NtOpenFile`(`library/std/src/sys/process/windows/child_pipe.rs`), 故 Python(`CreatePipe`)/.NET(命名管道, 含可继承)同构造均正常、只有 Rust 撞墙; agent 进程内同时可见 WorkBuddy 沙箱 DLL `tsbx.dll` 与 360 `SafeWrapper.dll`, **无法进一步区分真凶**(`schtasks` 被黑名单挡住, 拿不到"脱离进程树"的对照组)。**产品代码不改**: `supervisor/procs.rs:80` 的 `stdin(Stdio::piped())` 是**写入**通道(给子进程发 `stop`), 文件句柄替不了, 且它在用户终端本就正常 —— 属环境差异; 故此前"本机 `ricow start` 大概率失败"的推论**一并撤回**(用户普通终端里它正常)。
   **门禁**: `clippy --workspace --all-targets -- -D warnings` **exit 0、零代码告警**(仅刷 Windows incremental 锁文件 `os error 5` 环境告警); `cargo fmt --all -- --check` **已通过(exit 0 / 0 处 diff)** —— 首跑曾报 28 处 diff / 7 文件(`ai/provider.rs`、`commands/backtest.rs`、`strategies/catalog.rs`、`web/backtest_jobs.rs`、`web/mod.rs`、`web/strategy_io/{mod,tests}.rs`), 已于 2026-10-05 用 `cargo fmt --all` 修好(**纯格式, 不改语义**); 修测试文件后又复跑一轮: **fmt --check 0 差异 / clippy -D warnings exit 0 / 全量 test 670 passed / 0 failed** —— 三门禁齐备, 提交不会红。本基线取自在建工作区(该轮改动尚未提交)。
@@ -61,7 +64,7 @@
   ignored 全部为需真实外部环境的用例 (BN demo 现货 / 合约 / 用户流、Nasdaq 冒烟、019 AI 真机与 demo 联调), 不 mock 替代; 其中 008 的 3 例已于 2026-09-12 跑绿, 011 新增 2 例现货用户流用例与实盘闭环(CLI 探针)已于 2026-09-13 真实跑绿 —— 记录见 `specs/testnet.md`。
   220 → 204 的差额 = 009 移除 `locus_hl`(16 个内联测试); 204 → 216 = 008 新增 supervisor / CLI 命令面用例; 216 → 233 = 004 风控用例(频率窗口/两级熔断/装配与参数校验/接线); 233 → 270 = 011 用例(下单参数对齐 / 时钟预检判定 / 归属与停机清理编排 / 门禁 / proto 往返 / 现货事件解析 / 交易所过滤器解析 / 归属前缀长度约束)。
 - 验证方式: `cargo test --workspace`(纯逻辑) + 带 env key 的 `#[ignore]` 真实联调 (见 `specs/testnet.md`)。
-- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → 589(032 Web UI 工作台) → 608(033 密钥管理页) → 611(034 UI 主题+折叠) → 642(035 工程底座加固) → 650(036 回测敏感性 + Web 工程债加固) → **670(2026-10-05 Web 策略创建/回测可视化 + 策略日志透出 + 目录诚实性护栏; 含 `ai_live_smoke` 2 例环境性失败修复, 全目标 0 failed, 当前)**。
+- 历史基线: P1 63 → P2 76 → P3 125 → 回测重构 173 → 001-vwap 154(分支基线) → 220 → 204(009 移除 locus_hl) → 216(008 实施后) → 233(004 实施后) → 270(011 实施后) → 282(012 实施后) → 286(013 实施后) → 289(014 实施后) → 294(003 实施后) → 301(002 实施后) → 304(015 实施后) → 306(016 实施后) → 308(018 实施后) → 339(021/022 告警清零与格式化后) → 348(019 R1/R2) → 355(019 R3) → 390(019 R4/R5) → 403(019 R5 + gr 复核修复) → 472(023 对话体验 + 025 Web UI) → 504(026 交易可见性) → 538(031 策略目录重构) → 589(032 Web UI 工作台) → 608(033 密钥管理页) → 611(034 UI 主题+折叠) → 642(035 工程底座加固) → 650(036 回测敏感性 + Web 工程债加固) → 670(2026-10-05 Web 策略创建/回测可视化 + 策略日志透出 + 目录诚实性护栏; 含 `ai_live_smoke` 2 例环境性失败修复, 全目标 0 failed) → 736(2026-10-06 审计加固四提交 — 安全/资源泄漏/稳定性三梯队 + 中危×2 + 低危收尾; 未单独记基线, 由 037 起点反推) → **761(2026-10-06 037 实盘资金安全加固: 启动接管遗留挂单 / 引擎级最小订单登记 / 组合敞口只读视图; 全目标 0 failed, 当前)**。
 
 ## 变更档案状态 (specs/changes/)
 
@@ -85,6 +88,7 @@
 | 017-spot-live-snapshot-fix | 现货实盘快照一致性修复 (dogfood 实测) | ✅ 已实施 (2026-09-13) | demo 实盘预演暴露三处: ① **`stop --close-all` 静默不平仓**(012 起清理改走 `get_positions_directional`, 现货实现恒空 → 报告"无持仓"而账户仍持 2.016 ETH); ② **现货成交后只刷持仓不刷现金** → 策略按 equity 决策以为"只有币没有钱", 每 tick 再卖一半, 几何级数清仓(`1.0079→0.5039→0.252→…` 全卖光); ③ 成交回写异步窗口内重复下单(1.4s 内 3 次同单)。修复: 清理/残留持仓源按市场分支(现货复用 `spot_position_of`)+ 现货补刷 base/quote 余额 + 下单后按 `any_filled` 立刻对齐快照。实测修复前 `提交订单=216/拒单=209/成交=8/持仓清空` → 修复后 `提交订单=1/拒单=0/成交=2/平仓单执行/残留 0.000058`, 交易所侧 `openOrders=0`; 测试 306 不变(接线/时序缺陷无 mock 单测, 以真实链路为证) |
 | 018-first-use-risk-ack | 首次使用风险确认 | ✅ 已实施 (2026-09-13) | 补齐 `product.md` §十 风险披露的第二条(README 免责声明早已有, 代码侧确认**完全缺失** —— 克隆仓库配好 key 即可用真钱开跑且无任何告知)。实盘启动最前置判定: 未确认 → 拒绝 + 打印四条披露要点与确认方式; `--accept-risk` → 记录到 `$RICOW_ROOT/risk_ack.json`(含 schema 版本, 披露变更可递增触发重新确认)后放行, 之后不再要求; 判定顺序 风险确认→时长门禁→时钟预检(未确认时零交易所往返), Dry Run/回测不受影响; 实测三步(拒绝且无记录文件 / 确认落地 / 再跑不再要求并正常启动); 测试 306 → 308 |
 | 019-ai-assistant | 内置 AI 助手 + 生态入口 + 开箱即用分发 | 🔄 **主线已打通, 做文档/测试收口 (2026-09-16)** | 已落地并真机验证: `ricow ai`(交互/单次/`--plain`, 只读 12 + 虚拟 4 工具)、策略生成闭环(`preview_strategy` → 编译门禁 → 真实 K 线沙箱回测 → 零落盘)、`ricow create/approve/deploy` 两步确认(逐字短语)、**`ricow agent-kit`**(AGENTS.md / SKILL.md / CLAUDE.md / lua-api.md, 与内置 AI 系统提示同源; 命令速查由 clap 生成; 拒覆盖)、`--demo` 测试网运行、实盘二次分离(逐字 `确认实盘 <name>`)、策略名规范、提示词按需取文档(8k→1.8k tokens)、**单一配置文件 `ricow.toml`**(provider+api_key 同段, 删 keyring/setup/写凭据命令)。**R4(2026-09-16)全功能对话化**: 裸 `ricow` 即入口(默认 `chat`, 首次跑走向导 `onboard`)、会话缝 `ai/session.rs`(`ChatSession` + `SessionSink`, 业务零 stdio)、对话内七动作确认状态机(逐字短语:`确认部署` / `确认启动测试网` / `确认风险` / `确认实盘` / `确认停止测试网` / `确认停止实盘` / `确认平仓停止`; 实盘仍原样跑 `ctrl::live_preflight` 三判据)、`/keys` `/market` 外科式改 `ricow.toml`(`set_values` 白名单 9 键, 保留注释 + 原子写; 权限 Unix 0600 / Windows 仅当前用户 ACL)、`pairs` 命令与交易对视野。**R5(2026-09-16)删平台风控残留**: 删 `risk.rs` 静态限额(`RiskEngine` / `[risk]` 配置面 / 装配器)与 `scheduler.rs`, 只留固定 100 单·秒⁻¹ 工程护栏 `order_guard` —— 平台不做投资判断, 风控由策略自管(`constitution.md` 已同步修订)。未完成: 三平台分发(CI)、文档/测试收口、agent-kit 的真机第三方 agent 验证(T047)(`ricow mcp` **不做** —— 2026-09-15 定案: 单机程序, 用户已有的 agent 直接调本机 CLI, 生态入口 = agent-kit 手册); Phase 1–4 主体完成(仅 Windows 双击入口 T034/T035 未做, 本机无法产出 Windows 产物), 见 `specs/changes/019-ai-assistant/tasks.md`(T001–T078) |
+| 037-live-safety-hardening | 实盘资金安全加固(启动接管 / 订单登记 / 组合敞口) | ✅ 已实施 (2026-10-06) | 对标商用框架(NautilusTrader / LEAN / Hummingbot)**架构级**差距的 P0 三项(依据 [`specs/research/framework-vs-commercial-2026-10.md`](research/framework-vs-commercial-2026-10.md))。① **P0-A 启动接管遗留挂单**: 启动按归属前缀切分交易所挂单 → 本实例归属逐个撤销(逐笔落事件 `orphan_canceled`)→ 复查 → **live 仍有残留或枚举失败则拒绝启动**(带单号与手工撤单指引), demo 只警告; 非归属单只上报不撤; **无 `orphan_policy` 配置面**。② **P0-B 引擎级最小订单登记** `ricow_engine::oms`: 会话内订单生命周期 + **传输失败 = `Unknown`**(收尾提示手工核对, 不谎报结论) + 非终态重复单号检测 + 账目计入 `RunOutcome`; 纯内存无 IO, 失败不阻断交易。③ **P0-C 组合敞口只读视图**: 新增 `ricow exposure`, 逐 `(标的 × 模式)` 汇总净头寸 / 多空合计 / 总名义(按开仓均价估算, 低估则标 `*`)/ 未终结挂单数 / 活跃策略数, `--detail` 下钻; **只展示不拦截、不直连交易所、绝不跨模式相加**。**不做 P0-D**(单笔名义上限 / 速率熔断 —— 需可配置风险参数面, 与宪法 D15/D17 冲突, 待用户拍板)。测试 736 → **761 passed / 0 failed / 22 ignored**(+25), 门禁五件全绿; 端到端以临时数据目录 + 手工灌库模拟验证; 见 `specs/changes/037-live-safety-hardening/` |
 
 > **023-ai-chat-ux(2026-09-18, 实施中)**: 对话体验重构 —— 中英双语(`[ui].lang` + `/lang`, AI 回复语言跟随)、每轮分隔线与轮次号 + `/history`、去术语化(面向用户不出现 `ricow xxx` 命令)、宿主持有菜单的选项式交互(菜单 A 5 项 / B 4 项)、**写操作全确认**(7 → 13 类, 唯一入口 `request_write_confirmation`)。确认词**分渠道**: 对话 = 当前语言**口语词**(`确认`/`确定`/`同意` · `confirm`/`confirmed`), 终端 = **逐字长短语**(`approve.rs` / `ctrl.rs` 一行不改); 见 `specs/changes/023-ai-chat-ux/`。
 
@@ -164,6 +168,27 @@
 > `strategy_io`/`runs` 目录化下沉测试体 —— `web::` 全组 102 用例未改断言全绿即零行为变化取证。
 > 测试 642 → **650 passed / 22 ignored**(+8); 见 `specs/changes/036-backtest-sensitivity-web-hardening/`。
 
+> **037-live-safety-hardening(2026-10-06, 已实施)**: **实盘资金安全加固** —— 依据
+> [`specs/research/framework-vs-commercial-2026-10.md`](research/framework-vs-commercial-2026-10.md) 的差距分级, 只做 🔴 P0 三项(架构范式差距, 不扩功能面)。
+> ① **P0-A 启动接管遗留挂单**(`live::split_owned` / `must_refuse_start` + `command.rs` 接线): 修"进程崩溃/强杀/断电后重启,
+> 交易所仍挂着旧单而策略 `on_init` 再下一张同样的单 → 敞口翻倍"。启动按归属前缀切分 → 本实例归属逐个撤销(逐笔事件
+> `orphan_canceled` + `outcome.orphan`)→ 复查 → **live 仍有残留或枚举失败则拒绝启动**(错误带残留单号 + 手工撤单指引),
+> demo 只警告；非归属单只上报不撤。**刻意不加 `orphan_policy` 配置面**(固定工程不变量, 与 `order_guard` 同口径)。
+> ② **P0-B 引擎级最小订单登记**(`ricow_engine/src/oms.rs`): 修"`orders` 表只写不读、下单传输失败不落任何记录,
+> 事后无法回答这一单到底提交成功没有"。会话内生命周期 + **传输失败 = `Unknown`**(单独入账, 收尾醒目提示用户手工核对交易所,
+> 不谎报结论)+ **非终态重复单号检测**(策略 bug 信号)+ 账目计入 `RunOutcome`; 纯内存、无 IO、失败不阻断交易。
+> ③ **P0-C 组合敞口只读视图**(`ricow_engine/src/exposure.rs` + `ricow exposure`): 修"daemon 跑 N 个策略却看不到合起来的敞口"。
+> 逐 `(标的 × 模式)` 汇总净头寸 / 多空合计 / 总名义(按开仓均价**估算**, 算不出就标 `*` 并注明被低估)/ 未终结挂单数 / 活跃策略数,
+> `--detail` 下钻策略明细; **只展示不拦截**(守宪法"平台不做投资判断")、**不直连交易所**、**绝不跨模式相加**(模拟持仓混进实盘敞口比不给数字更危险)、
+> **不跨交易对汇总**(报价资产未必一致)。
+> **验证**: 纯逻辑单测 25 例(引擎 13 + CLI 12, 含跨策略对冲 / 模式隔离 / 名义低估标记 / 输出顺序稳定 / 显示宽度对齐)
+> + 端到端以**临时数据目录 + 手工灌库**模拟验证(含 live 拒绝路径、空库、只剩已平仓行、`--pair`/`--mode` 过滤与拼错报错);
+> **不引入 Exchange 替身**(宪法原则三"交易流程禁 mock Exchange 替身"不可协商, 本变更也不新增下单语义)。
+> 测试 736 → **761 passed / 0 failed / 22 ignored**(+25); 门禁五件(fmt / clippy -D warnings / cargo deny / 安全红线 / architecture_guard)全绿。
+> **不做(显式记录)**: **P0-D 单笔名义上限 / 异常速率熔断** —— 需**可配置的风险参数面**, 与宪法 D15/D17(删除 `RiskEngine` 四条静态限额、
+> 只保留固定 `order_guard`)**直接冲突**, 属宪法级决策, 待用户显式拍板后再立项(见 spec §三/§六)。
+> 见 `specs/changes/037-live-safety-hardening/`。
+
 > SDD 产物规范: 计划与任务分解应存于 `specs/changes/<feature>/{spec,plan,tasks}.md`。
 > 005/006/007 的计划当时落在 `.hermes/plans/`(临时区, 已 git 忽略), 未回填档案 —— 后续变更须归档到位。
 
@@ -238,6 +263,17 @@
      "实例被停掉、没起来"(还可能带未平仓敞口) → 收口则**必须**配 restart **先判后停**;
      不收口则维持现状(restart 不判)。两者绑定, 不允许只做一半。
    - **状态**: 截至 2026-10-05 **均未落码**, 待用户拍板是否实施。
+
+8. **P0-D 操作级熔断 / 单笔名义上限**(2026-10-06, 037 显式不做, 待用户拍板)
+   - **来源**: [`specs/research/framework-vs-commercial-2026-10.md`](research/framework-vs-commercial-2026-10.md) §四的 🔴 P0-D ——
+     商用框架普遍有"单笔名义上限 + 异常速率熔断"作为**引擎级**的最后一层操作护栏; ricow 目前只有固定 100 单/秒的
+     `order_guard`(防 bug 风暴被交易所封禁), **没有按金额的口径**。
+   - **为什么没做**: 金额上限必须是**可配置的**才有意义(每个用户资金规模不同), 而"新增可配置的风险参数面"与宪法
+     D15/D17(019 R5 删除 `RiskEngine` 四条静态限额、只保留固定 `order_guard`, 理由 = **平台不做投资判断**)直接冲突 ——
+     属**宪法级决策**, 不能由实现者在变更里顺手绕开。
+   - **可选方案(待选)**: ⓐ 维持现状(护栏只在策略侧, 用 `ctx:equity()` 自管); ⓑ 加**固定比例**的引擎级上限(如单笔名义 ≤ 权益×N,
+     N 为固定常量不落配置 → 仍守"无配置面"); ⓒ 显式修订宪法、开一个受控的风险参数面。三者代价递增, 须用户拍板。
+   - **状态**: 截至 2026-10-06 **未落码**, 待用户拍板。
 
 ## 文档-实现缺口 (2026-09-11 审计)
 

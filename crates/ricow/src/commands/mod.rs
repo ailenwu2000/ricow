@@ -18,6 +18,7 @@ pub mod ctrl;
 pub mod daemon;
 pub mod db;
 pub mod deploy;
+pub mod exposure;
 pub mod instances;
 pub mod logs;
 pub mod market;
@@ -188,6 +189,42 @@ pub(crate) fn load_live_credentials() -> ricow_core::CoreResult<(String, String)
             path.display()
         ))),
     }
+}
+
+/// 终端显示宽度: CJK 全角字符算 2 列, 其余算 1 列 (只为把表头对齐, 不外引依赖)。
+///
+/// **唯一实现**: `backtest`(敏感性表) 与 `exposure`(组合敞口表) 共用 —— 此前各写一份,
+/// 结果是同一份终端里两张表的对齐口径不一致。
+pub(crate) fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| {
+            let u = c as u32;
+            let wide = (0x1100..=0x115F).contains(&u)
+                || (0x2E80..=0xA4CF).contains(&u)
+                || (0xAC00..=0xD7A3).contains(&u)
+                || (0xF900..=0xFAFF).contains(&u)
+                || (0xFE30..=0xFE6F).contains(&u)
+                || (0xFF00..=0xFF60).contains(&u)
+                || (0xFFE0..=0xFFE6).contains(&u);
+            if wide {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// 按显示宽度右补空格 (左对齐到 `width` 列)。
+pub(crate) fn pad_display(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    format!("{s}{}", " ".repeat(width.saturating_sub(w)))
+}
+
+/// 按显示宽度左补空格 (右对齐到 `width` 列) —— 数字列用它。
+pub(crate) fn pad_display_right(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    format!("{}{s}", " ".repeat(width.saturating_sub(w)))
 }
 
 /// 项目根 (数据目录, 决策 D4):

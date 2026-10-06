@@ -10,8 +10,8 @@ mod web;
 use clap::{Parser, Subcommand};
 
 use commands::{
-    agentkit, approve, backtest, chat, create, ctrl, daemon, db, deploy, instances, logs, market,
-    new, pairs, run,
+    agentkit, approve, backtest, chat, create, ctrl, daemon, db, deploy, exposure, instances, logs,
+    market, new, pairs, run,
 };
 
 #[derive(Parser)]
@@ -39,6 +39,8 @@ enum Command {
     Info(instances::InfoArgs),
     /// 查看成交记录 (按策略过滤)
     Fills(instances::FillsArgs),
+    /// 跨策略组合敞口 (只读: 各标的净头寸 + 挂单数, 数据源 = 本地库)
+    Exposure(exposure::ExposureArgs),
     /// 策略进程管理器 (start/stop/status/run)
     Daemon(daemon::DaemonArgs),
     /// 前台运行策略 (Dry Run, 退出前无自动重启)
@@ -102,6 +104,7 @@ async fn main() {
         Some(Command::Status(args)) => instances::status(args).await,
         Some(Command::Info(args)) => instances::info(args).await,
         Some(Command::Fills(args)) => instances::fills(args).await,
+        Some(Command::Exposure(args)) => exposure::run(args).await,
         Some(Command::Daemon(args)) => daemon::run(args).await,
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Backtest(args)) => backtest::run(args).await,

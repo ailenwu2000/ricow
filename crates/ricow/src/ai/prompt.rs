@@ -44,7 +44,7 @@ pub const GATES_GUIDE: &str = r#"【运行四档(同一策略, 风险递增)】
   实盘实例**不自动重启**(新参数暂不生效), 要让实盘生效须另说"重启实盘 <名字>", 重过三判据。
 - 删除策略: 先停机(不平仓), 再删 strategies/<名字>.toml 与同名 .lua(**不可逆**); **logs/ 保留**(追溯用)。
 - 终端等价命令: `ricow start <名字> [--demo|--live --accept-risk]` / `ricow stop <名字> [--close-all]` / `ricow restart <名字>`。
-- 状态与成交查询: `ricow status [名字]` / `ricow fills [名字]` / `ricow logs <名字>`。
+- 状态与成交查询: `ricow status [名字]` / `ricow fills [名字]` / `ricow logs <名字>` / `ricow exposure`(跨策略组合敞口: 各标的净头寸与挂单数, 只读本地库、不直连交易所)。
 "#;
 
 /// 最容易跑偏的点(编译期常量): 内置 AI `read_doc("commands")` 与 agent-kit 手册 §四 **同源**。

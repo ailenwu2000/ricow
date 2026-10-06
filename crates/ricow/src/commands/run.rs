@@ -399,6 +399,54 @@ fn print_run_outcome(o: &RunOutcome) {
             println!("注意: 存在残留, 请在交易所账户侧人工核对处理");
         }
     }
+    // 037 P0-A: 启动接管遗留挂单 —— 有动静才打印 (健康运行不刷噪音)。
+    if let Some(op) = &o.orphan {
+        if !op.canceled.is_empty() || !op.cancel_failed.is_empty() || !op.residual.is_empty() {
+            println!(
+                "启动接管: 撤销上一轮遗留挂单={} 撤单失败={} 残留={}",
+                op.canceled.len(),
+                op.cancel_failed.len(),
+                op.residual.len()
+            );
+            for cid in &op.canceled {
+                println!("  已撤遗留挂单: {cid}");
+            }
+            for (cid, why) in &op.cancel_failed {
+                println!("  接管撤单失败: {cid} — {why}");
+            }
+            for cid in &op.residual {
+                println!("  接管后残留: {cid}");
+            }
+        }
+    }
+    // 037 P0-B: 会话订单账目 —— 消除"下单结果未知"的黑洞。
+    if o.oms.submitted > 0 {
+        println!(
+            "订单账目: 提交={} 在途={} 成交={} 已撤={} 拒单={} 结果未知={} 重复单号={}",
+            o.oms.submitted,
+            o.oms.live,
+            o.oms.filled,
+            o.oms.canceled,
+            o.oms.rejected,
+            o.oms.unknown,
+            o.oms.duplicates
+        );
+    }
+    if o.oms.unknown > 0 {
+        println!(
+            "注意: 有 {} 笔下单**结果未知** (提交时传输失败) — 交易所可能已受理, 请到交易所核对是否挂单/成交",
+            o.oms.unknown
+        );
+    }
+    if o.oms.duplicates > 0 {
+        println!(
+            "注意: 出现 {} 次重复单号提交 (策略侧 bug 信号, 交易所通常已按 DUPLICATE_ORDER 拒掉)",
+            o.oms.duplicates
+        );
+    }
+    if o.oms.live > 0 {
+        println!("注意: 收尾仍有 {} 笔订单未了结 (挂单中/部分成交), 请在交易所核对", o.oms.live);
+    }
     if !o.on_stop_implemented {
         println!("提示: 该策略未实现清理 (on_stop); 如仍有挂单或持仓, 请手工处理");
     }

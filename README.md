@@ -89,7 +89,7 @@ binance_secret=***
 
 demo and live both hit the real exchange API — they differ only in domain (`demo-api`/`demo-fapi` vs mainnet) and credentials, and the two credential sets **never fall back to each other**. The two live-only gates (risk acknowledgement / minimum Dry Run duration) do not apply to demo, because they protect real money.
 
-Inspect: `ricow list` / `ricow info <name>`; stop: `ricow stop <name> [--close-all]` (residual open orders / positions are reported from the exchange's actual state).
+Inspect: `ricow list` / `ricow info <name>` / `ricow exposure` (cross-strategy exposure: net position and open-order count per symbol, read from the local database only); stop: `ricow stop <name> [--close-all]` (residual open orders / positions are reported from the exchange's actual state).
 
 Common backtest flags: `--days` (default 90) / `--interval` (default 1h) / `--cash` (initial cash, default 100000 USDT). Futures-specific flags (`--leverage` / `--max-leverage` / `--mmr-pct` / `--funding-rate` / `--market` / `--position-mode`) and all accepted values: see `ricow backtest --help`.
 

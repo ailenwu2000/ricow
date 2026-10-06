@@ -90,8 +90,8 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 ## 五、CLI
 
-命令集(**以 `ricow --help` 实测为准**, 2026-09-19):
-`start [--demo]` / `stop [--close-all]` / `restart` / `list` / `status [name]` / `info` / `fills` / `logs` / `run [--live|--demo]` /
+命令集(**以 `ricow --help` 实测为准**, 2026-10-06):
+`start [--demo]` / `stop [--close-all]` / `restart` / `list` / `status [name]` / `info` / `fills` / **`exposure`**(037) / `logs` / `run [--live|--demo]` /
 `backtest` / `ticker` / `orderbook` / `pairs [--market] [--all]` / `create` / `approve` / `deploy` / `db` / `daemon {start|stop|status|run}` /
 **`ai`**(019: 内置 AI 助手, 交互 / 单次 / `--plain`)/ **`agent-kit`**(019: `ricow agent-kit [--install [目录]]` 生成给外部 agent 的手册 —— AGENTS.md / SKILL.md / CLAUDE.md / lua-api.md, 与内置 AI 同源)/ **`web`**(025: Web UI 模式 —— 启动内置网页, 浏览器里完成全部对话与操作); `mcp` **不做**(2026-09-15 定案)。
 
@@ -155,6 +155,9 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - 进程管理: `daemon start`(自后台化) / `daemon stop`(优雅停全部策略) / `daemon status`;
   `start|stop|restart <name>` 经 daemon 控制通道; `list|status` 为总览(daemon ∪ 台账 ∪ 部署清单), `status <name>` = 详情;
   `info <name>` 运行信息 + 成交统计; `fills [name] [--limit N]` 按 `strategy_id` 过滤; `logs <name> [-f] [--lines N]`
+- 组合敞口(037 P0-C): `ricow exposure [--pair P] [--mode live|demo|dry_run] [--detail] [--limit N]` —— **只读**聚合本地库
+  `positions` / `orders`, 逐 `(标的 × 模式)` 给出净头寸 / 多空合计 / 总名义(**按开仓均价估算**)/ 未终结挂单数 / 活跃策略数;
+  `--detail` 下钻到"策略 × 标的 × 模式"。**只展示不拦截 · 不直连交易所(不需要密钥) · 绝不跨模式相加**; 无写路径、无新确认面。
 - 前台调试: `ricow run <name>`(Dry Run; 进程内监听 stdin `stop` / 管道 EOF / Ctrl-C 优雅停机, 不被 daemon 管理)
 - 回测: `ricow backtest --strategy <名|类型> [--pair] [--days] [--interval] [--script] [--param k=v] [--market spot|futures] [--position-mode one-way|hedge] [--fee/--fee-maker/--fee-taker/--slippage-bps/--cash/--leverage/--max-leverage/--mmr-pct/--funding-rate]`(杠杆默认上限 10x,超限须 --max-leverage 显式放宽;MMR 默认按 symbol 内置首档表, 表外 1.0%)
   - 数据源按市场分支: 现货走交易所 REST; 合约 (futures) 走 fapi 公共数据源 (K 线; MMR 按 symbol 内置首档表,表外回落 1.0%)
@@ -187,6 +190,21 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **端点**(全部**只读**, 挂在同一道 token 中间件之内): `GET /api/trades/{fills,orders,positions,pnl}`(查询串 `strategy_id` / `limit`) + `GET /api/logs`(策略日志清单) / `GET /api/logs/{name}/tail?lines=`(尾读, 缺省 50、一律夹到 200) / `GET /api/logs/{name}/stream`(SSE, 服务端 500ms 尾读驱动, **独立通道**不共用会话 SSE; **断线续传(036)**: 事件 id = 文件字节 offset, 重连按 `Last-Event-ID` 头(前端统一打开器重开新对象时以 `last_event_id` 查询参数兜底, 头优先)从断点续读, 不重发已给过的行)。日志**原样返回** —— 不解析、不改写、不做着色推断; 策略未运行也能看历史日志。前端消费侧(036): `common.js` 的 `R.sse` 统一打开器 —— 指数退避(1s→2s→4s→8s 封顶, ±20% 抖动)接管浏览器原生重连(不退避也不封顶), 连续失败 5 次放弃回调 `onfail`; `new EventSource` 全前端只此一处。
 - **前端只读(D17)**: 交易面板与日志面板只做展示 + 轮询/订阅, **没有任何直连交易所的写按钮** —— 撤单 / 平仓 / 停机仍走既有的对话确认。
 - **AI 回流(FR-019 ~ FR-024)**: 新增三个只读工具(`positions` / `open_orders` / `pnl`); 写操作执行结果注入对话 history, 使下一轮 LLM 看得到"刚才那步真做了什么"。
+
+### 组合敞口只读视图(037, 2026-10-06)
+
+- **只读聚合**: 算法在 `ricow_engine/src/exposure.rs::aggregate_with`(纯函数, 无 IO), 展示在 `commands/exposure.rs`。
+  回答的是多策略场景下的盲区: "合起来我到底押了多少" —— 单看任一策略都正常, 合起来可能是自相对冲(白付两遍手续费)。
+- **聚合键 = `(标的, 模式)`**: `dry_run` / `demo` / `live` **分开成行, 绝不相加** —— 模拟持仓混进实盘敞口会造出一个
+  看似精确、实则错误的"总敞口", 那比不给数字更危险。
+- **口径**: 净头寸 = Σ 带符号 `size`(多 − 空, 跨策略反向持仓相互抵消; `size` 由 `command::position_row_of` 落库时算好);
+  总名义 = `Σ|头寸| × 开仓均价` —— 是**规模估算**, 本地库没有实时价; 有头寸但 `entry_price = 0` 时该行名义标 `*`
+  并注脚**被低估**(不假装数字完整); **刻意不跨交易对汇总**(不同交易对报价资产未必一致, 相加无意义 —— 宁缺勿错)。
+- **未终结判据单一来源** = `ricow_engine::is_open_status`(`open` / `partially_filled`) —— 挂单视图与敞口视图共用。
+  此前各写一份白名单, 漂移的后果是"敞口视图说有挂单、挂单视图说没有"。
+- **只展示, 不拦截**(守宪法"平台不做投资判断"): 无写路径、无新确认面、不直连交易所(因此不需要密钥, 也不会因网络问题给不出答案)。
+  挂单数只覆盖传入的那段订单 —— 触到 `--limit` 时如实打印"更早的挂单可能未计入", 不把"没看到"说成"没有"。
+- **已无敞口的组合不进表**(头寸全 0 且无挂单答不了"押了多少"), 但**不静默丢弃**: 如实报出漏了多少个, `--detail` 可见。
 
 ### 网络请求重试与限流(035, 2026-10-03)
 
@@ -239,6 +257,18 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   `demo_key/demo_secret`(币安模拟交易 demo)**两套独立槽位, 永不跨套回落**; 缺失即拒绝启动并**点名键名与文件路径**, 不静默用空凭据发请求。
   旧方案(env `RICOW_BN_*` / OS Keyring / `ricow keyring` / `credentials.toml`)已于 2026-09-14 全部移除 —— 不保留回退(keyring 在本机不可用)。
 - 实盘下单参数由引擎按交易所过滤器**自动对齐**(数量按 `step_size` 向下取整 / 限价取"不劣于意图"的一侧 / 不足 `min_qty`·`min_notional` 拒单并如实报错); 订单号统一带 `<策略名>-` 前缀, 停机撤单**只撤本实例归属**的单, 非归属单只上报不撤
+- **启动接管遗留挂单**(037 P0-A, 资金安全): 实盘/demo 启动时先按**归属前缀**切分交易所该交易对的挂单(`live::split_owned`) ——
+  本实例归属逐个**撤销**(逐笔落事件流 `orphan_canceled` + 写 `outcome.orphan`, 不静默), 非归属单(用户手工/其他实例)**只上报不撤**(沿用既有 `plan_cleanup` 口径);
+  撤销后**复查**: 仍有本实例残留 **或** 枚举本身失败 → **live 拒绝启动**(错误带残留单号 + 手工撤单指引 + "撤销后重启"), demo 只警告继续。
+  理由与"时钟预检拒绝启动"同口径 —— **无法建立安全前置时不进实盘**。**不提供 `orphan_policy` 配置面**(固定工程不变量, 与 `order_guard` 同口径:
+  安全不变量不接受配置)。修的是"进程崩溃/强杀/断电后重启, 遗留挂单仍挂在交易所而策略 `on_init` 再下一张同样的单 → 敞口翻倍"。
+- **引擎级最小订单登记**(037 P0-B, 资金安全): `ricow_engine/src/oms.rs` 的 `OrderRegistry` 记录**本次会话**提交的每张单及其生命周期
+  (`open` / `partially_filled` / `filled` / `canceled` / `rejected` / **`unknown`**)。三条口径:
+  ① **传输失败 = `Unknown`** —— 交易所可能已收到并挂单, 也可能没有; 单独入账、收尾**醒目提示用户手工核对交易所**, 不谎报结论;
+  ② **重复单号检测** —— 同一 `client_order_id` 在**非终态**时被再次提交 = 策略 bug 信号(计数 + warn), 终态后的复用不算(交易所允许);
+  ③ 会话账目(`submitted` / `live` / `filled` / `canceled` / `rejected` / `unknown` / `duplicates` / `unresolved`)计入 `RunOutcome`, CLI 收尾打印。
+  纯内存、无 IO、无 await; 一切失败**如实降级不抛出**(与事件流同一旁路哲学 —— 交易比观测重要)。**策略侧看不到它**(策略仍只经 `ctx` 的既有只读查询)。
+  增量/累计两个成交口径分开: `OrderFill.fill_size` 是**增量**(用加), `OrderUpdate.filled_size` 是**累计**(用取大), 不可互相套用。
 - Lua 沙箱: 无 os/io/require/loadstring/pcall, 指令预算 1M/tick, 内存 64MB
 - 网络: 仅交易所 API + 美股行情(Nasdaq 官方); 无遥测、无自动更新
 
@@ -253,8 +283,13 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-10-03, 035 工程底座加固后实跑)**: `cargo test --workspace --no-fail-fast` = **642 passed / 22 ignored**(另有 2 例 `ai_live_smoke` **本机沙箱环境性失败**: `ERROR_PIPE_BUSY(231)`, 非代码缺陷; 真机终端为全绿)。
-  门禁四件: `fmt --check` 0 差异 / `clippy --workspace --all-targets -D warnings` 0 / `cargo deny --locked check` 全绿(许可证白名单 + 已知漏洞 + 重复版本 warn + 来源禁未知) / `bash scripts/ci_grep_gates.sh` 四条安全红线全绿(AI 工具层零落盘 · 明文密钥不进日志 · 无调试残留 · `execute_strategy` 调用点白名单; 按 `#[cfg(test)]` 配平跳过测试代码)。
+- **基线(2026-10-06, 037 实盘资金安全加固后实跑)**: `cargo test --workspace --no-fail-fast` = **761 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+25**, 与本变更同源: `ricow` bin **370 → 382**(+12: `commands::exposure` 聚合视图的渲染/过滤/显示宽度对齐) + `ricow_engine` lib **99 → 112**(+13: `exposure.rs` 的组合敞口聚合, 含跨策略对冲/模式隔离/名义低估标记/顺序稳定); 其余 target 一字未变
+  (ricow_binance 59 / ricow_core 18 / ricow_strategy 184 / `architecture_guard` 3 / `ai_live_smoke` 3)。
+  > **如实**: 同口径上次记为 670(2026-10-05)。670 → 736 的差额来自 **2026-10-06 的四笔审计加固提交**(三梯队 + 中危 ×2 + 低危收尾, 见 `git log 8bbecd3` 起), 那几轮只写了提交说明、**未单独记基线**, 故此处以 736 为 037 的起点。
+  门禁五件: `fmt --all -- --check` 0 差异 / `clippy --workspace --all-targets -- -D warnings` exit 0 / `cargo deny --locked check` 全绿 / `bash scripts/ci_grep_gates.sh` 五条安全红线全绿 / `architecture_guard` 三条用例全绿。
+- **前基线(2026-10-03, 035 工程底座加固后实跑)**: `cargo test --workspace --no-fail-fast` = **642 passed / 22 ignored**(另有 2 例 `ai_live_smoke` **本机沙箱环境性失败**: `ERROR_PIPE_BUSY(231)`, 非代码缺陷; 真机终端为全绿)。
+  门禁: `fmt --check` 0 差异 / `clippy --workspace --all-targets -D warnings` 0 / `cargo deny --locked check` 全绿(许可证白名单 + 已知漏洞 + 重复版本 warn + 来源禁未知) / `bash scripts/ci_grep_gates.sh` 五条安全红线全绿(AI 工具层零落盘 · 明文密钥不进日志 · 无调试残留 · `execute_strategy` 调用点白名单 · **生产代码不得对 `Instant` 做裸减法**〔红线 5, 2026-10-06 加: Windows 单调时钟锚在开机时刻, 往回减大 Duration 必 panic, windows-latest 曾因此固定红〕; 按 `#[cfg(test)]` 配平跳过测试代码)。
   CI 矩阵 ubuntu + windows + **macOS**(发布了 macOS 产物就必须测); `release.yml` 去 PR 触发(dist 持久开关在 `dist-workspace.toml` 的 `pr-run-mode`)。
 - 前基线(2026-09-24, paired_grid 新增后实跑): `cargo test --workspace` = **544 passed / 0 failed / 22 ignored**(ignored 仍为需真实外部环境的联调用例, 不 mock 替代; paired_grid 新增 4 条集成测试: ATR 未就绪不动 / 激活建仓与上下单结构 / 配对卖价恒>买价 / 连续下跌 flag 为负)
 - 历史基线(2026-09-15, 021 clippy 清零后): 339 passed / 0 failed / 12 ignored; 更早(2026-09-13, 018 实施后): 308 passed / 0 failed / 11 ignored(ignored = 需真实外部环境的联调用例, 不 mock 替代; 构成: BN demo 现货 4 + 合约 5 + Nasdaq 冒烟 2)

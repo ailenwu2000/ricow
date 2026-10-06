@@ -11,7 +11,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 
-use crate::commands::format_backtest_report;
+use crate::commands::{format_backtest_report, pad_display};
 use ricow_strategy::{BacktestParams, BacktestToml, ConfigValue, Context, StrategyConfig};
 
 /// `YYYY-MM-DD` -> 当日 00:00 UTC 毫秒 (回测窗口边界用)。
@@ -1107,33 +1107,6 @@ fn fmt_bps(v: f64) -> String {
     }
 }
 
-/// 终端显示宽度: CJK 全角字符算 2 列 (只为把表头对齐, 不外引依赖)。
-fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| {
-            let u = c as u32;
-            let wide = (0x1100..=0x115F).contains(&u)
-                || (0x2E80..=0xA4CF).contains(&u)
-                || (0xAC00..=0xD7A3).contains(&u)
-                || (0xF900..=0xFAFF).contains(&u)
-                || (0xFE30..=0xFE6F).contains(&u)
-                || (0xFF00..=0xFF60).contains(&u)
-                || (0xFFE0..=0xFFE6).contains(&u);
-            if wide {
-                2
-            } else {
-                1
-            }
-        })
-        .sum()
-}
-
-/// 按显示宽度右补空格 (不足处补到 `width` 列)。
-fn pad_display(s: &str, width: usize) -> String {
-    let w = display_width(s);
-    format!("{s}{}", " ".repeat(width.saturating_sub(w)))
-}
-
 /// 表格列宽 (显示宽度): 档位 / 成交 / 净盈亏 / 权益变化 / 最大回撤 / 夏普 / 胜率 / 手续费 / 结论。
 const SENS_COLS: [usize; 9] = [8, 8, 14, 14, 12, 8, 10, 12, 8];
 const SENS_HEADERS: [&str; 9] =
@@ -1445,6 +1418,7 @@ fn prune_run_cards(dir: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::display_width;
     use crate::commands::test_util::ENV_LOCK;
 
     /// 审计 低危 #4: 根数上限校验 —— 常规窗口放行, 越界窗口报错且文案点名建议。

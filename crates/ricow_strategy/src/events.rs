@@ -33,6 +33,12 @@ pub const KIND_ORDER_PLACED: &str = "order_placed";
 pub const KIND_ORDER_REJECTED: &str = "order_rejected";
 /// 订单已撤销。
 pub const KIND_ORDER_CANCELED: &str = "order_canceled";
+/// 启动接管: 撤销上一轮遗留的本实例归属挂单 (037 P0-A)。
+///
+/// 与 `order_canceled` 分开记一个 kind, 是因为它**不是**策略运行期的动作, 而是引擎在
+/// **启动装配阶段**发现"上一次没有正常退出"的痕迹并做恢复 —— 下游按 kind 分流即可把
+/// "崩溃恢复"与"策略主动撤单"区分开, 不必去解析 reason 文本。
+pub const KIND_ORPHAN_CANCELED: &str = "orphan_canceled";
 /// 实例停止(带停机原因与统计)。
 pub const KIND_STOPPED: &str = "stopped";
 

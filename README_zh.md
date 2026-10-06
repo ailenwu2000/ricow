@@ -91,7 +91,7 @@ binance_secret=***
 
 demo 与实盘都真实调用交易所接口, 差别只在域名(`demo-api`/`demo-fapi` vs 主网)与凭据, 两套凭据**互不回落**; demo 不适用实盘的两道门(风险确认 / 时长门禁), 因为那两道门保护的是真实资金。
 
-查看状态: `ricow list` / `ricow info <名字>`; 停机: `ricow stop <名字> [--close-all]`(按交易所侧实际结果提示残留挂单/持仓)。
+查看状态: `ricow list` / `ricow info <名字>` / `ricow exposure`(跨策略组合敞口: 各标的净头寸与挂单数, 只读本地库); 停机: `ricow stop <名字> [--close-all]`(按交易所侧实际结果提示残留挂单/持仓)。
 
 回测常用参数: `--days`(默认 90) / `--interval`(默认 1h) / `--cash`(初始现金, 默认 100000 USDT); 合约类参数 `--leverage` / `--max-leverage` / `--mmr-pct` / `--funding-rate` / `--market` / `--position-mode` 及全部取值见 `ricow backtest --help`。
 
