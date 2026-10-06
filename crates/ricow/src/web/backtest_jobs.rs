@@ -183,6 +183,17 @@ impl JobStore {
         Self { inner: Mutex::new(HashMap::new()) }
     }
 
+    /// 038 P1-B: 供 `/metrics` 用的作业计数 —— `(运行中, 全部)`。
+    ///
+    /// 只读计数, 顺手做一次惰性清理(与各查询入口同一语义: 看到的计数不该包含早就该过期的作业)。
+    pub(super) fn counts(&self) -> (usize, usize) {
+        let now = Utc::now();
+        let mut map = lock_or_recover(&self.inner);
+        Self::prune(&mut map, now);
+        let running = map.values().filter(|j| j.status == JobStatus::Running).count();
+        (running, map.len())
+    }
+
     /// 惰性清理: 删除"完成时刻"已过保留期的 done/error。
     ///
     /// 审计 H-5: running **原本**永不因时间被清 —— 但 panic 的作业 finish 永不执行,
@@ -450,6 +461,7 @@ pub(super) async fn start_backtest(
         fee_maker: None,
         fee_taker: None,
         slippage_bps: None,
+        limit_fill_penetration_bps: None,
         cash: req.cash,
         leverage: req.leverage,
         max_leverage: None,
@@ -661,6 +673,7 @@ pub(super) async fn start_sweep(
                     fee_maker: None,
                     fee_taker: None,
                     slippage_bps: None,
+                    limit_fill_penetration_bps: None,
                     cash,
                     leverage,
                     max_leverage: None,

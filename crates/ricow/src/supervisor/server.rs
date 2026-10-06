@@ -24,6 +24,53 @@ struct State {
     /// **同一策略两个子进程同时交易** (双份下单、client_order_id 前缀相同导致
     /// 成交事件互相污染)。占位标记在锁内完成 check+insert, 窗口期内的重复请求一律拒绝。
     starting: HashSet<String>,
+    /// 崩溃自动重启策略 (038 P1-C, 来自 `ricow.toml` 的 `[supervisor]` 段)。
+    /// 默认 [`RestartPolicy::None`] = 行为与没有这一项时完全一致。
+    restart: RestartPolicy,
+    /// 各实例**已自动重启过几次** (键 = 策略名)。成功跑满
+    /// [`RESTART_HEALTHY_SECS`] 后清零, 免得长跑之后的偶发崩溃被历史计数卡死。
+    retries: HashMap<String, u32>,
+    /// 最多自动重启几次 (默认 3)。
+    restart_max: u32,
+    /// 退避基数秒 (默认 5; 第 N 次重启前等 `base × N` 秒)。
+    restart_backoff_secs: u64,
+}
+
+/// 崩溃自动重启策略 (038 P1-C)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RestartPolicy {
+    /// 不自动重启 (默认 —— 与加这项之前的行为一字不差)。
+    #[default]
+    None,
+    /// 异常退出 (退出码非 0 / 被信号杀死) 后自动重启, 最多 `max_retries` 次。
+    OnFailure,
+}
+
+/// 跑满这么久就认为"这次运行是健康的", 自动重启计数**清零**。
+///
+/// 固定常量, 不新增配置面: 没有它的话, "崩 → 重启 → 跑三天 → 又崩" 会因为三次重试已用完
+/// 而拒绝重启 —— 那不是用户想要的语义。60s 取自"短于一次的行情重连周期"。
+const RESTART_HEALTHY_SECS: u64 = 60;
+
+/// 判断这次子进程退出**该不该**自动重启 (纯函数, 可单测)。
+///
+/// - `code`: 退出码; `None` = 被信号杀死 (按异常处理)。
+/// - `retries_done`: 已经自动重启过几次。
+pub fn restart_decision(
+    policy: RestartPolicy,
+    code: Option<i32>,
+    retries_done: u32,
+    max_retries: u32,
+) -> bool {
+    match policy {
+        RestartPolicy::None => false,
+        RestartPolicy::OnFailure => code != Some(0) && retries_done < max_retries,
+    }
+}
+
+/// 到第 `attempt` 次重启前应等多久 (线性退避)。
+pub fn restart_backoff(attempt: u32, base_secs: u64) -> Duration {
+    Duration::from_secs(base_secs.saturating_mul(attempt.max(1) as u64))
 }
 
 /// 控制通道服务 (可克隆; 连接处理与监控共用同一状态)。
@@ -32,6 +79,37 @@ pub struct Server {
     state: Arc<Mutex<State>>,
     token: String,
     shutdown_tx: watch::Sender<bool>,
+}
+
+/// 从数据根的 `ricow.toml` 读 `[supervisor]` 段, 折成 `(策略, 最大重试, 退避基数秒)`
+/// (038 P1-C)。
+///
+/// **读不到 / 解析失败 → `(None, 3, 5)` 并 warn**: daemon 不该因为一份写坏的配置文件起不来
+/// (其它入口会在真正需要时给出明确的配置错误); 静默降级到"不重启"是安全方向 —— 少做一次动作
+/// 总好过在配置没确认的情况下自动拉起实盘进程。
+fn load_restart_policy(root: &std::path::Path) -> (RestartPolicy, u32, u64) {
+    let (policy, max, backoff) = match crate::commands::config_file::load(root) {
+        Ok(f) => (
+            match f.supervisor.restart_policy.as_deref() {
+                Some("on-failure") => RestartPolicy::OnFailure,
+                _ => RestartPolicy::None,
+            },
+            f.supervisor.max_retries.unwrap_or(3).clamp(0, 100) as u32,
+            f.supervisor.backoff_secs.unwrap_or(5).clamp(0, 3600) as u64,
+        ),
+        Err(e) => {
+            tracing::warn!(target: "supervisor", "读取 ricow.toml 失败, 自动重启按默认(关闭)处理: {e}");
+            (RestartPolicy::None, 3, 5)
+        }
+    };
+    if policy == RestartPolicy::OnFailure {
+        tracing::info!(
+            target: "supervisor",
+            max_retries = max, backoff_secs = backoff,
+            "已启用崩溃自动重启 (on-failure): 主动停机不会触发, 重启前会走启动挂单接管"
+        );
+    }
+    (policy, max, backoff)
 }
 
 /// 取状态锁, **容忍锁中毒**。
@@ -89,11 +167,18 @@ impl Server {
         token: String,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
+        // 038 P1-C: 监督策略在 daemon 启动时读一次。读失败或没写 → `none`(保持既有行为),
+        // 只 warn —— 配置文件的问题不该让 daemon 起不来(那是 `ricow` 其它入口的职责)。
+        let (restart, restart_max, restart_backoff_secs) = load_restart_policy(&root);
         let state = Arc::new(Mutex::new(State {
             root,
             exe,
             children: HashMap::new(),
             starting: HashSet::new(),
+            restart,
+            retries: HashMap::new(),
+            restart_max,
+            restart_backoff_secs,
         }));
         Self { state, token, shutdown_tx }
     }
@@ -384,7 +469,10 @@ impl Server {
         listener: TcpListener,
         mut shutdown: watch::Receiver<bool>,
     ) -> CoreResult<()> {
-        let monitor = tokio::spawn(monitor_loop(self.state.clone()));
+        // 监控循环拿一份 `Server`(而非只有 State): 崩溃自动重启要复用 `start()` 的
+        // 全部既有校验(TOML / 视野 / 并发占位锁), 那是个 `&self` 方法。
+        // 另收一份 `shutdown` 接收器: 停机过程中一律不重启(见 `handle_child_exit`)。
+        let monitor = tokio::spawn(monitor_loop(self.clone(), shutdown.clone()));
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -457,7 +545,7 @@ async fn serve_conn(socket: tokio::net::TcpStream, server: Server) {
 /// 子进程监控: 发现自行退出 (崩溃/行情流中断) → 落台账, 供 `list` 如实展示退出码;
 /// 并按 [`procs::LOG_ROTATE_INTERVAL`] 周期检查日志体积 (只在启动时查会让长运行策略的
 /// 日志无限增长 —— 10MB 阈值形同虚设)。
-async fn monitor_loop(state: Arc<Mutex<State>>) {
+async fn monitor_loop(server: Server, mut shutdown: watch::Receiver<bool>) {
     // `None` = 尚未轮转过 → 首轮即视为到期 (等价于旧写法的 `now - INTERVAL`, 但**不下溢**)。
     //
     // 旧写法 `Instant::now() - LOG_ROTATE_INTERVAL` 在系统开机不足 INTERVAL(60s)时会 panic
@@ -471,7 +559,7 @@ async fn monitor_loop(state: Arc<Mutex<State>>) {
         let mut exited: Vec<(String, Option<i32>, InstanceView, PathBuf)> = Vec::new();
         let mut rotate_targets: Vec<PathBuf> = Vec::new();
         {
-            let mut guard = lock_state(&state);
+            let mut guard = lock_state(&server.state);
             let root = guard.root.clone();
             let names: Vec<String> = guard.children.keys().cloned().collect();
             for name in names {
@@ -498,13 +586,102 @@ async fn monitor_loop(state: Arc<Mutex<State>>) {
         }
 
         for (name, code, view, root) in exited {
-            write_exit_record(&root, &name, &view, code, "进程自行退出");
+            handle_child_exit(&server, &mut shutdown, &name, code, view, root).await;
         }
 
         if rotate_due(last_rotate) {
             last_rotate = Some(Instant::now());
         }
     }
+}
+
+/// 一个子进程自行退出后的处置: 落台账 + (按策略)自动重启 (038 P1-C)。
+///
+/// **主动停机不会走到这里**: `stop_all` 会先把 `children` 整体 `drain` 走, 监控循环根本看不到
+/// 那些实例 —— 这是"stop 不会被自动重启顶回来"的结构性保证(有单测锁定)。
+async fn handle_child_exit(
+    server: &Server,
+    shutdown: &mut watch::Receiver<bool>,
+    name: &str,
+    code: Option<i32>,
+    view: InstanceView,
+    root: PathBuf,
+) {
+    // 停机过程中一律不重启: 此刻 `stop_all` 正在(或已经)收摊, 再拉起一个子进程会**逃出**
+    // 停机清单, 变成 daemon 退出后仍在跑的孤儿(虽然它靠 stdin EOF 会自愈退出, 但窗口内
+    // 它仍可能在交易)。
+    let shutting_down = *shutdown.borrow();
+    // 跑满 RESTART_HEALTHY_SECS 的实例视为"健康过" → 清零历史重试计数, 免得
+    // "崩→重启→长跑三天→再崩"被前面那几次计数卡死(那显然不是用户想要的语义)。
+    let ran_secs = uptime_secs(&view);
+    let (policy, max, backoff_base, retries_done) = {
+        let mut guard = lock_state(&server.state);
+        if ran_secs >= RESTART_HEALTHY_SECS && guard.retries.contains_key(name) {
+            guard.retries.remove(name);
+        }
+        let done = guard.retries.get(name).copied().unwrap_or(0);
+        (guard.restart, guard.restart_max, guard.restart_backoff_secs, done)
+    };
+    let will_restart = !shutting_down && restart_decision(policy, code, retries_done, max);
+
+    let reason = if will_restart {
+        format!("进程自行退出 (exit={:?}), 即将自动重启 #{}", code, retries_done + 1)
+    } else if shutting_down {
+        "进程自行退出 (daemon 正在停机, 不重启)".to_string()
+    } else if policy == RestartPolicy::OnFailure && code != Some(0) && retries_done >= max {
+        format!("进程自行退出 (exit={code:?}); 已达最大重试次数 {max}, 停止自动重启, 需人工介入")
+    } else {
+        "进程自行退出".to_string()
+    };
+    write_exit_record(&root, name, &view, code, &reason);
+
+    if !will_restart {
+        if policy == RestartPolicy::OnFailure && code != Some(0) && retries_done >= max {
+            tracing::error!(
+                target: "supervisor", name = %name,
+                "策略 {name} 连续异常退出已达上限 {max} 次, 不再自动重启 —— 请查看日志排查后手工启动"
+            );
+        }
+        return;
+    }
+
+    if retries_done > 0 {
+        let wait = restart_backoff(retries_done + 1, backoff_base);
+        tracing::warn!(target: "supervisor", name = %name, secs = wait.as_secs(), "自动重启退避中");
+        tokio::time::sleep(wait).await;
+    }
+
+    // 重启复用 `start()` —— 它带**全部**既有校验(TOML / 交易对视野 / 并发占位锁),
+    // 比自己拼一遍 spawn 安全得多; 且子进程会在启动段执行 037 P0-A 的挂单接管,
+    // 所以重启不会让敞口翻倍。
+    let mode = view.mode.clone().unwrap_or_default();
+    let (live, demo) = (mode == "live", mode == "demo");
+    tracing::warn!(
+        target: "supervisor", name = %name, mode = %mode,
+        "策略 {name} 非正常退出, 自动重启中 (第 {} 次; 重启会先撤销本实例遗留挂单)",
+        retries_done + 1
+    );
+    // 实盘确认在**首次**启动时已由用户在交互终端逐字完成; 自动重启沿用该次确认(配置里
+    // 显式开了 on-failure 就是用户对"崩了帮我拉起来"的授权)。子进程侧仍走原有的
+    // `RICOW_DAEMON_SPAWNED` 标记路径, 不绕过任何门禁 —— 只是不再重复索要 stdin 确认。
+    let resp = server.start(name, live, demo, true).await;
+    let mut guard = lock_state(&server.state);
+    if resp.ok {
+        *guard.retries.entry(name.to_string()).or_insert(0) += 1;
+    } else {
+        // 启动失败(TOML 没了 / 视野越界 / 秒退): 不臆造次数, 如实记日志。
+        tracing::error!(
+            target: "supervisor", name = %name,
+            "策略 {name} 自动重启失败: {}", resp.error.unwrap_or_else(|| "未知原因".into())
+        );
+    }
+}
+
+/// 统计某实例本次已连续运行多久 (秒); 取不到视图 → 0。
+///
+/// 只用于"跑够久就重置重试计数"这一个判断 —— 拿不到就不重置(保守: 不重置只会更早停手)。
+fn uptime_secs(view: &InstanceView) -> u64 {
+    view.uptime_secs.unwrap_or(0)
 }
 
 /// 是否到达下一次日志轮转时刻: 从未轮转过(首轮) 或已满 [`procs::LOG_ROTATE_INTERVAL`]。
@@ -807,6 +984,177 @@ mod tests {
         assert!(state.children.len() <= 1, "不得登记两个子进程句柄");
         drop(state);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- 038 P1-C: 崩溃自动重启的判定(纯逻辑) ----
+
+    /// **零行为变更的核心断言**: 默认策略下, 任何退出码都不重启。
+    #[test]
+    fn restart_decision_default_policy_never_restarts() {
+        for code in [None, Some(0), Some(1), Some(101), Some(137)] {
+            assert!(!restart_decision(RestartPolicy::default(), code, 0, 100), "{code:?}");
+            assert!(!restart_decision(RestartPolicy::None, code, 0, 100), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn restart_decision_on_failure_restarts_only_unexpected_exits() {
+        assert!(restart_decision(RestartPolicy::OnFailure, Some(1), 0, 3), "非零退出应重启");
+        assert!(
+            restart_decision(RestartPolicy::OnFailure, None, 0, 3),
+            "被信号杀死(无退出码)同样算异常"
+        );
+        assert!(
+            !restart_decision(RestartPolicy::OnFailure, Some(0), 0, 3),
+            "退出码 0 = 正常结束, 不该被顶回来"
+        );
+    }
+
+    #[test]
+    fn restart_decision_respects_max_retries() {
+        assert!(restart_decision(RestartPolicy::OnFailure, Some(1), 2, 3), "未到上限应重启");
+        assert!(!restart_decision(RestartPolicy::OnFailure, Some(1), 3, 3), "到上限即停手");
+        assert!(!restart_decision(RestartPolicy::OnFailure, Some(1), 9, 3), "超限也不重启");
+        // max_retries = 0 是"显式关掉"的一种写法。
+        assert!(!restart_decision(RestartPolicy::OnFailure, Some(1), 0, 0));
+    }
+
+    #[test]
+    fn restart_backoff_is_linear_and_never_zero() {
+        assert_eq!(restart_backoff(1, 5), Duration::from_secs(5));
+        assert_eq!(restart_backoff(3, 5), Duration::from_secs(15));
+        // attempt 0 也至少等一个基数: 退化成"立即重启"就是忙循环。
+        assert_eq!(restart_backoff(0, 5), Duration::from_secs(5));
+        // 基数 0(用户显式关退避) 不 panic。
+        assert_eq!(restart_backoff(5, 0), Duration::from_secs(0));
+        // 极大 attempt 走 saturating, 不 panic。
+        assert!(restart_backoff(u32::MAX, 5).as_secs() > 0);
+    }
+
+    /// 配置 → 策略 的整链: 写了 `on-failure` 才启用; 缺省/写坏一律回到"不重启"。
+    #[test]
+    fn restart_policy_is_read_from_config_file() {
+        let root = tmp_root("restart-cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = root.join("ricow.toml");
+
+        // ① 缺省(文件不存在 → 模板): none + 默认上限/退避。
+        let (p, max, back) = load_restart_policy(&root);
+        assert_eq!(p, RestartPolicy::None, "默认必须是不重启");
+        assert_eq!((max, back), (3, 5));
+
+        // ② 显式 on-failure + 自定义上限与退避。
+        std::fs::write(
+            &cfg,
+            "schema_version = 1\n[supervisor]\nrestart_policy = \"on-failure\"\nmax_retries = 7\nbackoff_secs = 12\n",
+        )
+        .unwrap();
+        let (p, max, back) = load_restart_policy(&root);
+        assert_eq!(p, RestartPolicy::OnFailure);
+        assert_eq!((max, back), (7, 12));
+
+        // ③ 拼错的策略名: `load` 直接拒绝 → 降级为不重启(安全方向: 少做动作)。
+        std::fs::write(&cfg, "[supervisor]\nrestart_policy = \"onfail\"\n").unwrap();
+        let (p, max, back) = load_restart_policy(&root);
+        assert_eq!(p, RestartPolicy::None, "非法值不得被当成启用");
+        assert_eq!((max, back), (3, 5));
+
+        // ④ 类型写错(max_retries 给字符串): 同样硬拒并降级, 不静默丢值。
+        std::fs::write(
+            &cfg,
+            "[supervisor]\nrestart_policy = \"on-failure\"\nmax_retries = \"三\"\n",
+        )
+        .unwrap();
+        let (p, _, _) = load_restart_policy(&root);
+        assert_eq!(p, RestartPolicy::None, "类型错的配置不得被当成启用");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 起一个**立刻正常退出**的真子进程当替身 —— 只走 `std::process`, 不涉交易、不碰网络。
+    ///
+    /// 两个平台各给一份: 早先这里只有 `#[cfg(unix)]` 分支, 于是 Windows 上 `children` 恒为空,
+    /// 下面那条 `graceful == 1` 的断言在 windows-latest 上**必然为 0** —— 测试成了平台相关,
+    /// 而 CI 是三平台矩阵。要测的是"停机把 children 收干净"这一条结构性事实, 与平台无关。
+    ///
+    /// stdin 给 `null` 而非 `piped`: 本测试要验的是 `stop_all` 的 drain + `wait_exit`, 不该顺带
+    /// 依赖"往子进程 stdin 写停机指令"那条链路(那条由 `procs` 的「子进程 stdin 停机链路」测试组
+    /// 覆盖, 三平台都跑),
+    /// 也免得这条断言多背一个环境依赖。
+    ///
+    /// **实测备注 (2026-10-06, 探针 `tmp/pipe_probe2.rs` / `tmp/pipe_probe.rs`)**: 在本机
+    /// **agent 进程树内**, 给子进程 `stdin(Stdio::piped())` 会让 `spawn` 直接失败并返回
+    /// `ERROR_PIPE_BUSY(231)`("所有的管道范例都在使用中")。触发面**仅是 Rust std 为子进程
+    /// stdin 走的那条 `NtCreateNamedPipeFile` 路径**
+    /// (`library/std/src/sys/process/windows/child_pipe.rs` 已明确弃用 `CreatePipe`);
+    /// 同源却**不受影响**的有: `stdout` / `stderr` piped、`stdin = null | File`、
+    /// 以及 Win32 `CreatePipe` 造的匿名管道(`std::io::pipe()` 实测正常)。
+    /// 故"匿名管道被拦"是**不准确**的描述; 与 ricow 代码无关, 属环境侧注入 DLL 的行为
+    /// (Rust 上游 issue #143078 记录的正是这类 hook)。用户普通终端无此现象。
+    fn quick_exit_child() -> std::process::Child {
+        use std::process::{Command, Stdio};
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg("exit 0");
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg("exit 0");
+            c
+        };
+        #[cfg(not(any(unix, windows)))]
+        let mut cmd = Command::new("true");
+        // 不用 `.ok()`: 起不来时必须把真实 errno 打出来, 否则又一次只能靠猜。
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("起替身进程失败: {e} (raw_os_error={:?})", e.raw_os_error()))
+    }
+
+    /// 主动停机**结构性**不会被自动重启顶回来: `stop_all` 先把 `children` 整体 drain 走,
+    /// 监控循环里根本不会出现这些实例 —— 它们不会走到 `handle_child_exit`。
+    #[tokio::test]
+    async fn intentional_stop_removes_children_so_no_restart_can_fire() {
+        let root = tmp_root("restart-stop");
+        let (_tx, rx) = watch::channel(false);
+        let server = Server::new(root.clone(), PathBuf::from("/bin/true"), "t".into(), _tx);
+        {
+            let mut st = lock_state(&server.state);
+            st.restart = RestartPolicy::OnFailure;
+            st.restart_max = 9;
+        }
+        // 模拟"实例在跑": 用一个立刻结束的真子进程当替身。
+        let mut c = quick_exit_child();
+        let stdin = c.stdin.take();
+        let view = InstanceView {
+            name: "s1".into(),
+            running: true,
+            pid: Some(c.id()),
+            started_at: Some(ledger::now_str()),
+            uptime_secs: Some(0),
+            mode: Some("dry_run".into()),
+            pair: Some("ETHUSDT".into()),
+            market: Some("spot".into()),
+            last_exit: None,
+            last_exit_at: None,
+            last_reason: None,
+        };
+        lock_state(&server.state)
+            .children
+            .insert("s1".into(), ChildHandle { child: c, stdin, view });
+
+        // 主动停机: drain 后监控循环再也看不到它 → 不可能触发重启。
+        let (graceful, _) = stop_all(&server.state);
+        assert_eq!(graceful, 1, "应正常收摊这一个实例");
+        assert!(lock_state(&server.state).children.is_empty(), "停完不得残留句柄");
+        // 重试计数也不该因此增长(没有任何一次"自动重启")。
+        assert!(lock_state(&server.state).retries.is_empty(), "主动停机不得计入重试次数");
+        drop(rx);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

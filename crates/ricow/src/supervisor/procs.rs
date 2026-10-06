@@ -118,13 +118,24 @@ pub fn stop_instruction(close_all: bool) -> &'static str {
     }
 }
 
+/// 把停机指令写进给定 writer 并 flush。
+///
+/// 与 [`request_stop`] 拆开, 是为了让"指令文本真的被写出去"这半条链路能**不依赖
+/// `Stdio::piped()`** 被覆盖: `ChildStdin` 只能由 `Stdio::piped()` 产出, 而某些受限进程树里
+/// 那条 NT 具名管道根本起不来(实测见 `supervisor::server::tests::quick_exit_child` 的备注),
+/// 一旦只能用它, 这条链路就永久测不到。拆开之后测试可以用 `std::io::pipe()` 的写端 ——
+/// 同样是真实管道, 覆盖的语义一模一样。
+fn write_stop<W: Write>(w: &mut W, close_all: bool) -> std::io::Result<()> {
+    w.write_all(stop_instruction(close_all).as_bytes())?;
+    w.flush()
+}
+
 /// 下发停机指令。子进程未接 stdin 时返回错误, 由调用方如实报告。
 pub fn request_stop(stdin: &mut Option<ChildStdin>, close_all: bool) -> std::io::Result<()> {
     let Some(s) = stdin.as_mut() else {
         return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "子进程 stdin 不可用"));
     };
-    s.write_all(stop_instruction(close_all).as_bytes())?;
-    s.flush()
+    write_stop(s, close_all)
 }
 
 /// 阻塞等待子进程退出 (调用方应在 spawn_blocking 中执行)。
@@ -414,49 +425,180 @@ mod tests {
         assert_eq!(w.len(), 30);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn stop_instruction_and_wait_exit() {
-        // 用 sh 模拟策略进程: 读到 stop 行后执行"清理"再退出 (与 run 的 stdin 监听同构)
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("while read line; do [ \"$line\" = stop ] && exit 0; done; exit 7")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn sh");
-        let mut stdin = child.stdin.take();
+    // ── 子进程 stdin 停机链路 ─────────────────────────────────────────────────
+    //
+    // 这一组早先是 `#[cfg(unix)]`(要 `sh`), 于是"停机指令 → 优雅退出"这条链**在 Windows 上
+    // 零覆盖**, 而 CI 是三平台矩阵 —— 平台不同就少测一半, 这是最容易漏掉缺陷的形状。
+    //
+    // 两条纪律:
+    // ① 平台分支写 `#[cfg(not(windows))]` 而不是 `#[cfg(unix)]`: 门开得更宽, 不会再出现
+    //    "某个平台被悄悄排除"的同类问题(non-Windows 一律有 POSIX `sh`)。
+    // ② 凡涉及"子进程 stdin"的用例**优先走 `std::io::pipe()`** 而不是 `Stdio::piped()`。
+    //    后者是 Rust std 为子进程 stdin 走的 NT 具名管道路径, 在某些进程树里会被注入 DLL
+    //    拦掉 `ERROR_PIPE_BUSY(231)`(实测见 `supervisor::server::tests::quick_exit_child` 备注);
+    //    一旦只能用它, 这条链就永久测不到。`std::io::pipe()`(Win32 `CreatePipe`)三平台 +
+    //    受限环境都能跑, 覆盖的语义完全一样: 写字节 → 子进程读到 → 退出码。
 
-        // 发送停机指令 → 优雅退出 (exit 0)
-        request_stop(&mut stdin, false).expect("send stop");
-        let (exited, code, _) = wait_exit(&mut child, Duration::from_secs(10));
-        assert!(exited, "应观察到退出");
-        assert_eq!(code, Some(0), "收到 stop 后按 0 退出");
-
-        // stdin 关闭 (EOF) → 子进程读到 EOF 退出 (自愈路径的同构)
-        let mut child2 = Command::new("sh")
-            .arg("-c")
-            .arg("while read line; do :; done; exit 3")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn sh2");
-        let stdin2 = child2.stdin.take();
-        drop(stdin2); // 关闭管道写端 = daemon 消失
-        let (exited2, code2, _) = wait_exit(&mut child2, Duration::from_secs(10));
-        assert!(exited2, "EOF 后应退出");
-        assert_eq!(code2, Some(3), "EOF 路径退出码由策略进程决定");
+    /// 读 stdin 的替身策略进程: 读到 `stop` → 退出 0; 其余(EOF / 别的行) → 退出 3。
+    ///
+    /// Windows 侧**不能**用 `findstr`: 它要读到 **EOF** 才退出, 而生产靠的是子进程
+    /// **读到那一行就退**(daemon 之后才关 stdin)。`cmd` 的 `set /p` 读一行即返回, 才同构。
+    ///
+    /// 替身只认 **单 token** 的 `stop`: `cmd` 的 `if` 用空格切词, 比较含空格的
+    /// `'stop --close-all'` 会把后半截当成命令去执行(实测报 `'--close-all'' 不是内部或
+    /// 外部命令` 并返回 1)。带平仓意图的那个形态没必要挤进"管道送达"这条用例 ——
+    /// 指令原文由 [`write_stop_emits_instruction_and_flushes`] 直测, 解析由
+    /// `commands::run::parse_stop_command_handles_close_all` 覆盖。
+    fn stop_reading_child() -> Command {
+        #[cfg(not(windows))]
+        let mut c = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg("while read line; do [ \"$line\" = stop ] && exit 0; done; exit 3");
+            c
+        };
+        #[cfg(windows)]
+        let mut c = {
+            // `!L!` 必须延迟展开 —— `%L%` 在解析期就展开, 恒为空(这条早先踩过)。
+            // 比较用**单引号**: cmd 的 `if` 只做字符串比较, 引号只是普通字符; 于是整条命令里
+            // 一个双引号都没有, 免掉 Rust→cmd 的引号转义规则(那里极易出错)。
+            let mut c = Command::new("cmd");
+            c.arg("/V:ON").arg("/C").arg("set /p L= & if not '!L!'=='stop' exit 3");
+            c
+        };
+        c.stdout(Stdio::null()).stderr(Stdio::null());
+        c
     }
 
-    #[cfg(unix)]
+    /// `Command::stdin()` 返回 `&mut Command`, 直接串进 `spawn()` 会借不到 —— 包一层。
+    fn with_stdin(mut c: Command, s: Stdio) -> Command {
+        c.stdin(s);
+        c
+    }
+
+    /// 起替身进程; 起不来就把**真实 errno** 打出来 —— 不许再出现"`.ok()` 吞掉错误然后靠猜"。
+    fn spawn_or_panic(mut c: Command, what: &str) -> Child {
+        c.spawn()
+            .unwrap_or_else(|e| panic!("{what} 起不来: {e} (raw_os_error={:?})", e.raw_os_error()))
+    }
+
+    /// 停机指令真的送达子进程并触发优雅退出; daemon 消失(EOF) 时子进程自愈退出。
+    ///
+    /// 走 `std::io::pipe()`: 读端给子进程当 stdin, 写端自己持有(理由见本组开头)。
+    #[test]
+    fn stop_instruction_reaches_child_and_eof_self_heals() {
+        // ① 普通停机 → 子进程读到那一行就按 0 退。
+        //    写端 `w` **全程不关**(活到断言之后) —— 这才证明是"读到 stop 就退", 而不是"靠 EOF 收摊"。
+        let (read_end, mut w) = std::io::pipe().expect("std::io::pipe");
+        let mut child =
+            spawn_or_panic(with_stdin(stop_reading_child(), Stdio::from(read_end)), "替身策略进程");
+        write_stop(&mut w, false).expect("下发停机指令");
+        let (exited, code, _) = wait_exit(&mut child, Duration::from_secs(10));
+        assert!(exited, "收到 stop 后应退出");
+        assert_eq!(code, Some(0), "停机指令应被识别为优雅退出");
+        drop(w);
+
+        // ② 从不写指令, 直接关掉写端 = daemon 消失 → 子进程读到 EOF 自己退(自愈路径)。
+        let (read_end, w) = std::io::pipe().expect("std::io::pipe");
+        let mut child = spawn_or_panic(
+            with_stdin(stop_reading_child(), Stdio::from(read_end)),
+            "替身策略进程 (EOF 路径)",
+        );
+        drop(w);
+        let (exited, code, _) = wait_exit(&mut child, Duration::from_secs(10));
+        assert!(exited, "EOF 后应退出");
+        assert_eq!(code, Some(3), "EOF 路径退出码由策略进程自己决定");
+    }
+
+    /// [`write_stop`] 直测: 写出去的就是指令原文, 每次都必须 flush, 写失败要原样冒泡。
+    ///
+    /// 收在纯函数上是因为它覆盖两件管道用例覆盖不到的事: **flush 这一步**
+    /// (漏了它, 停机指令会卡在缓冲里直到子进程超时) 与**错误冒泡**
+    /// (调用方要靠这个错误如实报告, 不许吞成"已下发")。
+    #[test]
+    fn write_stop_emits_instruction_and_flushes() {
+        /// 记录收到的字节与 flush 次数。
+        struct Spy {
+            buf: Vec<u8>,
+            flushes: usize,
+        }
+        impl Write for Spy {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.buf.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let mut spy = Spy { buf: Vec::new(), flushes: 0 };
+        write_stop(&mut spy, false).expect("普通停机");
+        assert_eq!(spy.buf, b"stop\n");
+        write_stop(&mut spy, true).expect("带平仓意图的停机");
+        assert_eq!(spy.buf, b"stop\nstop --close-all\n", "两种形态的原文都要原样写出");
+        assert_eq!(spy.flushes, 2, "每下发一次都必须 flush");
+
+        /// 写端直接报错。
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "管道已断"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = write_stop(&mut Broken, false).expect_err("写失败必须冒泡");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// **生产路线本人**: `Stdio::piped()` → `child.stdin.take()` → `request_stop` ——
+    /// 只有这条真跑 `ChildStdin` 类型(`Option<ChildStdin>` 正是 `ChildHandle.stdin` 的形状)。
+    ///
+    /// 受限进程树里 `Stdio::piped()` 会被注入 DLL 拦在 `NtCreateNamedPipeFile` 上(231):
+    /// 那是**环境行为, 不是 ricow 缺陷**, 故此处如实跳过。但跳过设三道闸, 免得它变成
+    /// "掩盖缺陷的借口": ① 只认 231 这一个 errno(命令不存在/权限/其他错误一律照常变红);
+    /// ② 跳过前做**正对照** —— 同进程里 `std::io::pipe()` 必须可用, 否则说明不是那条已知路径;
+    /// ③ 打印明确的跳过说明。CI(三平台)与用户普通终端会真跑下面三条断言。
+    #[test]
+    fn request_stop_writes_through_real_child_stdin() {
+        let mut child = match with_stdin(stop_reading_child(), Stdio::piped()).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                assert_eq!(
+                    e.raw_os_error(),
+                    Some(231),
+                    "只认已知的 ERROR_PIPE_BUSY(231); 其它失败都不是那条已知路径: {e}"
+                );
+                let (r, _w) = std::io::pipe()
+                    .expect("正对照失败: 同进程内普通匿名管道也不可用 ⇒ 不是已知环境行为");
+                drop(r);
+                eprintln!(
+                    "[环境跳过] 本进程树拦掉了子进程 stdin 的 NT 具名管道(231); \
+                     正对照 std::io::pipe() 通过, 故非 ricow 代码原因。\
+                     CI 三平台与用户普通终端会真跑下面的断言。"
+                );
+                return;
+            }
+        };
+        let mut stdin = child.stdin.take();
+        request_stop(&mut stdin, false).expect("下发停机指令");
+        let (exited, code, _) = wait_exit(&mut child, Duration::from_secs(10));
+        assert!(exited, "收到 stop 后应退出");
+        assert_eq!(code, Some(0), "停机指令应被识别为优雅退出");
+    }
+
+    /// `wait_exit` 的超时分支: 让子进程**阻塞在 stdin 上**(读端给了它, 写端一直不写也不关),
+    /// 它必然不会自己退出。比"用 `sleep` 熬时间"更确定, 也不必依赖平台自带的计时命令
+    /// (Windows 上没有干净的单进程 sleep), 于是这条用例也回到跨平台。
     #[test]
     fn wait_exit_times_out_without_exit() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 5")
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn");
+        let (read_end, _held) = std::io::pipe().expect("std::io::pipe");
+        let mut child = spawn_or_panic(
+            with_stdin(stop_reading_child(), Stdio::from(read_end)),
+            "阻塞在 stdin 上的替身进程",
+        );
         let (exited, code, waited) = wait_exit(&mut child, Duration::from_millis(300));
         assert!(!exited, "超时应返回未退出");
         assert_eq!(code, None);

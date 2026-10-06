@@ -8,8 +8,9 @@
 //! - `piped_confirm_phrases_never_reach_the_host`: 配置齐全(不撞首次向导)时, 从非 tty stdin 喂七个
 //!   动作的逐字短语仍进不了读行循环 → 宿主一个写实动作都不执行(零 risk_ack.json / 零 strategies/)
 //!
-//! 注: A 段两处 `stdin` 走**文件句柄**而非管道, 见 `spawn_with_non_tty_stdin` 的注释
-//! (同一门禁分支, 语义等价; 规避本机 agent 进程树对 Rust 匿名管道构造的 231 拦截)。
+//! 注: A 段两处 `stdin` 走 `std::io::pipe()` 造的**真管道**(非终端, 与生产同形),
+//! 见 `spawn_with_piped_stdin` 的注释 —— 早先为绕开受限进程树对 NT 具名管道的 231 拦截
+//! 退用过文件句柄, 现按 `CreatePipe` 路线回到管道。
 //!
 //! ## B. 真机 LLM 场景(全部 `#[ignore]`, 纪律: 不 mock, 真实 HTTP)
 //!
@@ -116,45 +117,42 @@ fn require_ai_key() -> String {
     )
 }
 
-/// 起一个"stdin **非终端**"的子进程; 返回 (child, stdin 夹具文件路径, 调用方自行删夹具)。
+/// 起一个"stdin 是**管道**(非终端)"的子进程, 并把 `stdin_content` 预写进管道、随后关掉写端
+/// (子进程看到的就是"管道里有这些字节, 然后 EOF")。
 ///
-/// 为什么用**文件**而不是 `Stdio::piped()`:
-/// - D5 门禁只判 `std::io::stdin().is_terminal()`(`commands::mod::require_interactive_terminal`
-///   与 `commands::chat` 的读行循环), **管道与文件都非终端**, 走的是同一分支, 语义等价;
-/// - 但 Rust `std` 给子进程 stdin 建**匿名管道**走 NT 层 `NtCreateNamedPipeFile`+`NtOpenFile`,
-///   在本机 agent 进程树里返回 `ERROR_PIPE_BUSY(231)` 导致 `spawn` 直接失败
-///   (系统自带 `cmd.exe` + 20 行探针即可复现, 与 ricow 代码无关)。
-///   文件句柄不经过该路径 —— agent 环境与用户普通终端都能起, 测试不再被环境卡红。
-fn spawn_with_non_tty_stdin(
-    cmd: &mut Command,
-    stdin_content: &str,
-) -> (std::process::Child, std::path::PathBuf) {
-    let fixture = std::env::temp_dir().join(format!(
-        "ricow-ai-live-stdin-{}-{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-    ));
-    std::fs::write(&fixture, stdin_content).expect("写 stdin 夹具");
-    let child = cmd
-        .stdin(Stdio::from(std::fs::File::open(&fixture).expect("打开 stdin 夹具")))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ricow");
-    (child, fixture)
+/// **为什么不用 `Stdio::piped()`**: Rust `std` 给子进程 stdin 建管道走的是 NT 层
+/// `NtCreateNamedPipeFile` + `NtOpenFile`(**不是** Win32 `CreatePipe`,
+/// 见 `library/std/src/sys/process/windows/child_pipe.rs`), 在本机 agent 进程树里被注入的 DLL
+/// 拦掉并返回 `ERROR_PIPE_BUSY(231)`, `spawn` 直接失败(零 ricow 代码的探针即可复现)。
+/// 而 `std::io::pipe()` 走的正是 `CreatePipe` —— **同一进程里实测可用**, 三平台与受限环境都能跑,
+/// 且它本来就是管道, 与测试名里的 "piped" 名实相符。
+///
+/// **别把它描述成"匿名管道被拦"**: 被拦的只是 std 为子进程 stdin 走的那条 NT 具名管道路径;
+/// `stdout`/`stderr` piped、`stdin = null`、以及 `CreatePipe` 造的管道都正常。
+fn spawn_with_piped_stdin(cmd: &mut Command, stdin_content: &str) -> std::process::Child {
+    let (read_end, mut write_end) = std::io::pipe().expect("std::io::pipe");
+    {
+        // 内容很短(远小于管道缓冲 ~64KB), 先写完再关写端, 不会阻塞。
+        use std::io::Write;
+        write_end.write_all(stdin_content.as_bytes()).expect("写 stdin 管道");
+        write_end.flush().expect("flush stdin 管道");
+    }
+    drop(write_end);
+    cmd.stdin(Stdio::from(read_end)).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.spawn().expect("spawn ricow")
 }
 
 // ── A. 确定性门禁(默认运行)──────────────────────────────────────────────────
 
 #[test]
 fn approve_requires_interactive_tty() {
-    // D5: 非 tty stdin(此处文件句柄, 见 spawn_with_non_tty_stdin) → approve 必须在任何
+    // D5: 非 tty stdin(此处真管道, 见 spawn_with_piped_stdin) → approve 必须在任何
     // DB/写实动作之前硬拒。
     let root = temp_root("tty");
     let mut cmd = Command::new(bin());
     cmd.args(["approve", "pv-nonexistent"]).env("RICOW_ROOT", &root);
-    // 空文件 = 读到即 EOF(等价于原"管道关闭后无输入"), 且非终端 → 门禁必拒。
-    let (child, fixture) = spawn_with_non_tty_stdin(&mut cmd, "");
+    // 空内容 = 读到即 EOF(等价于"管道关闭后无输入"), 且非终端 → 门禁必拒。
+    let child = spawn_with_piped_stdin(&mut cmd, "");
     let out = child.wait_with_output().expect("wait");
     let merged = format!(
         "{}\n{}",
@@ -163,7 +161,6 @@ fn approve_requires_interactive_tty() {
     );
     assert!(!out.status.success(), "非 tty stdin 喂入必须被拒绝: {merged}");
     assert!(merged.contains("交互终端"), "门禁文案缺失: {merged}");
-    let _ = std::fs::remove_file(&fixture);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -224,8 +221,8 @@ fn piped_confirm_phrases_never_reach_the_host() {
     // 裸入口 = `ricow`(无子命令); 用夹具里的占位 key, 不依赖开发机环境。
     let mut cmd = Command::new(bin());
     cmd.env("RICOW_ROOT", &root).env_remove("RICOW_AI_API_KEY");
-    // 把四个动作的逐字短语预置进非 tty stdin(文件句柄): 它们照样没有承接者。
-    let (child, fixture) = spawn_with_non_tty_stdin(
+    // 把四个动作的逐字短语预置进非 tty stdin(真管道): 它们照样没有承接者。
+    let child = spawn_with_piped_stdin(
         &mut cmd,
         "确认风险\n确认实盘 demofix01\n确认平仓停止 demofix01\n确认部署 demofix01\n",
     );
@@ -241,7 +238,6 @@ fn piped_confirm_phrases_never_reach_the_host() {
     // 硬证据: 四个写实动作一个都没发生
     assert!(!root.join("risk_ack.json").exists(), "非 tty stdin 不得完成风险确认");
     assert!(!root.join("strategies").exists(), "非 tty stdin 不得落盘策略");
-    let _ = std::fs::remove_file(&fixture);
     let _ = std::fs::remove_dir_all(&root);
 }
 

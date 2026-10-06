@@ -44,7 +44,9 @@ pub const GATES_GUIDE: &str = r#"【运行四档(同一策略, 风险递增)】
   实盘实例**不自动重启**(新参数暂不生效), 要让实盘生效须另说"重启实盘 <名字>", 重过三判据。
 - 删除策略: 先停机(不平仓), 再删 strategies/<名字>.toml 与同名 .lua(**不可逆**); **logs/ 保留**(追溯用)。
 - 终端等价命令: `ricow start <名字> [--demo|--live --accept-risk]` / `ricow stop <名字> [--close-all]` / `ricow restart <名字>`。
-- 状态与成交查询: `ricow status [名字]` / `ricow fills [名字]` / `ricow logs <名字>` / `ricow exposure`(跨策略组合敞口: 各标的净头寸与挂单数, 只读本地库、不直连交易所)。
+- 状态与成交查询: `ricow status [名字]` / `ricow fills [名字]` / `ricow logs <名字>` / `ricow exposure`(跨策略组合敞口: 各标的净头寸与挂单数, 只读本地库、不直连交易所) /
+  `ricow align <名字>`(实盘/回测对齐: 该策略最新一张回测卡 vs 同一窗口的实盘成交, 只读; 窗口内实盘 0 笔时它直说"无从对比"而不给空表; 期货下它把现金流叫"现金净流入"而**不叫盈亏**)。
+- Web 运行期只读指标: `GET /metrics`(Prometheus 文本格式, 与其它端点同一道 token 门; 指标见 `specs/architecture.md` §六 038 小节)。
 "#;
 
 /// 最容易跑偏的点(编译期常量): 内置 AI `read_doc("commands")` 与 agent-kit 手册 §四 **同源**。
@@ -60,6 +62,8 @@ pub const TRAPS_GUIDE: &str = r#"【最容易跑偏的点(逐条核对)】
 9. 盈亏政策属于策略(2026-09-15 起): 平台不再代做亏损熔断/峰值回撤; 策略用 ctx:net_pnl()/ctx:equity() 自实现回撤止损。平台只保留工程护栏(100 单/秒下单频率上限)防程序失控。
 10. 改参数不会让实盘自动换血(023): dry_run / demo 实例按原模式自动重启, 实盘实例**不自动重启**(新参数暂不生效) —— 要让实盘生效必须单独再说一次"重启实盘 <名字>", 重过三判据。
 11. 删除与覆盖不可逆(023): 删除策略只删 strategies/<名字>.toml 与 .lua, **logs/ 保留**; 覆盖部署会先把旧脚本备份为 <名字>.lua.<时间戳>.bak, 但新脚本一落盘就没有"撤销"——只有手工把 .bak 复制回原文件名。
+12. 回测的限价成交是**乐观**的: 默认"bar 内触及限价即按限价全成", 忽略排队位置(对网格类策略会系统性高估)。回测报告里"限价单成交"一行会写明笔数/占比与穿透深度; 要收紧就说"把 limit_fill_penetration_bps 调成 N"(策略 TOML `[backtest]` 段或 `ricow backtest --limit-fill-penetration-bps N`), 默认 0 = 保持既有口径不变。回测/实盘的差异用 `ricow align <名字>` 对照, 不要凭感觉归因。
+13. 崩溃自动重启是**默认关闭**的(038): 只有 ricow.toml 的 `[supervisor] restart_policy = "on-failure"` 才会在策略异常退出后自动拉起(最多 max_retries 次, 线性退避)。它**不绕过**任何实盘前置(风险确认/Dry Run 时长/时钟预检/启动挂单接管); "主动停机"不会触发。别把"实例没自动重启"当成 bug —— 先看这项配置。
 "#;
 
 /// 常驻规则段(表述纪律 / 文档纪律 / 建策略 / 权限分级 / 命名规范 / 安全边界)。

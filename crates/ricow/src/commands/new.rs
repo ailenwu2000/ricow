@@ -127,6 +127,8 @@ pub fn run(args: NewArgs) -> CoreResult<()> {
         fee_maker_bps: Some(bt.fee_maker_bps),
         fee_taker_bps: Some(bt.fee_taker_bps),
         slippage_bps: Some(bt.slippage_bps),
+        // 038 P1-A: 默认写 0 (触及即成交) —— 让「限价成交假设」这个旋钮在新策略里可见可改。
+        limit_fill_penetration_bps: Some(bt.limit_fill_penetration_bps),
         initial_cash: Some(bt.initial_cash),
         leverage: Some(bt.leverage),
         max_leverage: Some(bt.max_leverage),

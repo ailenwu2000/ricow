@@ -89,9 +89,11 @@ binance_secret=***
 
 demo and live both hit the real exchange API — they differ only in domain (`demo-api`/`demo-fapi` vs mainnet) and credentials, and the two credential sets **never fall back to each other**. The two live-only gates (risk acknowledgement / minimum Dry Run duration) do not apply to demo, because they protect real money.
 
-Inspect: `ricow list` / `ricow info <name>` / `ricow exposure` (cross-strategy exposure: net position and open-order count per symbol, read from the local database only); stop: `ricow stop <name> [--close-all]` (residual open orders / positions are reported from the exchange's actual state).
+Inspect: `ricow list` / `ricow info <name>` / `ricow exposure` (cross-strategy exposure: net position and open-order count per symbol, read from the local database only) / `ricow align <name>` (live-vs-backtest alignment: the backtest metrics from the strategy's latest run card and its live fills side by side over one window — read-only, and it says "no comparable sample" rather than showing an empty table); stop: `ricow stop <name> [--close-all]` (residual open orders / positions are reported from the exchange's actual state).
 
-Common backtest flags: `--days` (default 90) / `--interval` (default 1h) / `--cash` (initial cash, default 100000 USDT). Futures-specific flags (`--leverage` / `--max-leverage` / `--mmr-pct` / `--funding-rate` / `--market` / `--position-mode`) and all accepted values: see `ricow backtest --help`.
+When the web UI is running, `GET /metrics` (same token gate as every other endpoint) exposes read-only Prometheus metrics: daemon up, instances, open orders, position sizes, latest net PnL, total fills, backtest jobs.
+
+Common backtest flags: `--days` (default 90) / `--interval` (default 1h) / `--cash` (initial cash, default 100000 USDT). Futures-specific flags (`--leverage` / `--max-leverage` / `--mmr-pct` / `--funding-rate` / `--market` / `--position-mode`) and all accepted values: see `ricow backtest --help`. `--limit-fill-penetration-bps` (default `0`) tightens the optimistic limit-fill model: at `0` a bar that merely touches your limit fills the order (the historical behaviour, unchanged); at `N > 0` price must trade `N` bps through the limit. The backtest report always prints the limit-fill count and share so the assumption stays visible.
 
 ### 4. Built-in AI assistant (optional)
 

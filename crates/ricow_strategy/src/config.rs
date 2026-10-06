@@ -193,6 +193,8 @@ pub struct BacktestToml {
     pub fee_maker_bps: Option<f64>,
     pub fee_taker_bps: Option<f64>,
     pub slippage_bps: Option<f64>,
+    /// 038 P1-A: 限价单成交所需**穿透**深度 (bps)。默认 0 = 触及即成交 (旧行为)。
+    pub limit_fill_penetration_bps: Option<f64>,
     pub initial_cash: Option<f64>,
     pub leverage: Option<f64>,
     /// 杠杆上限 (默认 10; 超 10x 需显式放宽 = 知情, 方案 A)。
@@ -210,6 +212,14 @@ pub struct BacktestParams {
     pub fee_taker_bps: f64,
     /// 市价单滑点 bps。
     pub slippage_bps: f64,
+    /// 038 P1-A: 限价单成交所需**穿透**深度 (bps)。
+    ///
+    /// `0`(默认) = 旧行为: bar 内价格**触及**限价即按限价成交 —— 忽略排队位置,
+    /// 对网格类策略会**系统性高估**成交率与收益。
+    /// `N > 0` = 需穿透 `N` bps 才算成交 (买: `bar.low ≤ limit×(1−N/1e4)`;
+    /// 卖: `bar.high ≥ limit×(1+N/1e4)`), 是对"排不到队"的轻量近似。
+    /// 成交价恒为 `limit`(不给额外滑点 —— 无 tick 数据时伪造滑点是另一种失真)。
+    pub limit_fill_penetration_bps: f64,
     /// 初始现金 (quote)。
     pub initial_cash: f64,
     /// 合约杠杆 L (逐仓保证金 = 名义/L)。
@@ -229,6 +239,8 @@ impl Default for BacktestParams {
             fee_maker_bps: 10.0,
             fee_taker_bps: 10.0,
             slippage_bps: 0.0,
+            // 038 P1-A: 0 = 保持既有"触及即成交"行为 (默认不改既有回测数字)。
+            limit_fill_penetration_bps: 0.0,
             initial_cash: 100_000.0,
             leverage: 1.0,
             max_leverage: 10.0,
@@ -281,6 +293,9 @@ impl BacktestParams {
             if let Some(v) = bt.slippage_bps {
                 p.slippage_bps = v;
             }
+            if let Some(v) = bt.limit_fill_penetration_bps {
+                p.limit_fill_penetration_bps = v;
+            }
             if let Some(v) = bt.initial_cash {
                 p.initial_cash = v;
             }
@@ -311,6 +326,9 @@ impl BacktestParams {
         }
         if let Some(v) = ov.slippage_bps {
             self.slippage_bps = v;
+        }
+        if let Some(v) = ov.limit_fill_penetration_bps {
+            self.limit_fill_penetration_bps = v;
         }
         if let Some(v) = ov.initial_cash {
             self.initial_cash = v;

@@ -14,6 +14,8 @@ mod db;
 pub mod events;
 mod exec;
 mod fee;
+/// 038 P1-D: K 线时间连续性校验(数据缺口检测)—— 纯逻辑, 供回测取数后调用。
+pub mod gaps;
 mod indicators_api;
 pub mod lua;
 mod lua_sandbox;

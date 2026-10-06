@@ -14,6 +14,7 @@ mod keyring;
 mod keys;
 mod logs;
 mod markets;
+mod metrics;
 mod runs;
 mod sessions;
 mod settings;
@@ -265,6 +266,9 @@ pub fn router(state: WebState) -> Router {
         .route("/api/markets/{symbol}/klines", get(markets::get_klines))
         // 策略目录(031 FR-013 / FR-014): 只读展示策略清单 + 参数 schema。
         .merge(strategies::routes())
+        // Prometheus 只读指标(038 P1-B): 实例/挂单/持仓/净盈亏/成交/回测作业计数。
+        // 与**全部**端点同一道 token 门(D5): 不新开放行口、不新开端口; 不读密钥、不落盘。
+        .merge(metrics::routes())
         // 策略源码读取与页面保存(032 US3 / FR-015 ~ FR-017): 读 Lua/实例 TOML 原文;
         // POST 保存走命名校验链 → 编译门禁 → 引擎同一落盘内核(免 preview, FR-028)。
         .route("/api/strategies", axum::routing::post(strategy_io::save_strategy))

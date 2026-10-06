@@ -91,9 +91,11 @@ binance_secret=***
 
 demo 与实盘都真实调用交易所接口, 差别只在域名(`demo-api`/`demo-fapi` vs 主网)与凭据, 两套凭据**互不回落**; demo 不适用实盘的两道门(风险确认 / 时长门禁), 因为那两道门保护的是真实资金。
 
-查看状态: `ricow list` / `ricow info <名字>` / `ricow exposure`(跨策略组合敞口: 各标的净头寸与挂单数, 只读本地库); 停机: `ricow stop <名字> [--close-all]`(按交易所侧实际结果提示残留挂单/持仓)。
+查看状态: `ricow list` / `ricow info <名字>` / `ricow exposure`(跨策略组合敞口: 各标的净头寸与挂单数, 只读本地库) / `ricow align <名字>`(实盘/回测对齐: 把该策略最新一张回测卡与同一窗口的实盘成交放在一张表里 —— 只读, 且样本不足时直说"无从对比"而不是给一张空表); 停机: `ricow stop <名字> [--close-all]`(按交易所侧实际结果提示残留挂单/持仓)。
 
-回测常用参数: `--days`(默认 90) / `--interval`(默认 1h) / `--cash`(初始现金, 默认 100000 USDT); 合约类参数 `--leverage` / `--max-leverage` / `--mmr-pct` / `--funding-rate` / `--market` / `--position-mode` 及全部取值见 `ricow backtest --help`。
+Web UI 运行期间, `GET /metrics`(与其它端点同一道 token 门)提供只读 Prometheus 指标: daemon 是否在跑 / 实例 / 挂单 / 持仓 size / 最新净盈亏 / 累计成交 / 回测作业数。
+
+回测常用参数: `--days`(默认 90) / `--interval`(默认 1h) / `--cash`(初始现金, 默认 100000 USDT); 合约类参数 `--leverage` / `--max-leverage` / `--mmr-pct` / `--funding-rate` / `--market` / `--position-mode` 及全部取值见 `ricow backtest --help`。`--limit-fill-penetration-bps`(默认 `0`)用于收紧乐观的限价成交模型: `0` = bar 内**触及**限价即成交(既有行为, 一字未改); `N > 0` = 需价格**穿过**限价 N bps 才算成交。回测报告始终单列"限价单成交笔数与占比", 让这条假设一直看得见。
 
 ### 4. AI 助手(可选)
 

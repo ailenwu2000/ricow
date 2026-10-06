@@ -9,6 +9,7 @@ macro_rules! line {
 
 pub mod agentkit;
 pub mod ai;
+pub mod align; // 038 P1-E: 实盘/回测对齐工具(只读)
 pub mod approve;
 pub mod backtest;
 pub mod chat;
@@ -986,6 +987,23 @@ pub(crate) fn format_backtest_report(
     line!(out, "{header}");
     line!(out, "  K 线数: {}", report.total_bars);
     line!(out, "  成交笔数: {}", report.total_trades);
+    // 038 P1-A: 限价成交假设的暴露面。撮合模型是"bar 内价格**触及**限价即按限价 100% 全成" ——
+    // 忽略排队位置, 对网格类策略会**系统性高估**成交率与收益。这里把限价成交笔数与穿透深度
+    // 摆出来, 让用户看得见假设; 收紧手段 = 加 `limit_fill_penetration_bps`。
+    let limit_fills = report.limit_fills;
+    let filled_total = limit_fills + report.market_fills;
+    let limit_share =
+        if filled_total == 0 { 0.0 } else { limit_fills as f64 / filled_total as f64 * 100.0 };
+    let pen_note = if report.limit_fill_penetration_bps == 0 {
+        "穿透 0 bps = 触及即成交, 属乐观假设(未计排队位置)"
+    } else {
+        "已要求穿透限价, 较接近真实排队"
+    };
+    line!(
+        out,
+        "  限价单成交: {limit_fills} 笔 (占全部成交 {limit_share:.1}%; 穿透 {} bps — {pen_note})",
+        report.limit_fill_penetration_bps
+    );
     line!(out, "  已实现盈亏: {}", report.realized_pnl);
     line!(out, "  手续费: {}", report.total_fees);
     line!(out, "  手续费占比: {:.4}%", report.fee_ratio * Decimal::from(100));

@@ -668,6 +668,9 @@ pub struct RunOutcome {
     /// 会话内订单登记账目 (037 P0-B): 提交/在途/成交/未知/重复。
     /// 只有走交易所的路径 (demo/live) 才有意义; Dry Run 恒为零值。
     pub oms: OmsCounts,
+    /// 下单往返延迟统计 (038 P1-F): P50/P95/P99/最大, 微秒。
+    /// 只在走交易所的路径上有样本; Dry Run 与"一次都没下单"的运行恒为 `None`。
+    pub order_latency: Option<crate::latency::LatencyStats>,
 }
 
 impl Engine {
@@ -1257,6 +1260,9 @@ impl Engine {
         // 会话内订单登记 (037 P0-B): 引擎视角的订单生命周期账目。纯内存、无 IO、无 await
         // —— 它是**旁路观测**, 绝不给交易路径增加阻塞面; 任何失败都只如实降级。
         let mut registry = OrderRegistry::new();
+        // 下单往返耗时样本 (038 P1-F): 微秒; 只在**走交易所**的路径上有意义 (Dry Run 是虚拟撮合)。
+        // 纯内存追加, 无 IO —— 与 registry 同属旁路观测, 不给交易路径增阻塞面。
+        let mut order_latency_us: Vec<u64> = Vec::new();
         tracing::info!(target: "engine", name = %strategy_name, pair = %pair, mode = %mode.label(), "live run started");
 
         let mut stop_rx = stop;
@@ -1393,7 +1399,12 @@ impl Engine {
                         let (req_cid, req_pair, req_side, req_size) =
                             (req.client_order_id.clone(), req.pair.clone(), req.side, req.size);
                         let now_ms = Utc::now().timestamp_millis();
-                        match ctx.place_order(req) {
+                        // 038 P1-F: 计时 REST 往返 —— 唯一能反映"交易所侧到底多慢"的地方。
+                        // 失败(传输错误)的调用同样计入 (第 1419 行往后走 Err 分支也是真实等待)。
+                        let t_place = std::time::Instant::now();
+                        let placed = ctx.place_order(req);
+                        order_latency_us.push(t_place.elapsed().as_micros() as u64);
+                        match placed {
                             Ok(ack) => {
                                 if ack.client_order_id.is_empty()
                                     && ack.status == OrderStatus::Cancelled
@@ -1713,7 +1724,11 @@ impl Engine {
             for req in plan.closes {
                 let cid = req.client_order_id.clone();
                 let (req_pair, req_side, req_size) = (req.pair.clone(), req.side, req.size);
-                match exchange.place_order(req).await {
+                // 038 P1-F: 兜底平仓同样是真实下单往返, 一并计时(撤单不计 —— 本指标口径是"下单")。
+                let t_close = std::time::Instant::now();
+                let closed = exchange.place_order(req).await;
+                order_latency_us.push(t_close.elapsed().as_micros() as u64);
+                match closed {
                     Ok(ack) => {
                         // 037 P0-B: 兜底平仓单同样是本实例的委托, 纳入会话登记
                         registry.record_ack(&ack, Utc::now().timestamp_millis());
@@ -1814,6 +1829,11 @@ impl Engine {
         // "结果未知"是本次加固要消灭的静默黑洞: 提交时传输失败, 交易所可能已受理, 用户若不知道
         // 就可能重复下单。所以只要存在未知项, 就逐条 error 打出来 (带单号/方向/数量), 让用户能核对。
         outcome.oms = registry.counts();
+        // 038 P1-F: 下单往返延迟归集 (含停机清理的兜底平仓单)。无样本 → None, 不打印假数字。
+        outcome.order_latency = crate::latency::summarize(&mut order_latency_us);
+        if let Some(s) = &outcome.order_latency {
+            tracing::info!(target: "engine", name = %strategy_name, "{}", s.report_line());
+        }
         if !registry.unknowns().is_empty() {
             tracing::error!(
                 target: "engine", name = %strategy_name,

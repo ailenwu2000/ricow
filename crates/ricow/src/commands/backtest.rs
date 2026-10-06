@@ -62,6 +62,9 @@ pub struct BacktestArgs {
     /// 市价滑点 (bps)
     #[arg(long = "slippage-bps")]
     pub slippage_bps: Option<f64>,
+    /// 限价成交所需穿透深度 (bps; 默认 0 = 触及即成交, 属乐观假设)。>0 时须穿透限价才算成交。
+    #[arg(long = "limit-fill-penetration-bps")]
+    pub limit_fill_penetration_bps: Option<f64>,
     /// 初始现金 (quote; 默认 100000, 见内核 BacktestParams::default)
     #[arg(long)]
     pub cash: Option<f64>,
@@ -218,6 +221,8 @@ pub(crate) struct BacktestRunSpec {
     pub(crate) fee_taker: Option<f64>,
     /// 市价滑点 (bps)。
     pub(crate) slippage_bps: Option<f64>,
+    /// 038 P1-A: 限价成交所需穿透深度 (bps)。
+    pub(crate) limit_fill_penetration_bps: Option<f64>,
     /// 初始现金 (quote)。
     pub(crate) cash: Option<f64>,
     /// 合约杠杆 (逐仓)。
@@ -246,6 +251,7 @@ impl BacktestRunSpec {
             fee_maker,
             fee_taker,
             slippage_bps,
+            limit_fill_penetration_bps,
             cash,
             leverage,
             max_leverage,
@@ -279,6 +285,7 @@ impl BacktestRunSpec {
             fee_maker,
             fee_taker,
             slippage_bps,
+            limit_fill_penetration_bps,
             cash,
             leverage,
             max_leverage,
@@ -302,6 +309,9 @@ impl BacktestRunSpec {
         }
         if let Some(v) = self.slippage_bps {
             ov.slippage_bps = Some(v);
+        }
+        if let Some(v) = self.limit_fill_penetration_bps {
+            ov.limit_fill_penetration_bps = Some(v);
         }
         if let Some(v) = self.cash {
             ov.initial_cash = Some(v);
@@ -424,6 +434,11 @@ fn apply_backtest_overrides(
     config.params.insert("fee_maker_bps".into(), ConfigValue::Float(params.fee_maker_bps));
     config.params.insert("fee_taker_bps".into(), ConfigValue::Float(params.fee_taker_bps));
     config.params.insert("slippage_bps".into(), ConfigValue::Float(params.slippage_bps));
+    // 038 P1-A: 限价穿透深度同样全量回写 (与其它回测参数一致, 保证 CLI/TOML 两层都能生效)。
+    config.params.insert(
+        "limit_fill_penetration_bps".into(),
+        ConfigValue::Float(params.limit_fill_penetration_bps),
+    );
     config.params.insert("initial_cash".into(), ConfigValue::Float(params.initial_cash));
     config.params.insert("leverage".into(), ConfigValue::Float(params.leverage));
     config.params.insert("max_leverage".into(), ConfigValue::Float(params.max_leverage));
@@ -839,6 +854,15 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
     };
     if klines.is_empty() {
         return Err(CoreError::Exchange(format!("no klines in window for {pair}")));
+    }
+    // 038 P1-D: 时间连续性校验。此前不校验 —— 交易所漏 bar / 分页拼接出错 / 本地缓存残缺,
+    // 都会把有洞的序列**静默**喂给策略, 指标在错误的时间轴上算出来却产出一份看着正常的报告。
+    // 按项目纪律"错误必须暴露": 有缺口**硬报错**(与"预热不足硬报错"同口径)。
+    let gaps = ricow_strategy::gaps::find_gaps(&klines, step_ms_i);
+    if !gaps.is_empty() {
+        return Err(CoreError::InvalidArgument(ricow_strategy::gaps::gap_error_message(
+            &pair, &interval, &gaps,
+        )));
     }
     // 预热段"取到多少算多少": 交易所历史短于请求的 `warmup_bars` 时(例: 2022-01-01 起算 + 603 天
     // 日线趋势判据预热, 而 SOL 现货自 2020-08 才上线), 若不裁剪, 引擎的 `skip` 会把**请求窗口的
@@ -1283,70 +1307,72 @@ fn params_json(config: &StrategyConfig) -> serde_json::Map<String, serde_json::V
 }
 
 /// run card 的策略区。
-#[derive(serde::Serialize)]
-struct RunCardStrategy {
+///
+/// 038 P1-E: 补 `Deserialize` —— 对齐工具要**读回**卡(`ricow align`)。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RunCardStrategy {
     /// 调用方给出的策略名 (内置 id 或已部署策略名)。
-    name: String,
+    pub(crate) name: String,
     /// 策略类型 (`lua` / 内置类型名)。
     #[serde(rename = "type")]
-    kind: String,
+    pub(crate) kind: String,
     /// Lua 源码 SHA-256 (小写 hex); 无源码 (不应发生) 时为 `none`。
-    source_sha256: String,
+    pub(crate) source_sha256: String,
     /// Lua 源码字节数。
-    source_bytes: usize,
+    pub(crate) source_bytes: usize,
 }
 
 /// run card 的数据窗口区。
-#[derive(serde::Serialize)]
-struct RunCardWindow {
-    pair: String,
-    interval: String,
-    market: String,
-    position_mode: String,
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RunCardWindow {
+    pub(crate) pair: String,
+    pub(crate) interval: String,
+    pub(crate) market: String,
+    pub(crate) position_mode: String,
     /// 请求取数根数 (窗口 + 预热)。
-    requested_bars: u32,
-    warmup_bars: u32,
+    pub(crate) requested_bars: u32,
+    pub(crate) warmup_bars: u32,
     /// 实际喂给引擎的 K 线根数 (裁掉终点 bar 后)。
-    bars: usize,
-    first_open_time_ms: Option<i64>,
-    last_open_time_ms: Option<i64>,
+    pub(crate) bars: usize,
+    pub(crate) first_open_time_ms: Option<i64>,
+    pub(crate) last_open_time_ms: Option<i64>,
     /// 窗口终点 (毫秒, 不含); None = 到"现在"。
-    end_ms: Option<i64>,
+    pub(crate) end_ms: Option<i64>,
     /// 数据来源 (`binance-rest`; 2.2 本地缓存落地后可命中 `local-cache`)。
-    data_source: String,
+    pub(crate) data_source: String,
 }
 
 /// run card 的指标区 (回测报告标量; Decimal 一律转字符串保精度)。
-#[derive(serde::Serialize)]
-struct RunCardMetrics {
-    total_trades: u64,
-    rejected_count: u64,
-    net_pnl: String,
-    realized_pnl: String,
-    total_fees: String,
-    win_rate: f64,
-    max_drawdown: String,
-    annual_return: Option<f64>,
-    annual_volatility: Option<f64>,
-    sharpe: Option<f64>,
-    sortino: Option<f64>,
-    calmar: Option<f64>,
-    profit_factor: Option<f64>,
-    turnover_ratio: f64,
-    equity_change_pct: f64,
-    benchmark_return_pct: Option<f64>,
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RunCardMetrics {
+    pub(crate) total_trades: u64,
+    pub(crate) rejected_count: u64,
+    pub(crate) net_pnl: String,
+    pub(crate) realized_pnl: String,
+    pub(crate) total_fees: String,
+    pub(crate) win_rate: f64,
+    pub(crate) max_drawdown: String,
+    pub(crate) annual_return: Option<f64>,
+    pub(crate) annual_volatility: Option<f64>,
+    pub(crate) sharpe: Option<f64>,
+    pub(crate) sortino: Option<f64>,
+    pub(crate) calmar: Option<f64>,
+    pub(crate) profit_factor: Option<f64>,
+    pub(crate) turnover_ratio: f64,
+    pub(crate) equity_change_pct: f64,
+    pub(crate) benchmark_return_pct: Option<f64>,
 }
 
 /// 一次回测的可复现证据卡。
-#[derive(serde::Serialize)]
-struct RunCard {
-    schema_version: u32,
-    generated_at: String,
-    engine_version: String,
-    strategy: RunCardStrategy,
-    params: serde_json::Map<String, serde_json::Value>,
-    window: RunCardWindow,
-    metrics: RunCardMetrics,
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RunCard {
+    pub(crate) schema_version: u32,
+    pub(crate) generated_at: String,
+    pub(crate) engine_version: String,
+    pub(crate) strategy: RunCardStrategy,
+    pub(crate) params: serde_json::Map<String, serde_json::Value>,
+    pub(crate) window: RunCardWindow,
+    pub(crate) metrics: RunCardMetrics,
 }
 
 /// run card 保留份数上限 (审计 资源-5): 每次回测写一个时间戳 JSON, 文件数无限增长。
@@ -1376,6 +1402,49 @@ fn write_run_card(root: &Path, card: &RunCard) -> CoreResult<PathBuf> {
     Ok(path)
 }
 
+/// 是否本模块自己写的 run card 文件 (`<数字>-...json` 形态)。
+///
+/// 单独抽出来是因为**两处**都依赖它: [`prune_run_cards`] 只删这类文件(目录里若混入用户
+/// 手放的东西不能误删), [`read_run_cards`] 也只读这类文件(免得把别的 json 当成卡解析失败)。
+fn is_run_card_file(p: &Path) -> bool {
+    p.extension().and_then(|s| s.to_str()) == Some("json")
+        && std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
+        && p.file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| {
+                n.split('-')
+                    .next()
+                    .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .unwrap_or(false)
+}
+
+/// 读回全部 run card, 按写入时间**倒序**(最新在前) —— 038 P1-E 的对齐工具要用。
+///
+/// 坏卡(解析失败 / 结构不兼容)直接**跳过**并 warn: 一份坏文件不该让工具彻底不可用。
+/// 返回 `(路径, 卡)` 便于调用方把"用了哪张卡"如实印出来(证据可追溯)。
+pub(crate) fn read_run_cards(root: &Path) -> Vec<(PathBuf, RunCard)> {
+    let dir = root.join("run").join("backtest");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> =
+        entries.flatten().map(|e| e.path()).filter(|p| is_run_card_file(p)).collect();
+    // 文件名 `<毫秒时间戳>-...` 前缀变长前字典序 = 时间序; 倒序取最新在前。
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    let mut out = Vec::new();
+    for p in files {
+        match std::fs::read_to_string(&p)
+            .map_err(|e| e.to_string())
+            .and_then(|t| serde_json::from_str::<RunCard>(&t).map_err(|e| e.to_string()))
+        {
+            Ok(card) => out.push((p, card)),
+            Err(e) => tracing::warn!(path = %p.display(), "跳过无法解析的 run card: {e}"),
+        }
+    }
+    out
+}
+
 /// 只保留最近 [`RUN_CARD_KEEP`] 份 run card, 更早的删除 (审计 资源-5)。返回删除数。
 ///
 /// 文件名以 `timestamp_millis-` 开头 → 按名字**字符串排序**即等价于按写入时间排序
@@ -1385,23 +1454,8 @@ fn prune_run_cards(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
-    let mut cards: Vec<std::path::PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-        .filter(|p| {
-            // 只认 `<数字>-...json` 形态(本函数自己写的卡), 别的 json 不碰。
-            std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
-                && p.file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|n| {
-                        n.split('-')
-                            .next()
-                            .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_digit()))
-                    })
-                    .unwrap_or(false)
-        })
-        .collect();
+    let mut cards: Vec<std::path::PathBuf> =
+        entries.flatten().map(|e| e.path()).filter(|p| is_run_card_file(p)).collect();
     if cards.len() <= RUN_CARD_KEEP {
         return 0;
     }

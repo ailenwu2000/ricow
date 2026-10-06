@@ -5,6 +5,8 @@ mod command;
 mod confirm;
 /// 跨策略组合敞口只读聚合 (037 P0-C): 从本地库 `positions`/`orders` 汇总各标的净头寸与挂单数。
 pub mod exposure;
+/// 下单往返延迟度量 (038 P1-F): 纯分位数统计, 不碰时钟。
+pub mod latency;
 mod live;
 mod loader;
 mod market;
@@ -26,6 +28,7 @@ pub use exposure::{
     aggregate, aggregate_with, is_open_status, ExposureFilter, ExposureView, PairExposure,
     StrategyExposure,
 };
+pub use latency::{summarize as summarize_latency, LatencyStats};
 pub use live::{
     check_clock_skew, clock_align_guidance, dry_run_gate, dry_run_initial_cash,
     liquidation_distance, live_gate, must_refuse_start, orphan_query_refuse_message,

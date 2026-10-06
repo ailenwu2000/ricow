@@ -447,6 +447,10 @@ fn print_run_outcome(o: &RunOutcome) {
     if o.oms.live > 0 {
         println!("注意: 收尾仍有 {} 笔订单未了结 (挂单中/部分成交), 请在交易所核对", o.oms.live);
     }
+    // 038 P1-F: 下单往返延迟 —— 无样本时**不打印**(不给 "P50 = 0ms" 这种假数字)。
+    if let Some(lat) = &o.order_latency {
+        println!("{}", lat.report_line());
+    }
     if !o.on_stop_implemented {
         println!("提示: 该策略未实现清理 (on_stop); 如仍有挂单或持仓, 请手工处理");
     }

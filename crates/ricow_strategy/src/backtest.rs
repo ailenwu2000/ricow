@@ -79,6 +79,12 @@ pub struct BacktestReport {
     pub risk_free_rate: f64,
     /// 资金不足/无仓可平被拒的订单数 (市价丢弃; Bug A 修复后如实显示)。
     pub rejected_count: u64,
+    /// 038 P1-A: 限价单成交笔数 (撮合假设的暴露面)。
+    pub limit_fills: u64,
+    /// 038 P1-A: 市价单成交笔数。
+    pub market_fills: u64,
+    /// 038 P1-A: 本次回测实际使用的限价穿透深度 (bps)。`0` = "触及即成交"(乐观)。
+    pub limit_fill_penetration_bps: u32,
     // ---- 合约字段 (现货回测为 None; 见 specs/backtest.md §五.8) ----
     /// 杠杆 L (逐仓)。
     pub leverage: Option<f64>,
@@ -228,6 +234,11 @@ pub struct BacktestContext {
     declarations: Vec<Declaration>,
     default_exchange: String,
     slippage_bps: u32,
+    /// 038 P1-A: 限价单成交所需**穿透**深度 (bps)。`0` = 触及即成交 (旧行为, 默认)。
+    limit_fill_penetration_bps: u32,
+    /// 038 P1-A: 成交笔数按订单类型分列 —— 用于在报告里说明"限价成交假设"的影响面。
+    limit_fills: u64,
+    market_fills: u64,
     initial_equity: Decimal,
     equity_curve: Vec<Decimal>,
     turnover: Decimal,
@@ -255,6 +266,10 @@ impl BacktestContext {
         if let Some(v) = config.get_f64("slippage_bps") {
             p.slippage_bps = v;
         }
+        // 038 P1-A: 限价穿透深度 (CLI 单次回测覆盖写回, 同 slippage_bps 路径)。
+        if let Some(v) = config.get_f64("limit_fill_penetration_bps") {
+            p.limit_fill_penetration_bps = v;
+        }
         if let Some(v) = config.get_f64("fee_maker_bps") {
             p.fee_maker_bps = v;
         }
@@ -278,6 +293,7 @@ impl BacktestContext {
             ("fee_maker_bps", p.fee_maker_bps),
             ("fee_taker_bps", p.fee_taker_bps),
             ("slippage_bps", p.slippage_bps),
+            ("limit_fill_penetration_bps", p.limit_fill_penetration_bps),
             ("leverage", p.leverage),
             ("mmr_pct", p.mmr_pct),
             ("funding_rate_8h", p.funding_rate_8h),
@@ -289,6 +305,7 @@ impl BacktestContext {
             Decimal::from_f64_retain(p.fee_taker_bps).unwrap_or(Decimal::ZERO),
         );
         let slippage_bps = p.slippage_bps.round().max(0.0) as u32;
+        let limit_fill_penetration_bps = p.limit_fill_penetration_bps.round().max(0.0) as u32;
         let initial_cash = initial_balance.free;
         let mut balance_map = HashMap::new();
         if !is_futures {
@@ -332,6 +349,9 @@ impl BacktestContext {
             entry_equity: None,
             default_exchange: "bn".to_string(),
             slippage_bps,
+            limit_fill_penetration_bps,
+            limit_fills: 0,
+            market_fills: 0,
             initial_equity: initial_cash,
             equity_curve: vec![initial_cash],
             turnover: Decimal::ZERO,
@@ -1075,6 +1095,9 @@ impl BacktestContext {
             avg_loss: avg.map(|a| a.1),
             risk_free_rate: rf,
             rejected_count: self.rejected_count,
+            limit_fills: self.limit_fills,
+            market_fills: self.market_fills,
+            limit_fill_penetration_bps: self.limit_fill_penetration_bps,
             leverage: if self.is_futures() { self.leverage.to_f64() } else { None },
             funding_net: if self.is_futures() { Some(self.funding_net) } else { None },
             hedge_sides: if self.is_hedge() { Some(self.hedge_side_stats()) } else { None },
@@ -1280,6 +1303,9 @@ impl BacktestContext {
             avg_loss: avg.map(|a| a.1),
             risk_free_rate: rf,
             rejected_count: self.rejected_count,
+            limit_fills: self.limit_fills,
+            market_fills: self.market_fills,
+            limit_fill_penetration_bps: self.limit_fill_penetration_bps,
             // 合约字段: 现货回测恒 None/空; 合约有效 (金额/次数 T5 结算, 报告 T6 收敛)。
             leverage: if self.is_futures() { self.leverage.to_f64() } else { None },
             funding_net: if self.is_futures() { Some(self.funding_net) } else { None },
@@ -1320,12 +1346,28 @@ impl BacktestContext {
             }
             OrderType::Limit => {
                 let limit = req.price?;
+                // 038 P1-A: 穿透深度。`0` = 旧行为 (bar 内**触及**限价即成交) —— 忽略排队位置,
+                // 对网格类策略会系统性高估成交率。`N > 0` 时要求价格**穿过**限价 N bps:
+                // 买要跌到 limit×(1−N/1e4) 之下, 卖要涨到 limit×(1+N/1e4) 之上。
+                //
+                // 成交价仍为 `limit`: 这是对"排不到队"的轻量近似, 不是在无 tick 数据时
+                // 伪造额外滑点 (那是另一种失真)。
+                let limit = if self.limit_fill_penetration_bps == 0 {
+                    limit
+                } else {
+                    let pen = Decimal::from(self.limit_fill_penetration_bps) / dec!(10000);
+                    match req.side {
+                        OrderSide::Buy => limit * (Decimal::ONE - pen),
+                        OrderSide::Sell => limit * (Decimal::ONE + pen),
+                    }
+                };
                 let crossed = match req.side {
                     OrderSide::Buy => bar.low <= limit,
                     OrderSide::Sell => bar.high >= limit,
                 };
                 if crossed {
-                    Some(limit)
+                    // 实际成交价 = **原始**限价 (穿透只用于判定, 不体现在价格上)。
+                    Some(req.price?)
                 } else {
                     None
                 }
@@ -1618,6 +1660,12 @@ impl BacktestContext {
         }
         let (close, open) = self.split_fill(req);
         let is_maker = matches!(req.order_type, OrderType::Limit);
+        // 038 P1-A: 按订单类型分列成交笔数 (报告要说明"限价成交按旧乐观假设"的影响面)。
+        if is_maker {
+            self.limit_fills += 1;
+        } else {
+            self.market_fills += 1;
+        }
         let fee = self.fee_model.calc_fee(fill_price, req.size, is_maker);
 
         if !self.is_futures() {
@@ -2095,6 +2143,116 @@ mod tests {
         let ack = ctx.place_order(req).unwrap();
         assert_eq!(ack.status, OrderStatus::Open);
         assert_eq!(ctx.report().total_trades, 0);
+    }
+
+    // ---- 038 P1-A: 限价成交穿透 (默认 0 = 既有行为; >0 = 收紧乐观假设) ----
+
+    /// 造一个只改了限价穿透参数的 spot 回测上下文 (默认 10 万 USDC)。
+    fn ctx_with_penetration(bps: Option<f64>) -> BacktestContext {
+        let mut params = std::collections::HashMap::new();
+        if let Some(v) = bps {
+            params.insert("limit_fill_penetration_bps".to_string(), ConfigValue::Float(v));
+        }
+        let config = StrategyConfig {
+            name: "t".into(),
+            strategy_type: "shannon_spot_grid".into(),
+            enabled: true,
+            exchange: "binance".into(),
+            params,
+            dry_run_started_at: None,
+            live_enabled: false,
+            market: "spot".into(),
+            position_mode: "one-way".into(),
+            backtest: None,
+        };
+        BacktestContext::new(
+            config,
+            Balance { asset: "USDC".into(), free: dec!(100000), locked: Decimal::ZERO },
+        )
+    }
+
+    /// **零行为变更的核心断言**: 不给这个参数时, 触及即成交 —— 与加它之前一字不差。
+    #[test]
+    fn test_limit_penetration_default_zero_still_fills_on_mere_touch() {
+        let mut ctx = ctx_with_penetration(None);
+        // low = 2999 只是**触及** 3000, 没有穿过。
+        ctx.step_bar(kline(dec!(3000), dec!(3010), dec!(2999), dec!(3005)));
+        let ack = ctx
+            .place_order(OrderRequest::new_limit("ETH", OrderSide::Buy, dec!(3000), dec!(1)))
+            .unwrap();
+        assert_eq!(ack.status, OrderStatus::Filled, "默认口径仍是'触及即成交'");
+        assert_eq!(ack.price, dec!(3000));
+        let r = ctx.report();
+        assert_eq!((r.limit_fills, r.market_fills), (1, 0), "限价成交单列计数");
+        assert_eq!(r.limit_fill_penetration_bps, 0, "报告必须如实报出当时用的穿透深度");
+    }
+
+    /// 给了正值后, **只是触及**的 bar 不再成交(这正是要收紧的那份乐观)。
+    #[test]
+    fn test_limit_penetration_positive_rejects_mere_touch() {
+        // 10 bps → 买单价要跌到 3000 × (1 − 0.001) = 2997.0 之下。
+        let mut ctx = ctx_with_penetration(Some(10.0));
+        ctx.step_bar(kline(dec!(3000), dec!(3010), dec!(2999), dec!(3005)));
+        let ack = ctx
+            .place_order(OrderRequest::new_limit("ETH", OrderSide::Buy, dec!(3000), dec!(1)))
+            .unwrap();
+        assert_eq!(ack.status, OrderStatus::Open, "2999 只触及没穿到 2997, 不该成交");
+        assert_eq!(ctx.report().total_trades, 0);
+    }
+
+    /// 真穿过时照常成交, 且**成交价仍是原始限价** —— 穿透只用于判定, 不冒充额外滑点。
+    #[test]
+    fn test_limit_penetration_positive_fills_at_original_limit() {
+        let mut ctx = ctx_with_penetration(Some(10.0));
+        ctx.step_bar(kline(dec!(3000), dec!(3010), dec!(2990), dec!(2995)));
+        let ack = ctx
+            .place_order(OrderRequest::new_limit("ETH", OrderSide::Buy, dec!(3000), dec!(1)))
+            .unwrap();
+        assert_eq!(ack.status, OrderStatus::Filled);
+        assert_eq!(ack.price, dec!(3000), "成交价 = 原始限价, 不是 2997");
+        assert_eq!(ctx.report().limit_fills, 1);
+    }
+
+    /// 卖侧对称: 默认触及即成交; 给了穿透后涨不到 `limit × (1 + bps)` 之上就不成交。
+    ///
+    /// 先买一笔建仓: 现货卖单**无仓可平**时在 `is_noop_fill` 那一层就被挂成 pending(L4),
+    /// 走不到穿透判定, 那样测的就不是穿透而是 L4。
+    #[test]
+    fn test_limit_penetration_sell_side_is_symmetric() {
+        fn hold_one(pen: Option<f64>) -> BacktestContext {
+            let mut c = ctx_with_penetration(pen);
+            c.step_bar(kline_at(18_000, dec!(3000), dec!(3010), dec!(2990), dec!(3005)));
+            c.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1))).unwrap();
+            assert_eq!(c.balance("ETH"), Some(dec!(1)), "建仓应成功, 否则这测的不是穿透");
+            c
+        }
+
+        // 默认: high = 3000.1 触及卖价 3000 → 成交。
+        let mut loose = hold_one(None);
+        loose.step_bar(kline_at(18_000 + 3_600, dec!(3000), dec!(3000.1), dec!(2990), dec!(3000)));
+        let ack = loose
+            .place_order(OrderRequest::new_limit("ETH", OrderSide::Sell, dec!(3000), dec!(1)))
+            .unwrap();
+        assert_eq!(ack.status, OrderStatus::Filled, "默认口径下触及即成交 (ack={ack:?})");
+
+        // 给了 10 bps: 要涨到 3000 × (1 + 0.001) = 3000.3 之上, high = 3000.1 不够。
+        let mut tight = hold_one(Some(10.0));
+        tight.step_bar(kline_at(18_000 + 3_600, dec!(3000), dec!(3000.1), dec!(2990), dec!(3000)));
+        let ack = tight
+            .place_order(OrderRequest::new_limit("ETH", OrderSide::Sell, dec!(3000), dec!(1)))
+            .unwrap();
+        assert_eq!(ack.status, OrderStatus::Open, "涨得不够深, 不该成交 (ack={ack:?})");
+    }
+
+    /// 市价单不走穿透判定, 但要单独计数(报告里两者相加 = 全部成交)。
+    #[test]
+    fn test_market_fills_are_counted_apart_from_limit_fills() {
+        let mut ctx = ctx_with_penetration(Some(1_000.0));
+        ctx.step_bar(kline(dec!(3000), dec!(3010), dec!(2990), dec!(3005)));
+        ctx.place_order(OrderRequest::new_market("ETH", OrderSide::Buy, dec!(1))).unwrap();
+        let r = ctx.report();
+        assert_eq!((r.limit_fills, r.market_fills), (0, 1), "市价单不受穿透影响, 单独计数");
+        assert_eq!(r.total_trades, 1);
     }
 
     #[test]

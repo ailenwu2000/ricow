@@ -1,8 +1,8 @@
 # ricow 框架深度评审: 与主流商用量化框架对比及改进建议
 
-> 评审日期: 2026-10-06 | 方法: 逐 crate 源码取证(带文件:行号) + 与 6 个主流框架的架构级对标
-> 性质: **分析报告**(research 档案), 非 SDD 变更; 结论供用户拍板后再决定是否立项
-> 前置资产: `specs/research/competitor-gap-2026-09.md`(功能清单级)、`competitor-architecture-2026-09.md`、`backtest-engines-2026.md`
+> 评审日期: 2026-10-06 | 方法: 逐 crate 源码取证(带文件:行号) + 与 6 个主流框架的架构级对标  
+> 性质: **分析报告**(research 档案), 非 SDD 变更; 结论供用户拍板后再决定是否立项  
+> 前置资产: `specs/research/competitor-gap-2026-09.md`(功能清单级)、`competitor-architecture-2026-09.md`、`backtest-engines-2026.md`  
 > 与前置资产的区别: 本报告**不再做功能勾选**, 而是做**架构范式对比** —— 回答"为什么这些功能缺失是系统性的, 而不是零散的功能待办"
 
 ---
@@ -24,12 +24,12 @@
 
 **分级结论**:
 
-| 级别 | 含义 | 数量 | 代表问题 |
-|:--|:--|:--|:--|
-| 🔴 P0 | **真金白银可能悄悄出错** | 4 | 启动不与交易所对账挂单; 无订单状态机/重复下单防护; 组合级敞口不可见; 无 operative kill switch |
-| 🟡 P1 | 工程健壮性落后于商用框架 | 6 | 无标准监控对接; 无崩溃自动恢复; 回测限价成交偏乐观(旗舰策略正好吃这个亏); 数据缺口无检测; 无延迟度量; 实盘/回测无对齐工具 |
-| 🟢 P2 | 能力边界(多为**有意**取舍) | 6 | 单交易所; 限价/市价两种订单; 实盘单标的; 无参数寻优; 无 tick 级回测 |
-| ⚪ | 建议**明确不做** | 5 | 跟单/社交; LLM 直连下单; 托管密钥; 公网信号入站; 图形化策略编辑器 |
+| 级别    | 含义               | 数量 | 代表问题                                                                |
+| :---- | :--------------- | :- | :------------------------------------------------------------------ |
+| 🔴 P0 | **真金白银可能悄悄出错**   | 4  | 启动不与交易所对账挂单; 无订单状态机/重复下单防护; 组合级敞口不可见; 无 operative kill switch       |
+| 🟡 P1 | 工程健壮性落后于商用框架     | 6  | 无标准监控对接; 无崩溃自动恢复; 回测限价成交偏乐观(旗舰策略正好吃这个亏); 数据缺口无检测; 无延迟度量; 实盘/回测无对齐工具 |
+| 🟢 P2 | 能力边界(多为**有意**取舍) | 6  | 单交易所; 限价/市价两种订单; 实盘单标的; 无参数寻优; 无 tick 级回测                           |
+| ⚪     | 建议**明确不做**       | 5  | 跟单/社交; LLM 直连下单; 托管密钥; 公网信号入站; 图形化策略编辑器                             |
 
 **如果只做三件事**: ① 启动对账并接管遗留挂单(P0-A) → ② 引擎级最小 OMS(P0-B) → ③ operative 熔断开关(P0-D)。这三件事直接服务于 roadmap P4 的验收口径"**可用且不会让用户莫名亏损**"。
 
@@ -39,13 +39,13 @@
 
 两种架构范式的根本分歧:
 
-| | 商用框架(Nautilus/LEAN/Hummingbot/vn.py) | ricow |
-|:--|:--|:--|
-| **状态权威** | 引擎持有权威 OMS: 订单状态机 + 持仓 + 账户, 本地缓存 = 权威 | 交易所 REST/WS 是唯一权威; 本地库 `orders` 表**只写不读** |
-| **策略角色** | 可插拔模块(Alpha/Portfolio/Risk/Execution 四层解耦), 引擎调策略 | **策略 = 全部交易逻辑**; 引擎只做执行+数据+门禁+状态(宪法原则二) |
-| **状态管理责任** | 引擎承担 | **下放给 Lua 脚本**(`ctx:state_set/get` 自记账) |
-| **重启语义** | 恢复缓存 → 与交易所对账 → 回到一致态 | 重新拉交易所快照; **遗留挂单只 warn 不接管** |
-| **生命周期** | 长驻 Node(多策略/多标的一进程) | 一策略 = 一 OS 进程 = 一交易对 |
+|            | 商用框架(Nautilus/LEAN/Hummingbot/vn.py)              | ricow                                     |
+| :--------- | :------------------------------------------------ | :---------------------------------------- |
+| **状态权威**   | 引擎持有权威 OMS: 订单状态机 + 持仓 + 账户, 本地缓存 = 权威            | 交易所 REST/WS 是唯一权威; 本地库 `orders` 表**只写不读** |
+| **策略角色**   | 可插拔模块(Alpha/Portfolio/Risk/Execution 四层解耦), 引擎调策略 | **策略 = 全部交易逻辑**; 引擎只做执行+数据+门禁+状态(宪法原则二)   |
+| **状态管理责任** | 引擎承担                                              | **下放给 Lua 脚本**(`ctx:state_set/get` 自记账)   |
+| **重启语义**   | 恢复缓存 → 与交易所对账 → 回到一致态                             | 重新拉交易所快照; **遗留挂单只 warn 不接管**              |
+| **生命周期**   | 长驻 Node(多策略/多标的一进程)                               | 一策略 = 一 OS 进程 = 一交易对                      |
 
 **证据**: `crates/ricow_engine/src/command.rs:30` `pub struct Engine;` —— **引擎零字段, 无状态**。这不是疏忽, 是宪法原则二的必然结果。但它有一个未被充分评估的副作用:
 
@@ -59,13 +59,13 @@
 
 ### 3.1 核心架构与事件模型
 
-| 框架 | 事件模型 | 备注 |
-|:--|:--|:--|
-| NautilusTrader | 单一事件队列 + 类型化事件, 消息总线解耦(Data/Exec/Risk 引擎) | Rust 内核 + PyO3 |
-| LEAN | `Event` 队列 + 4 层解耦(Alpha/PortfolioConstruction/Risk/Execution) | C#, 多资产多券商 |
-| Freqtrade | bar 收盘驱动, 主循环 5s 节流 | Python |
-| Hummingbot | tick 循环(默认 1s, 下限 0.1s) + Clock 事件 | Python |
-| **ricow** | **每进程一个 `tokio::select!` 事件循环**(`command.rs:1146-1171`), `biased` 保证停机优先; 盘口 100ms WS 驱动 tick | 实时性**优于**4/6 传统框架(§五) |
+| 框架             | 事件模型                                                                                          | 备注                    |
+| :------------- | :-------------------------------------------------------------------------------------------- | :-------------------- |
+| NautilusTrader | 单一事件队列 + 类型化事件, 消息总线解耦(Data/Exec/Risk 引擎)                                                     | Rust 内核 + PyO3        |
+| LEAN           | `Event` 队列 + 4 层解耦(Alpha/PortfolioConstruction/Risk/Execution)                                | C#, 多资产多券商            |
+| Freqtrade      | bar 收盘驱动, 主循环 5s 节流                                                                           | Python                |
+| Hummingbot     | tick 循环(默认 1s, 下限 0.1s) + Clock 事件                                                            | Python                |
+| **ricow**      | **每进程一个 `tokio::select!` 事件循环**(`command.rs:1146-1171`), `biased` 保证停机优先; 盘口 100ms WS 驱动 tick | 实时性**优于**4/6 传统框架(§五) |
 
 **评价**: 事件粒度 ricow 领先(100ms 盘口 vs Freqtrade 5s bar)。但商用框架的**事件总线解耦**带来一个 ricow 没有的能力: 风控/组合/对账可作为独立订阅者接入, 而 ricow 的 select 循环里所有逻辑(策略、落库、对账、看门狗)耦合在一个 match 分支里, 每加一个横切关注点都要改同一函数(现已 1,600+ 行)。
 
@@ -73,66 +73,67 @@
 
 ### 3.2 订单管理与状态机 (最大差距)
 
-| 能力 | 商用框架 | ricow |
-|:--|:--|:--|
-| 订单状态机 | ✅ 完整(FSA: Initialized→Submitted→Accepted→Partial→Filled/Canceled/Rejected) | ❌ **无**; 仅 `OrderStatus` 枚举 + 直接 upsert 覆盖(`db.rs:950-979`) |
-| 在途订单跟踪 | ✅ In-flight 表 + 超时检测 | ❌ 无 |
-| 重复下单防护 | ✅ client_order_id 幂等去重 | ❌ 仅靠策略自己 `pending_entry` 标记 |
-| 部分成交 | ✅ 累计量精确建模 | ⚠️ 有明确局限(`command.rs:377-383` 注释: "分笔部分成交会显示为已全成且累计量偏小") |
-| 订单类型 | ✅ 市价/限价/止损/OCO/冰山/TIF×N(Nautilus) | ❌ **仅 Limit / Market**(`types.rs:112-116`), 限价**硬编码 GTC** |
-| 改单/批量 | ✅ amend + batch(Binance 有 `batchOrders` 端点) | ❌ `Exchange` trait 只有 place/cancel(`exchange.rs:47-50`) |
-| 按单号撤单 | ✅ | ❌ 只能按"本实例归属前缀"整体撤(`types.rs:152-165` 注释) |
+| 能力     | 商用框架                                                                       | ricow                                                       |
+| :----- | :------------------------------------------------------------------------- | :---------------------------------------------------------- |
+| 订单状态机  | ✅ 完整(FSA: Initialized→Submitted→Accepted→Partial→Filled/Canceled/Rejected) | ❌ **无**; 仅 `OrderStatus` 枚举 + 直接 upsert 覆盖(`db.rs:950-979`) |
+| 在途订单跟踪 | ✅ In-flight 表 + 超时检测                                                       | ❌ 无                                                         |
+| 重复下单防护 | ✅ client_order_id 幂等去重                                                     | ❌ 仅靠策略自己 `pending_entry` 标记                                 |
+| 部分成交   | ✅ 累计量精确建模                                                                  | ⚠️ 有明确局限(`command.rs:377-383` 注释: "分笔部分成交会显示为已全成且累计量偏小")    |
+| 订单类型   | ✅ 市价/限价/止损/OCO/冰山/TIF×N(Nautilus)                                          | ❌ **仅 Limit / Market**(`types.rs:112-116`), 限价**硬编码 GTC**   |
+| 改单/批量  | ✅ amend + batch(Binance 有 `batchOrders` 端点)                                | ❌ `Exchange` trait 只有 place/cancel(`exchange.rs:47-50`)     |
+| 按单号撤单  | ✅                                                                          | ❌ 只能按"本实例归属前缀"整体撤(`types.rs:152-165` 注释)                    |
 
 **评价**: 这是 ricow 与商用框架最本质的差距。商用框架的 OMS 是独立子系统(数千行), ricow 完全省略。后果见 §四 P0-A/B。
 
 ### 3.3 对账与状态恢复
 
-| 场景 | 商用框架 | ricow |
-|:--|:--|:--|
-| 启动: 拉交易所挂单 vs 本地 | ✅ 全量对账, 不一致则**接管或撤销** | ⚠️ **只打 warn**(`command.rs:1042-1056`), 不接管不撤单 |
-| 启动: 拉持仓/余额 | ✅ 对账 | ✅ 拉取建快照(`command.rs:991-1035`)—— 但**不与本地库比对** |
-| 运行期: 持仓漂移 | ✅ 持续对账 | ✅ 每 5 分钟 REST 对账(`command.rs:1218-1250`)—— **只对持仓/余额, 不对挂单** |
-| 崩溃恢复 | ✅ 恢复缓存 + 对账回到一致态 | ❌ 无自动重启(`supervisor/server.rs:457-508` 只记台账); 遗留挂单留给下次启动的 warn |
-| 策略状态 | ✅ | ✅ `strategy_state` KV 断点续接(030) |
+| 场景               | 商用框架                  | ricow                                                          |
+| :--------------- | :-------------------- | :------------------------------------------------------------- |
+| 启动: 拉交易所挂单 vs 本地 | ✅ 全量对账, 不一致则**接管或撤销** | ⚠️ **只打 warn**(`command.rs:1042-1056`), 不接管不撤单                 |
+| 启动: 拉持仓/余额       | ✅ 对账                  | ✅ 拉取建快照(`command.rs:991-1035`)—— 但**不与本地库比对**                  |
+| 运行期: 持仓漂移        | ✅ 持续对账                | ✅ 每 5 分钟 REST 对账(`command.rs:1218-1250`)—— **只对持仓/余额, 不对挂单**   |
+| 崩溃恢复             | ✅ 恢复缓存 + 对账回到一致态      | ❌ 无自动重启(`supervisor/server.rs:457-508` 只记台账); 遗留挂单留给下次启动的 warn |
+| 策略状态             | ✅                     | ✅ `strategy_state` KV 断点续接(030)                                |
 
 **评价**: ricow 的持仓对账是**审计驱动补的**(注释 "审计 中危 #9"), 属被动补漏; 商用框架是**设计内置**。缺口集中在**挂单**这一半。
 
 ### 3.4 风控与护栏
 
-| 类型 | 商用框架 | ricow | 说明 |
-|:--|:--|:--|:--|
-| 订单合法性校验 | ✅ | ✅ `align.rs` 按交易所过滤器对齐(step_size/min_qty/min_notional) | 相当 |
-| 下单频率限制 | ✅ Nautilus 默认 100/s | ✅ `order_guard` 固定 100/s(`order_guard.rs`) | 持平 |
-| 单笔名义上限 | ✅ Nautilus RiskEngine | ❌ 无 | |
-| 平台级投资风控(最大持仓/日亏/回撤熔断) | ✅ LEAN RiskManagementModel / Passivbot Equity HSL | ❌ **已于 019-R5 删除**(宪法明确"平台不做投资判断") | **有意取舍** |
-| Kill switch(一键停机/停机平仓) | ✅ 普遍具备 | ⚠️ 有 `stop --close-all`(需逐字确认) | 半具备 |
-| 跨策略组合敞口 | ✅ 引擎统一视图 | ❌ 各进程独立, 无汇总 | 多策略场景下的盲区 |
+| 类型                     | 商用框架                                              | ricow                                                  | 说明        |
+| :--------------------- | :------------------------------------------------ | :----------------------------------------------------- | :-------- |
+| 订单合法性校验                | ✅                                                 | ✅ `align.rs` 按交易所过滤器对齐(step_size/min_qty/min_notional) | 相当        |
+| 下单频率限制                 | ✅ Nautilus 默认 100/s                               | ✅ `order_guard` 固定 100/s(`order_guard.rs`)             | 持平        |
+| 单笔名义上限                 | ✅ Nautilus RiskEngine                             | ❌ 无                                                    |           |
+| 平台级投资风控(最大持仓/日亏/回撤熔断)  | ✅ LEAN RiskManagementModel / Passivbot Equity HSL | ❌ **已于 019-R5 删除**(宪法明确"平台不做投资判断")                     | **有意取舍**  |
+| Kill switch(一键停机/停机平仓) | ✅ 普遍具备                                            | ⚠️ 有 `stop --close-all`(需逐字确认)                         | 半具备       |
+| 跨策略组合敞口                | ✅ 引擎统一视图                                          | ❌ 各进程独立, 无汇总                                           | 多策略场景下的盲区 |
 
 **评价**: "不做投资风控"是宪法级决定, **应当尊重**。但需区分两类:
+
 - **策略/政策层**(最大回撤、仓位政策)——**确实该由策略自管**, 保持不做。
 - **操作安全层**(单笔名义上限、全局 kill switch、异常订单速率熔断)——这是**工程债**, 商用框架无一例外都有, 与"是否替用户做投资判断"无关。ricow 目前只有"频率"一项。
 
 ### 3.5 执行算法
 
-| | 商用框架 | ricow |
-|:--|:--|:--|
+|      | 商用框架                                                                     | ricow                                                                      |
+| :--- | :----------------------------------------------------------------------- | :------------------------------------------------------------------------- |
 | 解耦形态 | 独立 ExecutionEngine + ExecAlgorithm 组件(Nautilus) / Execution models(LEAN) | `exec.*` 纯函数库(levels/pullback/detect_quote/ticks_per/slice_due/side_order) |
-| 评价 | 引擎级、可组合、跨策略复用 | 更轻, 但**算法与策略耦合**; 无 TWAP/VWAP/冰山等引擎级执行算法 |
+| 评价   | 引擎级、可组合、跨策略复用                                                            | 更轻, 但**算法与策略耦合**; 无 TWAP/VWAP/冰山等引擎级执行算法                                   |
 
 **评价**: ricow 的定位(执行算法不是独立策略)清晰, 但在商用框架里执行算法是**可复用的引擎资产**。ricow 的 `exec.*` 已经接近, 只是缺少"按时间/数量切片的通用执行器"(需要 TIF/IOC 支持才能做好, 见 P2)。
 
 ### 3.6 回测保真度
 
-| 维度 | 商用框架 | ricow |
-|:--|:--|:--|
-| 撮合粒度 | Nautilus tick/L1-L3 纳秒级; LEAN tick; Freqtrade bar+detail tf | bar 级(`backtest.rs`) |
-| 市价成交价 | 按盘口/下一 tick | **当根 `bar.open` ± 滑点**(`backtest.rs:1311-1319`) |
-| 限价判定 | 盘口队列建模 | **`low<=limit` / `high>=limit` 即全成** @ limit 价(`backtest.rs:1321-1332`) |
-| 部分成交 | ✅ | ❌ 整单成交(§七.7 已记录不集成) |
-| 滑点模型 | 多档(L1/L2、常数、成交量相关) | 固定 bps(默认市价 2bps) |
-| 前视防护 | ✅ lookahead 分析(Freqtrade) | ✅ 已收盘 bar 隔离 + 回归断言(`backtest_runner.rs:390-431`) |
-| 费用/资金费/强平 | ✅ | ✅ 完整(fee/8h funding/MMR 首档强平) |
-| 可复现 run card | 部分 | ✅ 策略 sha256 + 窗口 + 参数(`backtest.rs:893-920`) |
+| 维度           | 商用框架                                                        | ricow                                                                   |
+| :----------- | :---------------------------------------------------------- | :---------------------------------------------------------------------- |
+| 撮合粒度         | Nautilus tick/L1-L3 纳秒级; LEAN tick; Freqtrade bar+detail tf | bar 级(`backtest.rs`)                                                    |
+| 市价成交价        | 按盘口/下一 tick                                                 | **当根 `bar.open` ± 滑点**(`backtest.rs:1311-1319`)                         |
+| 限价判定         | 盘口队列建模                                                      | **`low<=limit` / `high>=limit` 即全成** @ limit 价(`backtest.rs:1321-1332`) |
+| 部分成交         | ✅                                                           | ❌ 整单成交(§七.7 已记录不集成)                                                     |
+| 滑点模型         | 多档(L1/L2、常数、成交量相关)                                          | 固定 bps(默认市价 2bps)                                                       |
+| 前视防护         | ✅ lookahead 分析(Freqtrade)                                   | ✅ 已收盘 bar 隔离 + 回归断言(`backtest_runner.rs:390-431`)                       |
+| 费用/资金费/强平    | ✅                                                           | ✅ 完整(fee/8h funding/MMR 首档强平)                                           |
+| 可复现 run card | 部分                                                          | ✅ 策略 sha256 + 窗口 + 参数(`backtest.rs:893-920`)                            |
 
 **关键发现(新增, 不在既有 §七 清单)**: ricow 的两个**内置旗舰策略都是网格类**(shannon_spot_grid / paired_grid), 而网格策略**恰恰最依赖限价单的成交假设**。当前模型"只要 bar 的 low 触及限价就 100% 全成"忽略了**排队位置**(touch 不等于 fill)。这意味着:
 
@@ -142,82 +143,82 @@
 
 ### 3.7 数据层
 
-| | 商用框架 | ricow |
-|:--|:--|:--|
-| 存储 | Parquet/feather/PostgreSQL + 数据目录(Nautilus 的 ParquetDataCatalog) | SQLite(`klines` 表, Decimal 存字符串) |
-| 粒度 | tick/L1-L3(Nautilus) | 仅 bar |
-| 缺口检测 | ✅ 数据质量校验 | ❌ 无专用缺口检测; 仅重采样桶丢弃(`multiframe.rs:48-156`) |
-| 多源 | ✅ 多所 + 商业数据商(Tardis/Databento) | 币安 + Nasdaq 日线(信号轨) |
-| 合约周期 | 全 | **仅 6 种**(1m/5m/15m/1h/4h/1d) vs 现货 14 种 |
-| 数据目录放置网络盘 | 视方案 | ⚠️ SQLite WAL **不支持网络盘**, 已有文档约束 |
+|           | 商用框架                                                             | ricow                                      |
+| :-------- | :--------------------------------------------------------------- | :----------------------------------------- |
+| 存储        | Parquet/feather/PostgreSQL + 数据目录(Nautilus 的 ParquetDataCatalog) | SQLite(`klines` 表, Decimal 存字符串)           |
+| 粒度        | tick/L1-L3(Nautilus)                                             | 仅 bar                                      |
+| 缺口检测      | ✅ 数据质量校验                                                         | ❌ 无专用缺口检测; 仅重采样桶丢弃(`multiframe.rs:48-156`) |
+| 多源        | ✅ 多所 + 商业数据商(Tardis/Databento)                                   | 币安 + Nasdaq 日线(信号轨)                        |
+| 合约周期      | 全                                                                | **仅 6 种**(1m/5m/15m/1h/4h/1d) vs 现货 14 种   |
+| 数据目录放置网络盘 | 视方案                                                              | ⚠️ SQLite WAL **不支持网络盘**, 已有文档约束           |
 
 **评价**: 对零售定位, SQLite 是合理取舍。缺**缺口检测**是实际问题: 回测拉数后若中间有空洞, 目前不会报错, 会静默用不连续数据算指标(除非恰好命中重采样桶阈值)。
 
 ### 3.8 多标的 / 组合
 
-| | 商用框架 | ricow |
-|:--|:--|:--|
-| 实盘多标的 | ✅ | ❌ 单 pair(`command.rs:930`) |
-| 组合回测 | ✅ | ✅ `run_portfolio_backtest`(**但无内置消费者**) |
-| 跨策略组合视图 | ✅ 统一 Portfolio | ❌ daemon 跑 N 个进程, 无汇总敞口 |
-| 资金分配/再平衡 | ✅ 引擎级 | ❌ 全由脚本自算 |
+|          | 商用框架           | ricow                                   |
+| :------- | :------------- | :-------------------------------------- |
+| 实盘多标的    | ✅              | ❌ 单 pair(`command.rs:930`)              |
+| 组合回测     | ✅              | ✅ `run_portfolio_backtest`(**但无内置消费者**) |
+| 跨策略组合视图  | ✅ 统一 Portfolio | ❌ daemon 跑 N 个进程, 无汇总敞口                 |
+| 资金分配/再平衡 | ✅ 引擎级          | ❌ 全由脚本自算                                |
 
 **评价**: "一策略一进程一标的"是刻意的隔离设计(崩溃不互相影响), 但**当用户跑 5 个策略时, 没有任何地方能看到总敞口/总保证金占用**。商用框架的 Portfolio 层正是解决这个的。
 
 ### 3.9 多交易所
 
-| | 商用框架 | ricow |
-|:--|:--|:--|
-| 广度 | Freqtrade 100+ / Hummingbot 30+ / Nautilus 18 / vn.py 国内全期货 | **1 所**(币安现货+USDT-M) |
-| 抽象质量 | 千所适配层(ccxt)或原生 gateway | `Exchange` trait 干净(14 方法), 但只有 2 个实现 |
+|      | 商用框架                                                        | ricow                                 |
+| :--- | :---------------------------------------------------------- | :------------------------------------ |
+| 广度   | Freqtrade 100+ / Hummingbot 30+ / Nautilus 18 / vn.py 国内全期货 | **1 所**(币安现货+USDT-M)                  |
+| 抽象质量 | 千所适配层(ccxt)或原生 gateway                                      | `Exchange` trait 干净(14 方法), 但只有 2 个实现 |
 
 **评价**: 单所是**产品定位**决定(返佣主线, 宪法未限制), 不改。但 `Exchange` trait 已具备多所扩展的形状, 属于"想扩就扩"的低成本, 列为 P2。
 
 ### 3.10 可观测性
 
-| | 商用框架 | ricow |
-|:--|:--|:--|
-| 日志 | 结构化 + 轮转 | ✅ `tracing` + supervisor 轮转(10MB) |
-| 结构化事件 | ✅ | ✅ `run/<name>/events.jsonl`(写完即 flush) |
-| 绩效指标 | ✅ | ✅ 夏普/索提诺/Calmar/回撤/胜率(`metrics.rs`) |
-| **标准监控对接** | ✅ **Prometheus / OTel**(普遍) | ❌ **零**(grep 无命中) |
-| 告警 | ✅ TG/webhook/on-call | ✅ webhook(成交/接近强平/停机残留) |
-| 实盘-回测对齐 | ✅ | ❌ 有 run card, 无自动比对工具 |
-| 延迟度量 | ✅ | ❌ 无 latency 采集 |
+|            | 商用框架                        | ricow                                  |
+| :--------- | :-------------------------- | :------------------------------------- |
+| 日志         | 结构化 + 轮转                    | ✅ `tracing` + supervisor 轮转(10MB)      |
+| 结构化事件      | ✅                           | ✅ `run/<name>/events.jsonl`(写完即 flush) |
+| 绩效指标       | ✅                           | ✅ 夏普/索提诺/Calmar/回撤/胜率(`metrics.rs`)    |
+| **标准监控对接** | ✅ **Prometheus / OTel**(普遍) | ❌ **零**(grep 无命中)                      |
+| 告警         | ✅ TG/webhook/on-call        | ✅ webhook(成交/接近强平/停机残留)                |
+| 实盘-回测对齐    | ✅                           | ❌ 有 run card, 无自动比对工具                  |
+| 延迟度量       | ✅                           | ❌ 无 latency 采集                         |
 
 ### 3.11 部署与运维
 
-| | 商用框架 | ricow |
-|:--|:--|:--|
-| 容器化 | ✅ 官方 Docker(普遍) | ❌ 无 Dockerfile |
-| 编排 | ✅ K8s/compose | ❌ |
-| 开机自启 | ✅ systemd `Restart=on-failure` | ❌ **明确不做**(`architecture.md:59`), 仅双击脚本 |
-| 崩溃自动重启 | ✅ | ❌ 只记台账(`server.rs:457-508`) |
-| 进程模型 | 单进程多策略 / 容器 | ✅ daemon + 子进程, stdin EOF 自愈(设计精巧) |
+|        | 商用框架                           | ricow                                   |
+| :----- | :----------------------------- | :-------------------------------------- |
+| 容器化    | ✅ 官方 Docker(普遍)                | ❌ 无 Dockerfile                          |
+| 编排     | ✅ K8s/compose                  | ❌                                       |
+| 开机自启   | ✅ systemd `Restart=on-failure` | ❌ **明确不做**(`architecture.md:59`), 仅双击脚本 |
+| 崩溃自动重启 | ✅                              | ❌ 只记台账(`server.rs:457-508`)             |
+| 进程模型   | 单进程多策略 / 容器                    | ✅ daemon + 子进程, stdin EOF 自愈(设计精巧)      |
 
 **评价**: "不做 systemd/不开机自启"是明确决策, 但**崩溃不自动重启**在 7×24 实盘语境下是硬伤 —— 进程一旦因网络抖动/内存问题退出, 用户若没看到告警, 策略就静默停了(而残留挂单还挂在交易所)。
 
 ### 3.12 安全
 
-| | 商用框架 | ricow |
-|:--|:--|:--|
-| 密钥静置加密 | Hummingbot AES-128-CTR / OctoBot 加密 | ❌ 明文 `ricow.toml` + 0600/ACL(fail-closed) |
-| 审计日志 | ✅ 防篡改台账 | ⚠️ events.jsonl(运行流水, 非安全审计) |
-| RBAC/多用户 | ✅(平台级) | ❌ 单用户本机(定位决定) |
-| AI 层安全 | — | ✅ **全行业独有**: 写动作不作工具注册 + CI grep 红线锁形状 |
-| 沙箱 | — | ✅ Lua 无 io/os/require + 指令预算 + 64MB |
+|          | 商用框架                                | ricow                                     |
+| :------- | :---------------------------------- | :---------------------------------------- |
+| 密钥静置加密   | Hummingbot AES-128-CTR / OctoBot 加密 | ❌ 明文 `ricow.toml` + 0600/ACL(fail-closed) |
+| 审计日志     | ✅ 防篡改台账                             | ⚠️ events.jsonl(运行流水, 非安全审计)              |
+| RBAC/多用户 | ✅(平台级)                              | ❌ 单用户本机(定位决定)                             |
+| AI 层安全   | —                                   | ✅ **全行业独有**: 写动作不作工具注册 + CI grep 红线锁形状    |
+| 沙箱       | —                                   | ✅ Lua 无 io/os/require + 指令预算 + 64MB       |
 
 **评价**: ricow 的 AI 安全模型是**真正的差异化**, 应保持。密钥明文因"本地 + 0600 + 已 gitignore"可接受(README 已披露取舍)。
 
 ### 3.13 测试与质量
 
-| | 商用框架 | ricow |
-|:--|:--|:--|
-| 单元测试 | ✅ | ✅ 670 例 |
-| testnet 真机闭环 | 部分 | ✅ **硬纪律: 禁 mock Exchange、禁假 token** |
-| CI 门禁 | ✅ | ✅ fmt/clippy/deny + **4 条 grep 安全红线** + 3 平台矩阵 |
-| 回测确定性回归 | 部分 | ✅ 逐位一致验证 |
-| Fuzzing / 属性测试 | Nautilus 较全 | ❌ 无 |
+|                | 商用框架        | ricow                                          |
+| :------------- | :---------- | :--------------------------------------------- |
+| 单元测试           | ✅           | ✅ 670 例                                        |
+| testnet 真机闭环   | 部分          | ✅ **硬纪律: 禁 mock Exchange、禁假 token**            |
+| CI 门禁          | ✅           | ✅ fmt/clippy/deny + **4 条 grep 安全红线** + 3 平台矩阵 |
+| 回测确定性回归        | 部分          | ✅ 逐位一致验证                                       |
+| Fuzzing / 属性测试 | Nautilus 较全 | ❌ 无                                            |
 
 **评价**: 测试纪律是 ricow 的强项, **不落后于任何开源框架**。
 
@@ -227,14 +228,14 @@
 
 ### 🔴 P0 — 资金安全级(建议优先)
 
-> **实施状态 (2026-10-06)**: **P0-A / P0-B / P0-C 已落地** —— 见 [`specs/changes/037-live-safety-hardening/`](../changes/037-live-safety-hardening/)。
-> 实施时有**三处刻意的偏离**(理由见该档案 spec §二 与 converge.md §四), 读本节建议时请以档案为准:
-> ① P0-A **不加 `orphan_policy` 配置面** —— 一律撤销(固定工程不变量, 与 `order_guard` 同口径: 平台不做投资判断, 安全不变量不接受配置);
-> 实际额外补了报告未提的一条: **撤销后复查, live 仍有残留或枚举失败 → 拒绝启动**(与时钟预检同口径)。
-> ② P0-B **不做"在途超时自动撤单"**(超时撤单可能撤掉正要成交的单, 风险大于收益; 未了结项改为收尾醒目提示),
-> **也不做"重复单号拒绝提交"**(交易所本就允许终态后复用单号, 硬拒会误伤) —— 改为**检测 + 计数 + warn**(策略 bug 信号)。
-> ③ P0-C **没有塞进 `ricow status` / Web 运行页**, 而是新增独立只读命令 `ricow exposure`(026 已确立"既有 CLI 用户可见文案零变化");
-> 聚合键取 `(标的, 模式)` —— 比报告设想多一条硬约束: **绝不跨模式相加**(dry_run 是模拟的)。
+> **实施状态 (2026-10-06)**: **P0-A / P0-B / P0-C 已落地** —— 见 [`specs/changes/037-live-safety-hardening/`](../changes/037-live-safety-hardening/)。  
+> 实施时有**三处刻意的偏离**(理由见该档案 spec §二 与 converge.md §四), 读本节建议时请以档案为准:  
+> ① P0-A **不加 `orphan_policy` 配置面** —— 一律撤销(固定工程不变量, 与 `order_guard` 同口径: 平台不做投资判断, 安全不变量不接受配置);  
+> 实际额外补了报告未提的一条: **撤销后复查, live 仍有残留或枚举失败 → 拒绝启动**(与时钟预检同口径)。  
+> ② P0-B **不做"在途超时自动撤单"**(超时撤单可能撤掉正要成交的单, 风险大于收益; 未了结项改为收尾醒目提示),  
+> **也不做"重复单号拒绝提交"**(交易所本就允许终态后复用单号, 硬拒会误伤) —— 改为**检测 + 计数 + warn**(策略 bug 信号)。  
+> ③ P0-C **没有塞进 `ricow status` / Web 运行页**, 而是新增独立只读命令 `ricow exposure`(026 已确立"既有 CLI 用户可见文案零变化");  
+> 聚合键取 `(标的, 模式)` —— 比报告设想多一条硬约束: **绝不跨模式相加**(dry_run 是模拟的)。  
 > **P0-D 未做**: 报告的"默认关闭 + 用户显式配置"是对宪法 D15/D17 的**实质修订**, 须用户拍板(候选方案见 `specs/roadmap.md` "下一步" 第 8 项)。
 
 #### P0-A. 启动对账并接管遗留挂单
@@ -246,6 +247,7 @@
   - `orphan_policy = "adopt"`(可选): 注入策略上下文, 让策略 `on_init` 能看到已挂单。
 - **落点**: `crates/ricow_engine/src/command.rs` 启动段 + `live.rs`(纯逻辑可单测)。
 - **成本**: 小(复用既有 `is_owned` / 撤单兜底代码)。
+
 
 #### P0-B. 引擎级最小 OMS(订单状态机 + 幂等)
 
@@ -314,14 +316,14 @@
 
 ### 🟢 P2 — 能力边界(多数是有意取舍)
 
-| 项 | 现状 | 建议 |
-|:--|:--|:--|
-| 订单类型 | 仅 Limit/Market, GTC 硬编码 | 优先补 **STOP_MARKET / 止损** —— 散户安全刚需, 且解析成本低; OCO/冰山可后置 |
-| TIF | 硬编码 GTC | 暴露 IOC/FOK/POST_ONLY(做市/执行算法需要) |
-| 改单/批量 | 无 | Binance `batchOrders` 可低成本接入(网格重挂场景收益明显) |
-| 实盘多标的 | 单 pair | 谨慎评估; 与"一策略一进程"隔离设计冲突, 建议维持 |
-| 多交易所 | 单所 | 维持按需(返佣主线) |
-| 参数寻优 | 不做 | 维持不做(宪法 YAGNI + 散户过拟合) |
+| 项     | 现状                      | 建议                                                    |
+| :---- | :---------------------- | :---------------------------------------------------- |
+| 订单类型  | 仅 Limit/Market, GTC 硬编码 | 优先补 **STOP_MARKET / 止损** —— 散户安全刚需, 且解析成本低; OCO/冰山可后置 |
+| TIF   | 硬编码 GTC                 | 暴露 IOC/FOK/POST_ONLY(做市/执行算法需要)                       |
+| 改单/批量 | 无                       | Binance `batchOrders` 可低成本接入(网格重挂场景收益明显)              |
+| 实盘多标的 | 单 pair                  | 谨慎评估; 与"一策略一进程"隔离设计冲突, 建议维持                           |
+| 多交易所  | 单所                      | 维持按需(返佣主线)                                            |
+| 参数寻优  | 不做                      | 维持不做(宪法 YAGNI + 散户过拟合)                                |
 
 ### ⚪ 建议明确不做(守住定位)
 
@@ -362,26 +364,26 @@
 
 ## 七、证据索引
 
-| 结论 | 证据位置 |
-|:--|:--|
-| 引擎无状态 | `crates/ricow_engine/src/command.rs:30` |
-| 仅两种订单类型 | `crates/ricow_core/src/types.rs:112-116` |
-| Exchange trait 无改单/批量 | `crates/ricow_core/src/exchange.rs:20-85` |
-| 启动挂单只 warn | `crates/ricow_engine/src/command.rs:1042-1056` |
-| 每 5min 只对账持仓 | `crates/ricow_engine/src/command.rs:1218-1250` |
-| 订单落库直接 upsert | `crates/ricow_strategy/src/db.rs:950-979` |
-| 回测限价"触及即全成" | `crates/ricow_strategy/src/backtest.rs:1311-1332` |
-| 市价按 bar.open 成交 | `crates/ricow_strategy/src/backtest.rs:1311-1319` |
-| 部分成交局限(自述) | `crates/ricow_engine/src/command.rs:377-383` |
-| 下单阻塞策略循环 | `crates/ricow_strategy/src/context.rs:366-372` |
-| 100/s 固定护栏 | `crates/ricow_strategy/src/order_guard.rs` |
-| 崩溃不自动重启 | `crates/ricow/src/supervisor/server.rs:457-508` |
-| 不做 OS 服务/自启 | `specs/architecture.md:59` |
-| 读写重试分档 | `crates/ricow_binance/src/retry.rs:1-13,103-124` |
-| 盘口快照重建 | `crates/ricow_binance/src/ws.rs:251-383` |
-| 回测不集成 9 项 | `specs/backtest.md:87-101` |
-| 实盘单 pair | `crates/ricow_engine/src/command.rs:930` |
-| AI 写门禁红线 | `scripts/ci_grep_gates.sh:72-140` |
+| 结论                    | 证据位置                                              |
+| :-------------------- | :------------------------------------------------ |
+| 引擎无状态                 | `crates/ricow_engine/src/command.rs:30`           |
+| 仅两种订单类型               | `crates/ricow_core/src/types.rs:112-116`          |
+| Exchange trait 无改单/批量 | `crates/ricow_core/src/exchange.rs:20-85`         |
+| 启动挂单只 warn            | `crates/ricow_engine/src/command.rs:1042-1056`    |
+| 每 5min 只对账持仓          | `crates/ricow_engine/src/command.rs:1218-1250`    |
+| 订单落库直接 upsert         | `crates/ricow_strategy/src/db.rs:950-979`         |
+| 回测限价"触及即全成"           | `crates/ricow_strategy/src/backtest.rs:1311-1332` |
+| 市价按 bar.open 成交       | `crates/ricow_strategy/src/backtest.rs:1311-1319` |
+| 部分成交局限(自述)            | `crates/ricow_engine/src/command.rs:377-383`      |
+| 下单阻塞策略循环              | `crates/ricow_strategy/src/context.rs:366-372`    |
+| 100/s 固定护栏            | `crates/ricow_strategy/src/order_guard.rs`        |
+| 崩溃不自动重启               | `crates/ricow/src/supervisor/server.rs:457-508`   |
+| 不做 OS 服务/自启           | `specs/architecture.md:59`                        |
+| 读写重试分档                | `crates/ricow_binance/src/retry.rs:1-13,103-124`  |
+| 盘口快照重建                | `crates/ricow_binance/src/ws.rs:251-383`          |
+| 回测不集成 9 项             | `specs/backtest.md:87-101`                        |
+| 实盘单 pair              | `crates/ricow_engine/src/command.rs:930`          |
+| AI 写门禁红线              | `scripts/ci_grep_gates.sh:72-140`                 |
 
 ---
 

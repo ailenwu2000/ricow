@@ -153,6 +153,20 @@ pub struct UiSection {
     pub theme: Option<String>,
 }
 
+/// daemon 监督段(038 P1-C): 子进程非正常退出后是否自动重启。
+///
+/// 与 `[market]` / `[ui]` 同处 `ricow.toml`, 但**不参与策略语义** —— 它是 daemon 的运维行为,
+/// 与"平台不做投资判断"无关(默认 `none` = 行为与加它之前一字不差)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SupervisorSection {
+    /// `none`(默认, 不重启) / `on-failure`(异常退出后重启)。
+    pub restart_policy: Option<String>,
+    /// `on-failure` 下最多重启几次(默认 3)。
+    pub max_retries: Option<i64>,
+    /// 退避基数(秒; 默认 5)。第 N 次重启前等 `backoff_secs × N` 秒(线性退避)。
+    pub backoff_secs: Option<i64>,
+}
+
 /// 密钥环(033)里的一套**备用 AI 凭据**: 别名 + 服务商 + 模型 + 接口地址 + 密钥。
 ///
 /// 与 [`AiSection`] 的分工: `[ai]` 段是**当前生效**的凭据, 本结构是"可按别名另存的一套";
@@ -192,6 +206,8 @@ pub struct File {
     pub exchange: ExchangeSection,
     pub market: MarketSection,
     pub ui: UiSection,
+    /// daemon 监督段(038 P1-C): 崩溃自动重启策略。缺省 = 不重启(与加它之前行为一致)。
+    pub supervisor: SupervisorSection,
     /// 密钥环: 备用 AI 凭据(033)。**空 = 未使用密钥环**, 一切照旧走 [`AiSection`]。
     pub ai_keys: Vec<AiKeyEntry>,
     /// 密钥环: 备用币安凭据(033)。
@@ -208,6 +224,7 @@ impl Default for File {
             exchange: ExchangeSection::default(),
             market: MarketSection::default(),
             ui: UiSection::default(),
+            supervisor: SupervisorSection::default(),
             ai_keys: Vec::new(),
             exchange_keys: Vec::new(),
         }
@@ -278,7 +295,19 @@ pub fn template_text() -> String {
          # Web 界面主题(034): dark = 深色(默认) · light = 白色浅色 · red = 红色。\n\
          # theme = \"{ui_theme}\"\n\
          \n\
-         # ── ⑤ 密钥环 / Key vault (可选, 033) ──────────────────────────────\n\
+         # ── ⑤ daemon 监督 / Supervisor (038, 可选) ──────────────────────\n\
+         # 策略进程**异常退出**(崩溃/被强杀, 退出码非 0)后, daemon 是否自动拉起它。\n\
+         # 默认 none = 不重启(与加本段之前行为完全一致)。\n\
+         # 选 on-failure 时: 最多重启 max_retries 次; 第 N 次前等 backoff_secs × N 秒。\n\
+         # **主动停机(ricow stop / daemon 退出)永远不会触发重启。**\n\
+         # 注意: 重启会走与首次启动完全相同的流程 —— 包括启动时的挂单接管\n\
+         # (本实例遗留挂单先撤销), 所以重启不会造成敞口翻倍。\n\
+         [supervisor]\n\
+         restart_policy = \"none\"\n\
+         # max_retries = 3\n\
+         # backoff_secs = 5\n\
+         \n\
+         # ── ⑥ 密钥环 / Key vault (可选, 033) ──────────────────────────────\n\
          # 上面 [ai] / [exchange] 段是**当前生效**的凭据;\n\
          # 下面用 [[ai_key]] / [[exchange_key]] 可以按别名**另存多套**备用密钥,\n\
          # 想用哪套就\"选用\"哪套(选用 = 把该套写回上面的生效段), 也可以随时删除。\n\
@@ -415,12 +444,15 @@ const AI_KEYS: [&str; 6] =
 const EXCHANGE_KEYS: [&str; 4] = ["demo_key", "demo_secret", "binance_key", "binance_secret"];
 const MARKET_KEYS: [&str; 1] = ["show_all_pairs"];
 const UI_KEYS: [&str; 2] = ["lang", "theme"];
+/// 038 P1-C: `[supervisor]` 允许的键。
+const SUPERVISOR_KEYS: [&str; 3] = ["restart_policy", "max_retries", "backoff_secs"];
 /// `[[ai_key]]` 每套允许的键(全部字符串)。
 const AI_KEY_FIELDS: [&str; 5] = ["alias", "provider", "model", "base_url", "api_key"];
 /// `[[exchange_key]]` 每套允许的键(全部字符串)。
 const EXCHANGE_KEY_FIELDS: [&str; 4] = ["alias", "env", "key", "secret"];
 /// 未知段提示里的"允许的段"清单(只此一处, 报错文案与解析保持同步)。
-const SECTION_LIST: &str = "[ai] / [exchange] / [market] / [ui] / [[ai_key]] / [[exchange_key]]";
+const SECTION_LIST: &str =
+    "[ai] / [exchange] / [market] / [ui] / [supervisor] / [[ai_key]] / [[exchange_key]]";
 
 /// 读取配置; **文件不存在 → 生成模板并按内置默认继续**(缺什么由使用处给出可执行提示)。
 pub fn load(root: &Path) -> CoreResult<File> {
@@ -518,6 +550,23 @@ pub fn load(root: &Path) -> CoreResult<File> {
                     }
                     out.ui.theme = Some(v.to_string());
                 }
+            }
+            "supervisor" => {
+                check_keys(&p, "supervisor", t, &SUPERVISOR_KEYS)?;
+                // restart_policy 白名单硬校验(与 [ui].lang / [ui].theme 同一纪律):
+                // 拼错一个字母宁可拒绝启动, 也不静默回退成 none —— 那会让用户以为
+                // "自动重启已开", 而崩了之后其实没人拉起它。
+                if let Some(v) = t.get("restart_policy").and_then(|v| v.as_str()).map(str::trim) {
+                    if !matches!(v, "none" | "on-failure") {
+                        return Err(CoreError::Auth(format!(
+                            "配置文件 {} 的 [supervisor].restart_policy 仅接受 \"none\" / \"on-failure\", 实际为 \"{v}\"",
+                            p.display()
+                        )));
+                    }
+                    out.supervisor.restart_policy = Some(v.to_string());
+                }
+                out.supervisor.max_retries = int_opt(&p, "supervisor", t, "max_retries")?;
+                out.supervisor.backoff_secs = int_opt(&p, "supervisor", t, "backoff_secs")?;
             }
             other => {
                 let msg = format!(
@@ -686,14 +735,19 @@ fn check_keys(p: &Path, section: &str, t: &toml::Table, allowed: &[&str]) -> Cor
         }
         let type_ok = match (section, k.as_str()) {
             ("ai", "max_turns") => v.is_integer(),
+            // 038 P1-C: `[supervisor]` 的两个数字键。漏在这里的后果不是"少个校验" —— 而是
+            // 用户照模板写了整数, 反而被这句"必须是字符串"拒掉(看着像配置写错, 其实是校验写错)。
+            ("supervisor", "max_retries") | ("supervisor", "backoff_secs") => v.is_integer(),
             ("market", "show_all_pairs") => v.is_bool(),
             _ => v.is_str(),
         };
         if !type_ok {
-            let expected = if (section, k.as_str()) == ("market", "show_all_pairs") {
-                "true/false"
-            } else {
-                "字符串(如 key = \"...\")"
+            let expected = match (section, k.as_str()) {
+                ("market", "show_all_pairs") => "true/false",
+                ("ai", "max_turns")
+                | ("supervisor", "max_retries")
+                | ("supervisor", "backoff_secs") => "整数",
+                _ => "字符串(如 key = \"...\")",
             };
             return Err(CoreError::Auth(format!(
                 "配置文件 {} 的 [{section}].{k} 类型非法: 必须是{expected}",
@@ -1076,6 +1130,22 @@ pub fn remove_exchange_key(root: &Path, alias: &str) -> CoreResult<bool> {
 
 fn str_opt(t: &toml::Table, key: &str) -> Option<String> {
     t.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// 取一个整数键; **类型不对就报错**(而不是静默当没写)。
+///
+/// 与 `ai.max_turns` 那处宽松取值不同: `[supervisor]` 的两项直接决定"崩溃后要不要拉起进程",
+/// 静默丢值会让用户以为策略设好了、实际从未生效 —— 这类"配置看着写了却没生效"是运维事故的温床。
+fn int_opt(p: &Path, section: &str, t: &toml::Table, key: &str) -> CoreResult<Option<i64>> {
+    match t.get(key) {
+        None => Ok(None),
+        Some(v) => v.as_integer().map(Some).ok_or_else(|| {
+            CoreError::Auth(format!(
+                "配置文件 {} 的 [{section}].{key} 必须是整数, 实际为 {v}",
+                p.display()
+            ))
+        }),
+    }
 }
 
 /// 权限提示(只提示不修改): 非 0600 时返回一句提醒。

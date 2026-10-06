@@ -28,6 +28,16 @@ pub const REPORT_TERMS: &[Term] = &[
         en: "Number of orders that actually filled; rejected orders are not counted.",
     },
     Term {
+        key: "限价单成交",
+        zh: "其中由限价单贡献的成交笔数与占比。回测撮合默认「价格触及限价即按限价全部成交」, \
+             忽略了排队位置 —— 对网格类策略会高估成交率与收益。想更保守, 可在策略 \
+             `[backtest]` 段设 `limit_fill_penetration_bps`(要求价格穿过限价若干基点才算成交)。",
+        en: "How many fills came from limit orders, and their share. The backtest matcher assumes \
+             \"price touching the limit fills the whole order at the limit\", ignoring queue position — \
+             this overstates fill rates and returns for grid-like strategies. For a more conservative \
+             model set `limit_fill_penetration_bps` in the strategy `[backtest]` section.",
+    },
+    Term {
         key: "已实现盈亏",
         zh: "已平仓部分结算出的盈亏, 不含手续费, 也不算未平仓的浮动盈亏。",
         en: "P&L settled on closed positions; excludes fees and unrealized P&L on open positions.",
