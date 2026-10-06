@@ -109,6 +109,8 @@ pub struct AiSection {
     pub base_url: Option<String>,
     pub max_turns: Option<i64>,
     pub api_key: Option<String>,
+    /// 显式确认白名单外的自建/中转 AI 端点 (审计 H-7); 缺省 = 拒绝非白名单主机。
+    pub allow_custom_base_url: Option<bool>,
 }
 
 impl Default for AiSection {
@@ -119,6 +121,7 @@ impl Default for AiSection {
             base_url: None,
             max_turns: None,
             api_key: None,
+            allow_custom_base_url: None,
         }
     }
 }
@@ -248,6 +251,7 @@ pub fn template_text() -> String {
          api_key = \"\"\n\
          max_turns = {ai_max_turns}\n\
          # base_url = \"https://api.deepseek.com/v1\"   # 仅自定义/自建端点才需要\n\
+         # allow_custom_base_url = true               # 白名单外厂商主机才需要: 显式确认后放行\n\
          \n\
          # ── ② 交易所凭据(用哪个环境就填哪个) ────────────────────────────\n\
          #   演示(测试网): demo.binance.com 登录 → API 管理 → 创建 Key(建议只开交易, 不开提现)\n\
@@ -386,7 +390,8 @@ pub(crate) fn harden_secret_file(path: &Path) -> Result<(), String> {
     ))
 }
 
-const AI_KEYS: [&str; 5] = ["provider", "model", "base_url", "max_turns", "api_key"];
+const AI_KEYS: [&str; 6] =
+    ["provider", "model", "base_url", "max_turns", "api_key", "allow_custom_base_url"];
 const EXCHANGE_KEYS: [&str; 4] = ["demo_key", "demo_secret", "binance_key", "binance_secret"];
 const MARKET_KEYS: [&str; 1] = ["show_all_pairs"];
 const UI_KEYS: [&str; 2] = ["lang", "theme"];
@@ -447,6 +452,8 @@ pub fn load(root: &Path) -> CoreResult<File> {
                 out.ai.base_url = str_opt(t, "base_url");
                 out.ai.api_key = str_opt(t, "api_key");
                 out.ai.max_turns = t.get("max_turns").and_then(|v| v.as_integer());
+                out.ai.allow_custom_base_url =
+                    t.get("allow_custom_base_url").and_then(|v| v.as_bool());
             }
             "exchange" => {
                 check_keys(&p, "exchange", t, &EXCHANGE_KEYS)?;
@@ -722,6 +729,19 @@ fn assert_writable(section: &str, key: &str) -> CoreResult<()> {
     }
 }
 
+/// ricow.toml 读改写的进程级互斥 (审计: 稳定-8)。
+///
+/// `write_private` 的 tmp+rename 只防**半写**, 不防**丢失更新**: 两个入口并发
+/// "读旧文件 → 各改各的字段 → 写回"时, 后写者会把前写者刚保存的内容整个覆盖掉
+/// (典型: 密钥保存与语言切换同时发生, 刚存的 API Key 静默消失)。
+/// 全部读改写入口 ([`set_values`] / [`upsert_table_block`] / [`remove_table_block`])
+/// 在读文件**之前**取此锁, 把整个"读→改→写"序列串行化。
+static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_config_write() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_WRITE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// **按行外科式更新**配置(019-R4): 只替换/插入给定键所在行, 保留全部注释与用户其它内容。
 ///
 /// - 键行匹配: 段头之后、下段头之前, 行首(允许空白)为 `key =`; 注释掉的行(`# key =`)不算;
@@ -729,6 +749,8 @@ fn assert_writable(section: &str, key: &str) -> CoreResult<()> {
 /// - 段在、键缺 → 在该段头部之后插入键行(不碰后续内容);
 /// - 原子写, 权限维持 0600; 文件不存在先报 Auth 错误(调用方应先 ensure_template)。
 pub fn set_values(root: &Path, updates: &[(&str, &str, SetValue)]) -> CoreResult<()> {
+    // 锁必须在读文件之前持有 (覆盖完整读改写序列, 见 CONFIG_WRITE_LOCK 文档)
+    let _lock = lock_config_write();
     for (s, k, _) in updates {
         assert_writable(s, k)?;
     }
@@ -918,6 +940,8 @@ fn upsert_table_block(
     prev_alias: Option<&str>,
     render: impl Fn(&str) -> String,
 ) -> CoreResult<()> {
+    // 锁必须在读文件之前持有 (覆盖完整读改写序列, 见 CONFIG_WRITE_LOCK 文档)
+    let _lock = lock_config_write();
     let text = read_body(root)?;
     let nl = newline_of(&text);
     let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
@@ -953,6 +977,8 @@ fn upsert_table_block(
 
 /// 块级删除; 返回是否真的删掉了(`false` = 别名不存在, 交调用方回 404)。
 fn remove_table_block(root: &Path, table: &str, alias: &str) -> CoreResult<bool> {
+    // 锁必须在读文件之前持有 (覆盖完整读改写序列, 见 CONFIG_WRITE_LOCK 文档)
+    let _lock = lock_config_write();
     let text = read_body(root)?;
     let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
     let Some((s, e)) = locate_block(&lines, table, alias) else {

@@ -47,15 +47,15 @@ impl LogQuery {
     }
 }
 
-/// 策略名 → 日志文件路径; 只接受**单段**名字(与 AI 工具 `safe_strategy_name` 同口径:
-/// 禁路径分隔与 `..`, 防目录穿越)。非法 → `None`。
+/// 策略名 → 日志文件路径 (审计 安全-12): 收敛到 `ricow_strategy::validate_strategy_name()`
+/// 白名单 (`[A-Za-z0-9_-]`、≤24 字符), 与 AI 工具 `safe_strategy_name` / 写盘入口同口径。
+/// 此前自维护的黑名单不拦 `:`, Windows 上 `name="C:x"` 经 `Path::join` 会替换整个路径,
+/// 读到 C 盘任意 `.log` 文件(`logs_tail` 是免审批 L0 工具, 可被 prompt 注入操纵)。
+/// 非法 → `None`(端点按 404 处理)。
 fn log_path_of(root: &Path, name: &str) -> Option<PathBuf> {
-    let unsafe_name = name.is_empty()
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains("..")
-        || name.starts_with('.');
-    (!unsafe_name).then(|| crate::supervisor::ledger::log_path(root, name))
+    ricow_strategy::validate_strategy_name(name)
+        .ok()
+        .map(|_| crate::supervisor::ledger::log_path(root, name))
 }
 
 /// 日志清单一行(FR-017): 面板据此列出**当前有日志**的策略。

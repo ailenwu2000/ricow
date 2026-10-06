@@ -1,6 +1,7 @@
 //! CLI 侧控制通道客户端 (008): 读 `run/daemon.json` → 连接 127.0.0.1 → 携带 token 请求。
 
 use std::path::Path;
+use std::time::Duration;
 
 use ricow_core::{CoreError, CoreResult};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -8,6 +9,15 @@ use tokio::net::TcpStream;
 
 use crate::supervisor::ledger::DaemonInfo;
 use crate::supervisor::proto::{self, Request, Response};
+
+/// 连接超时 (审计: 资源-1)。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 读取响应超时 (审计: 资源-1)。
+///
+/// daemon "活着但不回应" (卡死) 时, 无超时的 `next_line()` 会让调用方永久挂起 ——
+/// 包括 axum handler (`runs::start/stop_strategy`) 与 CLI `ricow daemon stop/status`。
+/// 上限取 stop 的最长优雅等待 (30s) + 余量, 保证正常慢停机不被误判。
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 已连接的控制通道。
 pub struct Client {
@@ -23,10 +33,13 @@ impl Client {
             )
         })?;
         let addr = format!("127.0.0.1:{}", info.port);
-        match TcpStream::connect(&addr).await {
-            Ok(_) => Ok(Self { info }),
-            Err(e) => Err(CoreError::Network(format!(
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+            Ok(Ok(_)) => Ok(Self { info }),
+            Ok(Err(e)) => Err(CoreError::Network(format!(
                 "无法连接 daemon ({addr}): {e}; 若 daemon 已退出, 可删除 run/daemon.json 后重启"
+            ))),
+            Err(_) => Err(CoreError::Network(format!(
+                "连接 daemon 超时 ({addr}, {CONNECT_TIMEOUT:?}): daemon 无响应"
             ))),
         }
     }
@@ -39,12 +52,15 @@ impl Client {
         self.info.pid
     }
 
-    /// 发一条请求并读一条响应。
+    /// 发一条请求并读一条响应 (连接与读取均带超时, daemon 卡死不再永久挂起调用方)。
     pub async fn call(&self, request: Request) -> CoreResult<Response> {
         let env = proto::Envelope { token: self.info.token.clone(), request };
         let addr = format!("127.0.0.1:{}", self.info.port);
-        let stream = TcpStream::connect(&addr)
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
             .await
+            .map_err(|_| {
+                CoreError::Network(format!("连接 daemon 超时 ({addr}, {CONNECT_TIMEOUT:?})"))
+            })?
             .map_err(|e| CoreError::Network(format!("连接 daemon 失败 ({addr}): {e}")))?;
         let (reader, mut writer) = stream.into_split();
         writer
@@ -54,9 +70,13 @@ impl Client {
         writer.flush().await.ok();
 
         let mut lines = BufReader::new(reader).lines();
-        let line = lines
-            .next_line()
+        let line = tokio::time::timeout(READ_TIMEOUT, lines.next_line())
             .await
+            .map_err(|_| {
+                CoreError::Network(format!(
+                    "读取 daemon 响应超时 ({READ_TIMEOUT:?}): daemon 可能已卡死, 请检查进程与日志"
+                ))
+            })?
             .map_err(|e| CoreError::Network(format!("读取响应失败: {e}")))?
             .ok_or_else(|| CoreError::Network("daemon 未返回响应 (连接被关闭)".into()))?;
         proto::decode_response(&line).map_err(CoreError::Parse)

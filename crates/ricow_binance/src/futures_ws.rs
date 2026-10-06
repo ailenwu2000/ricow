@@ -11,6 +11,7 @@
 
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -57,9 +58,19 @@ impl FuturesClient {
         let stream = format!("{}@depth@100ms", symbol.to_lowercase());
         let ws_url = format!("{}/{stream}", self.ws_base());
         let symbol_owned = symbol.to_string();
+
+        // 快照闭包 (审计 H-4): 重连成功后 REST 拉快照重建 book, 再应用其后增量。
+        let snap_client = self.clone();
+        let snap_symbol = symbol.to_uppercase();
+        let snapshot: Arc<crate::ws::DepthSnapshotFn> = Arc::new(move || {
+            let c = snap_client.clone();
+            let sym = snap_symbol.clone();
+            Box::pin(async move { c.depth_snapshot(&sym, 50).await.ok() })
+        });
+
         let (tx, rx) = mpsc::channel::<OrderBookUpdate>(256);
         tokio::spawn(async move {
-            run_depth_ws(&ws_url, &symbol_owned, tx).await;
+            run_depth_ws(&ws_url, &symbol_owned, tx, Some(snapshot)).await;
         });
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
@@ -71,14 +82,24 @@ impl FuturesClient {
         &self,
     ) -> CoreResult<Pin<Box<dyn Stream<Item = UserEvent> + Send>>> {
         let listen_key = self.create_listen_key().await?;
-        self.spawn_listen_key_keepalive(listen_key.clone());
-
         let ws_url = format!("{}/{}", self.ws_base(), listen_key);
+
+        // 当前有效 listenKey 的共享单元: keepalive 任务续期它, 重连重建时更新它,
+        // 保证续期目标始终是守护循环正在用的 key (审计 H-3)。
+        let key_cell = Arc::new(std::sync::Mutex::new(listen_key));
+
         let (tx, rx) = mpsc::channel::<UserEvent>(256);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<CoreResult<()>>();
+        let client = self.clone();
+        let run_cell = Arc::clone(&key_cell);
+        let run_tx = tx.clone();
         tokio::spawn(async move {
-            run_user_data_ws(&ws_url, tx, ready_tx).await;
+            run_user_data_ws(client, ws_url, run_cell, run_tx, ready_tx).await;
         });
+        // 审计 H-2: keepalive 持有事件通道的 tx —— 实盘会话结束 (receiver drop) 时
+        // `tx.closed()` 触发, 续期循环随之退出。此前该任务无任何退出条件, 每次启动
+        // 实盘都会永久泄漏一个 30 分钟间隔的续期任务 (对币安产生幽灵流量)。
+        self.spawn_listen_key_keepalive(key_cell, tx);
 
         match tokio::time::timeout(SUBSCRIBE_READY_TIMEOUT, ready_rx).await {
             Ok(Ok(Ok(()))) => {
@@ -97,16 +118,33 @@ impl FuturesClient {
     }
 
     /// listenKey 续期任务 (每 30 分钟 PUT 一次; listenKey 有效期 60 分钟)。
-    fn spawn_listen_key_keepalive(&self, listen_key: String) {
+    ///
+    /// 审计 H-2: 循环 `select!` 监听 `tx.closed()` —— 事件通道的 receiver 已 drop
+    /// (实盘会话结束/引擎停机) 即退出, 不再向币安发送幽灵续期请求。
+    /// 续期目标始终读 `key_cell` (审计 H-3): 重连重建 key 后, 续期跟着切到新 key。
+    fn spawn_listen_key_keepalive(
+        &self,
+        key_cell: Arc<std::sync::Mutex<String>>,
+        tx: mpsc::Sender<UserEvent>,
+    ) {
         let client = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
             interval.tick().await; // 立即返回一次, 跳过
             loop {
-                interval.tick().await;
-                match client.keepalive_listen_key(&listen_key).await {
-                    Ok(()) => tracing::debug!(target: "bn.ws", "listenKey 续期 OK"),
-                    Err(e) => tracing::warn!(target: "bn.ws", "listenKey 续期失败: {e}"),
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let key = key_cell.lock().map(|k| k.clone()).unwrap_or_default();
+                        match client.keepalive_listen_key(&key).await {
+                            Ok(()) => tracing::debug!(target: "bn.ws", "listenKey 续期 OK"),
+                            Err(e) => tracing::warn!(target: "bn.ws", "listenKey 续期失败: {e}"),
+                        }
+                    }
+                    // receiver 已 drop → 会话已结束, 停止续期
+                    _ = tx.closed() => {
+                        tracing::debug!(target: "bn.ws", "用户流已关闭, listenKey 续期任务退出");
+                        break;
+                    }
                 }
             }
         });
@@ -118,16 +156,31 @@ fn backoff_delay(retry_count: u32) -> Duration {
     Duration::from_secs(base_secs)
 }
 
-/// 用户流守护: 断线指数退避重连 (listenKey 在有效期内可复用同一 URL)。
+/// 消息空闲上限 (审计 H-3): 用户流事件稀疏, 但合约服务器 Ping 每 3 分钟一次;
+/// 超过此时长无任何消息 (含 Ping) 必为 TCP 半开挂死, `read.next()` 无 timeout
+/// 会永久挂起, 订单/成交事件静默丢失。
+const USER_DATA_READ_IDLE: Duration = Duration::from_secs(600);
+
+/// 用户流守护: 断线指数退避重连 (审计 H-3)。
+///
+/// - 消费端退出 (`tx.is_closed()`) 即停止重连, 不再泄漏守护任务;
+/// - **每次重连前重新 create listenKey**: 断线期间旧 key 可能已过期 (60 分钟有效期),
+///   复用旧 URL 会无限重连失败 (`listenKeyExpired` → 用同一过期 URL 重试是必然复现路径);
+/// - 重建的新 key 写回 `key_cell`, keepalive 任务随之切换续期目标。
 async fn run_user_data_ws(
-    ws_url: &str,
+    client: FuturesClient,
+    mut ws_url: String,
+    key_cell: Arc<std::sync::Mutex<String>>,
     tx: mpsc::Sender<UserEvent>,
     ready: tokio::sync::oneshot::Sender<CoreResult<()>>,
 ) {
     let mut ready = Some(ready);
     let mut retry = 0u32;
     loop {
-        match user_data_session(ws_url, &tx, &mut ready).await {
+        if tx.is_closed() {
+            return; // 消费端 (live 会话) 已退出: 不再重连
+        }
+        match user_data_session(&ws_url, &tx, &mut ready).await {
             Ok(()) => break,
             Err(e) => {
                 if let Some(r) = ready.take() {
@@ -135,10 +188,26 @@ async fn run_user_data_ws(
                     let _ = r.send(Err(e));
                     return;
                 }
+                if tx.is_closed() {
+                    break;
+                }
                 retry += 1;
                 let delay = backoff_delay(retry);
                 tracing::warn!(target: "bn.ws", error = %e, retry, delay_ms = delay.as_millis(), "futures user data WS disconnected, reconnecting");
                 tokio::time::sleep(delay).await;
+                // 重建 listenKey (失败则保留旧 URL, 下一轮再试)
+                match client.create_listen_key().await {
+                    Ok(k) => {
+                        if let Ok(mut cell) = key_cell.lock() {
+                            *cell = k.clone();
+                        }
+                        ws_url = format!("{}/{}", client.ws_base(), k);
+                        tracing::info!(target: "bn.ws", "已重建 listenKey, 用新 URL 重连");
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "bn.ws", error = %e, "重建 listenKey 失败, 下一轮重试");
+                    }
+                }
             }
         }
     }
@@ -157,9 +226,19 @@ async fn user_data_session(
     }
     let (mut write, mut read) = ws_stream.split();
 
-    while let Some(msg) = read.next().await {
+    loop {
+        // 审计 H-3: 读超时兜底, 半开连接不再永久挂起 (超时 → Err → 上层重连)
+        let msg = match tokio::time::timeout(USER_DATA_READ_IDLE, read.next()).await {
+            Ok(m) => m,
+            Err(_) => {
+                return Err(CoreError::Network(format!(
+                    "用户流空闲超时 ({}s 无任何消息, 含 Ping), 视为半开连接",
+                    USER_DATA_READ_IDLE.as_secs()
+                )))
+            }
+        };
         match msg {
-            Ok(Message::Text(text)) => {
+            Some(Ok(Message::Text(text))) => {
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
                     if let Some("listenKeyExpired") = v.get("e").and_then(|e| e.as_str()) {
                         return Err(CoreError::Exchange(
@@ -173,17 +252,17 @@ async fn user_data_session(
                     }
                 }
             }
-            Ok(Message::Ping(data)) => {
+            Some(Ok(Message::Ping(data))) => {
                 let _ = write.send(Message::Pong(data)).await;
             }
-            Ok(Message::Close(_)) => {
+            Some(Ok(Message::Close(_))) => {
                 return Err(CoreError::Network("server closed connection".into()))
             }
-            Err(e) => return Err(CoreError::Network(e.to_string())),
-            _ => {}
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(CoreError::Network(e.to_string())),
+            None => return Err(CoreError::Network("WS stream ended".into())),
         }
     }
-    Err(CoreError::Network("WS stream ended".into()))
 }
 
 /// 合约用户流事件解析 (纯函数, 便于单测)。
@@ -267,7 +346,9 @@ mod tests {
 
     #[test]
     fn test_ws_base_maps_hosts() {
-        let mk = |url: &str| FuturesClient::new().expect("client").with_base_url(url);
+        let mk = |url: &str| {
+            FuturesClient::new().expect("client").with_base_url(url).expect("白名单内域名")
+        };
         assert_eq!(mk("https://demo-fapi.binance.com").ws_base(), FAPI_DEMO_WS);
         assert_eq!(mk("https://fapi.binance.com").ws_base(), FAPI_MAINNET_WS);
     }

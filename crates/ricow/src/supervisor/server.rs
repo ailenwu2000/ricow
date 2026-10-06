@@ -1,6 +1,6 @@
 //! daemon 主体: 实例调度 + 控制通道服务 + 子进程监控 (008)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,6 +18,12 @@ struct State {
     root: PathBuf,
     exe: PathBuf,
     children: HashMap<String, ChildHandle>,
+    /// 启动中占位标记 (防并发双实例): `start` 从锁内检查"是否在跑"到锁外完成
+    /// 进程拉起之间有 1~3s 窗口 (TOML 校验 / pair 视野网络调用 / spawn_blocking /
+    /// 600ms 存活探测), 只查 `children` 时第二个同名 Start 会穿过检查, 造成
+    /// **同一策略两个子进程同时交易** (双份下单、client_order_id 前缀相同导致
+    /// 成交事件互相污染)。占位标记在锁内完成 check+insert, 窗口期内的重复请求一律拒绝。
+    starting: HashSet<String>,
 }
 
 /// 控制通道服务 (可克隆; 连接处理与监控共用同一状态)。
@@ -36,6 +42,23 @@ pub struct Server {
 /// 因此中毒后继续沿用内部值, 把影响限制在真正出问题的那一次请求上。
 fn lock_state(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `starting` 占位标记的 RAII 清理。
+///
+/// `start` 在锁内登记占位后即释放锁去跑网络/进程操作, 期间有**多条早期失败返回路径**
+/// (TOML 不存在 / 校验失败 / 缺实盘确认 / spawn 失败 / 秒退)。用 Drop guard 保证
+/// 任何一条路径返回都会摘除标记, 不留"该策略永远启动中"的死锁占位。
+/// 成功路径的 drop 同样摘除 —— 届时 `children` 已登记, 占位的历史使命完成。
+struct StartingGuard {
+    state: Arc<Mutex<State>>,
+    name: String,
+}
+
+impl Drop for StartingGuard {
+    fn drop(&mut self) {
+        lock_state(&self.state).starting.remove(&self.name);
+    }
 }
 
 /// 常量时间比较 (控制通道 token)。
@@ -66,7 +89,12 @@ impl Server {
         token: String,
         shutdown_tx: watch::Sender<bool>,
     ) -> Self {
-        let state = Arc::new(Mutex::new(State { root, exe, children: HashMap::new() }));
+        let state = Arc::new(Mutex::new(State {
+            root,
+            exe,
+            children: HashMap::new(),
+            starting: HashSet::new(),
+        }));
         Self { state, token, shutdown_tx }
     }
 
@@ -135,14 +163,27 @@ impl Server {
     }
 
     /// 启动策略: 台账校验 → spawn → 台账落盘。
+    ///
+    /// 并发防重 (审计 H-1): "是否已在跑"的检查与 `children.insert` 登记之间隔着
+    /// 整个启动流程 (含网络调用), 锁内只做检查会留下 1~3s 的双实例窗口。
+    /// 故锁内同步完成 **检查 + 占位登记**, 后续任何路径返回时由 [`StartingGuard`]
+    /// 摘除占位; 占位期间的重复 Start 一律拒绝。
     async fn start(&self, name: &str, live: bool, demo: bool, confirmed: bool) -> Response {
         let (root, exe) = {
-            let state = self.state();
+            let mut state = self.state();
             if state.children.contains_key(name) {
                 return Response::err(format!("策略 {name} 已在运行, 不重复拉起"));
             }
+            if state.starting.contains(name) {
+                return Response::err(format!(
+                    "策略 {name} 正在启动中, 请等待本次启动结束再试 (防重复拉起)"
+                ));
+            }
+            state.starting.insert(name.to_string());
             (state.root.clone(), state.exe.clone())
         };
+        // 作用域存续到函数结束: 任何 return 路径都会摘除占位标记。
+        let _starting = StartingGuard { state: Arc::clone(&self.state), name: name.to_string() };
 
         // 策略 TOML 校验 (enabled=false / 解析失败 / 缺脚本在此拒绝), 并取运行元数据
         // 目录与台账/子进程同源(daemon 的 root), 不用进程全局 `strategies_dir()` ——
@@ -307,8 +348,17 @@ impl Server {
         if exited {
             write_exit_record(&root, name, &handle.view, code, "停机指令");
         } else {
-            // 超时: 放回状态表, 避免"摘除后失联"
-            self.state().children.insert(name.to_string(), handle);
+            // 超时: 放回状态表, 避免"摘除后失联"。
+            // 防孤儿 (审计 H-1 关联): 停机等待最长 30s, 期间同名实例可能已被重新拉起
+            // (stop 已把旧句柄摘除, 新 Start 的占位检查拦不住它)。此时**不能**无条件
+            // 覆盖 —— 覆盖会把新进程的句柄换掉, 新进程从此无人监控也永远停不掉。
+            let mut state = self.state();
+            if state.children.contains_key(name) {
+                tracing::warn!(target: "supervisor", name = %name, pid = ?handle.pid(),
+                    "停机超时且同名实例已被重新启动: 旧句柄弃置 (旧进程请按 pid 手工核对), 不覆盖新实例");
+            } else {
+                state.children.insert(name.to_string(), handle);
+            }
         }
 
         let report = StopReport {
@@ -641,6 +691,87 @@ mod tests {
         // 无策略 TOML → 走 Dry Run 分支 (如实说明无法判定, 不臆测)
         let dry = cleanup_hint_for(&root, "s1", Some("dry_run"), false);
         assert!(dry.contains("无法判定清理实现"), "{dry}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn start_envelope(name: &str) -> Envelope {
+        Envelope {
+            token: "t".into(),
+            request: Request::Start {
+                name: name.into(),
+                live: false,
+                demo: false,
+                confirmed: false,
+            },
+        }
+    }
+
+    fn minimal_strategy_toml(root: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(root.join("strategies")).unwrap();
+        std::fs::write(
+            root.join("strategies").join(format!("{name}.toml")),
+            // 合法可装载的最小 TOML ([strategy] 段 + lua script), pair 留空跳过视野网络检查
+            format!(
+                "[strategy]\nname = \"{name}\"\ntype = \"lua\"\nenabled = true\nexchange = \"binance\"\n\n[strategy.params]\nscript = \"function on_tick() end\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// 审计 H-1 回归: 启动中占位标记必须拒绝并发的同名 Start。
+    ///
+    /// `start` 的"是否在跑"检查与 `children.insert` 登记之间隔着整个启动流程 (含网络
+    /// 调用与进程拉起), 只查 children 会留下 1~3s 双实例窗口 —— 同一策略两个子进程
+    /// 同时交易。占位标记在锁内原子完成 check+insert, 窗口内的重复 Start 一律拒绝。
+    #[tokio::test]
+    async fn concurrent_start_is_rejected_by_starting_marker() {
+        let root = tmp_root("starting-marker");
+        ledger::ensure_dirs(&root).unwrap();
+        let (tx, _rx) = watch::channel(false);
+        let server =
+            Server::new(root.clone(), PathBuf::from("definitely-not-an-exe"), "t".into(), tx);
+        minimal_strategy_toml(&root, "s1");
+
+        // 占位期间 (模拟另一请求正在启动流程中): handle(Start) 必须被拒, 且消息如实说明。
+        lock_state(&server.state).starting.insert("s1".into());
+        let resp = server.handle(start_envelope("s1")).await;
+        let body = serde_json::to_string(&resp).unwrap();
+        assert!(body.contains("正在启动中"), "占位期间的重复 Start 应被拒: {body}");
+
+        // 手工占位没有 guard 跟随, 测试自行摘除后再测真实启动路径。
+        lock_state(&server.state).starting.remove("s1");
+
+        // 失败路径不留死标记: 直接走完整 start (spawn 必败, exe 不存在), 返回后占位必须被清空。
+        let resp = server.handle(start_envelope("s1")).await;
+        let body = serde_json::to_string(&resp).unwrap();
+        assert!(body.contains("启动失败"), "exe 不存在应启动失败: {body}");
+        assert!(lock_state(&server.state).starting.is_empty(), "失败后不得残留占位标记");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 审计 H-1 回归: 两个并发 Start **绝不能都成功** (双实例 = 双份下单)。
+    ///
+    /// 占位 check+insert 在同一锁段内完成, 故第二个请求必然看到标记;
+    /// 无论调度顺序如何, 结果只能是"一个成功一个被拒"或"都失败 (spawn 必败)"。
+    #[tokio::test]
+    async fn concurrent_starts_never_both_succeed() {
+        let root = tmp_root("concurrent-start");
+        ledger::ensure_dirs(&root).unwrap();
+        let (tx, _rx) = watch::channel(false);
+        let server =
+            Server::new(root.clone(), PathBuf::from("definitely-not-an-exe"), "t".into(), tx);
+        minimal_strategy_toml(&root, "s1");
+
+        let (r1, r2) =
+            tokio::join!(server.handle(start_envelope("s1")), server.handle(start_envelope("s1")));
+        let ok = |r: &Response| serde_json::to_string(r).unwrap().contains("\"ok\":true");
+        assert!(!(ok(&r1) && ok(&r2)), "并发 Start 不得双双成功 (双实例同时交易): {r1:?} / {r2:?}");
+        let state = lock_state(&server.state);
+        assert!(state.starting.is_empty(), "结束后不得残留占位标记");
+        assert!(state.children.len() <= 1, "不得登记两个子进程句柄");
+        drop(state);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

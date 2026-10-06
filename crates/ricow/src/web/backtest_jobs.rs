@@ -28,6 +28,14 @@ use ricow_strategy::ConfigValue;
 /// done/error 结果保留时长(data-model §7: 5 分钟后惰性删除)。
 const RETAIN: Duration = Duration::minutes(5);
 
+/// running 作业的兜底超时 (审计 H-5)。
+///
+/// 后台作业 panic 时 `finish_*` 永不执行, running 记录会永久残留 → 该策略/参数的
+/// 回测从此 409 busy 直到进程重启。prune 时把超过此时长的 running 强制转 error,
+/// 释放 busy (真实 panic 源存在: rust_decimal 96-bit 溢出等)。取 60 分钟 ——
+/// 远大于最大合法窗口 (3650 天 1m ≈ 数分钟) + sweep 10 档串行的耗时, 不误杀长作业。
+const RUNNING_TIMEOUT: Duration = Duration::minutes(60);
+
 // ---- 作业存储(纯内存, 时间可注入便于单测) ----
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,17 +167,41 @@ fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 提取 panic 载荷的可读信息 (审计 H-5): panic 消息通常是 &str 或 String。
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "未知 panic 载荷".to_string()
+    }
+}
+
 impl JobStore {
     pub(super) fn new() -> Self {
         Self { inner: Mutex::new(HashMap::new()) }
     }
 
-    /// 惰性清理: 删除"完成时刻"已过保留期的 done/error; running 永不因时间被清。
+    /// 惰性清理: 删除"完成时刻"已过保留期的 done/error。
+    ///
+    /// 审计 H-5: running **原本**永不因时间被清 —— 但 panic 的作业 finish 永不执行,
+    /// running 永久残留会把该策略锁死在 409 busy。超时的 running 在此强制转 error
+    /// (保留 5 分钟供查询), 释放 busy; 若作业实际仍在跑, 其后到达的 finish 会因
+    /// 状态已非 Running 被单向状态机忽略, 不会二次覆盖。
     fn prune(map: &mut HashMap<String, BacktestJob>, now: DateTime<Utc>) {
         let cutoff = now - RETAIN;
         map.retain(|_, job| match job.finished_at {
             Some(finished) => finished > cutoff,
-            None => true,
+            None => {
+                if now - job.created_at > RUNNING_TIMEOUT {
+                    job.status = JobStatus::Error;
+                    job.error =
+                        Some("作业超时未结束 (内核异常退出或窗口过大), 已强制释放; 请重试".into());
+                    job.finished_at = Some(now);
+                }
+                true
+            }
         });
     }
 
@@ -443,8 +475,14 @@ pub(super) async fn start_backtest(
     let id = job_id.clone();
     let strategy_name = strategy.to_string();
     tokio::spawn(async move {
-        match run_backtest_full(spec).await {
-            Ok(out) => {
+        // 审计 H-5: 内核 panic (如 rust_decimal 96-bit 溢出) 若不捕获, finish 永不执行,
+        // 该策略的作业永久 running → 回测 409 直到重启。捕获后转 error 释放 busy。
+        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            run_backtest_full(spec).await
+        }))
+        .await;
+        match result {
+            Ok(Ok(out)) => {
                 let text = format_backtest_report(
                     &out.report,
                     &out.header(&strategy_name),
@@ -458,7 +496,12 @@ pub(super) async fn start_backtest(
                 jobs.finish_done_full(&id, text, metrics, chart, logs, Utc::now());
             }
             // CoreError 的中文 Display 直接作为 error 文本(含"预热段不足/窗口日期非法"等)。
-            Err(e) => jobs.finish_error(&id, e.to_string(), Utc::now()),
+            Ok(Err(e)) => jobs.finish_error(&id, e.to_string(), Utc::now()),
+            Err(panic) => {
+                let msg = panic_message(panic.as_ref());
+                tracing::error!(target: "web", strategy = %strategy_name, "回测内核 panic: {msg}");
+                jobs.finish_error(&id, format!("回测内核异常退出 (panic): {msg}"), Utc::now());
+            }
         }
     });
 
@@ -596,43 +639,61 @@ pub(super) async fn start_sweep(
     let leverage = req.leverage;
     let days = req.days;
     tokio::spawn(async move {
-        let mut rows: Vec<SweepRow> = Vec::with_capacity(ladders.len());
-        for (raw, cv) in ladders {
-            let mut params: HashMap<String, ConfigValue> = HashMap::new();
-            params.insert(param_owned.clone(), cv);
-            let spec = BacktestRunSpec {
-                root: (*root).clone(),
-                strategy: strategy_owned.clone(),
-                pair: pair.clone(),
-                days: days.unwrap_or(90),
-                interval: interval.to_string(),
-                start: None,
-                end: None,
-                market: market.clone(),
-                position_mode: None,
-                params,
-                script_path: None,
-                fee,
-                fee_maker: None,
-                fee_taker: None,
-                slippage_bps: None,
-                cash,
-                leverage,
-                max_leverage: None,
-                mmr_pct: None,
-                funding_rate: None,
-            };
-            match run_backtest_full(spec).await {
-                Ok(out) => {
-                    rows.push(SweepRow { value: raw, error: None, metrics: Some(out.metrics()) })
-                }
-                Err(e) => {
-                    rows.push(SweepRow { value: raw, error: Some(e.to_string()), metrics: None })
+        // 审计 H-5: 与单次回测同口径, panic 转 error 释放 busy (不锁死该参数键)。
+        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let mut rows: Vec<SweepRow> = Vec::with_capacity(ladders.len());
+            for (raw, cv) in ladders {
+                let mut params: HashMap<String, ConfigValue> = HashMap::new();
+                params.insert(param_owned.clone(), cv);
+                let spec = BacktestRunSpec {
+                    root: (*root).clone(),
+                    strategy: strategy_owned.clone(),
+                    pair: pair.clone(),
+                    days: days.unwrap_or(90),
+                    interval: interval.to_string(),
+                    start: None,
+                    end: None,
+                    market: market.clone(),
+                    position_mode: None,
+                    params,
+                    script_path: None,
+                    fee,
+                    fee_maker: None,
+                    fee_taker: None,
+                    slippage_bps: None,
+                    cash,
+                    leverage,
+                    max_leverage: None,
+                    mmr_pct: None,
+                    funding_rate: None,
+                };
+                match run_backtest_full(spec).await {
+                    Ok(out) => rows.push(SweepRow {
+                        value: raw,
+                        error: None,
+                        metrics: Some(out.metrics()),
+                    }),
+                    Err(e) => rows.push(SweepRow {
+                        value: raw,
+                        error: Some(e.to_string()),
+                        metrics: None,
+                    }),
                 }
             }
+            rows
+        }))
+        .await;
+        match result {
+            Ok(rows) => {
+                let report = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+                jobs.finish_done(&id, report, Utc::now());
+            }
+            Err(panic) => {
+                let msg = panic_message(panic.as_ref());
+                tracing::error!(target: "web", strategy = %strategy_owned, param = %param_owned, "寻优内核 panic: {msg}");
+                jobs.finish_error(&id, format!("寻优内核异常退出 (panic): {msg}"), Utc::now());
+            }
         }
-        let report = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
-        jobs.finish_done(&id, report, Utc::now());
     });
 
     Ok((StatusCode::ACCEPTED, Json(StartedReply { job_id })))
@@ -764,12 +825,12 @@ mod tests {
     }
 
     #[test]
-    fn test_running_never_expires_and_prune_happens_on_start() {
+    fn test_running_stays_within_timeout_and_prune_happens_on_start() {
         let store = JobStore::new();
         let t0 = t(4_000_000);
         let running_id = store.start("long-run", t0).unwrap();
-        // 跑很久(running 无 finished_at), 任何时刻都不能被惰性清理。
-        assert!(store.get(&running_id, t0 + Duration::seconds(3_600)).is_some());
+        // 超时阈值内 (59 分钟): running 不得被惰性清理。
+        assert!(store.get(&running_id, t0 + Duration::minutes(59)).is_some());
 
         // 另一个作业完成后过期; 发起第三个作业(触发 prune)只清过期者, running 保留。
         let done_id = store.start("old-one", t0).unwrap();
@@ -777,7 +838,35 @@ mod tests {
         let expire_at = t0 + Duration::seconds(310);
         let _new = store.start("new-one", expire_at).unwrap();
         assert!(store.get(&done_id, expire_at).is_none(), "过期 done 应在 start 时被清");
-        assert!(store.get(&running_id, expire_at).is_some(), "running 不应被清");
+        assert!(store.get(&running_id, expire_at).is_some(), "阈值内的 running 不应被清");
+    }
+
+    /// 审计 H-5 回归: panic 的作业 finish 永不执行, running 超过兜底时长必须被
+    /// prune 强制转 error —— 否则该策略回测 409 busy 直到进程重启。
+    #[test]
+    fn test_running_timeout_forces_error_and_releases_busy() {
+        let store = JobStore::new();
+        let t0 = t(5_000_000);
+        let id = store.start("zombie", t0).unwrap();
+
+        // 超过兜底时长后任一入口 (get/start) 触发 prune: running → error, 释放 busy。
+        let past = t0 + RUNNING_TIMEOUT + Duration::minutes(1);
+        let r = store.get(&id, past).expect("超时转 error 后仍保留一段时间供查询");
+        assert_eq!(r.status, "error", "超时 running 必须被强制转 error");
+        assert!(
+            r.error.as_deref().unwrap_or_default().contains("超时"),
+            "应说明超时: {:?}",
+            r.error
+        );
+
+        // busy 已释放: 同名策略可以立即再次发起。
+        assert!(store.start("zombie", past).is_ok(), "超时释放后不得再 409 busy");
+
+        // 单向状态机: 迟到的 finish (真实作业恰好在超时后完成) 不得覆盖已转 error 的记录。
+        store.finish_done(&id, "迟到的报告".into(), past + Duration::seconds(1));
+        let r = store.get(&id, past + Duration::seconds(1)).unwrap();
+        assert_eq!(r.status, "error", "迟到的 done 不得覆盖已强制 error 的作业");
+        assert!(r.report.is_none());
     }
 
     #[test]

@@ -39,10 +39,8 @@ const TOKEN_PLACEHOLDER: &str = "__RICOW_TOKEN__";
 
 /// 单页首页(FR-003 / FR-006): 把本次 token 填进各静态资源的 URL(见 [`TOKEN_PLACEHOLDER`])。
 pub(super) async fn index(req: Request) -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        render_index(&token_of(&req).unwrap_or_default()),
-    )
+    let token = token_of(&req).map(|(t, _)| t).unwrap_or_default();
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_index(&token))
 }
 
 /// 样式表: 编译期常量, 不含任何会话内容。

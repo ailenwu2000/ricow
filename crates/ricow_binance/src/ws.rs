@@ -1,7 +1,9 @@
 //! Binance 现货 WebSocket: 盘口 + 用户数据流 (listenKey)。
 
+use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -30,6 +32,15 @@ const SPOT_WS_API_DEMO: &str = "wss://demo-ws-api.binance.com/ws-api/v3";
 
 /// 订阅就绪等待上限: 超时即视为订阅失败 (实盘不允许"没订阅就开跑")。
 const SUBSCRIBE_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// REST 盘口快照提供者 (审计 H-4)。
+///
+/// 返回 `(lastUpdateId, OrderBook)`; `None` = 拉取失败 (降级为无快照的增量模式)。
+/// `run_depth_ws` 每次重连成功后调用一次: 先用快照整体替换累计盘口, 再应用其后的
+/// 增量 —— 直接把 `@depth` 增量合并进空盘口会得到只剩"重连后变动档"的残缺 book,
+/// 策略会以错误价格下单。
+pub(crate) type DepthSnapshotFn =
+    dyn Fn() -> Pin<Box<dyn Future<Output = Option<(u64, OrderBook)>> + Send>> + Send + Sync;
 
 impl BinanceClient {
     /// 根据 REST base_url 返回对应市场行情 WS base (mainnet / testnet / demo)。
@@ -66,9 +77,19 @@ impl BinanceClient {
         let ws_url = format!("{}/{stream_name}", self.ws_base());
         let symbol_owned = symbol.to_string();
 
+        // 快照闭包 (审计 H-4): 每次重连成功后由 run_depth_ws 调用, REST 拉一次含
+        // lastUpdateId 的快照。limit=50 与累计盘口的 MAX_DEPTH_LEVELS 对齐。
+        let snap_client = self.clone();
+        let snap_symbol = symbol.to_uppercase();
+        let snapshot: Arc<DepthSnapshotFn> = Arc::new(move || {
+            let c = snap_client.clone();
+            let sym = snap_symbol.clone();
+            Box::pin(async move { c.depth_snapshot(&sym, 50).await.ok() })
+        });
+
         let (tx, rx) = mpsc::channel::<OrderBookUpdate>(256);
         tokio::spawn(async move {
-            run_depth_ws(&ws_url, &symbol_owned, tx).await;
+            run_depth_ws(&ws_url, &symbol_owned, tx, Some(snapshot)).await;
         });
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
@@ -89,14 +110,17 @@ impl BinanceClient {
     pub async fn subscribe_user_data(
         &self,
     ) -> CoreResult<Pin<Box<dyn Stream<Item = UserEvent> + Send>>> {
-        let params = self.ws_api_subscribe_params()?;
-        let request = build_subscribe_request(&params);
+        // 先签一次: 密钥缺失立即报错 (而非在守护任务里异步失败), 语义与旧版一致。
+        self.ws_api_subscribe_params()?;
         let ws_url = self.ws_api_base().to_string();
 
         let (tx, rx) = mpsc::channel::<UserEvent>(256);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<CoreResult<u64>>();
+        let client = self.clone();
         tokio::spawn(async move {
-            run_user_data_ws(&ws_url, &request, tx, ready_tx).await;
+            // 审计 H-3: 传 client 而非一次性签名 —— 重连时重新签名 (旧签名 timestamp
+            // 超出 recvWindow 后, 币安必拒, 重连会永远失败)
+            run_user_data_ws(client, ws_url, tx, ready_tx).await;
         });
 
         match tokio::time::timeout(SUBSCRIBE_READY_TIMEOUT, ready_rx).await {
@@ -127,16 +151,31 @@ fn backoff_delay(retry_count: u32) -> Duration {
 
 // ---- Depth WS ----
 
+/// 快照就绪前缓冲的增量帧上限 (100ms 一帧 = 13 分钟余量; 快照请求 30s 内必然返回)。
+const SNAPSHOT_PENDING_CAP: usize = 8192;
+
 /// 盘口订阅守护: 断线指数退避重连 (现货市场流 / 合约 fapi 流共用)。
 ///
 /// `depthUpdate` 是**增量 diff**(`b`/`a` 只含变动档, `size=0` 表示删档), 故本函数维护累计盘口;
 /// 覆盖式解析会让某一侧变空 → `mid_price()` 返回 None → 策略拿不到价 (2026-09-13 修正)。
-pub(crate) async fn run_depth_ws(ws_url: &str, symbol: &str, tx: mpsc::Sender<OrderBookUpdate>) {
+///
+/// 审计 H-4: 每次重连成功后先经 `snapshot` 回调拉 REST 快照整体重建 book, 再应用其后
+/// 增量 —— 增量直接合并进空盘口会得到残缺盘口, 策略会以错误价格下单。
+pub(crate) async fn run_depth_ws(
+    ws_url: &str,
+    symbol: &str,
+    tx: mpsc::Sender<OrderBookUpdate>,
+    snapshot: Option<Arc<DepthSnapshotFn>>,
+) {
     let mut retry = 0u32;
     loop {
-        match depth_session(ws_url, symbol, &tx).await {
+        match depth_session(ws_url, symbol, &tx, snapshot.as_ref()).await {
             Ok(()) => break,
             Err(e) => {
+                if tx.is_closed() {
+                    // 消费端 (live 会话) 已退出: 守护循环随之退出, 不再无限重连。
+                    break;
+                }
                 retry += 1;
                 let delay = backoff_delay(retry);
                 tracing::warn!(target: "bn.ws", symbol = %symbol, error = %e, retry, delay_ms = delay.as_millis(), "depth WS disconnected, reconnecting");
@@ -204,20 +243,119 @@ fn merge_levels(
     levels.truncate(MAX_DEPTH_LEVELS);
 }
 
+/// 消息空闲上限 (审计 H-3): 深度流正常 100ms/帧, 服务器 Ping 最长 3 分钟一次;
+/// 超过此时长无任何消息必为 TCP 半开挂死, 触发重连 (半开连接下 `read.next()` 无
+/// timeout 会永久挂起, 行情静默中断且引擎侧看门狗只能事后告警)。
+const DEPTH_READ_IDLE: Duration = Duration::from_secs(60);
+
+/// 快照就绪后的缓冲重放 (纯逻辑, 便于单测): 以快照 book 为基准, 丢弃 `u <= last_update_id`
+/// 的旧帧, 按序应用其余帧, 返回对应的更新序列 (调用方负责推送)。
+fn replay_pending(
+    book: &mut ricow_core::OrderBook,
+    symbol: &str,
+    last_update_id: u64,
+    pending: &mut Vec<(u64, Value)>,
+) -> Vec<OrderBookUpdate> {
+    let mut out = Vec::new();
+    for (u, v) in pending.drain(..) {
+        if u > last_update_id && apply_depth_frame(book, symbol, &v) {
+            out.push(OrderBookUpdate {
+                pair: symbol.to_string(),
+                bids: book.bids.clone(),
+                asks: book.asks.clone(),
+                timestamp: book.timestamp,
+            });
+        }
+    }
+    out
+}
+
 async fn depth_session(
     ws_url: &str,
     symbol: &str,
     tx: &mpsc::Sender<OrderBookUpdate>,
+    snapshot: Option<&Arc<DepthSnapshotFn>>,
 ) -> CoreResult<()> {
     let (ws_stream, _) =
         connect_async(ws_url).await.map_err(|e| CoreError::Network(e.to_string()))?;
     let (mut write, mut read) = ws_stream.split();
     let mut book = ricow_core::OrderBook::default();
 
-    while let Some(msg) = read.next().await {
+    // ---- 快照同步 (审计 H-4) ----
+    // 连接成功后立即并发拉 REST 快照; 就绪前的增量帧按 `u`(final update id) 缓冲,
+    // 快照返回后整体替换 book、丢弃 `u <= lastUpdateId` 的旧帧、按序应用其余。
+    // (简化: 不做官方协议的 U/L 交叠细分 —— 帧条目是"该价位最终量"的绝对语义,
+    // 单帧重复应用幂等, 边界帧的交叠风险远小于"空盘口合并增量"。)
+    // 快照失败 → 退回无快照的增量模式并 warn (与修复前行为一致, 但有告警可查)。
+    let mut snap_rx = snapshot.cloned().map(|f| {
+        let (stx, srx) = tokio::sync::oneshot::channel::<Option<(u64, OrderBook)>>();
+        tokio::spawn(async move {
+            let _ = stx.send(f().await);
+        });
+        srx
+    });
+    let mut synced = snap_rx.is_none();
+    let mut pending: Vec<(u64, Value)> = Vec::new();
+
+    loop {
+        // 审计 H-3: 读超时兜底, 半开连接不再永久挂起 (超时 → Err → 上层重连)
+        let msg = match tokio::time::timeout(DEPTH_READ_IDLE, read.next()).await {
+            Ok(m) => m,
+            Err(_) => {
+                return Err(CoreError::Network(format!(
+                    "盘口流空闲超时 ({}s 无任何消息, 含 Ping), 视为半开连接",
+                    DEPTH_READ_IDLE.as_secs()
+                )))
+            }
+        };
         match msg {
-            Ok(Message::Text(text)) => {
+            Some(Ok(Message::Text(text))) => {
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    if !synced {
+                        // 快照就绪检查 (try_recv: Err = 请求仍在进行, 继续缓冲)
+                        let snap = match snap_rx.as_mut().expect("未同步时必有 snap_rx").try_recv()
+                        {
+                            Ok(snap) => snap,
+                            Err(_) => {
+                                // 快照仍在路上: 只缓冲带 `u` 的 depthUpdate 帧
+                                if let Some(u) = v.get("u").and_then(Value::as_u64) {
+                                    if pending.len() >= SNAPSHOT_PENDING_CAP {
+                                        pending.remove(0);
+                                    }
+                                    pending.push((u, v));
+                                }
+                                continue;
+                            }
+                        };
+                        synced = true;
+                        match snap {
+                            Some((last_update_id, snap_book)) => {
+                                book = snap_book;
+                                tracing::info!(
+                                    target: "bn.ws", symbol = %symbol,
+                                    "depth snapshot loaded, replaying {} buffered updates",
+                                    pending.len()
+                                );
+                                // 应用快照之后的缓冲帧 (丢弃旧帧)
+                                for update in
+                                    replay_pending(&mut book, symbol, last_update_id, &mut pending)
+                                {
+                                    if tx.send(update).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                continue;
+                            }
+                            None => {
+                                tracing::warn!(
+                                    target: "bn.ws", symbol = %symbol,
+                                    "depth snapshot failed; incremental-only book may be partial"
+                                );
+                                pending.clear();
+                                // synced 已置 true: 落回直接增量的旧行为
+                            }
+                        }
+                    }
                     if apply_depth_frame(&mut book, symbol, &v) {
                         let update = OrderBookUpdate {
                             pair: symbol.to_string(),
@@ -231,38 +369,65 @@ async fn depth_session(
                     }
                 }
             }
-            Ok(Message::Ping(data)) => {
+            Some(Ok(Message::Ping(data))) => {
                 let _ = write.send(Message::Pong(data)).await;
             }
-            Ok(Message::Close(_)) => {
+            Some(Ok(Message::Close(_))) => {
                 return Err(CoreError::Network("server closed connection".into()))
             }
-            Err(e) => return Err(CoreError::Network(e.to_string())),
-            _ => {}
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(CoreError::Network(e.to_string())),
+            None => return Err(CoreError::Network("WS stream ended".into())),
         }
     }
-    Err(CoreError::Network("WS stream ended".into()))
 }
 
-// ---- User Data WS ----
+/// 消息空闲上限 (审计 H-3): 用户流事件稀疏 (无成交可能长时间无事件帧), 但服务器
+/// Ping 最长 3 分钟一次 —— 超过此时长**无任何消息 (含 Ping)** 必为 TCP 半开挂死
+/// (网络切换/NAT 超时), `read.next()` 无 timeout 会永久挂起, 行情/成交静默中断。
+const USER_DATA_READ_IDLE: Duration = Duration::from_secs(600);
 
+/// 现货用户流守护: 断线指数退避重连 (审计 H-3)。
+///
+/// - 每轮重连**重新签名**订阅请求 —— 旧签名里的 `timestamp` 超出 recvWindow 后会被
+///   币安拒绝, 复用旧请求会让"第一次断线 → 此后每次重连必失败"并无限刷屏;
+/// - 消费端退出 (`tx.is_closed()`) 即停止重连, 不再泄漏守护任务。
 async fn run_user_data_ws(
-    ws_url: &str,
-    request: &str,
+    client: BinanceClient,
+    ws_url: String,
     tx: mpsc::Sender<UserEvent>,
     ready: tokio::sync::oneshot::Sender<CoreResult<u64>>,
 ) {
     let mut ready = Some(ready);
     let mut retry = 0u32;
     loop {
-        // 每次连接都是新会话 → 必须重新发订阅请求 (WS-API 连接有 24h 上限与空闲断开)
-        match user_data_session(ws_url, request, &tx, &mut ready).await {
+        if tx.is_closed() {
+            return; // 消费端 (live 会话) 已退出: 不再重连
+        }
+        // 每次连接都是新会话 → 必须重新签名 + 重新发订阅请求 (WS-API 连接有 24h 上限与空闲断开)
+        let request = match client.ws_api_subscribe_params() {
+            Ok(p) => build_subscribe_request(&p),
+            Err(e) => {
+                // 签名失败 (密钥缺失): 首连交给调用方; 重连期 warn 后退避重试
+                if let Some(r) = ready.take() {
+                    let _ = r.send(Err(e));
+                    return;
+                }
+                tracing::warn!(target: "bn.ws", error = %e, "重新签名用户流订阅请求失败, 稍后重试");
+                tokio::time::sleep(backoff_delay(retry.saturating_add(1))).await;
+                continue;
+            }
+        };
+        match user_data_session(&ws_url, &request, &tx, &mut ready).await {
             Ok(()) => break,
             Err(e) => {
                 if let Some(r) = ready.take() {
                     // 首次握手就失败: 把错误直接交给调用方 (不重试, 避免"静默重连 + 永远不就绪")
                     let _ = r.send(Err(e));
                     return;
+                }
+                if tx.is_closed() {
+                    break;
                 }
                 retry += 1;
                 let delay = backoff_delay(retry);
@@ -287,9 +452,19 @@ async fn user_data_session(
         .await
         .map_err(|e| CoreError::Network(format!("WS-API 订阅请求发送失败: {e}")))?;
 
-    while let Some(msg) = read.next().await {
+    loop {
+        // 审计 H-3: 读超时兜底, 半开连接不再永久挂起 (超时 → Err → 上层重连)
+        let msg = match tokio::time::timeout(USER_DATA_READ_IDLE, read.next()).await {
+            Ok(m) => m,
+            Err(_) => {
+                return Err(CoreError::Network(format!(
+                    "用户流空闲超时 ({}s 无任何消息, 含 Ping), 视为半开连接",
+                    USER_DATA_READ_IDLE.as_secs()
+                )))
+            }
+        };
         match msg {
-            Ok(Message::Text(text)) => {
+            Some(Ok(Message::Text(text))) => {
                 if let Ok(v) = serde_json::from_str::<Value>(&text) {
                     match parse_ws_api_frame(&v) {
                         WsApiFrame::Event(event) => {
@@ -318,17 +493,17 @@ async fn user_data_session(
                     }
                 }
             }
-            Ok(Message::Ping(data)) => {
+            Some(Ok(Message::Ping(data))) => {
                 let _ = write.send(Message::Pong(data)).await;
             }
-            Ok(Message::Close(_)) => {
+            Some(Ok(Message::Close(_))) => {
                 return Err(CoreError::Network("server closed connection".into()))
             }
-            Err(e) => return Err(CoreError::Network(e.to_string())),
-            _ => {}
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(CoreError::Network(e.to_string())),
+            None => return Err(CoreError::Network("WS stream ended".into())),
         }
     }
-    Err(CoreError::Network("WS stream ended".into()))
 }
 
 // ---- WS-API (用户数据流) ----
@@ -581,6 +756,41 @@ mod tests {
         assert!(!apply_depth_frame(&mut book, "ETHUSDT", &serde_json::json!({"foo": 1})));
     }
 
+    /// 审计 H-4 回归: 快照重放必须丢弃 `u <= lastUpdateId` 的旧帧、按序应用其后帧 ——
+    /// 否则旧增量会把快照后的价位改回断线前的值 (残缺盘口的另一种形态)。
+    #[test]
+    fn test_replay_pending_drops_frames_at_or_before_snapshot() {
+        // 快照: bid 3000/1.0 (lastUpdateId = 10)
+        let mut book = ricow_core::OrderBook {
+            bids: vec![ricow_core::PriceLevel { price: dec!(3000), size: dec!(1.0) }],
+            asks: vec![],
+            timestamp: Utc::now(),
+        };
+        // 缓冲: u=5 (旧帧, 应丢弃) / u=12 (应应用, 3000→2.0) / u=15 (应应用, 加 3001 卖档)
+        let mut pending: Vec<(u64, Value)> = vec![
+            (5, serde_json::json!({"e": "depthUpdate", "u": 5, "b": [["3000.0", "99"]], "a": []})),
+            (
+                12,
+                serde_json::json!({"e": "depthUpdate", "u": 12, "b": [["3000.0", "2.0"]], "a": []}),
+            ),
+            (
+                15,
+                serde_json::json!({"e": "depthUpdate", "u": 15, "b": [], "a": [["3001.0", "3.0"]]}),
+            ),
+        ];
+        let updates = replay_pending(&mut book, "ETHUSDT", 10, &mut pending);
+        assert_eq!(updates.len(), 2, "快照前的帧不得产生更新");
+        // 旧帧 (u=5) 被丢弃: 3000 绝不是旧帧写入的 99 (快照 1.0 → 新帧 2.0)
+        assert_ne!(book.bids[0].size, dec!(99));
+        // 新帧按序应用
+        assert_eq!(book.bids[0].size, dec!(2.0));
+        assert_eq!(book.asks[0].price, dec!(3001));
+        assert!(pending.is_empty(), "重放必须清空缓冲");
+        // 更新帧携带重放后的完整盘口
+        assert_eq!(updates[1].bids[0].size, dec!(2.0));
+        assert_eq!(updates[1].asks[0].price, dec!(3001));
+    }
+
     #[test]
     fn test_apply_depth_frame_sorting_and_cap() {
         let mut book = ricow_core::OrderBook::default();
@@ -655,7 +865,9 @@ mod tests {
 
     #[test]
     fn test_ws_api_base_maps_hosts() {
-        let mk = |url: &str| BinanceClient::new().expect("client").with_base_url(url);
+        let mk = |url: &str| {
+            BinanceClient::new().expect("client").with_base_url(url).expect("白名单内域名")
+        };
         assert_eq!(mk("https://demo-api.binance.com").ws_api_base(), SPOT_WS_API_DEMO);
         assert_eq!(mk("https://api.binance.com").ws_api_base(), SPOT_WS_API_MAINNET);
         assert_eq!(mk("https://testnet.binance.vision").ws_api_base(), SPOT_WS_API_TESTNET);
@@ -663,7 +875,9 @@ mod tests {
 
     #[test]
     fn test_ws_base_maps_demo_and_testnet_hosts() {
-        let mk = |url: &str| BinanceClient::new().expect("client").with_base_url(url);
+        let mk = |url: &str| {
+            BinanceClient::new().expect("client").with_base_url(url).expect("白名单内域名")
+        };
         assert_eq!(
             mk("https://demo-api.binance.com").ws_base(),
             SPOT_DEMO_WS,
@@ -671,6 +885,26 @@ mod tests {
         );
         assert_eq!(mk("https://api.binance.com").ws_base(), SPOT_MAINNET_WS);
         assert_eq!(mk("https://testnet.binance.vision").ws_base(), SPOT_TESTNET_WS);
+    }
+
+    #[test]
+    fn test_base_url_whitelist_blocks_foreign_hosts() {
+        // 审计 H-6: 环境变量/显式覆盖指向白名单外主机 → 构造期硬失败。
+        for bad in ["https://evil.com", "http://169.254.169.254", "https://binance.com.evil.io"] {
+            assert!(
+                BinanceClient::new().unwrap().with_base_url(bad).is_err(),
+                "{bad} 不应通过白名单"
+            );
+        }
+        // 白名单内: 币安系域名 + 回环。
+        for ok in [
+            "https://api.binance.com",
+            "https://demo-api.binance.com",
+            "https://testnet.binance.vision",
+            "http://127.0.0.1:8080",
+        ] {
+            assert!(BinanceClient::new().unwrap().with_base_url(ok).is_ok(), "{ok} 应放行");
+        }
     }
 
     #[test]

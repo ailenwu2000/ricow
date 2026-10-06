@@ -586,6 +586,7 @@ mod tests {
                 base_url: base_url.map(|s| s.to_string()),
                 max_turns: None,
                 api_key: api_key.map(|s| s.to_string()),
+                allow_custom_base_url: None,
             },
             exchange: ExchangeSection::default(),
             market: MarketSection::default(),

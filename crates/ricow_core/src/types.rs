@@ -356,3 +356,50 @@ pub struct OrderBookUpdate {
     pub asks: Vec<PriceLevel>,
     pub timestamp: DateTime<Utc>,
 }
+
+// ---------------------------------------------------------------------------
+// URL 主机解析 (审计 H-6/H-7 共用)
+// ---------------------------------------------------------------------------
+
+/// 从 `scheme://host[:port]/path` 形式的 URL 提取**小写主机名** (去 userinfo/端口, IPv6 去括号)。
+///
+/// 放在 `ricow_core`: 币安 REST 域名白名单 (H-6) 与 AI 端点主机白名单 (H-7) 各自做主机
+/// 判定时共用这一份解析, 避免"各抄一份解析逻辑、某一份有洞"的安全缺口。
+/// 解析不出主机名(非绝对 URL / 空主机) → `None`, 调用方一律按**拒绝**处理。
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    // authority 到路径/查询/片段为止; 去掉 userinfo(`user@host`)。
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    // IPv6 用 `[...]` 括起来; 其余按第一个 `:` 切端口。
+    let host = if let Some(tail) = authority.strip_prefix('[') {
+        tail.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod url_host_tests {
+    use super::url_host;
+
+    #[test]
+    fn test_url_host_extracts_lowercase_host() {
+        assert_eq!(url_host("https://api.binance.com").as_deref(), Some("api.binance.com"));
+        assert_eq!(
+            url_host("https://API.Binance.COM/api/v3/time").as_deref(),
+            Some("api.binance.com")
+        );
+        assert_eq!(url_host("http://127.0.0.1:8787/x?y=1").as_deref(), Some("127.0.0.1"));
+        assert_eq!(url_host("http://user:pw@evil.example:8080/p").as_deref(), Some("evil.example"));
+        assert_eq!(url_host("http://[::1]:11434/v1").as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn test_url_host_rejects_unparseable() {
+        assert_eq!(url_host("api.binance.com"), None, "无 scheme 不是绝对 URL");
+        assert_eq!(url_host("https://"), None);
+        assert_eq!(url_host(""), None);
+    }
+}

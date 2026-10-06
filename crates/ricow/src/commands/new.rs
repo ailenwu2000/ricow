@@ -182,8 +182,6 @@ fn template_default(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// 参数合成优先级: CLI --param > 模板默认; 保留键拒绝。
     #[test]
     fn test_param_merge_priority_and_reserved_keys() {

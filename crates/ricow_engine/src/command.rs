@@ -134,6 +134,13 @@ const FUNDING_LOOKBACK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// 资金费增量拉取间隔 (014 D4): 30 分钟 —— 资金费 8h 结算一次, 该粒度足够且无变现频压力。
 const FUNDING_POLL_SECS: u64 = 1800;
 
+/// 行情陈旧判定阈值 (秒): 深度流正常 100ms 一帧, 超过此阈值无任何行情帧 = 流已死或挂起
+/// (审计 H-4 看门狗)。WS 守护层内部重连对主循环透明, `Quote(None)` 分支实际不可达,
+/// 该阈值是断线的最后一道可观测防线。
+const QUOTE_STALE_SECS: u64 = 120;
+/// 看门狗巡检间隔 (秒)。
+const WATCHDOG_INTERVAL_SECS: u64 = 30;
+
 /// 实盘双流事件 (行情 / 用户数据流 / 停机信号 / 资金费对账)。
 enum LiveEvent {
     Stop(Option<StopRequest>),
@@ -141,6 +148,8 @@ enum LiveEvent {
     User(Option<UserEvent>),
     /// 资金费增量拉取 (014 FR-003): 不驱动策略 tick, 只对账落库。
     Funding,
+    /// 行情健康巡检 (审计 H-4): 行情超过 [`QUOTE_STALE_SECS`] 无帧时 error 告警。
+    Watchdog,
 }
 
 /// 拉取资金费流水并落库 (014 FR-003): 水位 = db `MAX(funding_time)`(无记录则回溯 `FUNDING_LOOKBACK_MS`)。
@@ -1085,6 +1094,11 @@ impl Engine {
         }
         let mut funding_tick = tokio::time::interval(Duration::from_secs(FUNDING_POLL_SECS));
         funding_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut watchdog_tick = tokio::time::interval(Duration::from_secs(WATCHDOG_INTERVAL_SECS));
+        watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 行情健康跟踪: 最近一帧的时刻 + 陈旧告警是否已发出 (恢复后重置, 避免告警风暴)
+        let mut last_quote_at = std::time::Instant::now();
+        let mut quote_stale_reported = false;
         tracing::info!(target: "engine", name = %strategy_name, pair = %pair, mode = %mode.label(), "live run started");
 
         let mut stop_rx = stop;
@@ -1106,11 +1120,13 @@ impl Engine {
                     upd = quote_stream.next() => LiveEvent::Quote(upd),
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
+                    _ = watchdog_tick.tick() => LiveEvent::Watchdog,
                 },
                 None => tokio::select! {
                     upd = quote_stream.next() => LiveEvent::Quote(upd),
                     ev = user_stream.next() => LiveEvent::User(ev),
                     _ = funding_tick.tick() => LiveEvent::Funding,
+                    _ = watchdog_tick.tick() => LiveEvent::Watchdog,
                 },
             };
 
@@ -1135,12 +1151,36 @@ impl Engine {
                         }
                     }
                 }
+                LiveEvent::Watchdog => {
+                    // 审计 H-4: WS 守护层内部重连对本循环透明, Quote(None) 实际不可达;
+                    // 行情超过阈值无帧 = 流已死/半开挂起。error 告警 + 落 last_error 供
+                    // 台账/通知可查 (恢复后 info 并重置)。告警不打断策略循环 —— 下单本身
+                    // 依赖行情价, 运维收到告警后可人工停机。
+                    let stale = last_quote_at.elapsed();
+                    if stale >= Duration::from_secs(QUOTE_STALE_SECS) {
+                        if !quote_stale_reported {
+                            quote_stale_reported = true;
+                            let msg = format!(
+                                "行情陈旧: 已 {}s 未收到任何盘口帧 (阈值 {}s), 疑似行情流断线/挂起; 策略仍在运行, 请人工核实网络与行情状态",
+                                stale.as_secs(),
+                                QUOTE_STALE_SECS
+                            );
+                            tracing::error!(target: "engine", name = %strategy_name, pair = %pair, "{}", msg);
+                            outcome.last_error = Some(msg);
+                        }
+                    } else if quote_stale_reported {
+                        quote_stale_reported = false;
+                        tracing::info!(target: "engine", name = %strategy_name, pair = %pair, "行情已恢复");
+                    }
+                }
                 LiveEvent::Quote(None) => {
                     outcome.stop_reason = Some(StopReason::StreamEnded);
                     outcome.last_error = Some("行情流中断 (WebSocket 断开)".into());
                     break;
                 }
                 LiveEvent::Quote(Some(update)) => {
+                    last_quote_at = std::time::Instant::now();
+                    quote_stale_reported = false;
                     let ob = market::to_orderbook(update);
                     ctx.update_orderbook(&pair, ob);
                     outcome.ticks += 1;

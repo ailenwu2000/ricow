@@ -19,14 +19,51 @@ const SPOT_TESTNET_REST: &str = "https://testnet.binance.vision";
 type HmacSha256 = Hmac<Sha256>;
 
 /// 构建带超时的 reqwest 客户端。
+///
+/// `redirect::Policy::none()` (审计 H-6): API 客户端不该跟随重定向 —— 默认策略会跟最多
+/// 10 跳, 签名与 `X-MBX-APIKEY` 自定义头不在 reqwest 的跨主机剥离列表里, 会原样发到跳转目标。
 fn build_http() -> CoreResult<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| CoreError::Network(e.to_string()))
 }
 
-/// Binance 现货 HTTP 客户端。
+/// base_url 主机白名单 (审计 H-6): 只放行**币安系域名**与**回环地址** (本地代理/测试)。
+///
+/// `RICOW_BN_BASE_URL` / `RICOW_FAPI_BASE_URL` 或 `with_base_url` 把签名请求指向白名单外
+/// 的主机 → 硬失败: 本机恶意进程改一个环境变量就能把 API key、signature 与全部请求参数
+/// (含下单意图) 静默导流到第三方主机, 这条门让该路径在构造客户端时即报错。
+pub(crate) fn validate_base_url(base_url: &str) -> CoreResult<()> {
+    let Some(host) = ricow_core::url_host(base_url) else {
+        return Err(CoreError::InvalidArgument(format!(
+            "base_url '{base_url}' 非法: 解析不出主机名 (需形如 https://api.binance.com)"
+        )));
+    };
+    let allowed = host == "binance.com"
+        || host.ends_with(".binance.com")
+        || host == "binance.vision"
+        || host.ends_with(".binance.vision")
+        || matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    if allowed {
+        Ok(())
+    } else {
+        Err(CoreError::InvalidArgument(format!(
+            "base_url 主机 '{host}' 不在白名单 (仅允许 *.binance.com / *.binance.vision / 回环地址): \
+             REST 域名决定签名请求发往何处, 放行未知主机等于把 API key 与签名交给它。\
+             请检查环境变量 RICOW_BN_BASE_URL / RICOW_FAPI_BASE_URL 是否被改过"
+        )))
+    }
+}
+
+/// env 覆盖 base_url 时的醒目警告 (审计 H-6): 域名被改过必须留痕, 不能静默生效。
+pub(crate) fn warn_base_url_override(env_name: &str, base_url: &str) {
+    tracing::warn!("{env_name} 覆盖 REST 域名 → {base_url} (已过主机白名单; 非本人操作请排查环境)");
+}
+
+/// Binance 现货 HTTP 客户端 (Clone 便宜: reqwest::Client 内部即 Arc, 供 WS 快照闭包捕获)。
+#[derive(Clone)]
 pub struct BinanceClient {
     http: reqwest::Client,
     base_url: String,
@@ -47,8 +84,12 @@ impl BinanceClient {
     pub fn new() -> CoreResult<Self> {
         let http = build_http()?;
         // 域名可配置 (备用数据域名/代理环境): RICOW_BN_BASE_URL 覆盖, 缺省主网。
-        let base_url =
-            std::env::var("RICOW_BN_BASE_URL").unwrap_or_else(|_| SPOT_MAINNET_REST.to_string());
+        let env = std::env::var("RICOW_BN_BASE_URL").ok();
+        let base_url = env.clone().unwrap_or_else(|| SPOT_MAINNET_REST.to_string());
+        validate_base_url(&base_url)?;
+        if env.is_some() {
+            warn_base_url_override("RICOW_BN_BASE_URL", &base_url);
+        }
         Ok(Self { http, base_url, api_key: None, secret_key: None })
     }
 
@@ -65,9 +106,14 @@ impl BinanceClient {
     }
 
     /// 显式指定 REST 域名 (覆盖 `RICOW_BN_BASE_URL`; demo/测试网/自建代理用)。
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
+    ///
+    /// 主机必须在白名单内 (审计 H-6), 否则返回错误 —— 调用方多为编译期常量
+    /// (demo 域名), 报错即说明常量或调用链被人改过。
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> CoreResult<Self> {
+        let base_url = base_url.into();
+        validate_base_url(&base_url)?;
+        self.base_url = base_url;
+        Ok(self)
     }
 
     /// 现货 WS-API 用户数据流 (`userDataStream.subscribe.signature`) 的订阅参数。
@@ -160,6 +206,27 @@ impl BinanceClient {
         let bids = parse_levels(v["bids"].as_array());
         let asks = parse_levels(v["asks"].as_array());
         Ok(OrderBook { bids, asks, timestamp: Utc::now() })
+    }
+
+    /// 拉取盘口快照 (含 `lastUpdateId`) —— WS 盘口重连后重建累计盘口用 (审计 H-4)。
+    ///
+    /// 与 [`Self::get_depth`] 的区别: 额外带回 `lastUpdateId`, 供 depth session 丢弃
+    /// 快照之前的增量帧, 保证"快照 → 其后增量"的衔接。
+    pub(crate) async fn depth_snapshot(
+        &self,
+        symbol: &str,
+        limit: u32,
+    ) -> CoreResult<(u64, OrderBook)> {
+        let url = format!(
+            "{}/api/v3/depth?symbol={}&limit={limit}",
+            self.base_url,
+            symbol.to_uppercase()
+        );
+        let v: Value = self.get_json(&url).await?;
+        let bids = parse_levels(v["bids"].as_array());
+        let asks = parse_levels(v["asks"].as_array());
+        let last_update_id = v["lastUpdateId"].as_u64().unwrap_or(0);
+        Ok((last_update_id, OrderBook { bids, asks, timestamp: Utc::now() }))
     }
 
     /// 交易所服务器时间 (`GET /api/v3/time`) —— 实盘启动前时钟预检的数据源。
@@ -618,6 +685,7 @@ mod tests {
         let c = BinanceClient::new()
             .unwrap()
             .with_base_url("https://demo-api.binance.com")
+            .unwrap()
             .with_credentials("KEY".into(), "SECRET".into());
         let p = c.ws_api_subscribe_params().unwrap();
         let api_key = p.iter().find(|(k, _)| k == "apiKey").unwrap().1.clone();

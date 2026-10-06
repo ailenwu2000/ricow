@@ -92,6 +92,9 @@ pub struct AiConfig {
     pub model: String,
     pub base_url: Option<String>,
     pub max_turns: usize,
+    /// 显式确认白名单外的自建/中转主机 (审计 H-7)。默认 false: 非白名单主机直接拒绝,
+    /// 防止"从网上抄的配置"或被改写的配置把 api_key 与完整对话上下文静默发给第三方。
+    pub allow_custom_base_url: bool,
 }
 
 /// 解析后的最终参数(base_url/model 已合成, env 覆盖已应用)。
@@ -130,12 +133,59 @@ pub fn check_max_turns(n: i64) -> CoreResult<usize> {
     Ok(n as usize)
 }
 
+/// 已知厂商主机集合 (由预设表推导, 加预设自动带上)。
+fn known_provider_hosts() -> Vec<String> {
+    PRESETS.iter().filter_map(|p| ricow_core::url_host(p.base_url)).collect()
+}
+
+/// AI base_url 目标主机门 (审计 H-7)。
+///
+/// api_key 以 Bearer 头直接发往 base_url, 对话上下文可能含账户/持仓/策略参数 ——
+/// base_url 被"从网上抄的配置"或恶意本地进程指向第三方主机时全部外流。防线:
+/// - **本机回环** (Ollama / 本地网关): 任意 scheme 放行;
+/// - **非本机**: 必须https (明文 http 直接拒) + 主机在已知厂商白名单(由预设表推导);
+/// - **白名单外的自建/中转**: 需配置 `allow_custom_base_url = true` 显式确认(人工版
+///   "新域名首次使用确认"), 放行时打醒目警告留痕。
+pub(crate) fn validate_base_url_host(base_url: &str, allow_custom: bool) -> CoreResult<()> {
+    let Some(host) = ricow_core::url_host(base_url) else {
+        return Err(CoreError::InvalidArgument(format!(
+            "base_url '{base_url}' 非法: 解析不出目标主机名"
+        )));
+    };
+    let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    if loopback {
+        return Ok(());
+    }
+    if !base_url.starts_with("https://") {
+        return Err(CoreError::InvalidArgument(format!(
+            "非本机 AI base_url '{base_url}' 必须使用 https: 明文 http 会把 api_key 与完整对话内容暴露给网络路径"
+        )));
+    }
+    let known = known_provider_hosts();
+    if known.iter().any(|h| h == &host) {
+        return Ok(());
+    }
+    if !allow_custom {
+        return Err(CoreError::InvalidArgument(format!(
+            "AI base_url 主机 '{host}' 不在已知厂商白名单 ({})。\n\
+             若确为自建/中转端点: 在 ricow.toml 的 [ai] 段加一行 allow_custom_base_url = true 显式确认 \
+             (api_key 与对话内容将发送到该主机, 请确认它归你信任的一方)",
+            known.join(", ")
+        )));
+    }
+    tracing::warn!(
+        "AI base_url 指向自定义主机 '{host}' (allow_custom_base_url=true): api_key 与对话内容将发送到该主机"
+    );
+    Ok(())
+}
+
 /// 合成最终参数: 预设给默认 base_url/模型, 配置文件可覆盖, env 覆盖优先(冒烟/换端点)。
 ///
 /// 规则(全部"报错不回落"):
 /// - `provider` 必须命中预设或为 `custom`(custom 必须给 base_url);
 /// - `model` 必须非空(预设的推荐模型可用于填空, 但 OpenRouter/Ollama 无推荐值);
-/// - env `RICOW_AI_BASE_URL` / `RICOW_AI_MODEL` 覆盖前两者(用于真实冒烟)。
+/// - env `RICOW_AI_BASE_URL` / `RICOW_AI_MODEL` 覆盖前两者(用于真实冒烟);
+/// - base_url 目标主机门 (审计 H-7, 见 [`validate_base_url_host`])。
 pub fn resolve(
     cfg: &AiConfig,
     env_base_url: Option<String>,
@@ -165,6 +215,7 @@ pub fn resolve(
             "base_url '{base_url}' 非法: 需以 http:// 或 https:// 开头"
         )));
     }
+    validate_base_url_host(&base_url, cfg.allow_custom_base_url)?;
 
     let model = env_m
         .or_else(|| Some(cfg.model.clone()).filter(|s| !s.is_empty()))
@@ -207,6 +258,7 @@ mod tests {
             model: model.into(),
             base_url: None,
             max_turns: DEFAULT_MAX_TURNS,
+            allow_custom_base_url: false,
         }
     }
 
@@ -238,6 +290,7 @@ mod tests {
     fn test_resolve_env_overrides_file_and_preset() {
         let mut c = cfg("deepseek", "deepseek-flash");
         c.base_url = Some("https://my-proxy.local/v1".into());
+        c.allow_custom_base_url = true; // 白名单外自建端点: 显式确认后放行
         let r = resolve(&c, Some("http://127.0.0.1:11434/v1".into()), Some("qwen3:0.6b".into()))
             .unwrap();
         assert_eq!(r.base_url, "http://127.0.0.1:11434/v1");
@@ -253,6 +306,7 @@ mod tests {
         assert!(err.contains("base_url"), "{err}");
         let mut c = cfg("myproxy", "m");
         c.base_url = Some("https://x.local/v1".into());
+        c.allow_custom_base_url = true;
         assert_eq!(resolve(&c, None, None).unwrap().base_url, "https://x.local/v1");
     }
 
@@ -270,5 +324,34 @@ mod tests {
         // OpenRouter / Ollama 无推荐模型 → 必须让用户填
         let err = resolve(&cfg("openrouter", ""), None, None).unwrap_err().to_string();
         assert!(err.contains("model") || err.contains("模型"), "{err}");
+    }
+
+    /// 审计 H-7: base_url 目标主机门。
+    #[test]
+    fn test_base_url_host_gate() {
+        // 本机回环: 任意 scheme 放行 (Ollama / 本地网关)。
+        for ok in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:1234/v1",
+            "https://api.deepseek.com/v1", // 预设厂商
+            "https://dashscope.aliyuncs.com/compatible-mode/v1", // 预设厂商
+        ] {
+            assert!(validate_base_url_host(ok, false).is_ok(), "{ok} 应放行");
+        }
+        // 非本机 + 明文 http → 直接拒 (与 allow_custom 无关)。
+        for bad in ["http://api.deepseek.com/v1", "http://my-relay.example.com/v1"] {
+            assert!(validate_base_url_host(bad, true).is_err(), "{bad} 必须拒绝");
+        }
+        // 非本机 + https + 白名单外: 未显式确认拒, 确认后放行。
+        assert!(validate_base_url_host("https://my-relay.example.com/v1", false).is_err());
+        assert!(validate_base_url_host("https://my-relay.example.com/v1", true).is_ok());
+        // 解析不出主机的怪串 → 拒。
+        assert!(validate_base_url_host("https:///path", false).is_err());
+        // 拒绝文案要点名主机 + 给出确认方法。
+        let err = validate_base_url_host("https://my-relay.example.com/v1", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("my-relay.example.com"), "{err}");
+        assert!(err.contains("allow_custom_base_url"), "{err}");
     }
 }

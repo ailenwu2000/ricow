@@ -205,12 +205,12 @@ fn arg_str(args: &Value, key: &str) -> Result<String, ToolExecutionError> {
         .ok_or_else(|| ToolExecutionError::invalid_args(format!("缺少参数 {key}(字符串)")))
 }
 
-/// 策略名安全校验: 只接受单段名字, 不允许路径分隔/上跳(防目录穿越)。
+/// 策略名安全校验 (审计 安全-12): 收敛到 `ricow_strategy::validate_strategy_name()` 白名单
+/// (`[A-Za-z0-9_-]`、≤24 字符) —— 此前本处自维护的黑名单不拦 `:`, Windows 上
+/// `name="C:x"` 经 `Path::join` 会**替换整个路径**变成盘符相对路径, 读到 C 盘任意 `.log`。
+/// 名字同时会派生订单归属前缀, 与写盘/启动入口共用同一份校验, 不再各抄一份留缺口。
 fn safe_strategy_name(name: &str) -> Result<(), ToolExecutionError> {
-    if name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') {
-        return Err(ToolExecutionError::invalid_args("策略名不能包含路径分隔符或 .."));
-    }
-    Ok(())
+    ricow_strategy::validate_strategy_name(name).map_err(ToolExecutionError::invalid_args)
 }
 
 /// 列出某 strategies 目录下全部 *.toml 策略名(不存在 → 空)。会话数据目录用, 不走全局 ROOT。
@@ -2198,7 +2198,18 @@ mod tests {
     fn test_safe_strategy_name_blocks_traversal() {
         assert!(safe_strategy_name("grid_v1").is_ok());
         assert!(safe_strategy_name("grid-v1").is_ok());
-        for bad in ["../secret", "a/b", "a\\b", ".hidden"] {
+        // 审计 安全-12 的收敛目标: 路径分隔 / 上跳 / 隐藏前缀 / **Windows 盘符 `:`** / 超长
+        // 一律拒 (盘符样本是本次缺口的关键: `C:x` 经 Path::join 会替换整个路径)。
+        for bad in [
+            "../secret",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "C:x",
+            "C:\\x",
+            "D:",
+            "超长名字超过二十四个字符的上限了xxxx",
+        ] {
             assert!(safe_strategy_name(bad).is_err(), "{bad} 应被拒绝");
         }
     }

@@ -19,6 +19,7 @@ use ricow_core::{CoreError, CoreResult, Kline, Market};
 use rust_decimal::Decimal;
 use serde_json::Value;
 
+use crate::client::{validate_base_url, warn_base_url_override};
 use crate::retry::{send_with_retry, status_error, RequestKind, RetryPolicy};
 
 /// USDT-M 合约主网 REST。
@@ -43,11 +44,17 @@ impl FuturesDataClient {
     pub fn new() -> CoreResult<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            // 审计 H-6: 公共数据客户端同样不跟随重定向 (K 线 URL 含符号参数, 不外流密钥但同样不该被导流)。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CoreError::Network(e.to_string()))?;
         // 域名可配置 (代理/备用环境): RICOW_FAPI_BASE_URL 覆盖, 缺省主网。
-        let base_url =
-            std::env::var("RICOW_FAPI_BASE_URL").unwrap_or_else(|_| FAPI_MAINNET_REST.to_string());
+        let env = std::env::var("RICOW_FAPI_BASE_URL").ok();
+        let base_url = env.clone().unwrap_or_else(|| FAPI_MAINNET_REST.to_string());
+        validate_base_url(&base_url)?;
+        if env.is_some() {
+            warn_base_url_override("RICOW_FAPI_BASE_URL", &base_url);
+        }
         Ok(Self { http, base_url })
     }
 

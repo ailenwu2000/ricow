@@ -486,6 +486,7 @@ async fn one_shot(root: &Path, preamble: &str, prompt: &str) -> CoreResult<Strin
             .map(config::check_max_turns)
             .transpose()?
             .unwrap_or(config::DEFAULT_MAX_TURNS),
+        allow_custom_base_url: file.ai.allow_custom_base_url.unwrap_or(false),
     };
     // 覆盖优先级与对话会话一致: 环境变量 > ricow.toml > 预设(Web 无命令行覆盖层)。
     let env_base_url = std::env::var(config::ENV_BASE_URL).ok();

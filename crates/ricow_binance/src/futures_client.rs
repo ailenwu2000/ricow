@@ -20,16 +20,23 @@ use ricow_core::{
 use rust_decimal::Decimal;
 use serde_json::Value;
 
-use crate::client::{build_query_string, check_bn_response, parse_levels, sign_hmac_sha256};
+use crate::client::{
+    build_query_string, check_bn_response, parse_levels, sign_hmac_sha256, validate_base_url,
+    warn_base_url_override,
+};
 use crate::retry::{send_with_retry, status_error, RequestKind, RetryPolicy};
 
 /// USDT-M 合约主网 REST。
 const FAPI_MAINNET_REST: &str = "https://fapi.binance.com";
 
 /// 构建带超时的 reqwest 客户端。
+///
+/// `redirect::Policy::none()` (审计 H-6): 默认重定向策略会把签名与 `X-MBX-APIKEY`
+/// 自定义头带到跳转目标主机, API 客户端一律不跟随重定向。
 fn build_http() -> CoreResult<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| CoreError::Network(e.to_string()))
 }
@@ -59,8 +66,12 @@ impl FuturesClient {
     pub fn new() -> CoreResult<Self> {
         let http = build_http()?;
         // 域名可配置 (代理/测试环境): RICOW_FAPI_BASE_URL 覆盖, 缺省主网。
-        let base_url =
-            std::env::var("RICOW_FAPI_BASE_URL").unwrap_or_else(|_| FAPI_MAINNET_REST.to_string());
+        let env = std::env::var("RICOW_FAPI_BASE_URL").ok();
+        let base_url = env.clone().unwrap_or_else(|| FAPI_MAINNET_REST.to_string());
+        validate_base_url(&base_url)?;
+        if env.is_some() {
+            warn_base_url_override("RICOW_FAPI_BASE_URL", &base_url);
+        }
         Ok(Self { http, base_url, api_key: None, secret_key: None })
     }
 
@@ -71,9 +82,18 @@ impl FuturesClient {
         base_url: Option<String>,
     ) -> CoreResult<Self> {
         let http = build_http()?;
-        let base_url = base_url.unwrap_or_else(|| {
-            std::env::var("RICOW_FAPI_BASE_URL").unwrap_or_else(|_| FAPI_MAINNET_REST.to_string())
-        });
+        let base_url = match base_url {
+            Some(u) => u,
+            None => {
+                let env = std::env::var("RICOW_FAPI_BASE_URL").ok();
+                let u = env.clone().unwrap_or_else(|| FAPI_MAINNET_REST.to_string());
+                if env.is_some() {
+                    warn_base_url_override("RICOW_FAPI_BASE_URL", &u);
+                }
+                u
+            }
+        };
+        validate_base_url(&base_url)?;
         Ok(Self { http, base_url, api_key: Some(api_key), secret_key: Some(secret_key) })
     }
 
@@ -82,9 +102,13 @@ impl FuturesClient {
     }
 
     /// 显式指定 REST 域名 (覆盖 `RICOW_FAPI_BASE_URL`; demo/测试网用)。
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
+    ///
+    /// 主机必须在白名单内 (审计 H-6), 否则返回错误。
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> CoreResult<Self> {
+        let base_url = base_url.into();
+        validate_base_url(&base_url)?;
+        self.base_url = base_url;
+        Ok(self)
     }
 
     fn ensure_credentials(&self) -> CoreResult<(&str, &str)> {
@@ -184,6 +208,29 @@ impl FuturesClient {
             asks: parse_levels(v["asks"].as_array()),
             timestamp: Utc::now(),
         })
+    }
+
+    /// 拉取盘口快照 (含 `lastUpdateId`) —— WS 盘口重连后重建累计盘口用 (审计 H-4)。
+    pub(crate) async fn depth_snapshot(
+        &self,
+        symbol: &str,
+        limit: u32,
+    ) -> CoreResult<(u64, OrderBook)> {
+        let url = format!(
+            "{}/fapi/v1/depth?symbol={}&limit={limit}",
+            self.base_url,
+            symbol.to_uppercase()
+        );
+        let v: Value = self.get_json(&url).await?;
+        let last_update_id = v["lastUpdateId"].as_u64().unwrap_or(0);
+        Ok((
+            last_update_id,
+            OrderBook {
+                bids: parse_levels(v["bids"].as_array()),
+                asks: parse_levels(v["asks"].as_array()),
+                timestamp: Utc::now(),
+            },
+        ))
     }
 
     /// listenKey 生命周期 (`POST/PUT/DELETE /fapi/v1/listenKey`) —— 合约用户数据流入口。

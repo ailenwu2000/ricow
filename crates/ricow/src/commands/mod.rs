@@ -111,7 +111,7 @@ pub(crate) fn bn_spot_signed_mode(
     let (key, secret) = load_credentials(mode)?;
     let mut client = ricow_binance::BinanceClient::new()?.with_credentials(key, secret);
     if mode == Mode::Demo {
-        client = client.with_base_url(DEMO_SPOT_URL);
+        client = client.with_base_url(DEMO_SPOT_URL)?;
     }
     Ok(std::sync::Arc::new(ricow_binance::BnSpotExchange::new(client)))
 }
@@ -123,7 +123,7 @@ pub(crate) fn bn_futures_signed_mode(
     let (key, secret) = load_credentials(mode)?;
     let mut client = ricow_binance::FuturesClient::with_credentials(key, secret, None)?;
     if mode == Mode::Demo {
-        client = client.with_base_url(DEMO_FAPI_URL);
+        client = client.with_base_url(DEMO_FAPI_URL)?;
     }
     Ok(ricow_binance::BnFuturesExchange::new(client))
 }
@@ -149,11 +149,11 @@ pub(crate) async fn fetch_clock_skew(market: &str, mode: Mode) -> CoreResult<i64
     let server = if market.eq_ignore_ascii_case("futures") {
         // 公开端点: 无需凭据
         let c = ricow_binance::FuturesClient::new()?;
-        let c = if demo { c.with_base_url(DEMO_FAPI_URL) } else { c };
+        let c = if demo { c.with_base_url(DEMO_FAPI_URL)? } else { c };
         c.server_time().await
     } else {
         let c = ricow_binance::BinanceClient::new()?;
-        let c = if demo { c.with_base_url(DEMO_SPOT_URL) } else { c };
+        let c = if demo { c.with_base_url(DEMO_SPOT_URL)? } else { c };
         c.server_time().await
     }
     .map_err(|e| {
@@ -286,22 +286,14 @@ pub(crate) fn read_strategy_config_in(
     StrategyConfig::from_toml(&text).ok()
 }
 
-/// 写文件类动作的策略名门禁(防目录穿越): 只接受单段名, 不得含路径分隔/上跳/隐藏前缀。
+/// 写文件类动作的策略名门禁(防目录穿越): 收敛到 `ricow_strategy::validate_strategy_name()`
+/// 白名单(`[A-Za-z0-9_-]`、≤24 字符; 审计 安全-12 —— 三份黑名单只留这一份权威实现)。
 ///
-/// 与 `ai::tools::safe_strategy_name` 同一口径 —— 那一个在工具入口校验(模型入参),
-/// 这一个在**宿主内核**再校验一次(写盘/删除路径的最后一道, 不依赖上游是否校验过)。
+/// 与 `ai::tools::safe_strategy_name` / `web::logs::log_path_of` 同口径 —— 它们在工具与
+/// 端点入口校验, 这一个在**宿主内核**再校验一次(写盘/删除路径的最后一道, 不依赖上游是否校验过)。
 fn safe_strategy_file_stem(name: &str) -> CoreResult<()> {
-    if name.is_empty()
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains("..")
-        || name.starts_with('.')
-    {
-        return Err(CoreError::InvalidArgument(format!(
-            "策略名非法: \"{name}\" (不得为空、不得含路径分隔符/..)"
-        )));
-    }
-    Ok(())
+    ricow_strategy::validate_strategy_name(name)
+        .map_err(|e| CoreError::InvalidArgument(format!("策略名非法: {e}")))
 }
 
 /// 参数值渲染(回执用): 字符串原样, 数值/布尔按字面。
