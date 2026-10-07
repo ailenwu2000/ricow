@@ -109,6 +109,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 **Web UI 工作台化(032, 2026-09-29)**: `ricow web` 从「浏览器内对话工作台」升级为**多视图工作台** —— 左侧导航 + 五视图(对话 / 市场 / 策略 / 运行 / 设置), 视图间用 **hash 路由**(`#chat` / `#markets` / `#strategies[/{id}]` / `#runs` / `#settings`, 刷新恢复)。上列 D18 中的「图表可视化 / 前端构建链」由本变更推翻并按新口径执行, 其余(WSS / 公网 / 多用户 / 会话导出)仍不做。
 
 - **前端脚本拆分(仍无构建链)**: 三件套拆为 `common.js`(API/双语/工具) + `router.js`(hash 路由) + 五视图模块(`chat.js` / `markets.js` / `strategies.js` / `runs.js` / `settings.js`) + `app.js`(装配), 全部 `include_str!` 编译期嵌入; K 线图用 **lightweight-charts UMD 内嵌**(无 CDN 依赖); 每份脚本 URL 仍由服务端按 token 回填。浏览器持久存储依旧零写入(SC-011 静态扫描锁死)。
+- **资产单一清单 + 开发回路(041, 2026-10-07)**: 全部可服务资产收敛为 `web/assets.rs` 的模块级 `const ASSETS`(文件名 / Content-Type / 内嵌副本) —— **运行时路由表与 `--web-assets-dir` 的磁盘白名单都由它派生**, 消除了最后一处手抄点(历史事故: 033 新增 `keys.js` 时三处手写清单**一处都没追加**, 存储红线 / 只读红线 / 首页对齐三项断言**集体漏扫且全绿**)。发布形态不变(**内嵌单二进制**); `ricow web --web-assets-dir <DIR>` 时改从**同一批文件名**热读磁盘 —— 改一行 JS 刷新即见, 免 `cargo build` 全量重编。安全形状: 磁盘寻址一律 `规范化目录.join(编译期常量名)`, **请求里的路径从不参与拼路径** → 无 `..` 穿越、无任意文件读取(结构上不可能, 而非过滤攻击串); 目录在**启动时**校验(存在 / 是目录 / 含 `index.html`), 否则 exit 1 并给可操作文案; 磁盘模式**缺文件 → 500 并点名文件**, **不静默退回内嵌**(同 040 的诚实性口径); `Cache-Control: no-store` **只加在磁盘来源**(内嵌来源行为一字未改, 有意的不对称); 走**同一批路由与同一道 token 门**, 不新开端口 / 不新增放行口。纪律扫描口径不放松 —— 扫描对象仍是内嵌副本, 而磁盘目录按约定就是下一次 `cargo build` 要内嵌的同一批文件。
 - **新增只读/写端点**(全部仍在 token 中间件之后): 密钥与配置 `GET/POST /api/config/keys`(密钥静默写入 ricow.toml 只回显尾 4 位; 通用配置走 `updates` 数组 —— 市场视野开关 `market.show_all_pairs` 同端点); 行情 `GET /api/markets*`(免 key 公共行情 + 盘口 + K 线); 策略 `GET/POST /api/strategies`(POST = 创建/覆盖保存: 编译门禁 + 运行中 409 + 保留名/互前缀拒绝)、`GET .../source`(Lua/TOML 原文)、`POST .../ai-edit`(LLM 草稿, 编译失败 400 带行号)、`POST /api/backtest`(202 拿 job_id 后台跑 CLI 同一内核)+ `GET /api/backtest/{job_id}` 轮询; 运行 `GET /api/runs`、`POST /api/strategies/{id}/{status|start|stop}`(启停复用 CLI 同一内核 `commands::ctrl`, daemon 自举幂等)、`GET /api/logs/{name}/stream`(SSE 行内日志, 与对话视图各一条独立流); **`GET /metrics`**(038: Prometheus 只读指标, 不新开端口, 见 §六「工程健壮性加固」)。
 - **Web 渠道确认规则(宪法 1.2.0, FR-027~029)**: 页面直控写操作的确认 = 页面显式交互(确认对话框/表单提交); live 不降级 —— 启动模态逐字输 `确认实盘 <策略名>`, 首次 live 另须风险披露确认(逐字输 `确认风险`, 落盘 `risk_ack.json`), daemon 侧门禁复用不变。
 
@@ -343,7 +344,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-10-07, 040 行情实时化后实跑)**: `cargo test --workspace --no-fail-fast` = **829 passed / 0 failed / 22 ignored**(全目标零失败)。
+- **基线(2026-10-07, 041 前端开发回路后实跑)**: `cargo test --workspace --no-fail-fast` = **834 passed / 0 failed / 22 ignored**(全目标零失败)。
   增量 = **+17**, 与本变更同源: `ricow` bin **411 → 425**(+14: `web::realtime` 的订阅复用 / 租约与生命周期 / 死条目不复用 / 就绪窗口与按路隔离 / 帧口径与 20 档截断) +
   `ricow_binance` lib **59 → 62**(+3: `parse_kline_frame` 现货帧 / 合约帧 / 拒非 kline 与非对象); 其余 target 一字未变。
 - **前基线(2026-10-06, 039 Web 图表能力补强后实跑)**: `cargo test --workspace --no-fail-fast` = **812 passed / 0 failed / 22 ignored**(全目标零失败)。

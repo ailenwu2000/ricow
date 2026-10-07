@@ -24,6 +24,11 @@ pub struct WebArgs {
     /// 不自动打开浏览器(只打印带 token 的地址)
     #[arg(long)]
     pub no_open: bool,
+    /// 开发调试: 从这个目录热读前端资产(index.html / style.css / 各 *.js), 改完刷新即见, 免重新编译
+    ///
+    /// 目录须含 index.html; 生产环境不要使用。
+    #[arg(long, value_name = "DIR")]
+    pub web_assets_dir: Option<PathBuf>,
 }
 
 /// 启动 Web UI: 前置检查(与 CLI 对话同源) → 建服务与存储 → 打印带 token 的地址 → 开浏览器。
@@ -55,6 +60,29 @@ pub async fn run(args: WebArgs) -> CoreResult<()> {
     let store = SessionStore::new(db.clone());
     let starter = make_starter(root.clone(), store.clone());
     let state = WebState::new(token.clone(), root, db, store, starter);
+    // 041 开发回路: 显式给出目录**本身就是人工确认**(同 `[ai].allow_custom_base_url` 的口径),
+    // 故这里不按 debug/release 门控; 代价是必须把"这是调试模式"打出来(FR-5)。
+    // 目录校验放在 `with_assets_dir` 里: 给错目录在**启动时**就报错, 不当场白屏。
+    let state = match args.web_assets_dir.as_deref() {
+        Some(dir) => {
+            let state = state.with_assets_dir(dir)?;
+            println!(
+                "{} {}",
+                t(lang, "开发模式: 前端资产从磁盘热读", "dev mode: serving web assets from disk"),
+                dir.display()
+            );
+            println!(
+                "{}",
+                t(
+                    lang,
+                    "仅供开发调试, 生产环境请去掉 --web-assets-dir。",
+                    "development only; drop --web-assets-dir in production."
+                )
+            );
+            state
+        }
+        None => state,
+    };
 
     // token 只在内存里(不落盘、不进日志), 所以地址必须打出来才能进页面(FR-003)。
     let url = format!("http://127.0.0.1:{port}/?token={token}");

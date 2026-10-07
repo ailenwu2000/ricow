@@ -30,7 +30,7 @@ mod test_support;
 mod trades;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::http::{header, StatusCode};
@@ -181,6 +181,8 @@ pub struct WebState {
     jobs: Arc<backtest_jobs::JobStore>,
     /// 040: 行情实时订阅中枢(共享上游 + 引用计数生命周期; 纯内存, 无落盘)。
     realtime: Arc<realtime::MarketHub>,
+    /// 041: 前端资产来源 —— 默认编译期内嵌; `--web-assets-dir` 时改从磁盘热读。
+    assets: assets::AssetSource,
 }
 
 impl WebState {
@@ -203,7 +205,20 @@ impl WebState {
             hub,
             jobs: Arc::new(backtest_jobs::JobStore::new()),
             realtime: Arc::new(realtime::MarketHub::new()),
+            assets: assets::AssetSource::default(),
         }
+    }
+
+    /// 041 开发回路: 让前端资产改从磁盘热读(`ricow web --web-assets-dir <DIR>`)。
+    ///
+    /// 目录在这里就校验并规范化(见 [`assets::resolve_assets_dir`]) —— 给错目录是配置错误,
+    /// 该在启动时一句话说清, 而不是等浏览器白屏后再让人猜。
+    ///
+    /// **不改 [`WebState::new`] 的签名**: 既有装配处与全部测试调用点零改动
+    /// (沿用 032 `jobs` / 040 `realtime` 的既有做法)。
+    pub fn with_assets_dir(mut self, dir: &Path) -> CoreResult<Self> {
+        self.assets = assets::AssetSource::Disk(assets::resolve_assets_dir(dir)?);
+        Ok(self)
     }
 }
 
@@ -231,20 +246,9 @@ pub async fn bind(port: u16) -> CoreResult<(TcpListener, u16)> {
 /// 这里只做装配 —— 静态资源与仍属本文件的散点(`ping` / `terms` / 其余子模块)单独挂。
 pub fn router(state: WebState) -> Router {
     Router::new()
-        // 单页与静态资源(FR-003 / FR-006): 页面本身也要 token, 资源 URL 里的 token 由 `index` 填。
-        .route("/", get(assets::index))
-        .route("/style.css", get(assets::style_css))
-        // 032: 脚本拆分后的五份静态资源(含第三方图表库), 同样挂在 token 中间件之后。
-        .route("/lightweight-charts.js", get(assets::lwc_js))
-        .route("/common.js", get(assets::common_js))
-        .route("/router.js", get(assets::router_js))
-        .route("/chat.js", get(assets::chat_js))
-        .route("/settings.js", get(assets::settings_js))
-        .route("/keys.js", get(assets::keys_js))
-        .route("/markets.js", get(assets::markets_js))
-        .route("/strategies.js", get(assets::strategies_js))
-        .route("/runs.js", get(assets::runs_js))
-        .route("/app.js", get(assets::app_js))
+        // 单页与静态资源(FR-003 / FR-006): 路由表由 `assets::ASSETS` **循环生成** ——
+        // 与 041 `--web-assets-dir` 的磁盘白名单共用同一份清单, 不可能脱钩。
+        .merge(assets::routes())
         .route("/api/ping", get(ping))
         // 会话端点族(FR-007 ~ FR-011): CRUD + 出入站通道。
         .merge(sessions::routes())
@@ -795,5 +799,92 @@ mod tests {
         // ③ /markets.js 静态资源对 token 可取(证明 401 拦的不是"路由不存在")。
         let res = get_raw(port, "/markets.js?token=tok-ok").await;
         assert!(res.starts_with("HTTP/1.1 200"), "对 token 应取到 markets.js: {res}");
+    }
+
+    /// 041 FR-1: 不给 `--web-assets-dir` 时, 资产仍是**编译期内嵌副本** —— 发布行为零变化。
+    #[tokio::test]
+    async fn test_assets_stay_embedded_without_the_flag() {
+        let root = trade_root("assets-embedded");
+        let db = Database::open_in_memory().await.expect("开内存库");
+        let port = serve_trade_test(root, db).await;
+
+        let res = get_raw(port, "/common.js?token=tok-ok").await;
+        assert!(res.starts_with("HTTP/1.1 200"), "对 token 应 200: {res}");
+        let embedded = super::assets::ASSETS
+            .iter()
+            .find(|a| a.name == "common.js")
+            .expect("资产表里有 common.js")
+            .embedded;
+        assert_eq!(body_of(&res), embedded, "内嵌模式下响应体应逐字等于内嵌副本");
+        // 内嵌来源**不**加 no-store: 这是有意的不对称(041 D5), 防止后人"顺手对齐"。
+        assert!(
+            !res.to_ascii_lowercase().contains("cache-control: no-store"),
+            "内嵌来源不该带 no-store: {res}"
+        );
+    }
+
+    /// 041: `--web-assets-dir` 磁盘热读 e2e —— 同一批路由改从磁盘取。
+    ///
+    /// 覆盖四件事: ① 内容 = 磁盘副本 + `Cache-Control: no-store`(否则改完刷新看不到新的);
+    /// ② 首页同样走磁盘且 **token 占位符照旧被替换**(少了这步整页 401 白屏);
+    /// ③ 缺文件 → 500 并点出文件名(**不静默退回内嵌**); ④ 白名单外的路径仍是 404 且不泄漏仓库文件。
+    #[tokio::test]
+    async fn test_assets_dir_serves_disk_copy_and_never_escapes_the_table() {
+        const MARK: &str = "// DISK-COPY-MARKER\n";
+        const MISSING: &str = "runs.js";
+
+        let root = trade_root("assets-dir");
+        let dir = root.join("web-assets");
+        std::fs::create_dir_all(&dir).expect("建资产目录");
+        std::fs::write(dir.join("index.html"), "<html>__RICOW_TOKEN__</html>").expect("写首页");
+        for a in super::assets::ASSETS {
+            std::fs::write(dir.join(a.name), format!("{MARK}{}", a.name)).expect("写资产");
+        }
+        // 故意留一份不写 —— 给"缺文件 → 500"用。
+        std::fs::remove_file(dir.join(MISSING)).expect("删掉一份");
+
+        let db = Database::open_in_memory().await.expect("开内存库");
+        let store = SessionStore::new(db.clone());
+        let starter: Starter = Arc::new(|_id: &str, _sink: &mut WebSink| Ok(()));
+        let state = WebState::new("tok-assets".to_string(), root, db, store, starter)
+            .with_assets_dir(&dir)
+            .expect("合法资产目录");
+        let (listener, port) = bind(0).await.expect("绑定回环端口");
+        tokio::spawn(serve(listener, state));
+
+        // ① 磁盘来源: 内容 = 磁盘副本 + 禁缓存。
+        let res = get_raw(port, "/common.js?token=tok-assets").await;
+        assert!(res.starts_with("HTTP/1.1 200"), "对 token 应 200: {res}");
+        assert!(res.contains(MARK), "应返回磁盘副本: {res}");
+        assert!(
+            res.to_ascii_lowercase().contains("cache-control: no-store"),
+            "磁盘来源要禁缓存, 否则改完刷新看不到新内容: {res}"
+        );
+
+        // ② 首页也走磁盘, 且 token 占位符照旧被替换。
+        let res = get_raw(port, "/?token=tok-assets").await;
+        assert!(res.starts_with("HTTP/1.1 200"), "首页应 200: {res}");
+        assert!(res.contains("tok-assets"), "首页 token 应被填进资源 URL: {res}");
+        assert!(!res.contains("__RICOW_TOKEN__"), "占位符必须替换掉: {res}");
+
+        // ③ 缺文件 → 500 且点出文件名(不静默退回内嵌)。
+        let res = get_raw(port, &format!("/{MISSING}?token=tok-assets")).await;
+        assert!(res.starts_with("HTTP/1.1 500"), "缺文件应 500, 实际: {res}");
+        assert!(res.contains(MISSING), "错误体要点出缺的是哪个文件: {res}");
+
+        // ④ 白名单外的路径: 404/400, 且不泄漏任何仓库文件内容。
+        for path in ["/nope.js", "/../Cargo.toml", "/style.css.bak"] {
+            let res = get_raw(port, &format!("{path}?token=tok-assets")).await;
+            assert!(
+                res.starts_with("HTTP/1.1 404") || res.starts_with("HTTP/1.1 400"),
+                "{path} 不该被服务, 实际: {res}"
+            );
+            assert!(!res.contains("[package]"), "{path} 泄漏了仓库文件: {res}");
+        }
+
+        // ⑤ 无 token 取资产仍 401、空体(FR-7: 同一道门没被放开)。
+        let res = get_raw(port, "/common.js").await;
+        assert!(res.starts_with("HTTP/1.1 401"), "无 token 应 401, 实际: {res}");
+        assert!(body_of(&res).is_empty(), "401 响应体必须为空: {res}");
     }
 }
