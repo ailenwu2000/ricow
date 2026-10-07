@@ -146,6 +146,14 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **引擎记账扩展**: `PnlTracker` 增 `ClosedTrade { time, pnl }` 明细(保最近 `MAX_CLOSED_TRADES=1000` + **单列总条数**), `record_pnl` 收时间戳; 回测侧传**虚拟 bar 收盘时间**(不用墙钟, 否则与图表时间轴对不上), live/dry-run 传成交自身时刻。`BacktestReport` 增 `closed_trades` / `closed_trades_total` / `benchmark_entry_time`; `MetricsSummary` 增 `realized_pnl` / `closed_trades_total`。
 - **诚实性**: 明细超限时界面明说"仅显示最近 N 条(共 M 条)"且只报**显示部分**的求和(不拿部分和冒充总数); 无平仓事件不渲染空表; 基准线建仓前为**空白段**而非 0。(2026-10-06)
 
+**行情实时化(040, 2026-10-07)**: 市场页的 K 线与盘口由「进入详情即拉一次的**死快照**」改为**真实时**。路线 = **后端币安 WS → SSE 下发**(不是前端轮询增强), 仍**不引新依赖**、不新开端口、WebSocket 只存在于**后端到币安**这一段(浏览器侧仍是 SSE, D18"前端不做 WebSocket"未被推翻)。
+
+- **上游新增 K 线流订阅**: `ricow_binance::ws` 新增 `parse_kline_frame`(纯函数, 只认 `e=="kline"`, 从 `k` 取 `t/T/o/h/l/c/v`, 字段缺失或类型不符一律 `None`, 不猜)+ `run_kline_ws`(与 `run_depth_ws` 同构: 退避重连 + 消费端退出即停; **无需快照同步** —— K 线帧自带整根完整 OHLCV); 现货 `BinanceClient::subscribe_klines` 与合约 `FuturesClient::subscribe_klines` 同签名, 差别只在 WS base(`stream.binance.com` / `fstream`)。`futures_ws.rs` 里**第二份** `backoff_delay` 已删, 改 import `ws::backoff_delay`。
+- **`web/realtime.rs`(新核心)**: `MarketHub` 按 **`(市场,标的,周期)`(K 线)/ `(市场,标的)`(盘口)共享上游订阅** —— 同键 N 个页面共用**一条**币安连接(引用计数 + `AbortHandle` 租约, **不用 `receiver_count()`**: Lease 与 Receiver 的 drop 顺序无保证, 靠计数会时而漏拆); 最后一个订阅者离开即 `abort()`(不设宽限期, 空闲连接白占币安配额); **死条目(计数为 0 的残留)一律中止重建, 不复用**。上游订阅在**锁外**构建、再回锁安装(避免持锁跨 await 让 future 不 Send)。
+- **SSE 端点**: `GET /api/markets/{symbol}/stream?market=&interval=`(在**同一道 token 中间件**之后, 无 token 401)。首帧 `hello`(回显 market/symbol/interval)先发, 让连接**不因某一路上游握手慢而白屏**; 之后 `kline` / `depth` 帧靠 `type` 分派(与会话流 `web/sink.rs` 同构, 只用默认 `message` 事件)。盘口**服务端截断到 20 档**再下发。`interval` **必填**(缺 → 400 并点明必填, 不继承兄弟端点的 `1h` 默认 —— 订阅是长承诺, 静默默认会把"我传了 4h、它订了 1h"表现为"图不对"而非报错); 标的不在行情视野 → **404**(实时订阅只接受视野内交易对), 在联网之前就拒绝。
+- **按路隔离 + 就绪窗口(诚实性)**: K 线 / 盘口两路**各自**独立订阅与报错(`error` 帧带 `scope: kline|depth` + 可核对的实情原文)。上游"订上了但**一帧不给**"由**每路 12 秒就绪窗口**检测并下发错误帧(**不整条连接打死**, 数据后来到了自行恢复)。两条实测依据(2026-10-07 真机): ① 币安对**不存在的标的**照常完成握手然后**一帧不发**(既不回错误帧也不断开)→ 故"解析错误帧"是死代码, 真正需要的是**标的预校验**; ② **合约 WS 主机的非订单簿行情整体不下发**(2026-10-07 补充取证后订正, 初版只记为"合约 K 线零帧") —— 同一 20s 窗口内 `bookTicker` **9 105 帧** / `depth@100ms` 153 帧, 而 `aggTrade` / `trade` / `kline_*` / `ticker` / `miniTicker` / `markPrice@1s` **全部 0 帧**(含与服务端定时器绑定的 `markPrice@1s`, 故与"有没有成交"无关); 帧级转储显示连接**连 PING/CLOSE 都没有**。已排除我方 URL/参数(现货同形 URL 正常)、客户端库(Node 内置 / 自写裸 WS / ricow 的 tokio-tungstenite 一致)、单节点(8 个 IP 全同)、预热(90s 仍 0)、走错主机与中间人(真币安 `*.binance.com` 证书 + 真实 AWS 东京 IP)、"合约没行情"(REST 当前 1h K 线含 123 320 笔成交、`aggTrades` 距本机 ~7s); 且**平台正常受理订阅**(`SUBSCRIBE` 回 `{"result":null,"id":1}`, `LIST_SUBSCRIPTIONS` 里 kline 已登记) → **推断**为币安侧按地区/出口 IP 的行情权限限制(**不臆造其内部原因**)。按路隔离正是为此(且它按**数据来源**隔离, 不只是按面板分路)。**不做 Last-Event-ID 续传**: 行情无补发语义, 重放旧帧只会把图拉回过去 —— 重连后一律以 REST 快照重新对齐。
+- **前端(`markets.js`)**: 进入详情即连、离开即断; 切周期 / 换标的先关旧连接(代际令牌防串台, 异步回来的上一代帧一律丢弃)。K 线走 `series.update()`(同 `open_time` 原地更新、更大 `open_time` 自动长出新根; `t`(ms) 与 REST `open_time`(ISO) 都落到同一 epoch 秒, 不满足单调则**丢弃该帧**而不是塞进去炸掉整图); 盘口帧整体替换(`OrderBookUpdate` 已是**累计**语义), 现价由最优买卖档求中值, **不再单独发请求**。状态 chip **三态 + 最后更新时刻**(`实时 12:34:56` / `重连中` / `已断开` + 手动重试), 静默窗口 15s 转"数据停滞"; **绝不静默降级成轮询**(那会让用户以为在看实时)。零持久化、帧数据一律经 `textContent`/DOM API 注入、无任何交易所写动作(面板只读不变)。(2026-10-07)
+
 ~~`keyring`~~ / ~~`setup`~~ / ~~`credentials`~~ / ~~`config`~~ —— 2026-09-14 随单一配置文件方案**全部删除**(019 D31: 文件即界面)。
 
 - 建策略(002, 写操作不得一步落盘): `ricow create --name <n> --pair <p> [--script <file|->] [--param k=v] [--days N] [--interval] [--market spot|futures]`
@@ -335,7 +343,10 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-10-06, 039 Web 图表能力补强后实跑)**: `cargo test --workspace --no-fail-fast` = **812 passed / 0 failed / 22 ignored**(全目标零失败)。
+- **基线(2026-10-07, 040 行情实时化后实跑)**: `cargo test --workspace --no-fail-fast` = **829 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+17**, 与本变更同源: `ricow` bin **411 → 425**(+14: `web::realtime` 的订阅复用 / 租约与生命周期 / 死条目不复用 / 就绪窗口与按路隔离 / 帧口径与 20 档截断) +
+  `ricow_binance` lib **59 → 62**(+3: `parse_kline_frame` 现货帧 / 合约帧 / 拒非 kline 与非对象); 其余 target 一字未变。
+- **前基线(2026-10-06, 039 Web 图表能力补强后实跑)**: `cargo test --workspace --no-fail-fast` = **812 passed / 0 failed / 22 ignored**(全目标零失败)。
 - **前基线(2026-10-06, 038 P1 健壮性加固后实跑)**: `cargo test --workspace --no-fail-fast` = **806 passed / 0 failed / 22 ignored**(全目标零失败)。
   增量 = **+45**, 与本变更同源: `ricow` bin **382 → 407**(+25: `commands::align` 的汇总/窗口/渲染 + `supervisor::server` 的重启判定/退避/配置读取/停机收摊 + `web::metrics` 的渲染/转义/空快照/token 门 + `supervisor::procs` 子进程 stdin 停机链路的跨平台覆盖 4) +
   `ricow_strategy` lib **184 → 197**(+13: `gaps.rs` 缺口检测 8 + `backtest.rs` 限价穿透 5〔默认 0 仍触及即成交 / 正穿透拒绝只触及 / 真穿过按原始限价成交 / 卖侧对称 / 市价单单独计数〕) +

@@ -66,8 +66,12 @@ fn parse_all(v: Option<&str>) -> Result<bool, String> {
 }
 
 /// 归一化市场限定: 容忍大小写与前后空白 (与 `filter_view` 同口径);
+/// 040: `pub(super)` 供 `realtime.rs` 的流端点复用 —— 同一份校验不复制第二份。
 /// `required` = 明细端点用, 缺省即硬失败。列表端点缺省 = 两组都返回 (`None`)。
-fn parse_market(v: Option<&str>, required: bool) -> Result<Option<&'static str>, String> {
+pub(super) fn parse_market(
+    v: Option<&str>,
+    required: bool,
+) -> Result<Option<&'static str>, String> {
     // 比较走小写归一化, 错误回显用户原文(trim 后) —— 报错要能对得上自己发出去的值。
     let Some(raw) = v.map(str::trim).filter(|s| !s.is_empty()) else {
         return if required {
@@ -98,7 +102,7 @@ fn parse_depth(v: Option<&str>) -> Result<u32, String> {
 }
 
 /// K 线周期: 缺省 1h, 白名单外硬失败。
-fn parse_interval(v: Option<&str>) -> Result<&'static str, String> {
+pub(super) fn parse_interval(v: Option<&str>) -> Result<&'static str, String> {
     match v.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok("1h"),
         Some(s) => INTERVALS
@@ -124,7 +128,7 @@ fn parse_limit(v: Option<&str>) -> Result<u32, String> {
 }
 
 /// 交易对符号规整: 去空白并转大写 (币安符号一律大写; 不让空白混进取数路径)。
-fn normalize_symbol(symbol: &str) -> String {
+pub(super) fn normalize_symbol(symbol: &str) -> String {
     symbol.trim().to_ascii_uppercase()
 }
 

@@ -1095,6 +1095,61 @@ body {
   font-size: 1.05rem;
   font-weight: 600;
 }
+/* 040: 行情实时状态标识 (FR-9) —— 三态 + 陈旧提示, 颜色只用既有主题变量。 */
+.mk-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.mk-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+.mk-live[data-state="live"] {
+  color: var(--accent);
+}
+.mk-live[data-state="live"] .mk-live-dot {
+  background: var(--accent);
+}
+/* "连接中"与"部分无实时"共用告警色: 都不是"正常实时"。 */
+.mk-live[data-state="warn"],
+.mk-live[data-state="wait"] {
+  color: var(--warn);
+}
+.mk-live[data-state="warn"] .mk-live-dot,
+.mk-live[data-state="wait"] .mk-live-dot {
+  background: var(--warn);
+}
+.mk-live[data-state="off"] {
+  color: var(--error);
+}
+.mk-live[data-state="off"] .mk-live-dot {
+  background: var(--error);
+}
+.mk-live-retry {
+  margin-left: 4px;
+  padding: 1px 8px;
+  font-size: 0.72rem;
+  color: var(--fg);
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.mk-live-retry:hover {
+  border-color: var(--accent);
+}
+/* 按路说明: 直接可见, 不藏在 hover 里 —— 用户不必猜"为什么这半页不动了"。 */
+.mk-live-note {
+  margin: -6px 0 10px;
+  font-size: 0.74rem;
+  color: var(--warn);
+}
 .mk-detail-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);

@@ -9,7 +9,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, Stream, StreamExt};
 use ricow_core::{
-    CoreError, CoreResult, OrderBook, OrderBookUpdate, OrderFill, OrderSide, OrderStatus,
+    CoreError, CoreResult, Kline, OrderBook, OrderBookUpdate, OrderFill, OrderSide, OrderStatus,
     OrderUpdate, UserEvent,
 };
 use rust_decimal::Decimal;
@@ -94,6 +94,28 @@ impl BinanceClient {
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
+    /// 订阅现货 K 线流 (040 FR-1)。
+    ///
+    /// 流名 `<symbol>@kline_<interval>` (小写标的)。K 线帧是**自带完整 OHLCV 的整根快照**,
+    /// 不需要盘口那样的 REST 快照同步与累计合并 —— 帧本身即可直接渲染。
+    /// 未收盘的那根会以**同一 `open_time`** 反复推送(原地更新), 收盘后定格; 前端据此
+    /// `update` 而非 `append`(见 `web/realtime.rs` 与 `markets.js`)。
+    pub async fn subscribe_klines(
+        &self,
+        symbol: &str,
+        interval: &str,
+    ) -> CoreResult<Pin<Box<dyn Stream<Item = Kline> + Send>>> {
+        let stream_name = format!("{}@kline_{interval}", symbol.to_lowercase());
+        let ws_url = format!("{}/{stream_name}", self.ws_base());
+        let symbol_owned = symbol.to_string();
+
+        let (tx, rx) = mpsc::channel::<Kline>(256);
+        tokio::spawn(async move {
+            run_kline_ws(&ws_url, &symbol_owned, tx).await;
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
     /// 订阅现货用户数据流 (成交/订单/余额事件)。
     ///
     /// 机制 = 现货 **WebSocket API** 的 `userDataStream.subscribe.signature` (HMAC 签名即可):
@@ -144,7 +166,12 @@ impl BinanceClient {
     }
 }
 
-fn backoff_delay(retry_count: u32) -> Duration {
+/// 重连退避 (指数, 60s 封顶)。
+///
+/// 040: 提为 `pub(crate)` —— 本文件的盘口/K 线守护与 `futures_ws.rs` 的守护共用这一份;
+/// 曾有一份私有副本留在 `futures_ws.rs`, 第三个使用者(K 线守护)出现时一并收编,
+/// 免得退避口径分裂成三套 (D8)。
+pub(crate) fn backoff_delay(retry_count: u32) -> Duration {
     let base_secs = (1u64 << retry_count.min(6)).min(60);
     Duration::from_secs(base_secs)
 }
@@ -382,11 +409,110 @@ async fn depth_session(
     }
 }
 
+// ---- Kline WS (040) ----
+
+/// K 线流消息空闲上限。
+///
+/// 与盘口 (`DEPTH_READ_IDLE` = 60s, 100ms 一帧) 不同, K 线只在**价格/量有变动**时才推:
+/// 冷门标的的一根 1d K 线可能几分钟没有一帧。服务器 Ping 最长 3 分钟一次, 故取 5 分钟 ——
+/// 超过即必为 TCP 半开 (而不是"这根 K 线正好没动")。
+const KLINE_READ_IDLE: Duration = Duration::from_secs(300);
+
+/// 解析一帧 K 线消息为 [`Kline`] (纯函数, 便于单测)。
+///
+/// 帧形如 `{"e":"kline","E":...,"s":"BTCUSDT","k":{"t":openMs,"T":closeMs,"o":..,"h":..,"l":..,"c":..,"v":..,"x":bool,..}}`。
+/// 只认 `e == "kline"`; 数值一律是**字符串**(币安口径) —— 类型不符/字段缺失回 `None` (不猜、不补 0)。
+/// 注意: `x`(是否已收盘) **不在此处消费** —— 前端按下标更新同一根即可, 无需区分。
+pub(crate) fn parse_kline_frame(v: &Value) -> Option<Kline> {
+    if v.get("e").and_then(Value::as_str) != Some("kline") {
+        return None;
+    }
+    let k = v.get("k")?;
+    let open_time = DateTime::from_timestamp_millis(k.get("t")?.as_i64()?)?;
+    let close_time = DateTime::from_timestamp_millis(k.get("T")?.as_i64()?)?;
+    Some(Kline {
+        open_time,
+        open: Decimal::from_str(k.get("o")?.as_str()?).ok()?,
+        high: Decimal::from_str(k.get("h")?.as_str()?).ok()?,
+        low: Decimal::from_str(k.get("l")?.as_str()?).ok()?,
+        close: Decimal::from_str(k.get("c")?.as_str()?).ok()?,
+        volume: Decimal::from_str(k.get("v")?.as_str()?).ok()?,
+        close_time,
+    })
+}
+
+/// K 线订阅守护: 断线指数退避重连 (现货/合约 K 线流共用)。
+///
+/// 与 [`run_depth_ws`] 的两点不同 (都不需要):
+/// - **无 REST 快照同步** —— 每帧 K 线自带整根 OHLCV, 不像盘口增量那样依赖基准 book;
+/// - **无累计合并** —— 帧即事实, 直接转发。
+///
+/// 退出条件同盘口: 消费端退出 (`tx.is_closed()`) 即停止重连, 不泄漏守护任务。
+pub(crate) async fn run_kline_ws(ws_url: &str, symbol: &str, tx: mpsc::Sender<Kline>) {
+    let mut retry = 0u32;
+    loop {
+        match kline_session(ws_url, &tx).await {
+            Ok(()) => break,
+            Err(e) => {
+                if tx.is_closed() {
+                    break;
+                }
+                retry += 1;
+                let delay = backoff_delay(retry);
+                tracing::warn!(
+                    target: "bn.ws", symbol = %symbol, error = %e, retry,
+                    delay_ms = delay.as_millis(), "kline WS disconnected, reconnecting"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// 单次 K 线连接会话: 连上 → 逐帧解析转发, 直到出错 (交 [`run_kline_ws`] 退避重连)。
+async fn kline_session(ws_url: &str, tx: &mpsc::Sender<Kline>) -> CoreResult<()> {
+    let (ws_stream, _) =
+        connect_async(ws_url).await.map_err(|e| CoreError::Network(e.to_string()))?;
+    let (mut write, mut read) = ws_stream.split();
+
+    loop {
+        let msg = match tokio::time::timeout(KLINE_READ_IDLE, read.next()).await {
+            Ok(m) => m,
+            Err(_) => {
+                return Err(CoreError::Network(format!(
+                    "K 线流空闲超时 ({}s 无任何消息, 含 Ping), 视为半开连接",
+                    KLINE_READ_IDLE.as_secs()
+                )))
+            }
+        };
+        match msg {
+            Some(Ok(Message::Text(text))) => {
+                // 订阅确认帧 (`{"result":null,"id":1}`) 等非 K 线消息解析为 None → 跳过。
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    if let Some(k) = parse_kline_frame(&v) {
+                        if tx.send(k).await.is_err() {
+                            return Ok(()); // 消费端已退出
+                        }
+                    }
+                }
+            }
+            Some(Ok(Message::Ping(data))) => {
+                let _ = write.send(Message::Pong(data)).await;
+            }
+            Some(Ok(Message::Close(_))) => {
+                return Err(CoreError::Network("server closed connection".into()))
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(CoreError::Network(e.to_string())),
+            None => return Err(CoreError::Network("WS stream ended".into())),
+        }
+    }
+}
+
 /// 消息空闲上限 (审计 H-3): 用户流事件稀疏 (无成交可能长时间无事件帧), 但服务器
 /// Ping 最长 3 分钟一次 —— 超过此时长**无任何消息 (含 Ping)** 必为 TCP 半开挂死
 /// (网络切换/NAT 超时), `read.next()` 无 timeout 会永久挂起, 行情/成交静默中断。
 const USER_DATA_READ_IDLE: Duration = Duration::from_secs(600);
-
 /// 现货用户流守护: 断线指数退避重连 (审计 H-3)。
 ///
 /// - 每轮重连**重新签名**订阅请求 —— 旧签名里的 `timestamp` 超出 recvWindow 后会被
@@ -805,6 +931,75 @@ mod tests {
         );
         assert_eq!(book.bids.len(), MAX_DEPTH_LEVELS, "超过上限应截断");
         assert_eq!(book.bids[0].price, dec!(3079), "买档应降序 (最优在前)");
+    }
+
+    /// 040 T001: K 线帧解析 (现货)。
+    ///
+    /// 帧体按**币安官方 kline stream 字段口径**构造 (字段名/字符串数值/`x` 收盘标志),
+    /// 数值是编的 —— 真实抓取的帧在 T008 真机取证时替换进来 (此处如实标注, 不假装真机数据)。
+    #[test]
+    fn test_parse_kline_frame_from_real_spot_frame() {
+        let v: Value = serde_json::from_str(
+            r#"{"e":"kline","E":1759808372860,"s":"ETHUSDT",
+                "k":{"t":1759806000000,"T":1759809599999,"s":"ETHUSDT","i":"1h",
+                     "o":"2497.43000000","c":"2501.09000000","h":"2510.00000000",
+                     "l":"2488.12000000","v":"12345.67800000","q":"30000000.0",
+                     "n":4321,"x":false,"V":"6000.0"}}"#,
+        )
+        .unwrap();
+        let k = parse_kline_frame(&v).expect("真实 K 线帧应解析成功");
+        assert_eq!(k.open_time.timestamp_millis(), 1_759_806_000_000);
+        assert_eq!(k.close_time.timestamp_millis(), 1_759_809_599_999);
+        assert_eq!(k.open, dec!(2497.43));
+        assert_eq!(k.close, dec!(2501.09));
+        assert_eq!(k.high, dec!(2510.00));
+        assert_eq!(k.low, dec!(2488.12));
+        assert_eq!(k.volume, dec!(12345.678));
+    }
+
+    /// 合约 fstream 的 K 线帧与现货**同构** —— 同一份解析必须都能吃下 (否则合约页面
+    /// 会静默无数据)。帧体同样按官方口径构造, T008 用真机帧替换。
+    #[test]
+    fn test_parse_kline_frame_from_real_futures_frame() {
+        let v: Value = serde_json::from_str(
+            r#"{"e":"kline","E":1759808372861,"s":"BTCUSDT",
+                "k":{"t":1759806000000,"T":1759809599999,"s":"BTCUSDT","i":"1h",
+                     "o":"121500.10","c":"121777.20","h":"121900.00","l":"121300.00",
+                     "v":"8888.888","x":true}}"#,
+        )
+        .unwrap();
+        let k = parse_kline_frame(&v).expect("合约 K 线帧应解析成功");
+        assert_eq!(k.open_time.timestamp_millis(), 1_759_806_000_000);
+        assert_eq!(k.close, dec!(121777.20));
+        assert_eq!(k.volume, dec!(8888.888));
+    }
+
+    /// 非 K 线消息与残缺帧一律 `None` —— 不猜、不补 0、不拿默认值顶替。
+    #[test]
+    fn test_parse_kline_frame_rejects_non_kline_and_malformed() {
+        // 订阅确认帧 (`{"result":null,"id":1}`): 真实会先到, 必须被忽略而不是当成 K 线。
+        assert!(parse_kline_frame(&serde_json::json!({"result": null, "id": 1})).is_none());
+        // 盘口帧混进同一条连接时也不该被误读。
+        assert!(
+            parse_kline_frame(&serde_json::json!({"e": "depthUpdate", "b": [], "a": []})).is_none()
+        );
+        // 缺 `k`。
+        assert!(parse_kline_frame(&serde_json::json!({"e": "kline"})).is_none());
+        // `k` 在但缺价 / 时间。
+        assert!(parse_kline_frame(&serde_json::json!({"e": "kline", "k": {"t": 1}})).is_none());
+        // 价格不是字符串 (币安口径一律字符串) → 拒绝而非静默按 0 处理。
+        assert!(parse_kline_frame(&serde_json::json!({
+            "e": "kline",
+            "k": {"t": 1_759_806_000_000_i64, "T": 1_759_809_599_999_i64,
+                  "o": 2497.43, "h": "1", "l": "1", "c": "1", "v": "1"}
+        }))
+        .is_none());
+        // 时间越界 (毫秒时间戳放不进 DateTime) → 拒绝。
+        assert!(parse_kline_frame(&serde_json::json!({
+            "e": "kline",
+            "k": {"t": i64::MAX, "T": i64::MAX, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1"}
+        }))
+        .is_none());
     }
 
     #[test]

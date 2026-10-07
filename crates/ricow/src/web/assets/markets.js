@@ -37,6 +37,15 @@
     mkBestAsk: "卖一",
     mkChartEmpty: "暂无 K 线",
     mkLegVol: "成交量",
+    // 040 实时行情状态标识 (FR-9 / FR-10): 三态 + 按路如实说明, 绝不静默假装实时。
+    mkLive: "实时",
+    mkLiveConnecting: "连接中…",
+    mkLiveOffline: "实时已断开",
+    mkLivePartial: "部分无实时",
+    mkLiveStale: "秒未更新",
+    mkScopeKline: "K 线",
+    mkScopeDepth: "盘口",
+    mkRetry: "重试",
   });
   Object.assign(R.TEXT.en, {
     mkTitle: "Markets",
@@ -62,6 +71,14 @@
     mkBestAsk: "Best ask",
     mkChartEmpty: "No candlesticks",
     mkLegVol: "Vol",
+    mkLive: "Live",
+    mkLiveConnecting: "Connecting…",
+    mkLiveOffline: "Live disconnected",
+    mkLivePartial: "Partial live",
+    mkLiveStale: "s since update",
+    mkScopeKline: "Candles",
+    mkScopeDepth: "Order book",
+    mkRetry: "Retry",
   });
 
   // K 线周期按钮(默认 1h; 不含 1m/5m —— 视图契约只要 15m/1h/4h/1d)。
@@ -77,6 +94,13 @@
   /// 成交量副图占图表底部的高度比例 (与主图共享时间轴, 但用独立价格轴 → 不需要同步代码)。
   const VOL_PANE_MARGIN = 0.82;
 
+  // 040: 实时流。
+  /// 服务端就绪窗口是 12s; 页面侧"多久没收到任何一帧就算陈旧"取 15s ——
+  /// 比服务端宽一点, 免得服务端刚报完"无数据"页面又自己造一个不同的说法。
+  const LIVE_STALE_MS = 15000;
+  /// 状态标识的自刷新节奏(只更新那个 chip, 不动图表)。
+  const LIVE_TICK_MS = 2000;
+
   let mounted = false;
   // 代际令牌(见文件头注释): 每次激活 / 离开自增; 回调捕获本次值, 过期响应直接丢弃。
   let gen = 0;
@@ -90,6 +114,20 @@
   const listState = { q: "", showAll: false, data: null, marketOf: null };
   // 详情态当前上下文(周期按钮回调读它)。
   let detailCtx = null;
+
+  // 040 实时流句柄与状态。`streamCtx` = 当前订阅目标(与 `detailCtx` 分开: 周期切换时
+  // 图表在重取, 但订阅目标已经变了, 两者不是一回事)。
+  let stream = null;
+  let streamCtx = null;
+  /// 连接态: connecting / open / failed(`failed` = R.sse 退避重试已放弃)。
+  let connState = "connecting";
+  /// 最近一次**收到数据帧**的时刻(本地钟, ms) —— 陈旧判据的唯一依据。
+  let lastFrameAt = 0;
+  let liveTimer = 0;
+  /// 本次 openStream 之后是否已收到过 hello(用于区分"首屏"与"重连")。
+  let helloSeen = false;
+  /// 按路状态: pending(还没数据) / live / error(附原因)。
+  const liveState = { kline: "pending", depth: "pending", klineMsg: "", depthMsg: "" };
 
   const $ = (id) => document.getElementById(id);
 
@@ -128,7 +166,11 @@
       // ---- 详情态 ----
       '<div id="mk-detail" class="mk-detail" hidden>' +
       '<div class="mk-crumbs"><a href="javascript:void(0)" id="mk-back"' + bilingual("mkBack") +
-      ">" + R.TEXT.zh.mkBack + '</a><span id="mk-symbol" class="mk-symbol"></span></div>' +
+      ">" + R.TEXT.zh.mkBack +
+      '</a><span id="mk-symbol" class="mk-symbol"></span>' +
+      // 040: 实时状态标识 (FR-9) + 按路说明 (FR-10)。文案由 renderLive() 用 DOM API 填。
+      '<span id="mk-live" class="mk-live" hidden></span></div>' +
+      '<div id="mk-live-note" class="mk-live-note" hidden></div>' +
       '<div class="mk-detail-grid">' +
       '<section class="mk-card"><div class="mk-card-head"><span' + bilingual("mkLastPrice") +
       ">" + R.TEXT.zh.mkLastPrice + "</span></div>" +
@@ -330,9 +372,11 @@
     }
     if (g !== gen || !market) return;
     detailCtx.market = market;
+    // 现价单独取一次 depth=1 快照作首屏(实时流的第一帧盘口 ~100ms 内会接管它)。
     loadPrice(g, symbol, market);
-    loadBook(g, symbol, market);
-    loadChart(g, symbol, market, DEFAULT_INTERVAL);
+    // 040: 盘口与 K 线的首屏快照由 openStream 内部取(REST, 与 SSE 无关 ——
+    // 实时流连不上时这三块仍能看, 只是状态标识会说"已断开")。
+    openStream(symbol, market, DEFAULT_INTERVAL);
   }
 
   /// 重试入口(解析失败后): 重跑整个详情装配。
@@ -424,6 +468,233 @@
     body.appendChild(grid);
   }
 
+  // ---------- 040 实时行情 (SSE) ----------
+  //
+  // 一条 SSE 同时推 K 线与盘口; 上游由服务端按 (市场,标的,周期) 共享。页面只负责:
+  // ① 增量更新图表/盘口; ② **如实**呈现连接状态与"哪一路没有数据"(FR-9 / FR-10);
+  // ③ 连接(重)建立时用 REST 快照重新对齐 —— 行情没有"补发"语义, 断线期间的变动不可能补发,
+  //    重放旧帧只会把图拉回过去, 所以不做事件续传(FR-11)。
+
+  function openStream(symbol, market, interval) {
+    closeStream();
+    streamCtx = { symbol: symbol, market: market, interval: interval };
+    connState = "connecting";
+    lastFrameAt = 0;
+    liveState.kline = "pending";
+    liveState.depth = "pending";
+    liveState.klineMsg = "";
+    liveState.depthMsg = "";
+    helloSeen = false;
+    renderLive();
+    // 首屏快照立刻取(不依赖 SSE 是否连上)。
+    resyncFromRest();
+    const g = gen;
+    const url =
+      "/api/markets/" + encodeURIComponent(symbol) + "/stream?market=" + market +
+      "&interval=" + encodeURIComponent(interval) + "&token=" + encodeURIComponent(R.TOKEN);
+    stream = R.sse(url, {
+      onopen: () => {
+        if (g !== gen || !streamCtx || streamCtx.symbol !== symbol) return;
+        connState = "open";
+        renderLive();
+      },
+      onmessage: (ev) => {
+        if (g !== gen || !streamCtx || streamCtx.symbol !== symbol) return;
+        onFrame(ev.data);
+      },
+      onfail: () => {
+        // 退避重试已放弃: 明说断了, 并给一个手动重试 —— 不静默降级成轮询(那会让页面
+        // 看起来仍在实时)。屏幕上已有的快照保留, 但状态标识不再说"实时"。
+        if (g !== gen || !streamCtx || streamCtx.symbol !== symbol) return;
+        connState = "failed";
+        renderLive();
+      },
+    });
+    liveTimer = setInterval(renderLive, LIVE_TICK_MS);
+  }
+
+  function closeStream() {
+    if (liveTimer) {
+      clearInterval(liveTimer);
+      liveTimer = 0;
+    }
+    if (stream) {
+      try {
+        stream.close();
+      } catch (_) {
+        // R.sse 的 close 是幂等的; 异常不影响后续状态清理。
+      }
+      stream = null;
+    }
+    streamCtx = null;
+    lastFrameAt = 0;
+    renderLive();
+  }
+
+  /// 一帧到 → 按 `type` 分派(与会话流同一套约定)。
+  function onFrame(raw) {
+    let f;
+    try {
+      f = JSON.parse(raw);
+    } catch (_) {
+      return; // 非 JSON 帧: 丢弃(不入 DOM)。
+    }
+    if (!f || typeof f.type !== "string") return;
+    if (f.type === "hello") {
+      // 首次 hello = 首屏那一次快照刚取过, 不重复拉; **重连**后的 hello 才重新对齐
+      // (补齐断线期间的空档 —— 不做事件续传, 见 FR-11)。
+      if (helloSeen) resyncFromRest();
+      helloSeen = true;
+      return;
+    }
+    if (f.type === "kline") {
+      lastFrameAt = Date.now();
+      liveState.kline = "live";
+      applyKlineFrame(f);
+      renderLive();
+      return;
+    }
+    if (f.type === "depth") {
+      lastFrameAt = Date.now();
+      liveState.depth = "live";
+      applyDepthFrame(f);
+      renderLive();
+      return;
+    }
+    if (f.type === "error") {
+      // 按路如实标记(FR-10): 某一路没数据不该连累另一路。
+      if (f.scope === "kline") {
+        liveState.kline = "error";
+        liveState.klineMsg = String(f.msg || "");
+      } else if (f.scope === "depth") {
+        liveState.depth = "error";
+        liveState.depthMsg = String(f.msg || "");
+      }
+      renderLive();
+    }
+  }
+
+  /// 连接(重)建立后按 REST 重新对齐两块快照。此窗口内到达的少数帧会随后续帧覆盖。
+  function resyncFromRest() {
+    if (!streamCtx) return;
+    const ctx = streamCtx;
+    const g = gen;
+    loadBook(g, ctx.symbol, ctx.market);
+    loadChart(g, ctx.symbol, ctx.market, ctx.interval);
+  }
+
+  /// K 线帧 → 原地更新最后一根(同一个 `t`)或长出新的一根。
+  function applyKlineFrame(f) {
+    const bar = {
+      time: Math.floor(Number(f.t) / 1000),
+      open: Number(f.o),
+      high: Number(f.h),
+      low: Number(f.l),
+      close: Number(f.c),
+      volume: Number(f.v),
+    };
+    if (!Number.isFinite(bar.time) || !Number.isFinite(bar.close)) return;
+    const last = chartData.length ? chartData[chartData.length - 1] : null;
+    if (last && bar.time < last.time) {
+      // 时间倒退: LightweightCharts 的 update 要求时间单调, 塞进去会炸掉整张图。
+      // 丢弃这一帧(不猜、不插), 图表最多晚一拍。
+      return;
+    }
+    if (!last || bar.time > last.time) chartData.push(bar);
+    else chartData[chartData.length - 1] = bar;
+    if (!chartSeries) return;
+    chartSeries.candle.update(bar);
+    if (Number.isFinite(bar.volume)) {
+      chartSeries.vol.update({
+        time: bar.time,
+        value: bar.volume,
+        color: bar.close >= bar.open ? chartSeries.up : chartSeries.down,
+      });
+    }
+    // 均线尾点: 值只取决于"最近 w 个收盘价", 故只重算最后一点, 不整列重算。
+    for (let i = 0; i < MA_WINDOWS.length; i++) {
+      const v = maValue(chartData, MA_WINDOWS[i]);
+      if (v !== null && chartSeries.ma[i]) {
+        chartSeries.ma[i].update({ time: bar.time, value: v });
+      }
+    }
+  }
+
+  /// 盘口帧 → 整体替换(上游已是**累计**语义, 不需要自己合并)。
+  function applyDepthFrame(f) {
+    const body = $("mk-book-body");
+    const priceBody = $("mk-price-body");
+    if (!body || !priceBody) return;
+    const book = { bids: f.bids || [], asks: f.asks || [] };
+    renderBook(body, book);
+    renderPrice(priceBody, book);
+  }
+
+  /// 状态标识 + 按路说明。三态 + 陈旧提示, 绝不在断流时说"实时"。
+  function renderLive() {
+    const el = $("mk-live");
+    const noteEl = $("mk-live-note");
+    if (!el) return;
+    el.textContent = "";
+    if (!streamCtx) {
+      el.hidden = true;
+      if (noteEl) noteEl.hidden = true;
+      return;
+    }
+    el.hidden = false;
+    const errs = [];
+    if (liveState.kline === "error") {
+      errs.push(t("mkScopeKline") + ": " + (liveState.klineMsg || "—"));
+    }
+    if (liveState.depth === "error") {
+      errs.push(t("mkScopeDepth") + ": " + (liveState.depthMsg || "—"));
+    }
+    const age = lastFrameAt ? Date.now() - lastFrameAt : null;
+    const stale = connState === "open" && age !== null && age > LIVE_STALE_MS;
+    let state;
+    let label;
+    if (connState === "failed") {
+      state = "off";
+      label = t("mkLiveOffline");
+    } else if (liveState.kline !== "live" && liveState.depth !== "live" && !errs.length) {
+      state = "wait";
+      label = t("mkLiveConnecting");
+    } else if (errs.length) {
+      state = "warn";
+      label = t("mkLivePartial");
+    } else if (stale) {
+      state = "warn";
+      label = t("mkLive") + " · " + Math.round(age / 1000) + t("mkLiveStale");
+    } else {
+      state = "live";
+      label = t("mkLive") + (lastFrameAt ? " · " + clockText(lastFrameAt) : "");
+    }
+    el.dataset.state = state;
+    el.appendChild(h("span", "mk-live-dot"));
+    el.appendChild(h("span", null, label));
+    if (connState === "failed") {
+      const btn = h("button", "mk-live-retry", t("mkRetry"));
+      btn.type = "button";
+      btn.addEventListener("click", () => {
+        if (streamCtx) openStream(streamCtx.symbol, streamCtx.market, streamCtx.interval);
+      });
+      el.appendChild(btn);
+    }
+    el.title = errs.join(" · ") || label;
+    if (noteEl) {
+      // 按路说明直接可见(不藏在 hover 里): 用户不必猜"为什么这半页不动了"。
+      const txt = errs.join(" · ");
+      noteEl.hidden = !txt;
+      noteEl.textContent = txt;
+    }
+  }
+
+  function clockText(ms) {
+    const d = new Date(ms);
+    const p = (n) => (n < 10 ? "0" + n : String(n));
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
   // ---------- K 线 ----------
 
   function buildIntervalButtons() {
@@ -438,7 +709,9 @@
         const ctx = detailCtx;
         if (!ctx) return;
         setIntervalActive(iv);
-        loadChart(g, ctx.symbol, ctx.market, iv);
+        // 040: 周期变了 → K 线上游的订阅键也变了(键含周期), 必须换一条流;
+        // 首屏快照由 openStream 内部重取, 这里不再单独 loadChart(否则白拉两次)。
+        openStream(ctx.symbol, ctx.market, iv);
       });
       box.appendChild(btn);
     }
@@ -476,12 +749,60 @@
     return v || fallback;
   }
 
-  let lastKlines = null; // 最近一次成功渲染的 K 线数据(切主题时免重新拉取即可重绘)
+  // 040: 图上的数据与序列句柄提到模块级 —— 实时帧要**就地更新**最后一根,
+  // 而不是整张图重建(重建会丢缩放位置与十字光标)。
+  /// 当前图上的 K 线(含实时帧更新的部分), 时间升序。
+  let chartData = [];
+  /// 图表序列句柄: 实时帧按它做 `update`。
+  let chartSeries = null;
+
+  /// REST K 线行 → 图表 bar。**时间统一 unix 秒**: 实时帧给的是 epoch 毫秒, 这里两条路径
+  /// 都折成秒, 才能保证实时帧落在同一根 K 线上(`update` 而不是多长一根)。
+  function rowsToBars(rows) {
+    return rows
+      .map((k) => ({
+        time: Math.floor(new Date(k.open_time).getTime() / 1000),
+        open: Number(k.open),
+        high: Number(k.high),
+        low: Number(k.low),
+        close: Number(k.close),
+        volume: Number(k.volume),
+      }))
+      .filter((d) => Number.isFinite(d.time) && Number.isFinite(d.close))
+      .sort((a, b) => a.time - b.time);
+  }
+
+  /// 窗口 `w` 的均线值(末尾 w 个收盘价均值); 不足 w 根回 `null` —— 不画、不补 0、不用前值冒充。
+  function maValue(bars, w) {
+    if (bars.length < w) return null;
+    let sum = 0;
+    for (let i = bars.length - w; i < bars.length; i++) sum += bars[i].close;
+    return sum / w;
+  }
+
+  /// 全量均线(首屏用)。数据不足窗口长度的前 w-1 根自然缺失(空点 → 断线)。
+  function maSeriesData(bars, w) {
+    const out = [];
+    let sum = 0;
+    for (let k = 0; k < bars.length; k++) {
+      sum += bars[k].close;
+      if (k >= w) sum -= bars[k - w].close;
+      if (k >= w - 1) out.push({ time: bars[k].time, value: sum / w });
+    }
+    return out;
+  }
 
   function renderChart(box, rows) {
+    renderBars(box, rowsToBars(rows));
+  }
+
+  /// 画一张全新的图并记下序列句柄(首屏 / 切主题 / 连接后重对齐都走它)。
+  function renderBars(box, bars) {
+    destroyChart();
     box.innerHTML = "";
-    lastKlines = rows;
-    if (!rows.length) {
+    chartSeries = null;
+    chartData = bars.slice();
+    if (!bars.length) {
       box.appendChild(h("div", "mk-empty mk-chart-empty", t("mkChartEmpty")));
       return;
     }
@@ -500,25 +821,14 @@
       },
       timeScale: { timeVisible: true, secondsVisible: false, borderColor: border },
     });
-    const series = chart.addCandlestickSeries({
+    const candle = chart.addCandlestickSeries({
       upColor,
       downColor,
       borderVisible: false,
       wickUpColor: upColor,
       wickDownColor: downColor,
     });
-    const data = rows
-      .map((k) => ({
-        time: Math.floor(new Date(k.open_time).getTime() / 1000),
-        open: Number(k.open),
-        high: Number(k.high),
-        low: Number(k.low),
-        close: Number(k.close),
-        volume: Number(k.volume),
-      }))
-      .filter((d) => Number.isFinite(d.time) && Number.isFinite(d.close))
-      .sort((a, b) => a.time - b.time);
-    series.setData(data);
+    candle.setData(chartData);
 
     // ---- 039: 成交量副图 (独立价格轴占底部约 18%; 与主图共享时间轴, 无需同步逻辑) ----
     const vol = chart.addHistogramSeries({
@@ -529,13 +839,17 @@
     });
     chart.priceScale("vol").applyOptions({ scaleMargins: { top: VOL_PANE_MARGIN, bottom: 0 } });
     vol.setData(
-      data
+      chartData
         .filter((d) => Number.isFinite(d.volume))
-        .map((d) => ({ time: d.time, value: d.volume, color: d.close >= d.open ? upColor : downColor }))
+        .map((d) => ({
+          time: d.time,
+          value: d.volume,
+          color: d.close >= d.open ? upColor : downColor,
+        }))
     );
 
     // ---- 039: MA7 / MA25 / MA99 (简单移动平均, 收盘价口径) ----
-    // 数据不足窗口长度的前 w-1 根**不画**(空数组自然断线): 不用 0 或前值冒充, 缺口就是缺口。
+    const ma = [];
     for (let i = 0; i < MA_WINDOWS.length; i++) {
       const w = MA_WINDOWS[i];
       const line = chart.addLineSeries({
@@ -545,15 +859,10 @@
         lastValueVisible: false,
         crosshairMarkerVisible: false,
       });
-      const points = [];
-      let sum = 0;
-      for (let k = 0; k < data.length; k++) {
-        sum += data[k].close;
-        if (k >= w) sum -= data[k - w].close;
-        if (k >= w - 1) points.push({ time: data[k].time, value: sum / w });
-      }
-      line.setData(points);
+      line.setData(maSeriesData(chartData, w));
+      ma.push(line);
     }
+    chartSeries = { candle: candle, vol: vol, ma: ma, up: upColor, down: downColor };
     chart.timeScale().fitContent();
   }
 
@@ -585,10 +894,10 @@
   // 034: 切主题时 K 线图跟着换配色 —— 用缓存的 K 线就地重绘, 不重新发请求。
   window.addEventListener("ricow:theme", () => {
     try {
-      if (chart && lastKlines && lastKlines.length && chart.parentElement) {
+      if (chart && chartData.length && chart.parentElement) {
+        // 用**当前图上的数据**(含实时帧)重绘, 不重新发请求。
         const box = chart.parentElement;
-        destroyChart();
-        renderChart(box, lastKlines);
+        renderBars(box, chartData);
       }
     } catch (_) {
       // 主题广播到达时视图可能正在切换, 图表已被销毁: 忽略, 下次进详情按新主题重取。
@@ -609,6 +918,8 @@
     deactivate: () => {
       gen += 1; // 离开视图: 在途响应全部作废, 一个 DOM 节点都不许再改
       clearTimeout(searchTimer);
+      // 040: 离开视图必须断流 —— 服务端按引用计数回收上游币安连接, 不断就会一直拉着。
+      closeStream();
       destroyChart();
     },
   };

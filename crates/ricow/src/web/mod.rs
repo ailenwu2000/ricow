@@ -15,6 +15,7 @@ mod keys;
 mod logs;
 mod markets;
 mod metrics;
+mod realtime;
 mod runs;
 mod sessions;
 mod settings;
@@ -178,6 +179,8 @@ pub struct WebState {
     hub: Arc<Hub>,
     /// 032 US3 (FR-019): 回测异步作业表(纯内存, 进程重启即清空; 同名策略同时只一个 running)。
     jobs: Arc<backtest_jobs::JobStore>,
+    /// 040: 行情实时订阅中枢(共享上游 + 引用计数生命周期; 纯内存, 无落盘)。
+    realtime: Arc<realtime::MarketHub>,
 }
 
 impl WebState {
@@ -199,6 +202,7 @@ impl WebState {
             store,
             hub,
             jobs: Arc::new(backtest_jobs::JobStore::new()),
+            realtime: Arc::new(realtime::MarketHub::new()),
         }
     }
 }
@@ -266,6 +270,9 @@ pub fn router(state: WebState) -> Router {
         .route("/api/markets/{symbol}/klines", get(markets::get_klines))
         // 策略目录(031 FR-013 / FR-014): 只读展示策略清单 + 参数 schema。
         .merge(strategies::routes())
+        // 行情实时化(040): 一条 SSE 同时推 K 线与盘口; 上游按 (市场,标的,周期) 共享,
+        // 最后一个订阅者离开即中止上游。挂在同一道 token 门之后(不新开端口/不新放行口)。
+        .merge(realtime::routes())
         // Prometheus 只读指标(038 P1-B): 实例/挂单/持仓/净盈亏/成交/回测作业计数。
         // 与**全部**端点同一道 token 门(D5): 不新开放行口、不新开端口; 不读密钥、不落盘。
         .merge(metrics::routes())

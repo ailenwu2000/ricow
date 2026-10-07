@@ -17,7 +17,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, Stream, StreamExt};
 use ricow_core::{
-    CoreError, CoreResult, OrderBookUpdate, OrderFill, OrderSide, OrderStatus, OrderUpdate,
+    CoreError, CoreResult, Kline, OrderBookUpdate, OrderFill, OrderSide, OrderStatus, OrderUpdate,
     UserEvent,
 };
 use rust_decimal::Decimal;
@@ -27,7 +27,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::futures_client::FuturesClient;
-use crate::ws::run_depth_ws;
+use crate::ws::{backoff_delay, run_depth_ws, run_kline_ws};
 
 const FAPI_MAINNET_WS: &str = "wss://fstream.binance.com/ws";
 const FAPI_DEMO_WS: &str = "wss://demo-fstream.binance.com/ws";
@@ -71,6 +71,26 @@ impl FuturesClient {
         let (tx, rx) = mpsc::channel::<OrderBookUpdate>(256);
         tokio::spawn(async move {
             run_depth_ws(&ws_url, &symbol_owned, tx, Some(snapshot)).await;
+        });
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    /// 订阅合约 K 线流 (040 FR-1)。
+    ///
+    /// 流名与现货**同构** (`<symbol>@kline_<interval>`), 差别只在 WS base (`fstream`) ——
+    /// 帧格式也一致 (`{"e":"kline","k":{...}}`), 故解析复用 `ws::parse_kline_frame`。
+    pub async fn subscribe_klines(
+        &self,
+        symbol: &str,
+        interval: &str,
+    ) -> CoreResult<Pin<Box<dyn Stream<Item = Kline> + Send>>> {
+        let stream_name = format!("{}@kline_{interval}", symbol.to_lowercase());
+        let ws_url = format!("{}/{stream_name}", self.ws_base());
+        let symbol_owned = symbol.to_string();
+
+        let (tx, rx) = mpsc::channel::<Kline>(256);
+        tokio::spawn(async move {
+            run_kline_ws(&ws_url, &symbol_owned, tx).await;
         });
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
@@ -149,11 +169,6 @@ impl FuturesClient {
             }
         });
     }
-}
-
-fn backoff_delay(retry_count: u32) -> Duration {
-    let base_secs = (1u64 << retry_count.min(6)).min(60);
-    Duration::from_secs(base_secs)
 }
 
 /// 消息空闲上限 (审计 H-3): 用户流事件稀疏, 但合约服务器 Ping 每 3 分钟一次;
