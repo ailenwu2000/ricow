@@ -9,7 +9,17 @@
   const R = (window.Ricow = window.Ricow || {});
 
   // 页面 URL 上的一次性 token(与 `<script src="?token=">` 同一条取值路径, 见 web/mod.rs)。
-  R.TOKEN = new URLSearchParams(location.search).get("token") || "";
+  //
+  // 取两处, 顺序不能反(043): 顶部导航带 `?token=` 进来时, 中间件 303 到去掉 token 的路径
+  // (安全-11: 地址栏/历史不留 token), 此后 `location.search` 里**就没有** token 了。
+  // `R.api` 还能靠 cookie 活着, 但 `EventSource`/WebSocket 无法自定请求头, 只能把 token 挂 URL 上 ——
+  // 而 "?token=" + "" 拼出来的空 query token 会**顶掉**后面那条有效的 cookie
+  // (`auth.rs::token_of` 里 query 优先于 cookie, 且不判空) → 全部流式连接 401。
+  // 兜底载体由服务端在渲染首页时填入(见 index.html 的 meta 注释), 与资源 URL 用的是同一个 token。
+  R.TOKEN =
+    new URLSearchParams(location.search).get("token") ||
+    (document.querySelector('meta[name="ricow-token"]') || {}).content ||
+    "";
 
   // 运行时文案(页面静态标签走 `data-zh` / `data-en`, 见 `R.applyLang`)。
   R.TEXT = {
@@ -40,6 +50,13 @@
       noLogs: "还没有任何策略日志(策略启动后才会生成)。",
       rotated: "日志已轮转(或被截断), 已从头重读 —— 不丢行、不重复",
       logUnreadable: "日志读不到",
+      // 044 日志工具条: 级别过滤是**行内关键字启发式**, 文案必须自陈 —— 日志行是文件里的原样
+      // 文本(FR-018 不解析), 说成"精确分级"就是骗人。
+      logLevelHint: "级别按行内关键字粗略匹配 —— 日志是原样文本, 不做解析",
+      logFollow: "跟随中",
+      logPaused: "已暂停",
+      logNew: "条新",
+      logCount: "显示 {shown} / 共 {total} 行 · 本地最多保留 {cap} 行",
       spot: "现货",
       futures: "合约",
       noStrategies: "无策略",
@@ -74,6 +91,11 @@
       noLogs: "No strategy logs yet (a log appears once a strategy has been started).",
       rotated: "Log rotated (or truncated); re-read from the start — no line dropped or repeated",
       logUnreadable: "Log unreadable",
+      logLevelHint: "Levels matched by keywords in the line text — log lines are shown verbatim, never parsed",
+      logFollow: "Following",
+      logPaused: "Paused",
+      logNew: "new",
+      logCount: "showing {shown} / {total} lines · at most {cap} kept locally",
       spot: "Spot",
       futures: "Futures",
       noStrategies: "No strategies",

@@ -29,6 +29,11 @@
     fills: document.getElementById("fills"),
     logName: document.getElementById("log-name"),
     logLines: document.getElementById("log-lines"),
+    // 044: 日志工具条(搜索 / 级别 / 跟随开关 / 诚实计数)。
+    logSearch: document.getElementById("log-search"),
+    logLevel: document.getElementById("log-level"),
+    logFollow: document.getElementById("log-follow"),
+    logCount: document.getElementById("log-count"),
     strategyList: document.getElementById("strategy-list"),
     strategyDetail: document.getElementById("strategy-detail"),
   };
@@ -44,6 +49,11 @@
     trade: null, // 交易面板最近一次读到的快照(还没读到就是 null, 不冒充"无持仓")
     logName: null, // 日志面板正在跟的策略
     logStream: null, // 日志面板那条流, 与会话流 state.source 各走各的(R5)
+    // 044 日志面板过滤/跟随: 三者都是**视图**状态, 不影响日志源(尾读/轮转/续传一律不动)。
+    logFollow: true, // 是否跟随最新; 用户往上滚即自动关掉(不抢用户的滚动位置)
+    logQuery: "", // 关键字过滤(已小写)
+    logLevel: "all", // 级别过滤 —— 行内关键字**启发式**(日志是原样文本, 不做解析), 见 spec FR-7
+    logPending: 0, // 暂停期间新到的行数 —— 如实显示, 不假装"没有新东西"
     strategyList: [], // 策略面板最近一次读到的列表(切语言重渲染用, 不重取)
     strategyDetail: null, // 策略面板正在展示详情的清单(null = 未点开)
     langCmd: false, // 本轮发过 /lang 命令: turn_end 后从服务端重读一次语言(D12, 对话内切换全视图生效)
@@ -69,6 +79,7 @@
     for (const node of els.logLines.querySelectorAll("[data-note]")) {
       node.textContent = noteText(node.dataset.note, node.dataset.reason);
     }
+    syncLogTools(); // 044: 工具条上的**动态**文案(跟随/已暂停 + 计数)也要跟着语言走
     if (!pop.hidden) renderPop(); // 浮层开着就地换语言, 不必关掉重开
   }
 
@@ -143,7 +154,7 @@
     div.className = "line " + (sev || "normal");
     div.textContent = text;
     append(div, pinned);
-    renderRich(div); // 报告行结构化 + 术语可点
+    renderRich(div); // 报告行结构化 + 术语可点(宿主输出不套 markdown, 见 renderRich 注释)
   }
 
   function appendMessage(role, content, sev) {
@@ -155,7 +166,7 @@
     div.className = "msg " + (role === "user" ? "user" : "assistant");
     div.textContent = content;
     append(div, atBottom());
-    if (role !== "user") renderRich(div);
+    if (role !== "user") renderRich(div, true); // 044: 助手气泡走受限 markdown
   }
 
   /// 助手文本增量 → 追加到当前回复气泡(FR-008 的"流式"), 没有气泡就开一个。
@@ -172,9 +183,10 @@
   }
 
   /// 收起当前增量气泡: 此刻全文已到齐, 才做报告结构化与术语标注(流式期间改不了 DOM 结构)。
+  /// 044: markdown 也在这里做 —— 流式期间只累积原文, 免得每个 delta 重排整块 DOM 还丢滚动位置。
   function finishStreaming() {
     if (!state.streaming) return;
-    renderRich(state.streaming);
+    renderRich(state.streaming, true);
     state.streaming = null;
   }
 
@@ -265,52 +277,62 @@
   ///
   /// 只动报告自己: 连续的 `指标名: 值` / `--- 段标题 ---` 收进一张卡片, 其余正文一字不动 ——
   /// 哪些名字算指标全部来自术语表, 前端不另立第二套定义。
-  function renderRich(el) {
+  ///
+  /// `md`(044)只作用于**助手气泡**: 那是 AI 的自由文本, 有代码块 / 表格 / 加粗要认。
+  /// 宿主的 `line` 帧是对齐排版的纯文本(回测报告就在里面), 套 markdown 会把对齐打散,
+  /// 所以默认关闭。分段规则不变 —— 先按既有判据切出报告段(仍进卡片), **剩下的散文段**
+  /// 才按 `md` 选 markdown 或纯文本; 于是"气泡里夹着报告"这种混合内容也能两全。
+  function renderRich(el, md) {
     const text = el.textContent || "";
-    if (text.indexOf(":") >= 0) {
-      const frag = document.createDocumentFragment();
-      let plain = [];
-      let card = null;
-      const flushPlain = () => {
-        if (!plain.length) return;
-        frag.appendChild(document.createTextNode(plain.join("\n")));
-        plain = [];
-      };
-      const flushCard = () => {
-        if (!card) return;
-        frag.appendChild(card);
-        card = null;
-      };
-      for (const line of text.split("\n")) {
-        const node = sectionTitle(line) || metricRow(line);
-        if (node) {
-          flushPlain();
-          if (!card) {
-            card = document.createElement("div");
-            card.className = "report";
-          }
-          card.appendChild(node);
-          continue;
+    const frag = document.createDocumentFragment();
+    let plain = [];
+    let card = null;
+    const flushPlain = () => {
+      if (!plain.length) return;
+      const body = plain.join("\n");
+      if (md && R.markdown) frag.appendChild(R.markdown.render(body));
+      else frag.appendChild(document.createTextNode(body));
+      plain = [];
+    };
+    const flushCard = () => {
+      if (!card) return;
+      frag.appendChild(card);
+      card = null;
+    };
+    for (const line of text.split("\n")) {
+      const node = sectionTitle(line) || metricRow(line);
+      if (node) {
+        flushPlain();
+        if (!card) {
+          card = document.createElement("div");
+          card.className = "report";
         }
-        flushCard();
-        plain.push(line);
+        card.appendChild(node);
+        continue;
       }
-      flushPlain();
       flushCard();
-      el.textContent = "";
-      el.appendChild(frag);
+      plain.push(line);
     }
+    flushPlain();
+    flushCard();
+    el.textContent = "";
+    el.appendChild(frag);
     decorateTerms(el);
   }
 
   /// 把正文里出现的术语包成可点击入口(FR-024); 已包好的不再进, 避免嵌套。
+  ///
+  /// 044: **代码块与行内代码里不挂术语** —— 代码里的 `手续费` / `成交量` 是标识符或字面量,
+  /// 变成可点术语会误导(而且点开浮层会盖住代码)。
   function decorateTerms(root) {
     if (!termRe) return;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     const nodes = [];
     while (walker.nextNode()) nodes.push(walker.currentNode);
     for (const node of nodes) {
-      if (node.parentElement && node.parentElement.classList.contains("term")) continue;
+      const parent = node.parentElement;
+      if (!parent) continue;
+      if (parent.classList.contains("term") || parent.closest("pre, code")) continue;
       const text = node.nodeValue;
       termRe.lastIndex = 0;
       let matched = termRe.exec(text);
@@ -863,6 +885,84 @@
     return reason ? t(key) + ": " + reason : t(key);
   }
 
+  // ---------- 日志工具条 (044: 搜索 / 级别 / 跟随开关) ----------
+  //
+  // 三条不变量:
+  //   1. **诚实**: 日志行是文件里的原样文本(FR-018, 不解析、不着色), 所以"级别"只能是行内
+  //      关键字启发式 —— UI 文案与 `title` 都自陈这一点(见 common.js 的 `logLevelHint`),
+  //      不把它说成"精确分级"。计数同理: 显示 **M / 共 N**, 并注明本地只留最近 500 行。
+  //   2. **宿主说明行不受过滤**: 轮转 / 读不到这类提示解释的是"日志为什么断了一截",
+  //      被搜索词滤掉会让人误以为日志是连续的。
+  //   3. **不抢滚动**: 只有跟随态才滚到底; 用户上滚即转为暂停并计待读, 由用户决定何时回底。
+
+  /// 距底多少像素内算"贴在底部"(与对话流的 `atBottom` 同口径, 但日志行高更小, 取小一点)。
+  const LOG_BOTTOM_SLACK = 24;
+
+  /// 级别启发式: 全是**小写子串**匹配, 口径写在 `logLevelHint` 里给用户看。
+  function logLevelHit(text) {
+    if (state.logLevel === "all") return true;
+    const hay = text.toLowerCase();
+    if (state.logLevel === "error") return hay.indexOf("error") >= 0 || hay.indexOf("fatal") >= 0;
+    return hay.indexOf("warn") >= 0;
+  }
+
+  /// 这一行当前是否该显示。
+  function logVisible(node) {
+    // 宿主说明行(轮转 / 读不到)与"还没有任何日志"占位: 不过滤 —— 它们解释的是"为什么没有行",
+    // 被搜索词滤掉会让人误以为日志是连续的。
+    if (node.classList.contains("log-note") || node.classList.contains("empty")) return true;
+    const text = node.textContent || "";
+    if (state.logQuery && text.toLowerCase().indexOf(state.logQuery) < 0) return false;
+    return logLevelHit(text);
+  }
+
+  /// 把过滤条件铺到已渲染的每一行上(改条件要能立刻恢复, 所以用 class 切换而不是删节点)。
+  function applyLogFilter() {
+    for (const node of els.logLines.children) {
+      node.classList.toggle("log-hidden", !logVisible(node));
+    }
+    syncLogTools();
+  }
+
+  /// 工具条上的**动态**文案: 跟随态 + 待读条数 + 显示/总数。切语言后也要再跑一次。
+  function syncLogTools() {
+    if (!els.logCount) return; // 面板不在(旧页面 / 被移除): 静默跳过, 不炸其余功能
+    els.logLevel.title = t("logLevelHint");
+    els.logSearch.title = t("logLevelHint");
+    els.logFollow.classList.toggle("paused", !state.logFollow);
+    els.logFollow.textContent = state.logFollow
+      ? t("logFollow")
+      : t("logPaused") + (state.logPending ? " · " + state.logPending + " " + t("logNew") : "");
+    if (els.logSearch.disabled) {
+      // 一个日志文件都没有: 工具条不可用, 也不该显示"显示 0 / 共 0 行"这种像结论的数字。
+      els.logCount.textContent = "";
+      return;
+    }
+    let shown = 0;
+    for (const node of els.logLines.children) {
+      if (!node.classList.contains("log-hidden")) shown += 1;
+    }
+    const total = els.logLines.childElementCount;
+    els.logCount.textContent = t("logCount")
+      .replace("{shown}", String(shown))
+      .replace("{total}", String(total))
+      .replace("{cap}", String(LOG_DOM_MAX));
+  }
+
+  /// 有没有日志可跟 —— 决定工具条可用与否。
+  function setLogToolsEnabled(on) {
+    els.logSearch.disabled = !on;
+    els.logLevel.disabled = !on;
+    els.logFollow.disabled = !on;
+  }
+
+  function resumeLog() {
+    state.logFollow = true;
+    state.logPending = 0;
+    els.logLines.scrollTop = els.logLines.scrollHeight;
+    syncLogTools();
+  }
+
   /// 策略清单(FR-017): 只认 `logs/*.log` 文件 —— 策略**没在跑**, 只要有文件就列得出来。
   async function refreshLogList() {
     const files = await R.api("/api/logs");
@@ -879,6 +979,8 @@
       closeLog();
       els.logLines.textContent = "";
       els.logLines.appendChild(emptyRow(t("noLogs")));
+      setLogToolsEnabled(false); // 没日志可跟: 搜索/级别/跟随无意义, 直接置灰(别给假控件)
+      syncLogTools();
       return;
     }
     // 选中的策略还在就**不重开**流(重开会清屏重读首屏, 白白打断正在跟的滚动位置)。
@@ -893,6 +995,10 @@
     if (!name) return;
     state.logName = name;
     els.logLines.textContent = "";
+    // 044: 换策略 = 新的一屏, 旧的待读计数作废; 过滤条件**保留**(用户的搜索词不该被清掉)。
+    state.logPending = 0;
+    setLogToolsEnabled(true);
+    applyLogFilter();
     const url =
       "/api/logs/" +
       encodeURIComponent(name) +
@@ -941,12 +1047,44 @@
     while (els.logLines.childElementCount > LOG_DOM_MAX) {
       els.logLines.removeChild(els.logLines.firstChild);
     }
-    els.logLines.scrollTop = els.logLines.scrollHeight;
+    // 044: 新到的行也要过当前过滤条件 —— 否则"搜索中"新来的行会无视条件冒出来。
+    div.classList.toggle("log-hidden", !logVisible(div));
+    if (state.logFollow) {
+      els.logLines.scrollTop = els.logLines.scrollHeight;
+      state.logPending = 0;
+    } else {
+      state.logPending += 1; // 暂停期间如实累计, 由工具条显示待读条数
+    }
+    syncLogTools();
   }
 
   els.logName.addEventListener("change", () => {
     openLog(els.logName.value);
   });
+
+  // 044 工具条交互: 三件套都只改**视图**, 不碰日志源(尾读/轮转/续传一律不动)。
+  els.logSearch.addEventListener("input", () => {
+    state.logQuery = els.logSearch.value.trim().toLowerCase();
+    applyLogFilter();
+  });
+  els.logLevel.addEventListener("change", () => {
+    state.logLevel = els.logLevel.value;
+    applyLogFilter();
+  });
+  els.logFollow.addEventListener("click", resumeLog);
+  // 上滚 = 停止跟随(用户正在看历史, 新行不该把他拽回底部); 回到底部 = 自动恢复跟随。
+  els.logLines.addEventListener(
+    "scroll",
+    () => {
+      const el = els.logLines;
+      const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight <= LOG_BOTTOM_SLACK;
+      if (atEnd === state.logFollow) return;
+      state.logFollow = atEnd;
+      if (atEnd) state.logPending = 0;
+      syncLogTools();
+    },
+    { passive: true },
+  );
 
   // ---------- 策略目录 (031 FR-013 / FR-014): 只读展示, 配置走对话确认 ----------
 

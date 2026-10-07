@@ -609,6 +609,54 @@ body {
   color: var(--error);
 }
 
+/* ---- 日志工具条 (044: 搜索 / 级别 / 跟随) ----
+   三个控件都只改**视图**(过滤、滚动), 不碰日志源; 一个日志文件都没有时由 JS 整体置灰。 */
+.log-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.log-tools .mini-input {
+  flex: 1 1 96px;
+  min-width: 72px;
+  padding: 2px 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.78rem;
+}
+.log-tools .mini-input:disabled,
+.log-tools .mini-select:disabled,
+.log-tools .mini-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.log-tools .mini-btn {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+/* 暂停跟随 = 明确的状态色(与"跟随中"一眼可分), 并提示还有多少条没看。 */
+.log-tools .mini-btn.paused {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+/* 被过滤掉的行留占位(display:none), 改搜索词即可原地恢复 —— 删节点就得重读日志。 */
+.log-lines .log-hidden {
+  display: none;
+}
+
 /* 策略目录(031): 只读展示, 按现货/合约分组 + 参数表单(disabled 预填)。 */
 #strategy-list {
   padding: 4px 0;
@@ -2633,4 +2681,121 @@ body {
 /* ---- 顶栏主题选择 ---- */
 #theme-select {
   min-width: 64px;
+}
+
+/* ---- 受限 markdown 渲染 (044) ----
+   只作用于**助手气泡**(`#stream .msg.assistant`); 宿主输出是对齐纯文本, 走原路径。
+   全部颜色引用主题变量, 三个主题自动跟随(别写死颜色)。 */
+#stream .md-p {
+  margin: 6px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#stream .md-p:first-child,
+#stream .md-h:first-child,
+#stream .md-list:first-child,
+#stream .md-pre:first-child {
+  margin-top: 0;
+}
+#stream .md-p:last-child,
+#stream .md-list:last-child,
+#stream .md-pre:last-child {
+  margin-bottom: 0;
+}
+#stream .md-h {
+  margin: 12px 0 4px;
+  color: var(--fg);
+  font-weight: 600;
+  line-height: 1.4;
+}
+#stream .md-h1 {
+  font-size: 1.12em;
+}
+#stream .md-h2 {
+  font-size: 1.05em;
+}
+#stream .md-h3 {
+  font-size: 1em;
+  color: var(--muted);
+}
+#stream .md-list {
+  margin: 6px 0 6px 1.25em;
+  padding: 0;
+}
+#stream .md-list-sub {
+  margin: 2px 0 2px 1.15em;
+}
+#stream .md-li {
+  margin: 2px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#stream .md-code {
+  padding: 1px 4px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 0.92em;
+  color: var(--accent);
+}
+#stream .md-pre {
+  margin: 8px 0;
+  padding: 8px 10px;
+  overflow-x: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+/* 代码块内的长行横向滚动, 不折行(折行会把缩进语义毁掉)。 */
+#stream .md-code-block {
+  display: block;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  white-space: pre;
+}
+#stream .md-quote {
+  margin: 6px 0;
+  padding: 2px 0 2px 10px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#stream .md-hr {
+  margin: 10px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+#stream .md-table {
+  margin: 8px 0;
+  border-collapse: collapse;
+  font-size: 0.9em;
+}
+#stream .md-th,
+#stream .md-td {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  text-align: left;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#stream .md-th {
+  background: var(--raised);
+  font-weight: 600;
+}
+#stream .md-link {
+  color: var(--accent);
+  text-decoration: underline;
+}
+#stream .md-del {
+  color: var(--muted);
+}
+#stream .md-em {
+  font-style: italic;
 }

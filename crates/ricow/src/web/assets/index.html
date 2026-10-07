@@ -3,6 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      token 的**页面内载体**(043): 顶部导航带 `?token=` 时, 中间件会 303 到去掉 token 的路径
+      (安全-11: 地址栏/历史不留 token), 此后 `location.search` 里就没有 token 了 —— 而
+      `EventSource` / WebSocket 无法自定义请求头, 只能把 token 挂在 URL 上, 于是前端必须**另有一处**
+      能读到它。服务端在 `/` 处把本占位符替换成**本次请求实际生效的 token**(与各资源 URL 同源,
+      内嵌与 `--web-assets-dir` 两形态都替换), 故不引入任何新的暴露面。
+      不用内联 `<script>` 是因为 CSP 为 `script-src 'self'`(无 `unsafe-inline`), 会被直接拦掉。
+    -->
+    <meta name="ricow-token" content="__RICOW_TOKEN__" />
     <title>Ricow</title>
     <!--
       静态资源的 URL 里带 `__RICOW_TOKEN__`: 服务端只在 `/` 处替换它(见 `web/mod.rs`)。
@@ -118,6 +127,37 @@
                 <span data-zh="策略日志" data-en="Strategy log">策略日志</span>
                 <select id="log-name" class="mini-select"></select>
               </div>
+              <!--
+                044: 日志工具条 —— 搜索 / 级别 / 跟随开关 + 诚实计数。
+                三点口径写在这里, 免得以后被"优化"掉:
+                  ① 日志行是文件里的**原样文本**(FR-018: 不解析、不着色), 故"级别"只能是行内
+                     关键字**启发式**; 控件 title 与文案都自陈这一点, 不假装是精确分级。
+                  ② 一个日志文件都没有时三个控件全 disabled(别给假控件)。
+                  ③ 面板仍是**只读**的: 这里没有、也不许有直连交易所的动作按钮(D17),
+                     一律禁用内联事件(见 assets.rs 的白名单断言)。
+              -->
+              <div class="log-tools">
+                <input
+                  id="log-search"
+                  class="mini-input"
+                  type="search"
+                  autocomplete="off"
+                  spellcheck="false"
+                  disabled
+                  placeholder="搜索日志…"
+                  data-zh-placeholder="搜索日志…"
+                  data-en-placeholder="Search log…"
+                />
+                <select id="log-level" class="mini-select" disabled>
+                  <option value="all" data-zh="全部级别" data-en="All levels">全部级别</option>
+                  <option value="error" data-zh="错误" data-en="Errors">错误</option>
+                  <option value="warn" data-zh="警告" data-en="Warnings">警告</option>
+                </select>
+                <button id="log-follow" class="mini-btn" type="button" disabled data-zh="跟随中" data-en="Following">
+                  跟随中
+                </button>
+                <span id="log-count" class="muted small"></span>
+              </div>
               <div id="log-lines" class="log-lines"></div>
             </section>
           </aside>
@@ -142,11 +182,18 @@
     <script src="/lightweight-charts.js?token=__RICOW_TOKEN__"></script>
     <script src="/common.js?token=__RICOW_TOKEN__"></script>
     <script src="/router.js?token=__RICOW_TOKEN__"></script>
+    <!-- 044: 受限 markdown 渲染器 —— chat.js 在 renderRich 里用它(助手气泡), 故须先加载。 -->
+    <script src="/markdown.js?token=__RICOW_TOKEN__"></script>
     <script src="/chat.js?token=__RICOW_TOKEN__"></script>
     <script src="/settings.js?token=__RICOW_TOKEN__"></script>
     <script src="/keys.js?token=__RICOW_TOKEN__"></script>
     <script src="/markets.js?token=__RICOW_TOKEN__"></script>
     <script src="/strategies.js?token=__RICOW_TOKEN__"></script>
+    <!-- 042: 策略视图拆出的三份子文件 —— **必须紧跟 strategies.js**(外壳先建立 `R.sg`,
+         子文件在加载期从它取工具/常量; 顺序反了会整片 `undefined`)。 -->
+    <script src="/strategy_form.js?token=__RICOW_TOKEN__"></script>
+    <script src="/strategy_editor.js?token=__RICOW_TOKEN__"></script>
+    <script src="/strategy_backtest.js?token=__RICOW_TOKEN__"></script>
     <script src="/runs.js?token=__RICOW_TOKEN__"></script>
     <script src="/app.js?token=__RICOW_TOKEN__"></script>
   </body>

@@ -54,6 +54,9 @@ pub(super) const ASSETS: &[Asset] = &[
     Asset { name: "common.js", ctype: CTYPE_JS, embedded: include_str!("assets/common.js") },
     // hash 路由与视图注册表(032 T003)。
     Asset { name: "router.js", ctype: CTYPE_JS, embedded: include_str!("assets/router.js") },
+    // 受限 markdown 渲染器(044): AI 助手气泡的结构化渲染, 只产 DOM(chart.js 在 renderRich 里用)。
+    // **必须排在 chat.js 之前** —— 加载顺序即契约, 见本文件末尾的顺序测试。
+    Asset { name: "markdown.js", ctype: CTYPE_JS, embedded: include_str!("assets/markdown.js") },
     // 对话视图(032 T006): 会话 / SSE / 三个只读面板逻辑。
     Asset { name: "chat.js", ctype: CTYPE_JS, embedded: include_str!("assets/chat.js") },
     // 设置视图(032 US1): 市场视野开关; 密钥配置已迁至 033 密钥视图。
@@ -62,11 +65,28 @@ pub(super) const ASSETS: &[Asset] = &[
     Asset { name: "keys.js", ctype: CTYPE_JS, embedded: include_str!("assets/keys.js") },
     // 市场视图(032 US2, 040 起含 SSE 实时): 交易对列表 / 订单簿 / K 线。
     Asset { name: "markets.js", ctype: CTYPE_JS, embedded: include_str!("assets/markets.js") },
-    // 策略管理视图(032 US3): 策略列表 / 源码编辑保存 / AI 改 Lua / 回测作业。
+    // 策略管理视图(032 US3, 042 拆四份): 外壳 —— 命名空间/工具/常量/共享状态 + 列表态 + 新建/复制。
+    // **必须排在三份子文件之前**: 子文件在加载期从 `R.sg` 取工具与常量, 顺序即契约。
     Asset {
         name: "strategies.js",
         ctype: CTYPE_JS,
         embedded: include_str!("assets/strategies.js"),
+    },
+    // 042: 策略视图拆出的三份子文件(顺序即加载顺序, 见上面那条注释)。
+    Asset {
+        name: "strategy_form.js",
+        ctype: CTYPE_JS,
+        embedded: include_str!("assets/strategy_form.js"),
+    },
+    Asset {
+        name: "strategy_editor.js",
+        ctype: CTYPE_JS,
+        embedded: include_str!("assets/strategy_editor.js"),
+    },
+    Asset {
+        name: "strategy_backtest.js",
+        ctype: CTYPE_JS,
+        embedded: include_str!("assets/strategy_backtest.js"),
     },
     // 运行管理视图(032 US4): 实例一览 / 启停 / 风险确认 / 行内日志。
     Asset { name: "runs.js", ctype: CTYPE_JS, embedded: include_str!("assets/runs.js") },
@@ -301,6 +321,101 @@ mod tests {
         assert!(!html.contains(TOKEN_PLACEHOLDER), "占位符必须全部替换掉");
     }
 
+    /// 043: 顶部导航的 303 换发会把 token 从地址栏拿掉, 而 SSE/WS **只能**把 token 挂在 URL 上 ——
+    /// 故页面必须有第二处 token 载体, 且 `R.TOKEN` 必须真的读它。
+    ///
+    /// 回归背景(`f0e65f9`, 2026-10-06): 303 换发上线后 `location.search` 里不再有 token →
+    /// `R.TOKEN` 为空 → `"?token=" + ""` 拼出的**空 query token** 顶掉了后面那条有效 cookie
+    /// (`auth.rs::token_of` 里 query 优先于 cookie 且不判空) → 页面上**所有** EventSource 401,
+    /// 而 `R.sse` 的 `onfail` 是空的, 于是全程静默: 对话收不到流式回复、日志/行情实时全断、
+    /// 发完第一条消息输入区永久禁用。
+    ///
+    /// 为什么当时没红: `curl` 与 `e2e_web.py` 都不带 `Sec-Fetch-Mode: navigate`, 触发不到 303,
+    /// 所以那句"真机冒烟 144 passed"**结构性**覆盖不到这条路径。这条单测是补洞的第一道闸,
+    /// 第二道在 `e2e_web.py` 的"模拟浏览器导航"段。
+    #[test]
+    fn test_index_carries_token_for_js_when_query_is_gone() {
+        assert!(
+            INDEX_HTML.contains(r#"name="ricow-token""#),
+            "首页须带 token 载体(043): 303 换发后 location.search 里没有 token, 而 SSE/WS 只能挂 URL"
+        );
+        assert!(
+            INDEX_HTML.contains(r#"name="ricow-token" content="__RICOW_TOKEN__""#),
+            "载体的内容必须是服务端会替换的占位符, 否则浏览器拿到的是字面量"
+        );
+        let html = render_index(INDEX_HTML, "tok-123");
+        assert!(
+            html.contains(r#"name="ricow-token" content="tok-123""#),
+            "渲染后载体须填上本次请求的 token"
+        );
+
+        let common = src_of("common.js");
+        assert!(
+            common.contains(r#"meta[name="ricow-token"]"#),
+            "common.js 的 R.TOKEN 必须回落到 meta 载体, 否则 303 之后 token 为空"
+        );
+        // 下游确实靠 `R.TOKEN` 拼流式地址 —— 载体失效时这一串会静默 401, 故在这里点名。
+        for name in ["chat.js", "markets.js", "runs.js"] {
+            assert!(src_of(name).contains("R.TOKEN"), "{name} 的流式地址要用 R.TOKEN");
+        }
+    }
+
+    /// 044: markdown 渲染器**只产 DOM**, 不碰 `innerHTML`。
+    ///
+    /// AI 的回答是**不可信内容**。走 `innerHTML` 就得维护一套转义 + 白名单, 漏一处就是 XSS;
+    /// `createElement` / `textContent` 路线从结构上就没有注入面, 也不需要给安全扫描开白名单
+    /// —— 分析文档原本建议"只对渲染器产物放行 innerHTML 并改 `assets.rs` 白名单", 已明确**不采纳**。
+    #[test]
+    fn test_markdown_renderer_is_dom_only() {
+        let md = src_of("markdown.js");
+        for banned in
+            [".innerHTML", "innerHTML =", ".outerHTML", "insertAdjacentHTML", "document.write"]
+        {
+            assert!(
+                !md.contains(banned),
+                "markdown.js 不得使用 `{banned}`(AI 输出不可信, 只走 DOM API)"
+            );
+        }
+        // 链接协议白名单: 只放行 http(s), 其余(`javascript:` / `data:`)降级为纯文本。
+        assert!(md.contains("https?"), "markdown.js 须含链接协议白名单");
+        assert!(md.contains("R.markdown = { render: render }"), "渲染入口须是 R.markdown.render");
+        assert!(src_of("chat.js").contains("R.markdown"), "chat.js 须真的调用渲染器");
+    }
+
+    /// 044: 渲染器必须**先于**消费者加载 —— 与 042 的策略外壳同一条契约(加载期取符号,
+    /// 顺序反了就是整片 `undefined`, 且只在用户打开对话页时才静默现形)。
+    /// 顺手把 `common.js`(工具/i18n/主题)必须先于所有视图脚本这条既有约定也钉住。
+    #[test]
+    fn test_markdown_loads_before_chat_and_common_loads_first() {
+        let idx = |name: &str| {
+            ASSETS
+                .iter()
+                .position(|a| a.name == name)
+                .unwrap_or_else(|| panic!("资产表里缺 {name}"))
+        };
+        let pos = |name: &str| {
+            INDEX_HTML.find(&format!("/{name}?token=")).unwrap_or_else(|| panic!("首页缺 /{name}"))
+        };
+        assert!(
+            idx("markdown.js") < idx("chat.js"),
+            "markdown.js 必须排在 chat.js 之前(加载顺序即契约)"
+        );
+        assert!(pos("markdown.js") < pos("chat.js"), "首页里 markdown.js 必须排在 chat.js 之前");
+        let common = idx("common.js");
+        for view in [
+            "chat.js",
+            "settings.js",
+            "keys.js",
+            "markets.js",
+            "strategies.js",
+            "runs.js",
+            "app.js",
+        ] {
+            assert!(common < idx(view), "common.js 必须排在所有视图脚本之前(缺 {view})");
+            assert!(pos("common.js") < pos(view), "首页里 common.js 必须排在 {view} 之前");
+        }
+    }
+
     /// SC-011(浏览器侧): 页面不往 `localStorage` / `sessionStorage` 写任何东西 —— 明文密钥与
     /// 对话内容都不该在浏览器里留存; 密钥提示一到就切遮蔽输入, 提交时也不画用户气泡。
     ///
@@ -353,8 +468,20 @@ mod tests {
         let start = INDEX_HTML.find(r#"<aside id="panels">"#).expect("右栏面板");
         let end = INDEX_HTML[start..].find("</aside>").expect("面板收尾") + start;
         let panels = &INDEX_HTML[start..end];
-        assert!(!panels.contains("<button"), "面板是只读的, 不得有按钮(D17)");
-        assert!(!panels.contains("onclick"), "面板是只读的, 不得有内联事件(D17)");
+        // 面板区里的**交互控件只能"看"**: 044 在日志面板加了搜索 / 级别 / 跟随三个**视图**控件,
+        // 于是原来那句"一个 `<button>` 都不许有"的**代理**断言要换成显式允许清单 ——
+        // 意图(D17: 面板没有直连交易所的动作)保住, 例外显式化: 往这里塞一个交易动作按钮依然会红。
+        let allowed_view_controls = ["log-follow"];
+        for chunk in panels.split("<button").skip(1) {
+            let head = &chunk[..chunk.find('>').unwrap_or(chunk.len())];
+            assert!(
+                allowed_view_controls.iter().any(|id| head.contains(&format!(r#"id="{id}""#))),
+                "面板区只允许视图控件按钮(白名单 {allowed_view_controls:?}), 这个不在其列: <button{head}>"
+            );
+        }
+        for inline in ["onclick", "oninput", "onchange", "onsubmit", "onload"] {
+            assert!(!panels.contains(inline), "面板是只读的, 不得有内联事件 `{inline}`(D17)");
+        }
 
         // 这两组端点在对话视图里只以 GET 出现(032: 逻辑迁入 chat.js)。
         for line in chat.lines().filter(|l| l.contains("/api/trades") || l.contains("/api/logs")) {
@@ -414,5 +541,31 @@ mod tests {
             matches!(AssetSource::default(), AssetSource::Embedded),
             "默认必须是内嵌: 不给开关时发布行为不得变化(FR-1)"
         );
+    }
+
+    /// 042: 策略视图拆成"外壳 + 三份子文件"后 **加载顺序成了正确性条件** —— 子文件在加载期
+    /// 从 `R.sg` 取工具与常量, 外壳没先跑就是整片 `undefined`; 而那种失败只在用户点开策略页
+    /// 时才现形(且是静默的), 离 `cargo test` 很远。`ASSETS` 的顺序 = 路由生成顺序 =
+    /// `index.html` 的 `<script>` 顺序, 故在这里把这条约定钉死。
+    #[test]
+    fn test_strategy_shell_loads_before_its_parts() {
+        let idx = |name: &str| {
+            ASSETS
+                .iter()
+                .position(|a| a.name == name)
+                .unwrap_or_else(|| panic!("资产表里缺 {name}"))
+        };
+        let shell = idx("strategies.js");
+        let parts = ["strategy_form.js", "strategy_editor.js", "strategy_backtest.js"];
+        for part in parts {
+            assert!(idx(part) > shell, "{part} 必须排在 strategies.js 之后(加载顺序即契约)");
+        }
+        // 首页的 <script> 顺序也要与表里一致 —— 两处顺序不一致时, 表里的断言就白做了。
+        let pos = |name: &str| {
+            INDEX_HTML.find(&format!("/{name}?token=")).unwrap_or_else(|| panic!("首页缺 /{name}"))
+        };
+        for part in parts {
+            assert!(pos(part) > pos("strategies.js"), "首页里 {part} 必须排在 strategies.js 之后");
+        }
     }
 }
