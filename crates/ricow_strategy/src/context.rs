@@ -973,7 +973,10 @@ impl DryRunContext {
 
     /// 执行成交: 更新虚拟持仓 + 余额, 记录 fill 到 PnL。
     fn execute_fill(&mut self, order_id: &str, req: &OrderRequest, fill_price: Decimal) {
-        self.apply_position_change(req, fill_price);
+        // 039: 本次成交时刻只取一次 —— 平仓明细 (逐笔盈亏) 与 fill 记录共用同一个时间戳,
+        // 两者逐条可对上 (live/dry-run 是真实墙钟; 回测路径在 BacktestContext 内另有虚拟 bar 时间)。
+        let ts = chrono::Utc::now();
+        self.apply_position_change(req, fill_price, ts);
         self.apply_virtual_balance_change(req, fill_price);
 
         let is_maker = matches!(req.order_type, OrderType::Limit);
@@ -987,13 +990,18 @@ impl DryRunContext {
             fill_price,
             fill_size: req.size,
             fee,
-            timestamp: chrono::Utc::now(),
+            timestamp: ts,
         };
         self.pnl.record_fill(&fill);
         self.fill_queue.push(fill);
     }
 
-    fn apply_position_change(&mut self, req: &OrderRequest, fill_price: Decimal) {
+    fn apply_position_change(
+        &mut self,
+        req: &OrderRequest,
+        fill_price: Decimal,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) {
         if let Ok(mut pos_cache) = self.virtual_positions.write() {
             let key = self.resolve_key(&req.pair);
             let entry = pos_cache.entry(key.clone()).or_insert_with(|| Position {
@@ -1009,7 +1017,7 @@ impl DryRunContext {
 
             let realized = apply_fill_to_net_position(entry, req.side, req.size, fill_price);
             if realized != Decimal::ZERO {
-                self.pnl.record_pnl(realized);
+                self.pnl.record_pnl(realized, ts);
             }
             entry.mark_price = fill_price;
         }

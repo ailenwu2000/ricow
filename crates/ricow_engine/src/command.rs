@@ -2392,7 +2392,7 @@ mod tests {
         db.insert_fill(name, &fill).await.unwrap();
         let mut pnl = PnlTracker::default();
         pnl.record_fill(&fill);
-        pnl.record_pnl(dec!(12.5));
+        pnl.record_pnl(dec!(12.5), fill.timestamp);
         persist_fill_facts(&db, &mut outcome, name, &fill, &pnl, RunMode::Demo).await;
 
         assert_eq!(db.fill_count().await.unwrap(), 1, "fills 表一行");

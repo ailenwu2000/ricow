@@ -139,6 +139,13 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   手动展开过的块(`data-keep-open`)不被自动收起、点术语先展开所在块、选文字不触发。
   入口钩子在 `chat.js` 的 `append` / `appendDelta`(最新一块始终完整可见)。
 
+**Web 图表能力补强(039, 2026-10-06)**: 纯前端 + 引擎侧一处记账扩展, 无新表、无新端点、无新依赖(仍无构建链)。
+
+- **市场 K 线指标(前端现算)**: `markets.js` 的 `renderChart` 在**同一图表实例**上叠加 MA7/25/99(独立线条, 数据不足窗口处**断线**, 不补 0 冒充)与**成交量柱**(独立价格轴 `vol` + `scaleMargins`, 占底部约 18% —— 与主图共享时间轴, 无需同步代码)。均线取色走新增 CSS 变量 `--ma-7/25/99`(三主题各一份), 图例 `.mk-chart-legend` 用 `currentColor` 色块与线同色。**配色修正**: K 线上涨色此前取 `--accent`(绿), 与指标卡 / 历史表的「涨红跌绿」相反 —— 039 一并改为 涨 = `--error`、跌 = `--accent`。
+- **回测图表五序列**: `BacktestChart` 由 `{times,price,equity,fills}` 扩为 + `benchmark` / `drawdown` / `closed`(+`closed_total`); 派生序列一律**在全分辨率上算完再抽稀**(对抽稀序列重算会低估回撤、并让基准起点漂移)。口径与标量指标的关系见 `specs/backtest.md` §十四。
+- **引擎记账扩展**: `PnlTracker` 增 `ClosedTrade { time, pnl }` 明细(保最近 `MAX_CLOSED_TRADES=1000` + **单列总条数**), `record_pnl` 收时间戳; 回测侧传**虚拟 bar 收盘时间**(不用墙钟, 否则与图表时间轴对不上), live/dry-run 传成交自身时刻。`BacktestReport` 增 `closed_trades` / `closed_trades_total` / `benchmark_entry_time`; `MetricsSummary` 增 `realized_pnl` / `closed_trades_total`。
+- **诚实性**: 明细超限时界面明说"仅显示最近 N 条(共 M 条)"且只报**显示部分**的求和(不拿部分和冒充总数); 无平仓事件不渲染空表; 基准线建仓前为**空白段**而非 0。(2026-10-06)
+
 ~~`keyring`~~ / ~~`setup`~~ / ~~`credentials`~~ / ~~`config`~~ —— 2026-09-14 随单一配置文件方案**全部删除**(019 D31: 文件即界面)。
 
 - 建策略(002, 写操作不得一步落盘): `ricow create --name <n> --pair <p> [--script <file|->] [--param k=v] [--days N] [--interval] [--market spot|futures]`
@@ -328,7 +335,8 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-10-06, 038 P1 健壮性加固后实跑)**: `cargo test --workspace --no-fail-fast` = **806 passed / 0 failed / 22 ignored**(全目标零失败)。
+- **基线(2026-10-06, 039 Web 图表能力补强后实跑)**: `cargo test --workspace --no-fail-fast` = **812 passed / 0 failed / 22 ignored**(全目标零失败)。
+- **前基线(2026-10-06, 038 P1 健壮性加固后实跑)**: `cargo test --workspace --no-fail-fast` = **806 passed / 0 failed / 22 ignored**(全目标零失败)。
   增量 = **+45**, 与本变更同源: `ricow` bin **382 → 407**(+25: `commands::align` 的汇总/窗口/渲染 + `supervisor::server` 的重启判定/退避/配置读取/停机收摊 + `web::metrics` 的渲染/转义/空快照/token 门 + `supervisor::procs` 子进程 stdin 停机链路的跨平台覆盖 4) +
   `ricow_strategy` lib **184 → 197**(+13: `gaps.rs` 缺口检测 8 + `backtest.rs` 限价穿透 5〔默认 0 仍触及即成交 / 正穿透拒绝只触及 / 真穿过按原始限价成交 / 卖侧对称 / 市价单单独计数〕) +
   `ricow_engine` lib **112 → 119**(+7: `latency.rs` 的延迟分位数); 其余 target 一字未变

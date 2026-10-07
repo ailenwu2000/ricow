@@ -111,6 +111,19 @@
     sgSharpe: "夏普",
     sgRejected: "拒单",
     sgReportFull: "完整文本报告",
+    // 039: 图表图例 + 平仓明细
+    sgLegPrice: "标的价格",
+    sgLegEquity: "策略权益",
+    sgLegBench: "买入持有(建仓起)",
+    sgLegDd: "回撤",
+    sgClosedTitle: "平仓盈亏明细",
+    sgClosedThTime: "时间",
+    sgClosedThPnl: "已实现盈亏",
+    sgClosedEmpty: "本次回测没有平仓事件(策略全程未平仓, 或从未建仓)。",
+    sgClosedSum: "求和 = 已实现盈亏 ",
+    sgClosedShownSum: "显示部分求和 = ",
+    sgClosedMismatch: "与指标卡不一致(指标卡 = ",
+    sgClosedTrunc: "明细仅保留最近 {n} 条(共 {m} 条)",
     sgSendToAi: "把结论带给 AI",
     sgHistory: "回测历史(本次会话)",
     sgHistoryTime: "时间",
@@ -257,6 +270,18 @@
     sgSharpe: "Sharpe",
     sgRejected: "Rejected",
     sgReportFull: "Full text report",
+    sgLegPrice: "Underlying price",
+    sgLegEquity: "Strategy equity",
+    sgLegBench: "Buy & hold (from entry)",
+    sgLegDd: "Drawdown",
+    sgClosedTitle: "Closed trades (realized PnL)",
+    sgClosedThTime: "Time",
+    sgClosedThPnl: "Realized PnL",
+    sgClosedEmpty: "No closing event in this backtest (never closed, or never opened).",
+    sgClosedSum: "Sum = realized PnL ",
+    sgClosedShownSum: "Sum of shown = ",
+    sgClosedMismatch: "differs from the metric card (card = ",
+    sgClosedTrunc: "only the most recent {n} rows are kept ({m} in total)",
     sgSendToAi: "Send result to AI",
     sgHistory: "Backtest history (this session)",
     sgHistoryTime: "Time",
@@ -2021,6 +2046,10 @@
       if (job.chart && job.chart.times && job.chart.times.length) {
         renderBtChart(box, job.chart);
       }
+      // 039 FR-7: 逐笔平仓明细(无事件时如实提示, 不渲染空表)。
+      if (job.chart) {
+        renderClosedTrades(box, job.chart, m);
+      }
       // 策略日志 (ctx:log): 让"0 成交/停机"有可解释原因 —— 缺 start_price 的 [FATAL] 就在其中。
       // 零成交或有 [FATAL] 时默认展开, 否则折叠(逐 tick 日志可能很长)。
       renderStrategyLogs(box, job.logs, m && (m.total_trades ?? 0) === 0);
@@ -2109,8 +2138,20 @@
   }
 
   /// 权益曲线 vs 标的价格(P0-2): 两者同 quote 计价共轴; 买卖点标记在价格线上。
+  /// 039 增补: 基准(买入持有)对照线 + 逐点回撤副图 + 图例。
   function renderBtChart(box, chart) {
     const wrap = h("div", "sg-bt-chart-wrap");
+    // 039: 图例 —— 颜色与线一致(CSS 变量), 免去"这条虚线是什么"的猜测。
+    const legend = h("div", "sg-bt-legend");
+    for (const [cls, key] of [
+      ["lg-price", "sgLegPrice"],
+      ["lg-equity", "sgLegEquity"],
+      ["lg-bench", "sgLegBench"],
+      ["lg-dd", "sgLegDd"],
+    ]) {
+      legend.appendChild(h("span", "lg " + cls, t(key)));
+    }
+    wrap.appendChild(legend);
     const div = h("div", "sg-bt-chart");
     wrap.appendChild(div);
     box.appendChild(wrap);
@@ -2148,6 +2189,48 @@
         .filter((d) => Number.isFinite(d.value) && Number.isFinite(d.time))
         .sort((a, b) => a.time - b.time)
     );
+    // ---- 039 FR-5: 基准线(买入持有, 自首次成交起同本金) ----
+    // 与指标卡 benchmark_return_pct 同一口径, 由后端算好下发; 建仓前的点是 null →
+    // 只喂 time(whitespace 点), 曲线自然从建仓那根开始, **不**画成 0。
+    if (chart.benchmark && chart.benchmark.length) {
+      const bench = btChart.addLineSeries({
+        color: themeColor("--warn", "#e3b341"),
+        lineWidth: 1,
+        lineStyle: 2, // 虚线: 一眼区别于策略权益与标的价格
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+      bench.setData(
+        chart.times
+          .map((t, i) => {
+            const v = chart.benchmark[i];
+            return Number.isFinite(v) ? { time: sec(t), value: v } : { time: sec(t) };
+          })
+          .filter((d) => Number.isFinite(d.time))
+          .sort((a, b) => a.time - b.time)
+      );
+    }
+    // ---- 039 FR-6: 逐点回撤(水下曲线) ----
+    // 值 ≤ 0, 0 在副图顶部; 由后端用**全分辨率**曲线算完再抽稀(口径 = 指标卡的 max_drawdown)。
+    if (chart.drawdown && chart.drawdown.length) {
+      const dd = btChart.addAreaSeries({
+        priceScaleId: "dd",
+        lineColor: themeColor("--error", "#f85149"),
+        topColor: "transparent",
+        bottomColor: themeColor("--error", "#f85149"),
+        lineWidth: 1,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        priceFormat: { type: "custom", formatter: (v) => (v * 100).toFixed(1) + "%" },
+      });
+      btChart.priceScale("dd").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
+      dd.setData(
+        chart.times
+          .map((t, i) => ({ time: sec(t), value: chart.drawdown[i] }))
+          .filter((d) => Number.isFinite(d.value) && Number.isFinite(d.time))
+          .sort((a, b) => a.time - b.time)
+      );
+    }
     // 买卖点(涨红跌绿: 买=红 上箭头, 卖=绿 下箭头)。
     const buyColor = themeColor("--error", "#f85149");
     const sellColor = themeColor("--accent", "#4dd4ac");
@@ -2162,6 +2245,59 @@
       .sort((a, b) => a.time - b.time);
     if (markers.length) price.setMarkers(markers);
     btChart.timeScale().fitContent();
+  }
+
+  /// 039 FR-7/FR-8: 平仓盈亏明细表 —— 逐笔列出平仓事件时刻与已实现盈亏。
+  ///
+  /// 明细与指标卡**同源**(引擎一次 record_pnl 既进聚合也进明细), 故可给出可核对的一致性副标:
+  /// 未被截断时 求和 == 已实现盈亏; 被截断时明说"仅显示最近 N 条(共 M 条)"并只报**显示部分**的和,
+  /// 不许拿部分和冒充总数(诚实性硬约束)。
+  function renderClosedTrades(box, chart, m) {
+    const rows = chart.closed || [];
+    if (!rows.length) {
+      // 0 行不渲染空表 —— 直接说清"没有平仓事件"。
+      box.appendChild(h("div", "sg-hint", t("sgClosedEmpty")));
+      return;
+    }
+    const total = Number.isFinite(chart.closed_total) ? chart.closed_total : rows.length;
+    const truncated = total > rows.length;
+    box.appendChild(h("div", "sg-mcards-title", t("sgClosedTitle") + " (" + rows.length + ")"));
+    const wrap = h("div", "sg-closed-wrap");
+    const tbl = h("table", "sg-hist-table");
+    const thead = h("thead");
+    const hr = h("tr");
+    hr.appendChild(h("th", null, t("sgClosedThTime")));
+    hr.appendChild(h("th", null, t("sgClosedThPnl")));
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+    const tbody = h("tbody");
+    // 最新一笔在最上面(与"刚跑完想看最近发生了什么"一致); 数据仍是时间升序下发, 这里倒序渲染。
+    for (const row of rows.slice().reverse()) {
+      const tr = h("tr");
+      tr.appendChild(h("td", null, fmtMs(row.t)));
+      const cls = row.pnl > 0 ? "up" : row.pnl < 0 ? "down" : "";
+      tr.appendChild(h("td", cls, fmtNum(row.pnl)));
+      tbody.appendChild(tr);
+    }
+    tbl.appendChild(tbody);
+    wrap.appendChild(tbl);
+    box.appendChild(wrap);
+    const shownSum = rows.reduce((acc, r) => acc + (Number.isFinite(r.pnl) ? r.pnl : 0), 0);
+    let note = "";
+    if (truncated) {
+      note =
+        t("sgClosedTrunc").replace("{n}", String(rows.length)).replace("{m}", String(total)) +
+        " · " +
+        t("sgClosedShownSum") +
+        fmtNum(shownSum);
+    } else {
+      note = t("sgClosedSum") + fmtNum(shownSum);
+      // 未截断时与指标卡交叉核对; 对不上如实提示(不静默)。
+      if (m && Number.isFinite(m.realized_pnl) && Math.abs(m.realized_pnl - shownSum) > 0.01) {
+        note += " · " + t("sgClosedMismatch") + fmtNum(m.realized_pnl) + ")";
+      }
+    }
+    box.appendChild(h("div", "sg-closed-sub", note));
   }
 
   function destroyBtChart() {
@@ -2187,6 +2323,19 @@
     const abs = Math.abs(v);
     const digits = abs >= 100 ? 2 : abs >= 1 ? 4 : 6;
     return (v > 0 ? "+" : "") + v.toFixed(digits).replace(/\.?0+$/, "");
+  }
+
+  /// 毫秒时间戳 → 展示串 (平仓明细用)。会话列表的秒级口径走 `R.formatTime`, 两者不可混
+  /// (与 chat.js 的 `formatStamp` 同款格式, 但各视图各持一份 —— 那两份本来就不同口径)。
+  function fmtMs(ms) {
+    if (!Number.isFinite(ms)) return "—";
+    const locale = R.lang === "en" ? "en-US" : "zh-CN";
+    return new Date(ms).toLocaleString(locale, {
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   }
 
   function signCls(v) {

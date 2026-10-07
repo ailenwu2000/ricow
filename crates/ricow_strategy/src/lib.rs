@@ -45,7 +45,9 @@ pub use name::{
     prefix_conflict, suggest_strategy_name, validate_strategy_name, MAX_STRATEGY_NAME_LEN,
 };
 pub use order_guard::{OrderGuard, OrderGuardError, DEFAULT_MAX_ORDERS_PER_SEC, RATE_WINDOW_MS};
-pub use pnl::PnlTracker;
+// 039: 平仓明细类型随 `BacktestReport` 公开字段一起出圈 (明细表用它); `max_drawdown` 公开
+// 是为了让图表侧的回撤序列能**机械对照**标量口径 (前端曲线的"最深点 = −最大回撤"由测试锁死)。
+pub use pnl::{max_drawdown, ClosedTrade, PnlTracker, MAX_CLOSED_TRADES};
 pub use strategy::Strategy;
 
 #[cfg(test)]

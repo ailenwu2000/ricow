@@ -131,6 +131,10 @@ pub(crate) struct MetricsSummary {
     pub rejected_count: u64,
     pub net_pnl: f64,
     pub total_fees: f64,
+    /// 039: 已实现盈亏 (未扣手续费)。前端用它给平仓明细表做"求和 == 已实现盈亏"的一致性副标。
+    pub realized_pnl: f64,
+    /// 039: 平仓事件总次数 (明细表可能被截断, 用它如实报数)。
+    pub closed_trades_total: u64,
     pub win_rate: f64,
     pub max_drawdown_pct: f64,
     pub equity_change_pct: f64,
@@ -162,6 +166,8 @@ impl BacktestOutcome {
             rejected_count: r.rejected_count,
             net_pnl: r.net_pnl.to_f64().unwrap_or(0.0),
             total_fees: r.total_fees.to_f64().unwrap_or(0.0),
+            realized_pnl: r.realized_pnl.to_f64().unwrap_or(0.0),
+            closed_trades_total: r.closed_trades_total,
             win_rate: r.win_rate,
             max_drawdown_pct: r.max_drawdown.to_f64().unwrap_or(0.0) * 100.0,
             equity_change_pct: r.equity_change_pct,
@@ -484,21 +490,46 @@ pub(crate) struct ChartFill {
     pub side: String,
 }
 
+/// Web 回测图表的单条平仓事件 (039 FR-7): 与指标卡的胜率/已实现盈亏同源。
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ChartClosed {
+    /// 平仓时刻 epoch 毫秒 (回测 = 该 bar 的收盘时刻)。
+    pub t: i64,
+    /// 本次平仓的已实现盈亏 (quote 计价, 未扣手续费)。
+    pub pnl: f64,
+}
+
 /// Web 回测图表数据 (P0-2): 价格轴 = 评测窗口内每根 bar 的收盘价, 权益轴 = 同一批 bar 的
-/// 收盘估值 (**不含**曲线初始现金点)。三条序列 (times/price/equity) 等长且逐点同刻 —— 前端
-/// 可直接按下标配对绘制。时间轴统一 epoch 毫秒; 点数超限时按同一步长抽稀 (三条同步, 保对齐)。
+/// 收盘估值 (**不含**曲线初始现金点)。`times`/`price`/`equity`/`benchmark`/`drawdown` 五条序列
+/// 等长且逐点同刻 —— 前端可直接按下标配对绘制。时间轴统一 epoch 毫秒; 点数超限时按同一步长
+/// 抽稀 (五条同步, 保对齐)。
+///
+/// 039 增补三条派生序列, 全部**在全分辨率上算完再抽稀**(路径相关的量不能对抽稀结果重算):
+/// - `benchmark`: 买入持有对照 (口径 = 023 指标卡 `benchmark_return_pct`, 建仓前为 `None` 空白);
+/// - `drawdown`: 逐点回撤 (≤ 0, 0 在峰值; 最小值 = 报告的最大回撤);
+/// - `closed`: 平仓事件明细 + 总条数 (明细超 [`CHART_MAX_CLOSED`] 时截断, 由 `closed_total` 报数)。
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct BacktestChart {
     pub times: Vec<i64>,
     pub price: Vec<f64>,
     pub equity: Vec<f64>,
+    /// 买入持有对照金额: 与 `times` 等长, 建仓前为 `None` (前端画成空白段, 不画 0)。
+    pub benchmark: Vec<Option<f64>>,
+    /// 逐点回撤 (比率, ≤ 0): `(权益 − 历史峰值) / 峰值`。
+    pub drawdown: Vec<f64>,
     pub fills: Vec<ChartFill>,
+    /// 平仓事件明细 (按时间升序; 只保最近 [`CHART_MAX_CLOSED`] 条)。
+    pub closed: Vec<ChartClosed>,
+    /// 平仓事件**总**条数: 大于 `closed.len()` 时前端必须明说"仅显示最近 N 条"。
+    pub closed_total: u64,
 }
 
 /// 曲线抽稀上限 (点): 超过按整步抽稀, 覆盖 3650 天 1m 的极端窗口也不至于拖垮前端。
 const CHART_MAX_POINTS: usize = 2000;
 /// 成交标记上限: 超长回测的成交清单只保前 N 笔 (表格另见报告文本)。
 const CHART_MAX_FILLS: usize = 1000;
+/// 平仓明细上限 (039): 与引擎侧 `MAX_CLOSED_TRADES` 同量级 —— 这里再兜一层, 防上游放宽后前端被撑爆。
+const CHART_MAX_CLOSED: usize = 1000;
 
 /// 本地 K 线缓存的保留期 (天, 审计 资源-4): 早于该天数的缓存行在回填后清理。
 ///
@@ -560,6 +591,15 @@ impl BacktestOutcome {
         );
         let n = times.len();
         let stride = if n == 0 { 1 } else { n.div_ceil(CHART_MAX_POINTS) };
+        // 039: 两条派生序列都在**全分辨率**窗口上算 (抽稀在最后统一做)。
+        let benchmark = Self::benchmark_series(
+            &times,
+            &price,
+            self.report.benchmark_entry_time,
+            self.report.benchmark_entry_price,
+            self.report.entry_equity,
+        );
+        let drawdown = Self::drawdown_series(&equity);
         let fills = self
             .report
             .fills
@@ -577,12 +617,87 @@ impl BacktestOutcome {
                 })
             })
             .collect();
+        // 平仓明细: 引擎侧已按"保最近"裁过一次, 这里同规则再兜一层 (截断由 closed_total 报数)。
+        let closed_all = &self.report.closed_trades;
+        let closed: Vec<ChartClosed> = closed_all
+            .iter()
+            .rev()
+            .take(CHART_MAX_CLOSED)
+            .rev()
+            .filter_map(|c| {
+                Some(ChartClosed { t: c.time.timestamp_millis(), pnl: c.pnl.to_f64()? })
+            })
+            .collect();
         BacktestChart {
             times: Self::downsample_i64(&times, stride),
             price: Self::downsample(&price, stride),
             equity: Self::downsample(&equity, stride),
+            benchmark: Self::downsample_opt(&benchmark, stride),
+            drawdown: Self::downsample(&drawdown, stride),
             fills,
+            closed,
+            closed_total: self.report.closed_trades_total,
         }
+    }
+
+    /// 买入持有对照序列 (039 FR-5, 纯函数): 与指标卡 `benchmark_return_pct` **同一口径** ——
+    /// 以**首次成交价** `entry_price` 买入、`entry_equity` 为本金, 持有到窗口末。
+    ///
+    /// - 建仓时刻之前的点 = `None` (前端画空白段; 策略建仓前的空仓期不计入对照, 与 023 注释一致);
+    /// - 三个入参任一缺失 (窗口内从未成交) → 整条 `None` (与指标卡 `None` 一致, 不编造);
+    /// - 价格非有限或 ≤ 0 → 该点 `None` (不产出 inf/NaN 喂给图表库)。
+    fn benchmark_series(
+        times_ms: &[i64],
+        price: &[f64],
+        entry_time: Option<chrono::DateTime<chrono::Utc>>,
+        entry_price: Option<Decimal>,
+        entry_equity: Option<Decimal>,
+    ) -> Vec<Option<f64>> {
+        let n = times_ms.len().min(price.len());
+        let (Some(entry_time), Some(p0), Some(e0)) = (entry_time, entry_price, entry_equity) else {
+            return vec![None; n];
+        };
+        let (Some(p0), Some(e0)) = (p0.to_f64(), e0.to_f64()) else {
+            return vec![None; n];
+        };
+        if !(p0.is_finite() && p0 > 0.0 && e0.is_finite()) {
+            return vec![None; n];
+        }
+        let entry_ms = entry_time.timestamp_millis();
+        (0..n)
+            .map(|i| {
+                if times_ms[i] < entry_ms {
+                    return None;
+                }
+                let v = e0 * price[i] / p0;
+                if v.is_finite() {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// 逐点回撤序列 (039 FR-6, 纯函数): `(权益 − 历史峰值) / 峰值`, 峰值处为 0, 其余 ≤ 0。
+    ///
+    /// 与标量 `pnl::max_drawdown` 同口径 (同一"峰值→当前"定义), 故 `min(序列) == −最大回撤`;
+    /// 必须喂**全分辨率**净值曲线 —— 对抽稀后的曲线重算会低估 (最深处常落在被抽掉的点上)。
+    fn drawdown_series(equity: &[f64]) -> Vec<f64> {
+        let mut peak = 0.0f64;
+        equity
+            .iter()
+            .map(|&e| {
+                if e > peak {
+                    peak = e;
+                }
+                if peak > 0.0 {
+                    (e - peak) / peak
+                } else {
+                    0.0
+                }
+            })
+            .collect()
     }
 
     /// 把引擎原始序列对齐成「同刻等长」三序列 (纯函数, 便于单测)。
@@ -618,6 +733,19 @@ impl BacktestOutcome {
             return v.to_vec();
         }
         let mut out: Vec<i64> = v.iter().step_by(stride).copied().collect();
+        if !(v.len() - 1).is_multiple_of(stride) {
+            out.push(v[v.len() - 1]);
+        }
+        out
+    }
+
+    /// Option 版抽稀 (039): 与 [`Self::downsample`] 同规则, `None`(空白段)原样透传 ——
+    /// 基准线建仓前是空白, 若在这里被压成 0 会凭空造出一段"本金线"。
+    fn downsample_opt(v: &[Option<f64>], stride: usize) -> Vec<Option<f64>> {
+        if stride <= 1 {
+            return v.to_vec();
+        }
+        let mut out: Vec<Option<f64>> = v.iter().step_by(stride).copied().collect();
         if !(v.len() - 1).is_multiple_of(stride) {
             out.push(v[v.len() - 1]);
         }
@@ -1551,6 +1679,91 @@ mod tests {
         );
         assert_eq!((t3.len(), p3.len(), e3.len()), (3, 3, 3));
         assert_eq!(t3, vec![10i64, 20, 30]);
+    }
+
+    /// 039 FR-5: 基准线口径 = 023 指标卡 —— 建仓前空白, 建仓点起按 本金 × 价/建仓价 等比放大。
+    #[test]
+    fn test_benchmark_series_starts_at_entry_and_matches_scalar() {
+        let times = vec![100i64, 200, 300, 400];
+        let price = vec![10.0, 20.0, 30.0, 40.0];
+        let entry_time = chrono::DateTime::from_timestamp_millis(300).expect("合法时间戳");
+        let out = BacktestOutcome::benchmark_series(
+            &times,
+            &price,
+            Some(entry_time),
+            Some(Decimal::from(20i64)),
+            Some(Decimal::from(1_000i64)),
+        );
+        assert_eq!(out.len(), times.len());
+        // 建仓前 (t < 300) 是空白, 不是 0 —— 画成 0 会凭空多一段"本金线"。
+        assert_eq!(out[0], None);
+        assert_eq!(out[1], None);
+        assert_eq!(out[2], Some(1_500.0), "1000 × 30/20");
+        assert_eq!(out[3], Some(2_000.0), "1000 × 40/20");
+        // 末点换算成收益率 == 指标卡口径 (100 × (40/20 − 1) = 100%)。
+        let last_pct = (out[3].unwrap() / 1_000.0 - 1.0) * 100.0;
+        assert!((last_pct - 100.0).abs() < 1e-9, "基准收益率 = {last_pct}");
+    }
+
+    /// 039 FR-5: 窗口内从未成交 / 入参缺失 / 建仓价非法 → 整条空白, 不编造基准。
+    #[test]
+    fn test_benchmark_series_all_none_when_unavailable() {
+        let times = vec![1i64, 2];
+        let price = vec![10.0, 11.0];
+        let ts = chrono::DateTime::from_timestamp_millis(1).expect("合法时间戳");
+        // 从未成交: `benchmark_entry_time` 为 None(组合路径亦如此)。
+        assert_eq!(
+            BacktestOutcome::benchmark_series(&times, &price, None, None, None),
+            vec![None, None]
+        );
+        // 缺本金 / 缺价 / 价为 0 / 价非有限 → 一律空白(不产出 inf/NaN 喂图表库)。
+        for (p, e) in [
+            (Some(Decimal::from(10i64)), None),
+            (None, Some(Decimal::from(100i64))),
+            (Some(Decimal::ZERO), Some(Decimal::from(100i64))),
+        ] {
+            let out = BacktestOutcome::benchmark_series(&times, &price, Some(ts), p, e);
+            assert_eq!(out, vec![None, None], "p={p:?} 应整条空白");
+        }
+    }
+
+    /// 039 FR-6: 逐点回撤与标量 `max_drawdown` 同口径 —— 峰值处 0, 序列最小值 = −最大回撤。
+    /// 全分辨率语义: 必须喂原始曲线(抽稀后重算会低估), 这里直接对照 `ricow_strategy::pnl`。
+    #[test]
+    fn test_drawdown_series_matches_scalar_max_drawdown() {
+        let equity = [100.0, 110.0, 90.0, 95.0, 80.0];
+        let dd = BacktestOutcome::drawdown_series(&equity);
+        assert_eq!(dd[0], 0.0, "首个点即峰值 → 0");
+        assert_eq!(dd[1], 0.0, "新高 → 0");
+        assert!((dd[2] + 20.0 / 110.0).abs() < 1e-12, "110 → 90");
+        assert!((dd[4] + 30.0 / 110.0).abs() < 1e-12, "110 → 80");
+        let scalar = ricow_strategy::max_drawdown(
+            &equity.iter().map(|v| Decimal::try_from(*v).unwrap()).collect::<Vec<_>>(),
+        )
+        .to_f64()
+        .unwrap();
+        assert!(
+            (-dd.iter().cloned().fold(f64::INFINITY, f64::min) - scalar).abs() < 1e-12,
+            "序列最深处 {dd:?} 应等于 −{scalar}"
+        );
+        // 单调上涨 / 空序列: 无回撤。
+        assert_eq!(BacktestOutcome::drawdown_series(&[1.0, 2.0, 3.0]), vec![0.0, 0.0, 0.0]);
+        assert!(BacktestOutcome::drawdown_series(&[]).is_empty());
+    }
+
+    /// 039: `None` 抽稀必须透传(基准线建仓前的空白段不能被压成 0), 且保首尾。
+    #[test]
+    fn test_downsample_opt_keeps_ends_and_transparent_none() {
+        let v = vec![Some(0.0), None, Some(2.0), None, Some(4.0), None];
+        // stride=2 → 取 idx 0/2/4, 末点(idx5)非整数倍 → 补一个。
+        assert_eq!(
+            BacktestOutcome::downsample_opt(&v, 2),
+            vec![Some(0.0), Some(2.0), Some(4.0), None]
+        );
+        // stride=1 原样; 偶数长度不被补点。
+        assert_eq!(BacktestOutcome::downsample_opt(&v, 1), v);
+        let even = vec![Some(0.0), None];
+        assert_eq!(BacktestOutcome::downsample_opt(&even, 2), vec![Some(0.0), None]);
     }
 
     #[test]

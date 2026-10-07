@@ -36,6 +36,7 @@
     mkBestBid: "买一",
     mkBestAsk: "卖一",
     mkChartEmpty: "暂无 K 线",
+    mkLegVol: "成交量",
   });
   Object.assign(R.TEXT.en, {
     mkTitle: "Markets",
@@ -60,6 +61,7 @@
     mkBestBid: "Best bid",
     mkBestAsk: "Best ask",
     mkChartEmpty: "No candlesticks",
+    mkLegVol: "Vol",
   });
 
   // K 线周期按钮(默认 1h; 不含 1m/5m —— 视图契约只要 15m/1h/4h/1d)。
@@ -67,6 +69,13 @@
   const DEFAULT_INTERVAL = "1h";
   const KLINE_LIMIT = 200;
   const SEARCH_DEBOUNCE_MS = 250;
+
+  // 039: K 线指标 —— 固定均线窗口 + 成交量副图。指标全在前端由 klines 现算(零后端改动、零新依赖)。
+  const MA_WINDOWS = [7, 25, 99];
+  /// 均线取色用的 CSS 变量名 (颜色本体定义在 style.css 的各主题块里)。
+  const MA_VARS = ["--ma-7", "--ma-25", "--ma-99"];
+  /// 成交量副图占图表底部的高度比例 (与主图共享时间轴, 但用独立价格轴 → 不需要同步代码)。
+  const VOL_PANE_MARGIN = 0.82;
 
   let mounted = false;
   // 代际令牌(见文件头注释): 每次激活 / 离开自增; 回调捕获本次值, 过期响应直接丢弃。
@@ -130,6 +139,12 @@
       '<section class="mk-card mk-chart-card"><div class="mk-card-head"><span' +
       bilingual("mkChartTitle") + ">" + R.TEXT.zh.mkChartTitle + "</span>" +
       '<span id="mk-intervals" class="mk-intervals"></span></div>' +
+      // 039: 图例 (均线 × 3 + 成交量) —— 颜色与线一致, 由 CSS 变量给出。
+      // 均线标签是语言无关的("MA7"), 走纯文本; 只有"成交量/Vol"需要双语。
+      '<div class="mk-chart-legend">' +
+      MA_WINDOWS.map((w) => '<span class="lg lg-ma' + w + '">MA' + w + "</span>").join("") +
+      '<span class="lg lg-vol"' + bilingual("mkLegVol") + ">" + t("mkLegVol") + "</span>" +
+      "</div>" +
       '<div id="mk-chart-box" class="mk-chart-box"></div></section>' +
       "</div></div></div>";
 
@@ -472,6 +487,9 @@
     }
     const border = themeColor("--border", "#2b333d");
     const LWC = window.LightweightCharts;
+    // 涨跌配色 = 项目既有约定(涨红跌绿, 与指标卡/历史表一致): 涨 = --error, 跌 = --accent。
+    const upColor = themeColor("--error", "#f85149");
+    const downColor = themeColor("--accent", "#4dd4ac");
     chart = LWC.createChart(box, {
       // autoSize: v4 内置 ResizeObserver 自适应容器宽高, 无需手写 resize 监听。
       autoSize: true,
@@ -483,11 +501,11 @@
       timeScale: { timeVisible: true, secondsVisible: false, borderColor: border },
     });
     const series = chart.addCandlestickSeries({
-      upColor: themeColor("--accent", "#4dd4ac"),
-      downColor: themeColor("--error", "#f85149"),
+      upColor,
+      downColor,
       borderVisible: false,
-      wickUpColor: themeColor("--accent", "#4dd4ac"),
-      wickDownColor: themeColor("--error", "#f85149"),
+      wickUpColor: upColor,
+      wickDownColor: downColor,
     });
     const data = rows
       .map((k) => ({
@@ -496,10 +514,46 @@
         high: Number(k.high),
         low: Number(k.low),
         close: Number(k.close),
+        volume: Number(k.volume),
       }))
       .filter((d) => Number.isFinite(d.time) && Number.isFinite(d.close))
       .sort((a, b) => a.time - b.time);
     series.setData(data);
+
+    // ---- 039: 成交量副图 (独立价格轴占底部约 18%; 与主图共享时间轴, 无需同步逻辑) ----
+    const vol = chart.addHistogramSeries({
+      priceScaleId: "vol",
+      priceFormat: { type: "volume" },
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+    chart.priceScale("vol").applyOptions({ scaleMargins: { top: VOL_PANE_MARGIN, bottom: 0 } });
+    vol.setData(
+      data
+        .filter((d) => Number.isFinite(d.volume))
+        .map((d) => ({ time: d.time, value: d.volume, color: d.close >= d.open ? upColor : downColor }))
+    );
+
+    // ---- 039: MA7 / MA25 / MA99 (简单移动平均, 收盘价口径) ----
+    // 数据不足窗口长度的前 w-1 根**不画**(空数组自然断线): 不用 0 或前值冒充, 缺口就是缺口。
+    for (let i = 0; i < MA_WINDOWS.length; i++) {
+      const w = MA_WINDOWS[i];
+      const line = chart.addLineSeries({
+        color: themeColor(MA_VARS[i], upColor),
+        lineWidth: 1,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      });
+      const points = [];
+      let sum = 0;
+      for (let k = 0; k < data.length; k++) {
+        sum += data[k].close;
+        if (k >= w) sum -= data[k - w].close;
+        if (k >= w - 1) points.push({ time: data[k].time, value: sum / w });
+      }
+      line.setData(points);
+    }
     chart.timeScale().fitContent();
   }
 

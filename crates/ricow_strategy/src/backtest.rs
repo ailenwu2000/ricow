@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use ricow_core::{
     parse_pair, Balance, CoreResult, Kline, OrderAck, OrderAction, OrderBook, OrderFill,
     OrderRequest, OrderSide, OrderStatus, OrderType, Position,
@@ -17,7 +18,7 @@ use crate::context::{Context, Declaration};
 use crate::fee::FeeModel;
 use crate::multiframe::{tf_key, TfCache};
 use crate::order_guard::OrderGuard;
-use crate::pnl::PnlTracker;
+use crate::pnl::{ClosedTrade, PnlTracker};
 
 /// hedge 模式按侧明细 (013 FR-006) —— 与交易所账单/真实清算事件对照用。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -113,6 +114,14 @@ pub struct BacktestReport {
     pub benchmark_max_drawdown: Option<Decimal>,
     /// 满仓持有年化波动率 (比率)。
     pub benchmark_annual_volatility: Option<f64>,
+    /// 首次成交时刻 (基准起算点的**时间轴**口径, 039 FR-5): 图表要按它决定基准线从哪根 bar 起画。
+    /// 与 `benchmark_entry_price` / `entry_equity` 同进同出 (窗口内从未成交 → 三个都 None)。
+    pub benchmark_entry_time: Option<DateTime<Utc>>,
+    // ---- 平仓事件明细 (039 FR-7/FR-8; 与 `win_rate` / `realized_pnl` 同源) ----
+    /// 已实现盈亏的逐次平仓明细 (只保最近 [`crate::pnl::MAX_CLOSED_TRADES`] 条)。
+    pub closed_trades: Vec<ClosedTrade>,
+    /// 平仓事件**总**次数 (不受明细上限影响): 展示方据此如实说明"仅显示最近 N 条"。
+    pub closed_trades_total: u64,
     // ---- 组合回测口径 (M2; 单标的: equity_curve/turnover_ratio 亦填, holdings_snapshots 为空) ----
     /// 净值曲线 (quote; 起点 = 初始现金, 逐 bar/tick 收盘估值 + 末根补估)。
     pub equity_curve: Vec<Decimal>,
@@ -803,7 +812,7 @@ impl BacktestContext {
         if !hit {
             return;
         }
-        let realized = self.close_position(pair_key, side, size, p_t);
+        let realized = self.close_position(pair_key, side, size, p_t, bar.close_time);
         let fee = self.fee_model.calc_fee(p_t, size, false);
         self.add_wallet(pair_key, side, realized - fee);
         self.liquidation_count += 1;
@@ -912,7 +921,7 @@ impl BacktestContext {
             let b2 = (s_l - s_s) - self.mmr * (s_l + s_s);
             let p_t = -a2 / b2;
             // 按强平价平掉整仓; 平仓费 (taker) 从钱包扣; fill 记录带 "LIQ" 标识。
-            let realized = self.close_position(pair_key, side, size, p_t);
+            let realized = self.close_position(pair_key, side, size, p_t, bar.close_time);
             let fee = self.fee_model.calc_fee(p_t, size, false);
             self.add_wallet(pair_key, side, realized - fee);
             let fill = OrderFill {
@@ -1119,6 +1128,10 @@ impl BacktestContext {
             benchmark_return_pct: None,
             benchmark_max_drawdown: None,
             benchmark_annual_volatility: None,
+            // 组合路径无"单一首次成交价"语义 (见上方 023 注记) → 时间轴同样留 None, 不编造。
+            benchmark_entry_time: None,
+            closed_trades: self.pnl.closed_trades().to_vec(),
+            closed_trades_total: self.pnl.closed_trades_total(),
             // 策略日志由引擎收尾 (on_stop 之后) take_logs() 填入; 报告构造期为空。
             strategy_logs: Vec::new(),
         }
@@ -1327,6 +1340,10 @@ impl BacktestContext {
             benchmark_return_pct: bm_ret,
             benchmark_max_drawdown: bm_dd,
             benchmark_annual_volatility: bm_vol,
+            benchmark_entry_time: self.first_fill_time,
+            // 039: 平仓明细与聚合同源 (同一次 `record_pnl` 既进聚合也进明细)。
+            closed_trades: self.pnl.closed_trades().to_vec(),
+            closed_trades_total: self.pnl.closed_trades_total(),
             // 策略日志由引擎收尾 (on_stop 之后) take_logs() 填入; 报告构造期为空。
             strategy_logs: Vec::new(),
         }
@@ -1538,12 +1555,16 @@ impl BacktestContext {
     /// Sell 侧批次 = 开空卖价, 平空 = 卖价 − 买回价 (真盈亏 = lot.0 − fill_price, D1 修复)。
     /// 返回已实现盈亏 (quote); 仓清零时 entry 复位, 部分平仓后 entry 重算为剩余批次加权均价
     /// (避免以含已平批次的混合均价估值剩余仓 → 未实现/强平权益基差错误, D2 修复)。
+    ///
+    /// `ts` (039 FR-7) = 该次平仓的时刻, 只用于平仓明细记录 —— 回测一律传**虚拟 bar 时间**,
+    /// 不用墙钟(否则明细表与图表时间轴对不上)。
     fn close_position(
         &mut self,
         pair: &str,
         side: OrderSide,
         size: Decimal,
         fill_price: Decimal,
+        ts: DateTime<Utc>,
     ) -> Decimal {
         let key = self.pos_key(pair, side);
         let close_size = size.min(self.side_size(pair, side));
@@ -1601,7 +1622,7 @@ impl BacktestContext {
             }
         }
         if realized != Decimal::ZERO {
-            self.pnl.record_pnl(realized);
+            self.pnl.record_pnl(realized, ts);
         }
         realized
     }
@@ -1650,6 +1671,10 @@ impl BacktestContext {
     /// 现货: 仓位 (恒 Buy 侧) + 资金簿, 手续费真实扣余额 (Bug B 修复)。
     /// 合约: 逐仓钱包转账 —— 平仓 wallet += realized − 平仓费; 开仓 cash −= M, wallet += M − 开仓费。
     fn execute_fill(&mut self, order_id: &str, req: &OrderRequest, fill_price: Decimal) {
+        // 039 FR-7: 本次成交的**虚拟**时刻 —— 平仓明细用它, 与图表时间轴(bar close_time)同源。
+        // 末根之后无 current_bar 的退化情况回退墙钟, 不让明细缺时间戳。
+        let bar_ts =
+            self.current_bar.as_ref().map(|b| b.close_time).unwrap_or_else(chrono::Utc::now);
         // 023 T8: 首笔成交留痕 —— 成交价(基准买入价)/时刻(起算点)/当时权益(公平对照的起点)。
         // 记录必须在仓位与现金变动**之前**。
         if self.first_fill_price.is_none() {
@@ -1671,7 +1696,7 @@ impl BacktestContext {
         if !self.is_futures() {
             // ---- 现货记账 ----
             if let Some((cs, sz)) = close {
-                self.close_position(&req.pair, cs, sz, fill_price);
+                self.close_position(&req.pair, cs, sz, fill_price, bar_ts);
             }
             if let Some((os, sz)) = open {
                 self.open_position(&req.pair, os, sz, fill_price);
@@ -1711,7 +1736,7 @@ impl BacktestContext {
             };
             let open_fee = fee - close_fee;
             if let Some((cs, sz)) = close {
-                let realized = self.close_position(&req.pair, cs, sz, fill_price);
+                let realized = self.close_position(&req.pair, cs, sz, fill_price, bar_ts);
                 // 平仓: 盈亏与平仓费走**被平方向**的钱包 (hedge 分侧; one-way symbol 级)。
                 self.add_wallet(&req.pair, cs, realized - close_fee);
                 // 该对平净 (两侧都无仓) → 钱包余额整体转回现金。

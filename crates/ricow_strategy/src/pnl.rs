@@ -1,10 +1,28 @@
 //! 策略盈亏追踪器。
 
+use chrono::{DateTime, Utc};
 use ricow_core::OrderFill;
 use rust_decimal::Decimal;
 
 /// 保留的成交记录上限。
 const MAX_FILLS: usize = 1000;
+
+/// 保留的平仓事件记录上限 (039 FR-8): 与成交记录同一取舍 —— 明细只保最近 N 条,
+/// **总数另计**(`closed_total`), 由展示方决定是否说明"仅显示最近 N 条"。
+pub const MAX_CLOSED_TRADES: usize = 1000;
+
+/// 一次平仓事件的已实现盈亏 (039 FR-7)。
+///
+/// 语义与 [`PnlTracker::record_pnl`] 完全一致: **一次调用 = 一次平仓**(可以是一笔部分平仓),
+/// 因此明细与聚合指标(胜/负笔数、已实现盈亏)天然自洽 —— 这是"逐笔盈亏"能机械核对的前提。
+/// 不做开→平的 round-trip 配对: 合约对冲/组合模式下"这笔卖是开空还是平多"无唯一解。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedTrade {
+    /// 平仓发生的时刻 (回测: 该 bar 的收盘时刻; live/dry-run: 成交时刻)。
+    pub time: DateTime<Utc>,
+    /// 本次平仓的已实现盈亏 (quote 计价; 未扣手续费, 费在 `total_fees` 单列)。
+    pub pnl: Decimal,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct PnlTracker {
@@ -18,6 +36,10 @@ pub struct PnlTracker {
     /// 亏损交易毛额合计 (负盈亏绝对值累加)。
     gross_loss: Decimal,
     fills: Vec<OrderFill>,
+    /// 平仓事件明细 (只保最近 `MAX_CLOSED_TRADES` 条)。
+    closed_trades: Vec<ClosedTrade>,
+    /// 平仓事件**总**次数 (不受上限影响, 供展示方如实报截断)。
+    closed_total: u64,
 }
 
 impl PnlTracker {
@@ -32,8 +54,11 @@ impl PnlTracker {
         self.total_fees += fill.fee;
     }
 
-    /// 记录已实现盈亏。
-    pub fn record_pnl(&mut self, amount: Decimal) {
+    /// 记录已实现盈亏 (一次调用 = 一次平仓事件)。
+    ///
+    /// `ts` = 该次平仓的时刻 (回测传虚拟 bar 时间, 不许用墙钟 `Utc::now()`, 否则明细表
+    /// 与图表时间轴对不上; live/dry-run 传成交自身的 `timestamp`)。
+    pub fn record_pnl(&mut self, amount: Decimal, ts: DateTime<Utc>) {
         self.realized_pnl += amount;
         if amount > Decimal::ZERO {
             self.winning_trades += 1;
@@ -41,6 +66,13 @@ impl PnlTracker {
         } else if amount < Decimal::ZERO {
             self.losing_trades += 1;
             self.gross_loss += -amount;
+        }
+        // 平仓明细: 总数无条件累加, 明细按上限保留**最近**的 (与 fills 同款 drain 语义)。
+        self.closed_total += 1;
+        self.closed_trades.push(ClosedTrade { time: ts, pnl: amount });
+        if self.closed_trades.len() > MAX_CLOSED_TRADES {
+            let excess = self.closed_trades.len() - MAX_CLOSED_TRADES;
+            self.closed_trades.drain(..excess);
         }
     }
 
@@ -88,6 +120,17 @@ impl PnlTracker {
     pub fn fills(&self) -> &[OrderFill] {
         &self.fills
     }
+
+    /// 平仓事件明细 (最多 [`MAX_CLOSED_TRADES`] 条, 最近优先保留)。
+    pub fn closed_trades(&self) -> &[ClosedTrade] {
+        &self.closed_trades
+    }
+
+    /// 平仓事件总次数 (不受明细上限影响; 与 `winning_trades + losing_trades` 同源,
+    /// 差别仅在 `amount == 0` 的事件: 它们进总数、不进胜/负分类)。
+    pub fn closed_trades_total(&self) -> u64 {
+        self.closed_total
+    }
 }
 
 /// 最大回撤 (比率): 权益序列峰值→谷值最大跌幅。空/单点序列返回 0。
@@ -113,9 +156,14 @@ pub fn max_drawdown(equity: &[Decimal]) -> Decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::TimeZone;
     use ricow_core::OrderSide;
     use rust_decimal_macros::dec;
+
+    /// 固定时刻 (避免测试依赖墙钟; 秒级递增便于断言顺序)。
+    fn ts(sec: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + sec, 0).single().expect("合法时间戳")
+    }
 
     fn sample_fill(side: OrderSide, fee: Decimal) -> OrderFill {
         OrderFill {
@@ -127,16 +175,16 @@ mod tests {
             fill_price: dec!(3000),
             fill_size: dec!(1),
             fee,
-            timestamp: Utc::now(),
+            timestamp: ts(0),
         }
     }
 
     #[test]
     fn test_record_pnl_and_win_rate() {
         let mut pnl = PnlTracker::default();
-        pnl.record_pnl(dec!(100));
-        pnl.record_pnl(dec!(-50));
-        pnl.record_pnl(dec!(200));
+        pnl.record_pnl(dec!(100), ts(1));
+        pnl.record_pnl(dec!(-50), ts(2));
+        pnl.record_pnl(dec!(200), ts(3));
         assert_eq!(pnl.realized_pnl(), dec!(250));
         assert_eq!(pnl.win_rate(), 2.0 / 3.0);
         assert_eq!(pnl.gross_profit(), dec!(300));
@@ -144,10 +192,54 @@ mod tests {
     }
 
     #[test]
+    fn test_closed_trades_mirror_aggregates() {
+        // 039 FR-7: 明细是聚合的**同源**展开 —— 顺序、时刻、正负号必须一一对应。
+        let mut pnl = PnlTracker::default();
+        pnl.record_pnl(dec!(10), ts(1));
+        pnl.record_pnl(dec!(-4), ts(2));
+        pnl.record_pnl(dec!(6), ts(3));
+        let closed = pnl.closed_trades();
+        assert_eq!(closed.len(), 3);
+        assert_eq!(closed[0], ClosedTrade { time: ts(1), pnl: dec!(10) });
+        assert_eq!(closed[2], ClosedTrade { time: ts(3), pnl: dec!(6) });
+        assert_eq!(pnl.closed_trades_total(), 3);
+        // 求和 = 已实现盈亏; 正数条数 = 胜, 负数条数 = 负。
+        let sum: Decimal = closed.iter().map(|c| c.pnl).sum();
+        assert_eq!(sum, pnl.realized_pnl());
+        assert_eq!(
+            closed.iter().filter(|c| c.pnl > Decimal::ZERO).count() as u64,
+            pnl.winning_trades()
+        );
+        assert_eq!(
+            closed.iter().filter(|c| c.pnl < Decimal::ZERO).count() as u64,
+            pnl.losing_trades()
+        );
+        assert_eq!(pnl.winning_trades() + pnl.losing_trades(), pnl.closed_trades_total());
+    }
+
+    #[test]
+    fn test_closed_trades_capped_but_total_kept() {
+        // 039 FR-8: 超上限只裁**最旧**的, 总数照实累加 (展示方据此说明截断)。
+        let mut pnl = PnlTracker::default();
+        for i in 0..(MAX_CLOSED_TRADES + 10) {
+            pnl.record_pnl(dec!(1), ts(i as i64));
+        }
+        assert_eq!(pnl.closed_trades().len(), MAX_CLOSED_TRADES);
+        assert_eq!(pnl.closed_trades_total(), (MAX_CLOSED_TRADES + 10) as u64);
+        // 保的是最近那批: 末条时刻 = 最后一次调用。
+        assert_eq!(
+            pnl.closed_trades().last().map(|c| c.time),
+            Some(ts((MAX_CLOSED_TRADES + 9) as i64))
+        );
+        // 聚合指标不受明细上限影响。
+        assert_eq!(pnl.realized_pnl(), Decimal::from(MAX_CLOSED_TRADES + 10));
+    }
+
+    #[test]
     fn test_net_pnl_with_fees() {
         let mut pnl = PnlTracker::default();
         pnl.record_fill(&sample_fill(OrderSide::Buy, dec!(2)));
-        pnl.record_pnl(dec!(200));
+        pnl.record_pnl(dec!(200), ts(1));
         assert_eq!(pnl.net_pnl(), dec!(198));
     }
 

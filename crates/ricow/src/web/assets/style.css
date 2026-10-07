@@ -25,6 +25,10 @@
   --mono:
     "Cascadia Code", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
     "Liberation Mono", monospace;
+  /* 039: K 线均线配色 (MA7/25/99) —— 与其它颜色一样, 只在这里定义, 组件一律引用变量。 */
+  --ma-7: #e3b341;
+  --ma-25: #58a6ff;
+  --ma-99: #bc8cff;
 }
 
 /* 034 白色浅色主题: 背景白、面板浅灰, 强调色加深保证对比度(WCAG AA)。 */
@@ -47,6 +51,10 @@
   --overlay: rgba(15, 23, 32, 0.4);
   --raise-1: rgba(15, 23, 32, 0.025);
   --raise-2: rgba(15, 23, 32, 0.05);
+  /* 039: 白底上要保证对比度, 均线用加深版。 */
+  --ma-7: #9a6a00;
+  --ma-25: #0969da;
+  --ma-99: #8250df;
 }
 
 /* 034 红色主题: 深红褐面 + 珊瑚强调 —— 整体仍是暗色系, 红色为主色调。 */
@@ -69,6 +77,10 @@
   --overlay: rgba(12, 4, 5, 0.65);
   --raise-1: rgba(255, 255, 255, 0.03);
   --raise-2: rgba(255, 255, 255, 0.05);
+  /* 039: 红褐底上的均线取更亮的一档, 保证可辨识。 */
+  --ma-7: #f0c674;
+  --ma-25: #7cc4ff;
+  --ma-99: #d7b0ff;
 }
 * {
   box-sizing: border-box;
@@ -1950,6 +1962,60 @@ body {
 .sg-bt-chart {
   width: 100%;
   height: 320px;
+}
+
+/* 039: 图表图例 (权益/价格/基准/回撤 + 市场页的均线) —— 与线同色, 一眼对得上。 */
+.sg-bt-legend,
+.mk-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 0.7rem;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.sg-bt-legend .lg,
+.mk-chart-legend .lg {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+/* 色块: 用 currentColor 跟随各自设定的 color, 免得为每条线写一份背景色。 */
+.sg-bt-legend .lg::before,
+.mk-chart-legend .lg::before {
+  content: "";
+  width: 9px;
+  height: 2px;
+  background: currentColor;
+  border-radius: 1px;
+}
+.sg-bt-legend .lg-price,
+.mk-chart-legend .lg-vol { color: var(--muted); }
+.sg-bt-legend .lg-equity { color: var(--accent); }
+.sg-bt-legend .lg-bench { color: var(--warn); }
+.sg-bt-legend .lg-dd { color: var(--error); }
+.mk-chart-legend .lg-ma7 { color: var(--ma-7); }
+.mk-chart-legend .lg-ma25 { color: var(--ma-25); }
+.mk-chart-legend .lg-ma99 { color: var(--ma-99); }
+
+/* 039: 平仓盈亏明细表 (复用 sg-hist-table 的表格样式, 这里只补滚动与说明)。 */
+.sg-closed-wrap {
+  margin: 8px 0;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.sg-closed-wrap .sg-hist-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+.sg-closed-sub {
+  margin: 4px 0 0;
+  font-size: 0.72rem;
+  color: var(--muted);
 }
 
 /* 回测历史对比表(P1-6) 与 寻优对比表(P2-7) 共用样式 */
