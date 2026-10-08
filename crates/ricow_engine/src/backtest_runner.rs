@@ -11,14 +11,89 @@ use chrono::{NaiveDate, Utc};
 use ricow_core::{Balance, Kline, OrderStatus};
 use ricow_strategy::{BacktestContext, BacktestReport, Context, Strategy, StrategyConfig};
 
+/// 034 事件驱动决策: "下单 → 撮合 → 成交派发 on_fill" 的有界递归闭环。
+///
+/// - 下单后拒单/撤单/过期回传 `on_order_update` (审计 #3);
+/// - 撮合出的成交**立即**入账并派发 `on_fill`; on_fill 返回的订单再次下单、
+///   新成交再次派发 —— 成交→决策→挂单零节流 (对齐 NautilusTrader 事件驱动语义);
+/// - 深度上限 [`MAX_FILL_DECISION_DEPTH`] 防病态策略 ("成交即市价反手") 无限递归,
+///   超限时不再静默丢批 —— 每笔被丢弃的订单回传 `on_order_update(Cancelled)` (038 R2);
+/// - 038 R1 撮合保真: on_fill 链内 (depth ≥ 1) 返回的**限价单**次 bar 生效 (defer 开关),
+///   市价单仍即时撮合; depth 0 (on_tick) 下单语义零改动。
+/// - on_fill 返回空(现有全部策略)时行为与旧逐 bar 循环逐分一致。
+pub(crate) const MAX_FILL_DECISION_DEPTH: u32 = 8;
+
+pub(crate) fn settle_orders(
+    ctx: &mut BacktestContext,
+    strategy: &mut dyn Strategy,
+    orders: Vec<ricow_core::OrderRequest>,
+    depth: u32,
+) {
+    if depth > MAX_FILL_DECISION_DEPTH {
+        tracing::warn!(
+            target: "backtest",
+            depth,
+            "on_fill 递归决策深度超限, 停止派发 (疑似'成交即反手'病态逻辑)"
+        );
+        // 038 R2: 丢批不静默 —— 每笔被丢弃订单回传 Cancelled, 策略可感知并重挂。
+        for req in orders {
+            let ack = ricow_core::OrderAck {
+                exchange_order_id: String::new(),
+                client_order_id: req.client_order_id.clone(),
+                pair: req.pair,
+                side: req.side,
+                price: req.price.unwrap_or_default(),
+                size: req.size,
+                filled_size: rust_decimal::Decimal::ZERO,
+                status: OrderStatus::Cancelled,
+            };
+            strategy.on_order_update(ctx, ack.to_update(Utc::now()));
+        }
+        return;
+    }
+    for req in orders {
+        // 038 R1: 链内限价单次 bar 生效 (defer 开关); 市价单/撤单指令照旧即时处理。
+        let defer = depth > 0 && req.order_type == ricow_core::OrderType::Limit;
+        if defer {
+            ctx.set_defer_new_limits(true);
+        }
+        match ctx.place_order(req) {
+            Ok(ack)
+                if matches!(
+                    ack.status,
+                    OrderStatus::Rejected | OrderStatus::Cancelled | OrderStatus::Expired
+                ) =>
+            {
+                // 审计 #3: 拒单/撤单回传给策略 (终态非成交)。
+                strategy.on_order_update(ctx, ack.to_update(Utc::now()));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(target: "backtest", "下单失败: {e}");
+            }
+        }
+        if defer {
+            ctx.set_defer_new_limits(false);
+        }
+    }
+    for fill in ctx.drain_fills() {
+        let follow_ups = strategy.on_fill(ctx, fill);
+        settle_orders(ctx, strategy, follow_ups, depth + 1);
+    }
+}
+
 /// 在历史 K 线上运行一次回测 (单标的)。
 ///
-/// 流程: on_init → 逐 bar step_bar + on_tick + place_order + drain_fills + on_fill → report。
+/// 流程: on_init → 逐 bar [step_bar → settle_orders(成交先入账 + on_fill 事件驱动闭环) →
+/// on_tick → settle_orders(下单即撮即派发)] → report。
+/// 期末 finalize/force_close 的 fill 只入账派发, 不再触发下单 (回测已收尾)。
+/// `close_at_end` = true 时收尾按期末价强制平掉所有方向仓 (032+ 可观测性, `--close-at-end`)。
 pub fn run_backtest(
     config: StrategyConfig,
     initial_balance: Balance,
     klines: &[Kline],
     strategy: &mut dyn Strategy,
+    close_at_end: bool,
 ) -> BacktestReport {
     let pair = config.get_str("pair").map(str::to_string);
     let mut ctx = BacktestContext::new(config, initial_balance);
@@ -67,32 +142,29 @@ pub fn run_backtest(
     let skip = if warmup > 0 && warmup < klines.len() { warmup } else { 0 };
     for k in &klines[skip..] {
         ctx.step_bar(k.clone());
+        // 时序保真 (032 复审根因 B): 撮合成交先于决策入账 —— step_bar 撮合出的成交
+        // 立即 drain + on_fill, 使 on_tick 看到含本 bar 成交的最新账本 (与实盘
+        // "WS 成交推送先于下一决策"语义对齐); 此前成交滞留到决策之后派发, 账本滞后
+        // 一根 bar, 策略按陈旧栈顶定单尺寸 → 账本/引擎残仓分叉。
+        // 034: on_fill 返回的订单立即下单并继续派发 (事件驱动闭环, 空返回 = 旧行为)。
+        settle_orders(&mut ctx, strategy, Vec::new(), 0);
         let orders = strategy.on_tick(&mut ctx);
-        for req in orders {
-            match ctx.place_order(req) {
-                Ok(ack)
-                    if matches!(
-                        ack.status,
-                        OrderStatus::Rejected | OrderStatus::Cancelled | OrderStatus::Expired
-                    ) =>
-                {
-                    // 审计 #3: 拒单/撤单回传给策略 (终态非成交)。
-                    strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(target: "backtest", "下单失败: {e}");
-                }
-            }
-        }
-        let fills = ctx.drain_fills();
-        for fill in fills {
-            strategy.on_fill(&mut ctx, fill);
-        }
+        // 本 tick 即时撮合的成交 (市价单/越线限价单) 仍在 place 后派发, 不跨 bar。
+        settle_orders(&mut ctx, strategy, orders, 0);
     }
 
     // 尾 bar 补结算 (013 FR-005): 最后一根 bar 的资金费/强平不由 push 路径触发
     ctx.finalize();
+    // 期末强制平仓 (032+ 可观测性, `--close-at-end`): 按期末价平掉所有方向仓,
+    // 让报告的净盈亏/权益是"已实现、干净"的。默认关闭 (行为零改动)。
+    if close_at_end {
+        ctx.force_close_all();
+        // 期末强平 fill 派发给策略 (032 复审): force_close_all 走同一 fill_queue,
+        // 不 drain 则策略账本残留幻影 lot、强平锁定损益不入策略统计(分侧归因缺失)。
+        for fill in ctx.drain_fills() {
+            strategy.on_fill(&mut ctx, fill);
+        }
+    }
     // 023: 回测收尾也跑一次 `on_stop` —— 策略的统计输出(跳过计数/重挂次数/末次方向)必须能在
     // 回测里看到, 否则"跳过占比"这类验收数字无处可取。语义是"收尾回调", 与实盘停机清理
     // 无关(回测没有交易所资源可清); 当前无内置策略在 on_stop 里下单。
@@ -100,6 +172,9 @@ pub fn run_backtest(
     let mut report = ctx.report();
     // 2026-10-05: 收尾日志 (on_stop 的"收益分解"等) 也要带上, 故在 on_stop 之后取。
     report.strategy_logs = strategy.take_logs();
+    // 策略级统计透传 (032+ 可观测性): state_snapshot 原样进报告"策略统计"区块。
+    // 引擎只搬运 key-value 字符串, 不读键名、不解释含义 (架构铁律安全)。
+    report.strategy_stats = strategy.state_snapshot();
     report
 }
 
@@ -178,8 +253,9 @@ pub fn build_interval_ticks(
 /// 组合回测 (M2): 多标的统一时间轴驱动。
 ///
 /// 流程与 `run_backtest` 对齐: on_init → 逐 tick [step_portfolio(推进 + 撮合前 tick
-/// 残留限价单) → on_tick 产单 → place_order(市价即时按本 tick 各 pair bar open 成交;
-/// 资金不足拒单计数) → drain_fills → on_fill] → report_portfolio。
+/// 残留限价单) → drain_fills/on_fill(撮合成交先入账) → on_tick 产单 → place_order
+/// (市价即时按本 tick 各 pair bar open 成交; 资金不足拒单计数) → drain_fills/on_fill]
+/// → report_portfolio。
 ///
 /// `signal_klines` (bs_momentum Lua 化, 2026-09-09): 美股信号日线 (键 = 原始 pair 名,
 /// 装配层按窗口截取), 构造 ctx 后装载 — 组合信号模式下 ctx:klines(pair) 返回按全局
@@ -197,28 +273,11 @@ pub fn run_portfolio_backtest(
 
     for bars in ticks {
         ctx.step_portfolio(bars);
+        // 时序保真: 与 run_backtest 同步 —— 撮合成交先于决策入账 (032 复审根因 B)。
+        // 034: on_fill 返回的订单立即下单并继续派发 (事件驱动闭环, 空返回 = 旧行为)。
+        settle_orders(&mut ctx, strategy, Vec::new(), 0);
         let orders = strategy.on_tick(&mut ctx);
-        for req in orders {
-            match ctx.place_order(req) {
-                Ok(ack)
-                    if matches!(
-                        ack.status,
-                        OrderStatus::Rejected | OrderStatus::Cancelled | OrderStatus::Expired
-                    ) =>
-                {
-                    // 审计 #3: 拒单/撤单回传给策略 (终态非成交)。
-                    strategy.on_order_update(&mut ctx, ack.to_update(Utc::now()));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(target: "backtest", "下单失败: {e}");
-                }
-            }
-        }
-        let fills = ctx.drain_fills();
-        for fill in fills {
-            strategy.on_fill(&mut ctx, fill);
-        }
+        settle_orders(&mut ctx, strategy, orders, 0);
     }
 
     let mut report = ctx.report_portfolio();
@@ -229,6 +288,7 @@ pub fn run_portfolio_backtest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ricow_core::OrderSide;
     use ricow_strategy::{ConfigValue, LuaStrategy};
     use rust_decimal::prelude::ToPrimitive;
     use rust_decimal::Decimal;
@@ -465,6 +525,35 @@ mod tests {
     }
 
     #[test]
+    fn test_run_backtest_close_at_end_and_strategy_stats_passthrough() {
+        // 032+ 可观测性: run_backtest(close_at_end=true) 收尾强平 + on_stop 的 state_set
+        // 经 report.strategy_stats 透传 (引擎只搬运 key-value, 不解释键名)。
+        let script = r#"
+            function on_init(ctx) ctx:need_klines("primary", "1d", 1) end
+            function on_tick(ctx)
+                -- 首 tick 市价开多 1 手, 之后不再下单 (留持仓给期末强平)。
+                if ctx:pos_size("TSLABUSDT", "long") <= 0 then
+                    return { { pair = "TSLABUSDT", side = "buy", order_type = "market", size = 1 } }
+                end
+                return {}
+            end
+            function on_stop(ctx) ctx:state_set("stat_hello", "world") end
+        "#;
+        let mut cfg = strategy_config();
+        cfg.params.insert("script".into(), ConfigValue::String(script.into()));
+        cfg.params.insert("pair".into(), ConfigValue::String("TSLABUSDT".into()));
+        let mut s = LuaStrategy::from_source(script, cfg.clone()).expect("脚本应编译通过");
+        let klines = vec![kline(1, 100, 101), kline(2, 101, 102)];
+        let report = run_backtest(cfg, balance(100_000), &klines, &mut s, true);
+        // 期末强平: 开多 1 手后收尾平掉 → 报告标注 applied, 且末尾多一笔平仓 fill。
+        assert!(report.close_at_end_applied, "close_at_end=true 应触发期末强平标注");
+        // 策略统计透传: on_stop 的 state_set 应出现在 strategy_stats。
+        let hello =
+            report.strategy_stats.iter().find(|(k, _)| k == "stat_hello").map(|(_, v)| v.clone());
+        assert_eq!(hello.as_deref(), Some("world"), "strategy_stats 应透传 on_stop 写入的键");
+    }
+
+    #[test]
     fn test_cancelled_order_visible_to_lua() {
         // 审计 #3 (撤单路径): 策略先挂限价买单(不成交), 下一 tick 撤单 → 引擎经
         // on_order_update 回传 Cancelled, Lua 侧 seen_status 记为 "cancelled"。
@@ -500,5 +589,78 @@ mod tests {
         let snap = s.state_snapshot();
         let seen = snap.iter().find(|(k, _)| k == "seen_status").map(|(_, v)| v.clone()).unwrap();
         assert_eq!(seen, "cancelled", "撤单必须经 on_order_update 回传给 Lua");
+    }
+
+    // ------------------------------------------------------------------
+    // 034 事件驱动决策: on_fill 可返回订单, 引擎"成交→决策→挂单"零节流闭环
+    // ------------------------------------------------------------------
+
+    /// 工具: 单标的 Lua 回测 (3 根等价 bar, 现价恒 100)。
+    fn run_lua(script: &str) -> ricow_strategy::BacktestReport {
+        let mut cfg = strategy_config();
+        cfg.params.insert("script".into(), ConfigValue::String(script.into()));
+        let mut s = LuaStrategy::from_source(script, cfg.clone()).expect("脚本应编译通过");
+        let klines: Vec<Kline> = (1..=3).map(|d| kline(d, 100, 100)).collect();
+        run_backtest(cfg, balance(100_000), &klines, &mut s, false)
+    }
+
+    /// 034 R1/R2: on_fill 返回的订单立即下单, 新成交在同一 bar 内继续派发。
+    /// 买 → on_fill 返还市价卖 → 同 bar 卖成交 → on_fill(卖) 不再返还 → 恰 2 笔。
+    #[test]
+    fn on_fill_orders_placed_and_chained_within_bar() {
+        let report = run_lua(
+            r#"
+            flag = false
+            function on_tick(ctx)
+                if not flag then
+                    flag = true
+                    return { { pair = "ETH", side = "buy", size = 1, order_type = "market" } }
+                end
+                return {}
+            end
+            function on_fill(ctx, f)
+                if f.side == "buy" then
+                    return { { pair = "ETH", side = "sell", size = f.fill_size, order_type = "market" } }
+                end
+                return {}
+            end
+        "#,
+        );
+        assert_eq!(report.fills.len(), 2, "买+卖两笔, 卖单来自 on_fill 同 bar 返回");
+        assert_eq!(report.fills[0].side, OrderSide::Buy);
+        assert_eq!(report.fills[1].side, OrderSide::Sell);
+        // 同 bar 闭环: 两笔成交时间戳都落在第 1 根 bar 内 (逐 bar 驱动下即同 bar)。
+        let first_bar_open = chrono::DateTime::from_timestamp_millis(86_400_000).unwrap();
+        assert!(
+            report.fills.iter().all(|f| f.timestamp < first_bar_open + chrono::Duration::days(1)),
+            "两笔成交都应发生在第 1 根 bar 内 (事件驱动, 不等下一根 bar)"
+        );
+        assert_eq!(report.final_pos_size, Decimal::ZERO, "卖单平掉了买单");
+    }
+
+    /// 034 R2 深度封顶: "成交即市价反手"的病态策略在 MAX_FILL_DECISION_DEPTH 处停止,
+    /// 不死循环。首笔(on_tick)成交触发链: 深度 0..8 各派发一笔 = 恰 9 笔。
+    #[test]
+    fn on_fill_recursion_depth_is_capped() {
+        let report = run_lua(
+            r#"
+            flag = false
+            function on_tick(ctx)
+                if not flag then
+                    flag = true
+                    return { { pair = "ETH", side = "buy", size = 0.001, order_type = "market" } }
+                end
+                return {}
+            end
+            function on_fill(ctx, f)
+                return { { pair = "ETH", side = "buy", size = 0.001, order_type = "market" } }
+            end
+        "#,
+        );
+        assert_eq!(
+            report.fills.len() as u32,
+            MAX_FILL_DECISION_DEPTH + 1,
+            "病态递归应在深度上限处封顶 (0..MAX 各一笔), 之后停止派发"
+        );
     }
 }

@@ -201,6 +201,8 @@ pub struct BacktestToml {
     pub max_leverage: Option<f64>,
     pub mmr_pct: Option<f64>,
     pub funding_rate_8h: Option<f64>,
+    /// 保证金模式: "cross" (全仓, 双向持仓多空盈亏互抵合并清算) | "isolated" (逐仓, 默认)。
+    pub margin_mode: Option<String>,
 }
 
 /// 回测引擎参数 (单次回测的全量有效值, 三层合并后)。
@@ -230,6 +232,8 @@ pub struct BacktestParams {
     pub mmr_pct: f64,
     /// 资金费率 / 8h (如 0.0001 = 0.01%)。
     pub funding_rate_8h: f64,
+    /// 保证金模式: "cross" (全仓) | "isolated" (逐仓, 默认; 现行口径)。
+    pub margin_mode: String,
 }
 
 /// 内置默认层 (specs/backtest.md §三)。现货费率 = BN 现货 10bps; 合约按 market 分支另定。
@@ -248,6 +252,7 @@ impl Default for BacktestParams {
             // 原 2.5% 为 exchangeInfo 深档误导值, 见 §十一 T7)。CLI 合约路径按 symbol 查表覆盖。
             mmr_pct: 1.0,
             funding_rate_8h: 0.0001,
+            margin_mode: "isolated".into(),
         }
     }
 }
@@ -311,6 +316,11 @@ impl BacktestParams {
             if let Some(v) = bt.funding_rate_8h {
                 p.funding_rate_8h = v;
             }
+            if let Some(v) = &bt.margin_mode {
+                if v == "cross" {
+                    p.margin_mode = v.clone();
+                }
+            }
         }
         p.apply_overrides(ov);
         p
@@ -344,6 +354,11 @@ impl BacktestParams {
         }
         if let Some(v) = ov.funding_rate_8h {
             self.funding_rate_8h = v;
+        }
+        if let Some(v) = &ov.margin_mode {
+            if v == "cross" {
+                self.margin_mode = v.clone();
+            }
         }
     }
 }

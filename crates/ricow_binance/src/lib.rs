@@ -13,6 +13,7 @@ mod futures;
 mod futures_client;
 mod futures_data;
 mod futures_ws;
+mod klines_fetch;
 mod retry;
 mod spot;
 mod ws;
@@ -27,4 +28,5 @@ pub use futures_client::{
 };
 pub use futures_data::{tier1_mmr_pct, FuturesDataClient, PERP_CONTRACT_TYPES};
 pub use futures_ws::parse_futures_user_event;
+pub use klines_fetch::{fetch_klines_concurrent, merge_pages, plan_windows, KLINE_PAGE_BARS};
 pub use spot::BnSpotExchange;

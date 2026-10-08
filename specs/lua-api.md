@@ -18,11 +18,27 @@
 |:-----|:-----|:-----|
 | `function on_init(ctx)` | 策略启动时调用一次 | 无 |
 | `function on_tick(ctx)` | 每个行情更新时调用 | 订单数组（可为空 `{}`） |
-| `function on_fill(ctx, fill)` | 订单成交时调用 | 无 |
+| `function on_fill(ctx, fill)` | 订单成交时调用 | 订单数组（可为空 `{}`; 034 事件驱动, 空返回 = 无动作） |
 | `function on_order_update(ctx, upd)` | 订单终态时调用 (拒单/撤单/过期回传, 2026-09-24 接线) | 无 |
 | `function on_stop(ctx)` | 策略停止时调用 (停机清理: 撤单/平仓) | 无 |
 
-所有回调的 `ctx` 参数为只读行情/账户快照；策略只能通过 on_tick 返回订单数组影响行为。
+所有回调的 `ctx` 参数为只读行情/账户快照；策略通过 on_tick / on_fill 返回订单数组影响行为。
+
+### on_fill 可返回订单（034 事件驱动决策）
+
+`on_fill(ctx, fill)` 可像 `on_tick` 一样返回订单表数组（同一套字段/校验）。引擎语义：
+
+- 成交**立即入账后**派发 `on_fill`；返回的订单立即提交：
+  - **市价单** → 回测同 bar 即时撮合（建仓/强平等语义依赖此路径）；
+  - **限价单** → 回测中**次 bar 生效**（038 R1 撮合保真: 不按当前 bar [low,high] 回溯匹配,
+    直接入簿从下一根 bar 起正常撮合, 含开盘跳空按 open 成交）——对齐行业默认
+    (backtrader/backtesting.py/NautilusTrader: 本 bar 新挂限价单绝不按本 bar 回溯成交),
+    从机制上消灭"买→卖→买"同 bar 乒乓链; 实盘则立即进交易所挂单（回测口径为保守近似）;
+- 新订单若即时成交（市价单路径）, 其 fill 会**再次**触发 `on_fill`（有界递归, 深度上限 8,
+  超限时每笔被丢弃订单回传 `on_order_update(Cancelled)`, 不再静默丢批, 038 R2）——
+  "成交→决策→挂单"零节流, 不受主时钟/下一根 bar 约束;
+- 返回空 `{}` / 不定义返回值 = 无动作（与旧行为一致, 决策等下一次 on_tick）;
+- ⚠️ 不要在 `on_fill` 里写"成交即市价反手"的循环逻辑 —— 会在深度上限处被截断并回传 Cancelled。
 
 ### on_fill 的 fill 字段（成交回调参数）
 
@@ -35,6 +51,7 @@
 | `fill_price` | number | 成交价 |
 | `fill_size` | number | 成交数量（基础币） |
 | `fee` | number | 手续费（计价币，已扣） |
+| `position_side` | string? | 合约 hedge 方向仓归属：`"long"` / `"short"`；one-way / 现货为 `nil`（032 新增，回测/Dry Run/实盘同源；实盘解析自用户流 `o.ps`） |
 
 ```lua
 function on_fill(ctx, fill)
@@ -74,6 +91,7 @@ end
 - 判定方式: 脚本里存在名为 `on_stop` 的函数即为"已实现清理"(引擎据此决定提示文案)
 - 清理里的下单与主循环一致: `ctx:place_order` 产生的成交同样计入统计并落 `fills` 表
 - **Dry Run**(虚拟撮合): 交易所侧不存在本策略挂单/持仓, 引擎不做撤单兜底, 只调用脚本 `on_stop`
+- **回测**(032+): 循环结束后、生成报告前也调用一次 `on_stop`(语义 = 收尾回调, 非停机清理; 回测无交易所资源可清)。`on_stop` 里 `ctx:state_set("stat_*", ...)` 写入的键经 `state_snapshot()` 透传到报告 `strategy_stats` 字段, 由 CLI 打印"策略统计"区块 —— 策略专有统计(如网格 flag 极值)不进引擎代码, 引擎只搬运 key-value 字符串(架构铁律安全)
 - **实盘**(011)停机顺序固定为: **停消费行情 → 策略 `on_stop` → 引擎撤单兜底 → (可选)平仓 → 残留复查 → 如实输出**; 两者**并存** —— `on_stop` 适合策略自有语义(记状态/撤销策略内部账), 引擎兜底保证"即使脚本没写清理也不留残单"
   - 撤单兜底只撤**本实例归属**的单(`clientOrderId` 带 `<策略名>-` 前缀); 非归属挂单只上报不撤(避免误撤手工单或其他实例的单)
   - 平仓仅在 `stop --close-all`(或启动 `--close-all`)时执行: 市价反向平掉该 pair 持仓, 数量按 `step_size` 向下取整, 不足 `min_qty` 则不平仓并如实说明; 平仓成交经用户流回写(清理后 ≤5s 吸干窗口)后落库
@@ -100,6 +118,8 @@ end
 | `ctx:position_entry(pair)` | number | 净仓开仓均价 (占优方向的加权均价) |
 | `ctx:pos_size(pair, side)` | number | 指定方向仓数量 (side = `"long"` / `"short"`; 合约 hedge 双仓独立可见, 现货恒 long, 无仓返回 0) |
 | `ctx:pos_entry(pair, side)` | number | 指定方向仓开仓均价 (无仓返回 0) |
+| `ctx:pos_liq(pair, side)` | number? | 指定方向仓**逐仓爆仓价** (032 新增)。回测/Dry Run = `isolated_liq_price` 公式值 (显示口径, 见 specs/backtest.md §五.4a); 实盘 = 交易所 `liquidationPrice`; 无仓 / 全仓 / 现货返回 `nil` |
+| `ctx:pos_mark(pair, side)` | number | 指定方向仓**标记价** (032 新增)。回测 = 当前 bar close; Dry Run / 实盘 = markPrice; 无仓返回 0 |
 | `ctx:balance(asset)` | number | 资产余额 (如 `"USDT"`; quote 跟随交易对报价币, 合约回测中为 quote 现金) |
 | `ctx:net_pnl()` | number | 已实现净盈亏 (报价币计, 已扣手续费; 回测/Dry Run/实盘同一口径) — 2026-09-15 新增, 供策略自管回撤/止损 |
 | `ctx:equity()` | number | 总权益: 现货 = 报价现金 + 持仓市值; 合约 = 钱包现金 + 未实现盈亏 — 2026-09-15 新增 |
@@ -109,7 +129,8 @@ end
 >
 > 持仓语义 (specs/backtest.md §五.6/§八 D9): 默认 `one-way` 模式同一交易对只有一个净仓, `position_*` 即全部信息;
 > `hedge` 模式下多空可并存, 净仓查询 (`position_*`) 合并多空后取净 (net = 0 时 side 为 `"none"`),
-> 精确的方向仓用 `pos_size` / `pos_entry` 查询。回测引擎 (BacktestContext) 支持方向仓; 实盘方向仓查询后续接入, 暂返回 0。
+> 精确的方向仓用 `pos_size` / `pos_entry` / `pos_liq` / `pos_mark` 查询。
+> 方向仓查询回测 (BacktestContext)、Dry Run (DryRunContext) 与实盘三端均已支持 (032 起; 原"实盘暂返回 0"已过时)。
 > Dry Run 虚拟净仓 (DryRunContext) 遵循同一不变式: `position_size > 0` 时 `position_side` = 建仓方向, 归零即报 `"none"`;
 > 平仓归零后按原持仓方向再次开仓不会残留旧方向、数量不会累加 (2026-09-19 由 `specs/changes/024-dryrun-position-side/` 修复)。
 
@@ -347,19 +368,20 @@ TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝�
 目录定位:默认取**当前工作目录**(在项目根运行 `ricow`);从其他目录运行可设
 `RICOW_ROOT=<项目根>`;数据库路径可单独用 `RICOW_DB=<path>` 覆盖。
 
-内置策略(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格)均为 Lua 脚本, 按市场分目录
+内置策略(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格 + shannon_grid 香农网格)均为 Lua 脚本, 按市场分目录
 `strategies/spot/`(现货)与 `strategies/futures/`(合约), 每策略 = `<id>.lua`(逻辑) + `<id>.toml`(清单: 中文名/说明/参数 schema),
 参考实现见 `strategies/spot/`(git 跟踪, 与用户策略同目录, 复制即自定义):
 
 - `strategies/spot/shannon_spot_grid.lua`(+ `shannon_spot_grid.toml`) — 香农现货网格(虚拟账本权重再平衡 + ATR 间距, 详见 §九)
 - `strategies/spot/paired_grid.lua`(+ `paired_grid.toml`) — 现货动态非对称网格(固定金额 + 配对卖价恒>买价 + 方向偏移, 详见 §九)
+- `strategies/spot/shannon_grid.lua`(+ `shannon_grid.toml`) — 香农网格(真实账本 1:1 权重模拟 + 动态 ATR 间距 + 最小间距下限, 033; 建仓/成交后按含费修正量恢复现金与仓位价值 1:1)
 
 **内置脚本为编译期嵌入(include_str!), 直接改文件不重编译不生效**;
 自定义请复制 `strategies/spot/` 下的 `.lua` + `.toml` 到新 id 再改。
 
 直接 `ricow backtest --strategy shannon_spot_grid --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
 **交易对必须带报价币**, 现货用 `ETHUSDT` 而非 `ETH`, 否则交易所返回 `Invalid symbol`);
-复制 `strategies/spot/shannon_spot_grid.lua` 或 `strategies/spot/paired_grid.lua`(连同同名 `.toml` 清单)到
+复制 `strategies/spot/` 下的 `.lua` + `.toml`(如 `shannon_spot_grid` / `paired_grid` / `shannon_grid`)到
 新 `<id>`, 改清单里的 `id` 即自定义(`strategies/{spot,futures}/` 下除内置示例外均被 git 忽略,
 用户策略默认私有;想入库自行调整 `.gitignore`)。
 

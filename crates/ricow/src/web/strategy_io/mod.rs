@@ -575,6 +575,9 @@ pub(super) fn build_manifest(
         suitable: non_empty(req.suitable),
         unsuitable: non_empty(req.unsuitable),
         params,
+        position_mode: None,
+        default_leverage: None,
+        backtest: None,
     })
 }
 

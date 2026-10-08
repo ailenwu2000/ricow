@@ -93,6 +93,7 @@ pub(super) async fn seed_trade_rows(db: &Database) {
             fill_size: dec("2"),
             fee: dec("0.1"),
             timestamp: at,
+            position_side: None,
         },
     )
     .await

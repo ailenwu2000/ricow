@@ -1,0 +1,130 @@
+# 合约做空香农网格 策略清单
+#
+# 清单是表现层数据(参数键不进引擎代码); 引擎/CLI/绑定层零策略参数名 ——
+# 本文件 [[params]] 的 key 不得与引擎按名读取的参数同名(leverage/mmr_pct 等)。
+
+id = "shannon_short_grid_futures"
+name = "合约做空香农网格"
+market = "futures"
+position_mode = "hedge"
+default_leverage = 2
+summary = "USDT-M 合约纯做空香农网格(杠杆默认 2, 只下 SHORT 侧): 用虚拟香农网格做多的方式管理实际空头 —— 总资金=投入×杠杆, 启动即按现价市价卖出做空一半资金(成交价=第一平衡价), 虚拟账本恒 1:1 计算挂单量, 平衡价 − 平空间距挂平空限价单 / + 开空间距挂开空限价单(基础间距 = atr_mult×ATR 与下限取大), 任一成交后立即更新平衡价并全撤重挂两侧; 方向 flag 驱动趋势侧间距指数放大(flag_spacing_mult, 默认 1.2); 爆仓价实时监控"
+description = """
+合约做空版香农网格(hedge 模式只下 SHORT 侧, 杠杆默认 2 倍、1~5 可配): 用虚拟香农网格做多的方式管理实际的做空。
+虚拟账本(虚拟现金 v_cash + 虚拟仓位 v_pos)恒 1:1 价值平衡是决策引擎, 代表"镜像多头"; 实际交易反向执行:
+虚拟买 = 买入平空, 虚拟卖 = 卖出开空。总资金 = 投入资金 × 杠杆。
+
+启动即建仓: 回测启动后第一个就绪 bar 按现价市价卖出做空一半资金(不等任何信号), 成交价 = 第一平衡价格,
+虚拟仓位按总资金在平衡价 1:1 建立(v_pos = 总资金/(2×建仓价), v_cash = 总资金/2)。
+
+挂单机制: 平衡价 − 平空间距挂**买入平空**限价单、平衡价 + 开空间距挂**卖出开空**限价单,
+每笔挂单量按"成交后虚拟现金与虚拟仓位价值恰好恢复 1:1"(含手续费修正)计算;
+任一成交后立即: 平衡价 := 成交价 → 全撤现有订单 → 在新平衡价上下重新挂单。
+虚拟账本逐笔实际成交推进; 真实空头账本逐笔成交同步, 停机与引擎交叉核对(误差 < 0.01)。
+
+网格间距 = max(atr_mult × ATR, min_spacing_pct × 价格): 默认 1h K 线 14 周期 ATR × 1, 最小间距 0.2%
+(防 ATR 过窄被手续费磨损; 负数禁用下限)。ATR 的 K 线周期与乘数均可配, 间距随行情波动动态伸缩。
+方向 flag(开空笔数 − 平空笔数, 建仓与强平不计)驱动趋势侧间距指数放大: |flag|≥2 时
+flag<0(净平空)放大平空间距、flag>0(净开空)放大开空间距, 另一侧不变(flag_spacing_mult 默认 1.2,
+1.0 = 禁用)。单边趋势中趋势方向成交自动变稀, 回调收割不变; 回调成交即 flag 回退、放大自收缩。
+买卖量随不对称挂单价自动跟随, 成交后仍精确回 1:1。
+
+资金约束: 平空量 cap 到实际空头持仓(不反向开多); 开空名义超真实可部署额度(逐仓 = 现金×杠杆,
+全仓 = 权益×杠杆 − 净名义)时告警记录(underfunded), 限价单照常挂出(引擎侧资金不足保持 pending 不阻塞)。
+漂移纠偏: 跳空成交使账本漂移、任一侧挂单量出负时把平衡价重锚到 C/Q(1:1 恒等式定义价), 防单侧挂单死锁。
+
+爆仓价实时监控(空头距爆仓价 < 阈值告警, 只提示不动作), 运行期记录距爆仓最近时刻
+(stat_liq_dist_min/ts/price); 真发生爆仓(引擎 LIQ- 强平成交)即停机不再交易, 损失单列 stat_liq_pnl。
+清算默认全仓(cross): 现金即账户余额、无保证金静态划转, 开空可部署额度 = 组合权益 × 杠杆 − 净名义,
+利润自动再部署; 投入资金整体作为清算缓冲, 爆仓距离按有效杠杆(名义/投入)走。逐仓
+(--param margin_mode=isolated)开空按名义/杠杆划转钱包保证金, 闲置现金不参与清算。
+cross 下单侧爆仓价无定义(pos_liq 返回 nil, 策略侧告警通道自动静默), 引擎按组合权益判定强平。
+
+⚠ 合约做空: 单边上涨行情持续开空加仓将逼近爆仓价, 请关注 stat_liq_dist_min 告警。
+"""
+suitable = "震荡偏空或宽幅波动市场; 希望用网格高频收割波动、同时保持净空头敞口的合约交易者"
+unsuitable = "单边急涨(空头套牢且逼近爆仓价)、极低波动(间距低于成本门槛自动停机)"
+
+[[params]]
+key = "pair"
+name = "合约对"
+type = "string"
+desc = "USDT-M 合约交易对(如 SOLUSDT)"
+required = true
+
+[[params]]
+key = "invest_cash"
+name = "投入资金"
+type = "f64"
+desc = "投入资金(保证金, USDT); 总资金 = 投入 × 杠杆(默认 2)。0 = 启动时 quote 余额全额"
+default = 0
+
+[[params]]
+key = "interval"
+name = "主时钟"
+type = "string"
+desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
+default = "1h"
+
+[[params]]
+key = "atr_interval"
+name = "ATR K 线周期"
+type = "string"
+desc = "用哪根 K 线算 ATR(默认 1h, 可配 4h/1d)"
+default = "1h"
+
+[[params]]
+key = "atr_period"
+name = "ATR 周期"
+type = "i64"
+desc = "ATR 回看根数"
+default = 14
+
+[[params]]
+key = "atr_mult"
+name = "ATR 乘数"
+type = "f64"
+desc = "网格间距 = atr_mult × ATR, 默认 1"
+default = 1
+
+[[params]]
+key = "min_spacing_pct"
+name = "最小间距(价格占比)"
+type = "f64"
+desc = "间距下限(占价格比例, 0.002 = 0.2% = 4×合约费率); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损; 负数 = 禁用下限"
+default = 0.002
+
+[[params]]
+key = "flag_spacing_mult"
+name = "间距放大系数"
+type = "f64"
+desc = "方向 flag 驱动的网格间距指数放大系数, 默认 1.2: flag = 开空笔数 − 平空笔数(建仓与强平不计); |flag|≥2 时趋势侧间距 × 系数^(|flag|−1)(flag<0 净平空→放大平空间距, flag>0 净开空→放大开空间距, 另一侧不变), 买卖量随间距自动跟随保持 1:1; 1.0 = 禁用放大(<1 按 1 处理)"
+default = 1.2
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额(合约 SOLUSDT fapi 最小名义 5)"
+default = 5
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "单边手续费率(0.0005 = 合约 taker 0.05%/边)"
+default = 0.0005
+
+[[params]]
+key = "liq_warn_ratio"
+name = "爆仓价告警阈值"
+type = "f64"
+desc = "小数(0.1=10%); 空头距爆仓价 < 该比例打 WARN(只告警不动作)"
+default = 0.1
+
+[backtest]
+# 全仓(cross): 现金即账户余额(无保证金静态划转), 开空可用 = 组合权益 − 净名义(1x) ——
+# 利润随行情自动再部署进开空量, 投入资金整体作为清算缓冲(爆仓距离按有效杠杆走)。
+# 逐仓(--param margin_mode=isolated)开空按名义全额划转钱包保证金, 单边行情现金锁死、
+# 开空停摆(SOL 一年回测实证: isolated 525 次截断 vs cross 资金持续可用)。
+margin_mode = "cross"

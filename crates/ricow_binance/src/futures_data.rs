@@ -127,6 +127,24 @@ impl FuturesDataClient {
         Ok(all)
     }
 
+    /// 显式时间窗**单页**取数 `[start_ms, end_ms)` (050 并发拉数用; ≤1000 根, fapi 路径)。
+    pub async fn get_klines_window(
+        &self,
+        symbol: &str,
+        interval: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        let url = format!(
+            "{}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={}&startTime={start_ms}&endTime={}",
+            self.base_url,
+            crate::klines_fetch::KLINE_PAGE_BARS,
+            end_ms - 1 // endTime 闭区间 → 右开窗口钉到 end_ms 前 1ms
+        );
+        let raw: Vec<Vec<Value>> = self.get_json(&url).await?;
+        Ok(raw.iter().filter_map(|row| parse_kline_row(row)).collect())
+    }
+
     /// 股票类永续 (EQUITY) 池枚举 — fapi exchangeInfo 按 `underlyingType=="EQUITY"` 过滤。
     ///
     /// 数据事实 (2026-09-06 免 key 实测): 币安美股代币永续的 contractType=`TRADIFI_PERPETUAL`

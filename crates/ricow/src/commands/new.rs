@@ -134,6 +134,7 @@ pub fn run(args: NewArgs) -> CoreResult<()> {
         max_leverage: Some(bt.max_leverage),
         mmr_pct: Some(bt.mmr_pct),
         funding_rate_8h: Some(bt.funding_rate_8h),
+        margin_mode: Some(bt.margin_mode),
     });
 
     // ⑤ 落盘 (复用 deploy/Web 同一内核: 同名拒绝覆盖 / 写 toml 失败回收 .lua)。

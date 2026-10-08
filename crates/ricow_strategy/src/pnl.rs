@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use ricow_core::OrderFill;
 use rust_decimal::Decimal;
 
-/// 保留的成交记录上限。
-const MAX_FILLS: usize = 1000;
+/// 保留的成交记录上限 (032+ 可观测性: 1000 → 100_000, 保证逐笔导出完整)。
+const MAX_FILLS: usize = 100_000;
 
 /// 保留的平仓事件记录上限 (039 FR-8): 与成交记录同一取舍 —— 明细只保最近 N 条,
 /// **总数另计**(`closed_total`), 由展示方决定是否说明"仅显示最近 N 条"。
@@ -35,11 +35,16 @@ pub struct PnlTracker {
     gross_profit: Decimal,
     /// 亏损交易毛额合计 (负盈亏绝对值累加)。
     gross_loss: Decimal,
+    /// 最佳/最差单笔盈亏 (回测规范 v1 B 区; record_pnl 时跟踪极值)。
+    best_trade: Option<Decimal>,
+    worst_trade: Option<Decimal>,
     fills: Vec<OrderFill>,
     /// 平仓事件明细 (只保最近 `MAX_CLOSED_TRADES` 条)。
     closed_trades: Vec<ClosedTrade>,
     /// 平仓事件**总**次数 (不受上限影响, 供展示方如实报截断)。
     closed_total: u64,
+    /// 分侧已实现盈亏 (032+ 可观测性, hedge 网格两侧各赚多少): key = "long"/"short"。
+    realized_by_side: std::collections::HashMap<String, Decimal>,
 }
 
 impl PnlTracker {
@@ -74,6 +79,21 @@ impl PnlTracker {
             let excess = self.closed_trades.len() - MAX_CLOSED_TRADES;
             self.closed_trades.drain(..excess);
         }
+        // 最佳/最差单笔极值 (0 为尘, 不参与极值以免覆盖真实极值)。
+        if amount != Decimal::ZERO {
+            self.best_trade = Some(self.best_trade.map_or(amount, |b: Decimal| b.max(amount)));
+            self.worst_trade = Some(self.worst_trade.map_or(amount, |w: Decimal| w.min(amount)));
+        }
+    }
+
+    /// 记录已实现盈亏并按方向仓侧累加 (032+ 可观测性; side_key = "long"/"short")。
+    pub fn record_pnl_side(&mut self, amount: Decimal, ts: DateTime<Utc>, side_key: &str) {
+        self.record_pnl(amount, ts);
+        *self.realized_by_side.entry(side_key.to_string()).or_insert(Decimal::ZERO) += amount;
+    }
+
+    pub fn realized_by_side(&self) -> &std::collections::HashMap<String, Decimal> {
+        &self.realized_by_side
     }
 
     pub fn realized_pnl(&self) -> Decimal {
@@ -115,6 +135,16 @@ impl PnlTracker {
 
     pub fn losing_trades(&self) -> u64 {
         self.losing_trades
+    }
+
+    /// 最佳单笔盈亏 (回测规范 v1 B 区)。
+    pub fn best_trade(&self) -> Option<Decimal> {
+        self.best_trade
+    }
+
+    /// 最差单笔盈亏 (回测规范 v1 B 区)。
+    pub fn worst_trade(&self) -> Option<Decimal> {
+        self.worst_trade
     }
 
     pub fn fills(&self) -> &[OrderFill] {
@@ -176,6 +206,7 @@ mod tests {
             fill_size: dec!(1),
             fee,
             timestamp: ts(0),
+            position_side: None,
         }
     }
 

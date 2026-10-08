@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use chrono::Utc;
 use clap::Args;
@@ -43,6 +44,11 @@ pub struct BacktestArgs {
     /// K 线间隔 (1m/5m/15m/1h/4h/1d, 默认 1h)
     #[arg(long)]
     pub interval: Option<String>,
+    /// K 线数据源市场 (spot|futures; 缺省跟随策略 market)。仅影响拉哪套 K 线,
+    /// 不改策略/引擎的 market 语义 —— 现货↔合约同 symbol 价格有 ~几 bps 基差,
+    /// 等价性对照 (现货策略 vs 期货只多头) 必须喂同一序列才能逐笔对齐 (032)。
+    #[arg(long = "klines-market")]
+    pub klines_market: Option<String>,
     /// lua 脚本路径 (strategy=lua 时必填)
     #[arg(long)]
     pub script: Option<String>,
@@ -95,6 +101,13 @@ pub struct BacktestArgs {
     /// 省略档位即用默认阶梯 5,10,20; 例: `--sensitivity-fee 2,5,10,20`
     #[arg(long = "sensitivity-fee", num_args = 0..=1, default_missing_value = "")]
     pub sensitivity_fee: Option<String>,
+    /// 期末强制平仓: 回测收尾按期末价平掉所有方向仓, 报告净盈亏为"已实现、干净"口径
+    /// (032+ 可观测性; 默认 false = 行为与历史逐位一致)。
+    #[arg(long = "close-at-end")]
+    pub close_at_end: bool,
+    /// 导出目录: 回测参数 / 逐笔成交 / 权益曲线 / 报告全文写入该目录 (032+ 可观测性)。
+    #[arg(long = "export-dir")]
+    pub export_dir: Option<String>,
 }
 
 /// 解析 `key=value` 参数: 值按 f64 优先, 否则字符串。
@@ -239,6 +252,14 @@ pub(crate) struct BacktestRunSpec {
     pub(crate) mmr_pct: Option<f64>,
     /// 资金费率 /8h。
     pub(crate) funding_rate: Option<f64>,
+    /// K 线数据源市场 spot|futures(None=跟随策略 market; 仅解耦拉数, 不改策略/引擎语义)。
+    pub(crate) klines_market: Option<String>,
+    /// CLI 是否显式给了 --interval (true = 运行时覆盖清单默认值)。
+    pub(crate) interval_explicit: bool,
+    /// 期末强制平仓 (032+ 可观测性; false = 行为与历史逐位一致)。
+    pub(crate) close_at_end: bool,
+    /// 导出目录 (032+ 可观测性): 参数 / 逐笔成交 / 权益曲线 / 报告全文写入该目录。
+    pub(crate) export_dir: Option<String>,
 }
 
 impl BacktestRunSpec {
@@ -265,6 +286,9 @@ impl BacktestRunSpec {
             funding_rate,
             market,
             position_mode,
+            klines_market,
+            close_at_end,
+            export_dir,
             // 敏感性是 CLI 编排层的事(扫多轮), 不进单次回测的输入 -> 此处刻意丢弃。
             sensitivity: _,
             sensitivity_fee: _,
@@ -275,6 +299,7 @@ impl BacktestRunSpec {
                 overrides.insert(k, v);
             }
         }
+        let interval_explicit = interval.is_some();
         Self {
             root,
             strategy,
@@ -297,6 +322,10 @@ impl BacktestRunSpec {
             max_leverage,
             mmr_pct,
             funding_rate,
+            klines_market,
+            interval_explicit,
+            close_at_end,
+            export_dir,
         }
     }
 
@@ -472,6 +501,15 @@ pub(crate) struct BacktestOutcome {
     pub(crate) data_source: String,
     /// 证据卡 (未落盘; 由调用方决定写不写 —— 敏感性扫描不为每档都落一张卡)。
     card: RunCard,
+    // ---- 导出 (032+ 可观测性, --export-dir): 逐笔成交 / 权益曲线 / 参数 / 报告全文 ----
+    /// 生效配置 (导出 params.json 用; 含三层合并后的全量参数)。
+    pub(crate) config: StrategyConfig,
+    /// 实际喂给引擎的 K 线序列 (导出窗口元数据用)。
+    pub(crate) klines: Vec<ricow_core::Kline>,
+    /// 策略标识 (导出文件名前缀)。
+    pub(crate) strategy: String,
+    /// 导出目录 (None = 不导出; 由 `--export-dir` 传入)。
+    pub(crate) export_dir: Option<String>,
     // ---- Web 可视化数据 (P0-2): 与净值曲线同窗对齐, 供回测作业回结构化图表 ----
     /// 每根 bar 的收盘价 (f64; 与 `close_times_ms` 一一对应)。
     pub(crate) closes: Vec<f64>,
@@ -772,6 +810,24 @@ impl BacktestOutcome {
             }
         )
     }
+
+    /// 测试参数区块 (032+ 可观测性): 生效配置全量通用 dump (剔除 script 源码, 太长)。
+    pub(crate) fn test_params(&self) -> Vec<(String, String)> {
+        let mut tp: Vec<(String, String)> = self
+            .config
+            .params
+            .iter()
+            .filter(|(k, _)| k.as_str() != "script")
+            .map(|(k, v)| (k.clone(), config_value_repr(v)))
+            .collect();
+        tp.push(("market".into(), self.config.market.clone()));
+        tp.push(("position_mode".into(), self.config.position_mode.clone()));
+        // 回测窗口参数用 bt_ 前缀: 避免与策略自有参数同名撞键 (如网格策略的 interval 主时钟)。
+        tp.push(("bt_days".into(), self.days.to_string()));
+        tp.push(("bt_interval".into(), self.interval.clone()));
+        tp.push(("bt_close_at_end".into(), self.report.close_at_end_applied.to_string()));
+        tp
+    }
 }
 
 /// 回测内核 (032 T025): 窗口计算 → 装载策略(TOML/直跑)→ 三层回测参数 → warmup 声明收集 →
@@ -780,6 +836,8 @@ impl BacktestOutcome {
 /// CLI(`run_backtest`)与 Web 异步作业(`web::backtest_jobs`)共用本函数; 不含任何 stdout。
 /// 报告文本、run card 落盘、敏感性扫描都建立在本函数之上 ([`BacktestOutcome`])。
 pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<BacktestOutcome> {
+    // 分阶段计时 (性能诊断, stderr): 配置 / 声明 / 拉数 / 引擎回放。
+    let t_total = Instant::now();
     let days = spec.days;
     let interval = spec.interval.clone();
     let hours_per_bar = match interval.as_str() {
@@ -846,10 +904,18 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
     // --interval 是主时钟粒度(通用配置, 与 pair 同类): 写入 params 供策略 need_klines("primary", ...)
     // 声明使用。用户显式 --param interval 优先(不覆盖)。若不写, 策略 primary 声明会 fallback "1h",
     // 与 --interval 拉的 K 线粒度错位 → warmup 换算错 → 高周期指标永不就绪(实测 0 成交)。
-    config.params.entry("interval".into()).or_insert(ConfigValue::String(interval.clone()));
+    // 清单默认值注入 (032 B) 在 resolve_builtin_script 里先落了 interval 默认 → CLI **显式**给出的
+    // --interval 必须再覆盖它 (CLI 运行时配置 > 清单展示默认; 实测 2026-09-26: 不覆盖则
+    // `--interval 1m` 被清单 "1h" 压制, 回测按 1h 拉线)。
+    if spec.interval_explicit {
+        config.params.insert("interval".into(), ConfigValue::String(interval.clone()));
+    } else {
+        config.params.entry("interval".into()).or_insert(ConfigValue::String(interval.clone()));
+    }
     // 030 数据需求声明收集: 构造空 ctx 跑一次 on_init, 策略 need_klines 写入 declarations;
     // 据此推 warmup(预热根数)。引擎不再读 atr_interval/regime_interval 等策略参数名。
     // on_init 幂等约定: 声明阶段只依赖 config, 不依赖 balance/K 线(见 specs/architecture.md)。
+    let t_phase = t_total.elapsed();
     let mut declare_strategy = ricow_engine::load_strategy(&config)?;
     let mut declare_ctx = ricow_strategy::BacktestContext::new(
         config.clone(),
@@ -857,6 +923,9 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
     );
     declare_strategy.on_init(&mut declare_ctx);
     let declarations = declare_ctx.declarations();
+    let t_declare = t_total.elapsed();
+    eprintln!("[timing] 配置+策略编译 = {:.2}s", t_phase.as_secs_f64());
+    eprintln!("[timing] 数据需求声明 = {:.3}s", (t_declare - t_phase).as_secs_f64());
     // 主时钟周期 = primary 声明; 未声明(异常)时回退 CLI --interval 粒度。
     let main_tf_ms = declarations
         .iter()
@@ -887,27 +956,26 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
     crate::commands::pairs::ensure_pair_in_scope(&spec.root, &pair, &config.market).await?;
     // 数据源分支 (三层配置的 market 决定, specs/backtest.md §五): 合约用 fapi 公共数据源,
     // 现货沿用交易所客户端。K 线 JSON 同构, 直接喂同一回测引擎。
-    // 分页取数 (2026-09-22, 030): 币安 K 线**单次请求上限 1000 根** —— 超过必须向前翻页拼接,
-    // 否则长窗口 (1m 数天 / 1h 数月) 会拿到错误响应: 表现为 "network error: error decoding
-    // response body" (120 天 1m) 或长时间无输出 (3 天/1 天 1m 实测)。此处按 1000 根/批往前翻页。
-    const KLINE_PAGE_MAX: u32 = 1000;
-    let fapi = if config.market == "futures" {
+    // 数据源市场: 默认跟随策略 market; --klines-market 仅解耦拉数 (策略/引擎语义不变)。
+    let kline_market = spec.klines_market.as_deref().unwrap_or(&config.market);
+    let fapi = if kline_market == "futures" {
         let f = ricow_binance::FuturesDataClient::new()?;
         // MMR 元数据: 调用方未显式给 mmr_pct 时, 按 symbol 查内置首档表 (exchangeInfo 公共值不可靠,
         // 见 specs/backtest.md §十一 T7); 表外回落 1.0%。
-        if spec.mmr_pct.is_none() {
+        if spec.mmr_pct.is_none() && config.market == "futures" {
             config
                 .params
                 .insert("mmr_pct".into(), ConfigValue::Float(ricow_binance::tier1_mmr_pct(&pair)));
         }
-        Some(f)
+        Some(std::sync::Arc::new(f))
     } else {
         None
     };
     // 035: 取数优先命中本地 klines 缓存 —— 仅当窗口**已全部收盘**时启用
     // (`end` 早于 now 至少一根 bar), 保证"实时尾 bar 可能未收盘"不会被缓存固化。
     // 未命中/根数不足 → 直连交易所取数并**回填**缓存 (best-effort, 失败不影响回测)。
-    let market_key = config.market.clone();
+    // 缓存键 = 实际拉数的市场 (kline_market), 与 --klines-market 解耦口径一致。
+    let market_key = kline_market.to_string();
     let step_ms_i = (hours_per_bar * 3_600_000.0) as i64;
     let now_ms = Utc::now().timestamp_millis();
     let window_end = end_ms.unwrap_or(now_ms);
@@ -934,25 +1002,52 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
         }
     }
     if klines.is_empty() {
-        let mut acc: Vec<ricow_core::Kline> = Vec::new();
-        let mut cursor = end_ms; // None = 到"现在"为止
-        while acc.len() < fetch_limit as usize {
-            let want = (fetch_limit as usize - acc.len()).min(KLINE_PAGE_MAX as usize) as u32;
-            let batch = match (&fapi, cursor) {
-                (Some(f), Some(e)) => f.get_klines_ending_at(&pair, &interval, want, e).await?,
-                (Some(f), None) => f.get_klines(&pair, &interval, want).await?,
-                (None, Some(e)) => exchange.get_klines_until(&pair, &interval, want, e).await?,
-                (None, None) => exchange.get_klines(&pair, &interval, want).await?,
-            };
-            if batch.is_empty() {
-                break;
-            }
-            cursor = Some(batch[0].open_time.timestamp_millis() - 1);
-            let mut merged = batch;
-            merged.extend(acc);
-            acc = merged;
-        }
-        klines = acc;
+        // 050 并发分页取数: 币安 K 线单次上限 1000 根, 年级 1m = 528 页 —— 旧串行翻页实测
+        // 527s 回测里占 96.8% (跨境 RTT ~0.95s/页)。改按固定时间片 buffer_unordered 并发拉取,
+        // 收齐后排序拼接 (结果与串行逐位一致); 单片失败重试 2 次, 仍失败整次报错 (不静默缺 bar)。
+        let window_start = window_end - (fetch_limit as i64) * step_ms_i;
+        let windows = ricow_binance::plan_windows(
+            window_start,
+            window_end,
+            step_ms_i,
+            ricow_binance::KLINE_PAGE_BARS,
+        );
+        // 并发度 = 16 (IO 密集, 与 CPU 核数无关)。币安 weight 限速: spot 6000/min、fapi 2400/min,
+        // klines 每请求 weight=2。16 并发 × ~1s/页 RTT ≈ 32 req/s = 1920 weight/min,
+        // 同时低于两者 (fapi 更严) → 不触发 429 限速, 也留足重试余量。
+        let conc = 16usize;
+        let pages = windows.len();
+        let (got, net_ms) = if let Some(f) = &fapi {
+            let f = f.clone();
+            let p = pair.clone();
+            let iv = interval.clone();
+            let t = std::time::Instant::now();
+            let got = ricow_binance::fetch_klines_concurrent(&windows, conc, move |_, s, e| {
+                let (f, p, iv) = (f.clone(), p.clone(), iv.clone());
+                async move { f.get_klines_window(&p, &iv, s, e).await }
+            })
+            .await?;
+            (got, t.elapsed().as_millis())
+        } else {
+            let ex = exchange.clone();
+            let p = pair.clone();
+            let iv = interval.clone();
+            let t = std::time::Instant::now();
+            let got = ricow_binance::fetch_klines_concurrent(&windows, conc, move |_, s, e| {
+                let (ex, p, iv) = (ex.clone(), p.clone(), iv.clone());
+                async move { ex.get_klines_window(&p, &iv, s, e).await }
+            })
+            .await?;
+            (got, t.elapsed().as_millis())
+        };
+        klines = ricow_binance::merge_pages(got, fetch_limit as usize);
+        eprintln!(
+            "[timing] K线拉数 = {:.2}s ({} 片×≤{} 根, 并发 {conc}: 网络+解析+合并 {:.2}s)",
+            (t_total.elapsed() - t_declare).as_secs_f64(),
+            pages,
+            ricow_binance::KLINE_PAGE_BARS,
+            net_ms as f64 / 1000.0
+        );
         // 回填缓存 (best-effort): 下次同窗口回测即可零网络命中。
         if let Some(db) = &cache_db {
             if let Err(e) = db.insert_klines(&market_key, &pair, &interval, &klines).await {
@@ -1040,7 +1135,14 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
     // Web 可视化数据 (P0-2): bar 收盘价与收盘时刻 (与净值曲线同窗对齐)。
     let closes: Vec<f64> = klines.iter().map(|k| k.close.to_f64().unwrap_or(0.0)).collect();
     let close_times_ms: Vec<i64> = klines.iter().map(|k| k.close_time.timestamp_millis()).collect();
-    let report = Engine::new().backtest(config, initial_balance, &klines)?;
+    let t_engine0 = t_total.elapsed();
+    let report =
+        Engine::new().backtest(config.clone(), initial_balance, &klines, spec.close_at_end)?;
+    eprintln!(
+        "[timing] 引擎回放 = {:.2}s ({} 根 bar, 含重采样/撮合/Lua 决策)",
+        (t_total.elapsed() - t_engine0).as_secs_f64(),
+        klines.len()
+    );
 
     // 035: 可复现 run card —— 策略源码指纹 + 数据窗口 + 参数 + 指标, 供归档/diff/复现。
     // **不在此落盘**: 敏感性扫描会跑多轮, 每轮都落一张卡会污染归档目录; 落盘由调用方决定。
@@ -1093,6 +1195,10 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
         params,
         data_source: data_source.to_string(),
         card,
+        config,
+        klines,
+        strategy: spec.strategy.clone(),
+        export_dir: spec.export_dir.clone(),
         closes,
         close_times_ms,
     })
@@ -1115,12 +1221,26 @@ pub(crate) async fn run_backtest_full(spec: BacktestRunSpec) -> CoreResult<Backt
 pub(crate) async fn run_backtest_core(spec: BacktestRunSpec) -> CoreResult<String> {
     let strategy = spec.strategy.clone();
     let out = run_backtest_full(spec).await?;
-    Ok(format_backtest_report(
+    let text = format_backtest_report(
         &out.report,
         &out.header(&strategy),
         out.initial_cash,
         out.is_futures,
-    ))
+        &out.test_params(),
+    );
+    // 导出 (032+ 可观测性, --export-dir): 参数 / 逐笔成交 / 权益曲线 / 报告全文。
+    if let Some(dir) = &out.export_dir {
+        export_backtest(
+            dir,
+            &out.strategy,
+            &out.pair,
+            &out.config,
+            &out.klines,
+            &out.report,
+            &text,
+        )?;
+    }
+    Ok(text)
 }
 
 /// CLI/AI 工具入口包装: 把 [`BacktestArgs`] 组装成 [`BacktestRunSpec`] (数据目录=全局 project_root)
@@ -1139,6 +1259,103 @@ pub(crate) async fn run_backtest(args: BacktestArgs) -> CoreResult<String> {
         return run_backtest_sensitivity(spec, slippage_ladder, fee_ladder).await;
     }
     run_backtest_core(spec).await
+}
+
+/// `ConfigValue` → 展示字符串 (报告"测试参数"区块用)。
+fn config_value_repr(v: &ConfigValue) -> String {
+    match v {
+        ConfigValue::String(s) => s.clone(),
+        ConfigValue::Float(f) => f.to_string(),
+        ConfigValue::Integer(i) => i.to_string(),
+        ConfigValue::Boolean(b) => b.to_string(),
+    }
+}
+
+/// 把回测输入参数与输出明细导出到目录 (032+ 可观测性):
+/// - `params.json` —— 生效配置全量 (market/position_mode/params) + 窗口与 K 线根数;
+/// - `fills.csv` —— 逐笔成交 (时间戳 = bar 时间, 见 032+ 修复);
+/// - `equity.csv` —— 逐 bar 收盘权益曲线;
+/// - `report.txt` —— 报告全文。
+fn export_backtest(
+    dir: &str,
+    strategy: &str,
+    pair: &str,
+    config: &StrategyConfig,
+    klines: &[ricow_core::Kline],
+    report: &ricow_strategy::BacktestReport,
+    text: &str,
+) -> CoreResult<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| CoreError::InvalidArgument(format!("导出目录创建失败 {dir}: {e}")))?;
+    let stem = format!("{strategy}_{pair}");
+
+    // params.json
+    let mut params_map = serde_json::Map::new();
+    for (k, v) in &config.params {
+        let jv = match v {
+            ConfigValue::String(s) => serde_json::Value::String(s.clone()),
+            ConfigValue::Float(f) => serde_json::json!(f),
+            ConfigValue::Integer(i) => serde_json::json!(i),
+            ConfigValue::Boolean(b) => serde_json::Value::Bool(*b),
+        };
+        params_map.insert(k.clone(), jv);
+    }
+    let root = serde_json::json!({
+        "strategy": strategy,
+        "pair": pair,
+        "market": config.market,
+        "position_mode": config.position_mode,
+        "kline_bars": klines.len(),
+        "kline_first_open_time": klines.first().map(|k| k.open_time.to_rfc3339()),
+        "kline_last_close_time": klines.last().map(|k| k.close_time.to_rfc3339()),
+        "close_at_end_applied": report.close_at_end_applied,
+        "params": serde_json::Value::Object(params_map),
+    });
+    std::fs::write(
+        std::path::Path::new(dir).join(format!("{stem}_params.json")),
+        serde_json::to_string_pretty(&root).unwrap_or_default(),
+    )
+    .map_err(|e| CoreError::InvalidArgument(format!("导出 params.json 失败: {e}")))?;
+
+    // fills.csv
+    let mut csv = String::from(
+        "index,timestamp,pair,side,position_side,fill_price,fill_size,fee,client_order_id,exchange_order_id\n",
+    );
+    for (i, f) in report.fills.iter().enumerate() {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{}\n",
+            i,
+            f.timestamp.to_rfc3339(),
+            f.pair,
+            match f.side {
+                ricow_core::OrderSide::Buy => "buy",
+                ricow_core::OrderSide::Sell => "sell",
+            },
+            f.position_side.clone().unwrap_or_default(),
+            f.fill_price,
+            f.fill_size,
+            f.fee,
+            f.client_order_id,
+            f.exchange_order_id
+        ));
+    }
+    std::fs::write(std::path::Path::new(dir).join(format!("{stem}_fills.csv")), csv)
+        .map_err(|e| CoreError::InvalidArgument(format!("导出 fills.csv 失败: {e}")))?;
+
+    // equity.csv
+    let mut eq = String::from("bar_index,equity\n");
+    for (i, e) in report.equity_curve.iter().enumerate() {
+        eq.push_str(&format!("{i},{e}\n"));
+    }
+    std::fs::write(std::path::Path::new(dir).join(format!("{stem}_equity.csv")), eq)
+        .map_err(|e| CoreError::InvalidArgument(format!("导出 equity.csv 失败: {e}")))?;
+
+    // report.txt
+    std::fs::write(std::path::Path::new(dir).join(format!("{stem}_report.txt")), text)
+        .map_err(|e| CoreError::InvalidArgument(format!("导出 report.txt 失败: {e}")))?;
+
+    tracing::info!(target: "backtest", "回测导出完成: {dir}/{stem}_* (params.json / fills.csv / equity.csv / report.txt)");
+    Ok(())
 }
 
 /// CLI 入口: 跑回测并打印报告(与 AI 工具 `run_backtest` 共用同一主体与同一份格式化)。
@@ -1795,7 +2012,7 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "shannon_spot_grid"
+type = "paired_grid"
 enabled = true
 exchange = "binance"
 
@@ -1832,7 +2049,7 @@ order_size = 0.02
             r#"
 [strategy]
 name = "nopair"
-type = "shannon_spot_grid"
+type = "paired_grid"
 enabled = true
 exchange = "binance"
 "#,

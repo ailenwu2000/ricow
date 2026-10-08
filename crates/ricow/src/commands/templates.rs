@@ -1,14 +1,9 @@
 //! 策略模板目录 (019 G8 → 031 薄封装到 `crate::strategies::catalog`)。
 //!
 //! 031 起,"内置模板"与"用户自写策略"已统一由 [`crate::strategies::catalog`] 管理;
-//! 本模块保留 `code_of` / `find` / `list_text` / `render_read` 接口与文案生成, 数据来自 catalog。
+//! 本模块保留 `find` / `list_text` / `render_read` 接口与文案生成, 数据来自 catalog。
 
 use crate::strategies::catalog::{self, CatalogEntry};
-
-/// 策略 id → Lua 原文(供 `resolve_builtin_script` 把内置名 Lua 化)。
-pub(crate) fn code_of(name: &str) -> Option<String> {
-    catalog::find(name).map(|e| e.code)
-}
 
 /// 按 id 查策略。
 pub fn find(name: &str) -> Option<CatalogEntry> {
@@ -97,31 +92,28 @@ mod tests {
     #[test]
     fn list_text_lists_builtin_strategies() {
         let text = list_text();
-        for must in ["shannon_spot_grid", "paired_grid", "香农现货网格", "现货动态非对称网格"]
-        {
+        for must in ["paired_grid", "paired_grid_futures_long", "现货动态非对称网格"] {
             assert!(text.contains(must), "清单缺少: {must}");
         }
     }
 
     #[test]
-    fn find_and_code_of_work() {
-        assert!(find("shannon_spot_grid").is_some());
+    fn find_works() {
         assert!(find("paired_grid").is_some());
         assert!(find("no-such-template").is_none());
-        assert!(code_of("shannon_spot_grid").is_some_and(|c| c.contains("on_tick")));
-        assert!(code_of("no-such-template").is_none());
+        assert!(find("paired_grid").is_some_and(|e| e.code.contains("on_tick")));
     }
 
     #[test]
     fn names_contains_builtin() {
         let names = names();
-        assert!(names.iter().any(|n| n == "shannon_spot_grid"));
         assert!(names.iter().any(|n| n == "paired_grid"));
+        assert!(names.iter().any(|n| n == "paired_grid_futures_long"));
     }
 
     #[test]
     fn render_read_includes_code() {
-        let grid = find("shannon_spot_grid").unwrap();
+        let grid = find("paired_grid").unwrap();
         let rendered = render_read(&grid);
         assert!(rendered.contains("on_tick"), "详情须带原文代码");
     }
@@ -129,14 +121,14 @@ mod tests {
     /// 诚实性标记要出现在 AI 工具文本里: 未声明清单 / 与内置脚本重复(2026-10-05)。
     #[test]
     fn marks_show_undeclared_and_duplicate() {
-        let mut e = find("shannon_spot_grid").expect("内置必须存在");
+        let mut e = find("shannon_grid").expect("内置必须存在");
         assert!(entry_marks(&e).is_empty(), "内置干净条目不该带 ⚠ 标记");
 
         e.declared = false;
-        e.duplicate_of = Some("shannon_spot_grid".to_string());
+        e.duplicate_of = Some("shannon_grid".to_string());
         let marks = entry_marks(&e);
         assert!(marks.contains("未声明参数清单"), "须提示未声明清单: {marks}");
-        assert!(marks.contains("shannon_spot_grid"), "须点名重复的内置 id: {marks}");
+        assert!(marks.contains("shannon_grid"), "须点名重复的内置 id: {marks}");
         assert!(render_read(&e).contains('⚠'), "详情也要带标记");
     }
 }

@@ -40,6 +40,21 @@ pub trait Exchange: Send + Sync {
         self.get_klines(pair, interval, limit).await
     }
 
+    /// 显式时间窗**单页**取数 `[start_ms, end_ms)` (050 并发拉数用; ≤1000 根)。
+    ///
+    /// 缺省实现 = 串行 `get_klines_until` 兜底 (mock/未覆盖的数据源可用, 但失去并发意义);
+    /// 币安现货/合约数据源覆盖为真正的单页窗口查询。
+    async fn get_klines_window(
+        &self,
+        pair: &str,
+        interval: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        let _ = start_ms;
+        self.get_klines_until(pair, interval, 1000, end_ms).await
+    }
+
     /// 获取当前盘口快照
     async fn get_orderbook(&self, pair: &str, depth: u32) -> CoreResult<OrderBook>;
 

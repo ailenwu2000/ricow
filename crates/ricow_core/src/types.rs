@@ -274,6 +274,11 @@ pub struct OrderFill {
     pub fill_size: Decimal,
     pub fee: Decimal,
     pub timestamp: DateTime<Utc>,
+    /// 合约 hedge 方向仓 (032): "long"/"short"; 现货与 one-way 为 None。
+    /// 用途: 双向策略的 on_fill 按方向路由回对应子网格
+    /// (多头开仓 buy+long 与空头平仓 buy+short 的 side 同为 buy, 仅此字段可区分)。
+    #[serde(default)]
+    pub position_side: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

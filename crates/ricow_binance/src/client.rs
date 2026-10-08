@@ -202,6 +202,34 @@ impl BinanceClient {
         .await
     }
 
+    /// 显式时间窗**单页**取数 `[start_ms, end_ms)` (050 并发拉数用; ≤1000 根)。
+    ///
+    /// 与 `fetch_klines_paged` 同 URL/解析口径, 只是窗口钉死、不翻页 —— 供上层按片并发调度。
+    pub async fn get_klines_window(
+        &self,
+        symbol: &str,
+        interval: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> CoreResult<Vec<Kline>> {
+        let url = format!(
+            "{}/api/v3/klines?symbol={symbol}&interval={interval}&limit={}&startTime={start_ms}&endTime={}",
+            self.base_url,
+            crate::klines_fetch::KLINE_PAGE_BARS,
+            end_ms - 1 // endTime 闭区间 → 右开窗口钉到 end_ms 前 1ms
+        );
+        let resp =
+            self.http.get(&url).send().await.map_err(|e| CoreError::Network(e.to_string()))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| CoreError::Network(e.to_string()))?;
+        if !status.is_success() {
+            return Err(CoreError::Exchange(format!("BN {status}: {text}")));
+        }
+        let raw: Vec<Vec<Value>> =
+            serde_json::from_str(&text).map_err(|e| CoreError::Parse(format!("{e}")))?;
+        Ok(raw.iter().filter_map(|r| parse_kline_row(r)).collect())
+    }
+
     /// 截止到 `end_ms` 的 K 线 (回测按自然年月分段); 与 `get_klines` 同源分页逻辑。
     pub async fn get_klines_ending_at(
         &self,

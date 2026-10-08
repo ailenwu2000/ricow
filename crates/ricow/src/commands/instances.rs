@@ -148,16 +148,18 @@ pub(crate) async fn format_table() -> CoreResult<String> {
 
     line!(
         out,
-        "{:<22} {:<20} {:<9} {:<10} {:>7} {:<9} {}",
+        "{:<22} {:<20} {:<9} {:<10} {:>7} {:<9} {:<20} {:>12} {}",
         "策略",
         "状态",
         "模式",
         "交易对",
         "PID",
         "运行时长",
+        "最新成交",
+        "当日盈亏",
         "备注"
     );
-    line!(out, "{}", "-".repeat(96));
+    line!(out, "{}", "-".repeat(128));
     if daemon_off {
         line!(
             out,
@@ -167,6 +169,8 @@ pub(crate) async fn format_table() -> CoreResult<String> {
     }
 
     let (mut running, mut exited, mut idle) = (0usize, 0usize, 0usize);
+    // 043: 整表共用一个本地库连接 (打开失败 = 两列全 "-", 不中断)
+    let shared_db = open_db(&root).await.ok();
     for name in &names {
         let view = live.iter().find(|v| &v.name == name);
         let cfg = crate::commands::read_strategy_config(name);
@@ -227,15 +231,23 @@ pub(crate) async fn format_table() -> CoreResult<String> {
             }
         }
 
+        // 043: 最新成交 / 当日盈亏 (仅已部署实例查本地库; 失败/无数据 = "-", 不中断整表)
+        let (last_fill, day_pnl) = match (&shared_db, cfg.as_ref()) {
+            (Some(db), Some(c)) if is_deployed => last_fill_and_day_pnl(db, &c.name).await,
+            _ => ("-".to_string(), "-".to_string()),
+        };
+
         line!(
             out,
-            "{:<22} {:<20} {:<9} {:<10} {:>7} {:<9} {}",
+            "{:<22} {:<20} {:<9} {:<10} {:>7} {:<9} {:<20} {:>12} {}",
             name,
             status,
             mode,
             pair,
             pid,
             uptime,
+            last_fill,
+            day_pnl,
             notes.join("; ")
         );
     }
@@ -586,6 +598,61 @@ async fn open_db(root: &std::path::Path) -> CoreResult<Database> {
     Database::open(&crate::commands::db_path_in(root)).await.core()
 }
 
+/// 043: `status` 一览两列的数据源 —— 最新成交 (`时间 价格x数量`) 与当日盈亏
+/// (今日 UTC 00:00 后累计净变化 = 今日最新快照 net_pnl − 今日前最后一条 net_pnl)。
+/// 任何查询失败/无数据显示 `-`, 绝不中断整表。
+pub(crate) async fn last_fill_and_day_pnl(db: &Database, sid: &str) -> (String, String) {
+    // 最新成交
+    let last_fill = match db.recent_fills(Some(sid), 1).await {
+        Ok(rows) => match rows.first() {
+            Some(f) => format!(
+                "{} {}x{}",
+                fmt_ts(f.timestamp),
+                trim_num(f.fill_price),
+                trim_num(f.fill_size)
+            ),
+            None => "-".to_string(),
+        },
+        Err(_) => "-".to_string(),
+    };
+    // 当日盈亏 (累计口径差分; 今日无快照 = "-")
+    let day_start_ms =
+        chrono::Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+    let day_pnl = match db.recent_pnl_snapshots(Some(sid), 500).await {
+        Ok(snaps) => match snaps.iter().find(|s| s.timestamp >= day_start_ms) {
+            Some(latest) => {
+                let base = snaps
+                    .iter()
+                    .find(|s| s.timestamp < day_start_ms)
+                    .map(|s| s.net_pnl)
+                    .unwrap_or(rust_decimal::Decimal::ZERO);
+                let d = latest.net_pnl - base;
+                if d > rust_decimal::Decimal::ZERO {
+                    format!("+{d}")
+                } else if d.is_zero() {
+                    "0".to_string()
+                } else {
+                    format!("{d}")
+                }
+            }
+            None => "-".to_string(),
+        },
+        Err(_) => "-".to_string(),
+    };
+    (last_fill, day_pnl)
+}
+
+/// 043: 表格内数字压缩 — 去尾零, 超过 10 字符则截到 4 位小数 (仅展示, 不改数据)。
+fn trim_num(d: rust_decimal::Decimal) -> String {
+    let n = d.normalize();
+    let s = n.to_string();
+    if s.len() > 10 {
+        format!("{n:.4}")
+    } else {
+        s
+    }
+}
+
 /// `mode` 列显示: 空串 = 未知(不猜), 其余走既有 [`mode_text`] 口径。
 fn mode_label(mode: &str) -> String {
     if mode.is_empty() {
@@ -852,5 +919,61 @@ mod tests {
         assert!(msg.contains("也无实例台账"), "{msg}");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 043: 最新成交 / 当日盈亏两列 —— 空库全 "-", 有数据时按差分口径; 今日无快照 = "-"。
+    #[tokio::test]
+    async fn last_fill_and_day_pnl_two_states() {
+        use ricow_core::{OrderFill, OrderSide};
+        use ricow_strategy::PnlSnapshotRecord;
+        use rust_decimal_macros::dec;
+
+        let db = Database::open_in_memory().await.expect("内存库");
+
+        // 空库: 两列都 "-"
+        let (f, p) = last_fill_and_day_pnl(&db, "s1").await;
+        assert_eq!((f.as_str(), p.as_str()), ("-", "-"));
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let yesterday = now - 24 * 3600 * 1000;
+        db.insert_fill(
+            "s1",
+            &OrderFill {
+                trade_id: Some("t1".into()),
+                exchange_order_id: "e1".into(),
+                client_order_id: "c1".into(),
+                pair: "ETHUSDT".into(),
+                side: OrderSide::Buy,
+                fill_price: dec!(117.16),
+                fill_size: dec!(0.1),
+                fee: dec!(0.01),
+                timestamp: chrono::DateTime::from_timestamp_millis(now).unwrap(),
+                position_side: None,
+            },
+        )
+        .await
+        .expect("写 fill");
+        // 昨日累计 1.0, 今日累计 3.5 → 当日 +2.5
+        for (ts, net) in [(yesterday, dec!(1.0)), (now, dec!(3.5))] {
+            db.insert_pnl_snapshot(&PnlSnapshotRecord {
+                strategy_id: "s1".into(),
+                timestamp: ts,
+                realized_pnl: net,
+                fees: rust_decimal::Decimal::ZERO,
+                net_pnl: net,
+                trade_count: 1,
+            })
+            .await
+            .expect("写快照");
+        }
+
+        let (f, p) = last_fill_and_day_pnl(&db, "s1").await;
+        assert!(f.contains("117.16"), "最新成交列应含价格: {f}");
+        assert!(f.contains("x"), "最新成交列应为 价格x数量 形态: {f}");
+        assert_eq!(p, "+2.5", "当日盈亏 = 今日累计 - 昨日累计");
+
+        // 其它策略 (无任何记录): 仍全 "-", 不受 s1 数据影响
+        let (f2, p2) = last_fill_and_day_pnl(&db, "s2").await;
+        assert_eq!((f2.as_str(), p2.as_str()), ("-", "-"));
     }
 }

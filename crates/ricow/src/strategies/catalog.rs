@@ -72,6 +72,17 @@ pub struct StrategyManifest {
     /// 参数列表(声明顺序即表单顺序)。
     #[serde(default)]
     pub params: Vec<ManifestParam>,
+    /// 持仓模式 (032, 可选): "one-way" (缺省) | "hedge" —— 直跑路径回填 config 用。
+    #[serde(default)]
+    pub position_mode: Option<String>,
+    /// 默认杠杆 (032, 可选): 直跑路径无 `[backtest]` 段时回填 `leverage` (审核 S1)。
+    #[serde(default)]
+    pub default_leverage: Option<f64>,
+    /// `[backtest]` 段 (045, 可选): 回测引擎参数持久默认 (如 margin_mode), 由
+    /// `resolve_builtin_script` 合并进 config —— 直跑/回测路径策略 TOML 的引擎级
+    /// 默认值必须生效, 不能只对 `ricow create` 之类读原始 TOML 的路径生效。
+    #[serde(default)]
+    pub backtest: Option<ricow_strategy::BacktestToml>,
 }
 
 impl StrategyManifest {
@@ -145,14 +156,44 @@ impl CatalogEntry {
 /// 内置示例(编译期嵌入): (策略 id, 清单 TOML, Lua 源码)。
 const BUILTIN: &[(&str, &str, &str)] = &[
     (
-        "shannon_spot_grid",
-        include_str!("../../../../strategies/spot/shannon_spot_grid.toml"),
-        include_str!("../../../../strategies/spot/shannon_spot_grid.lua"),
-    ),
-    (
         "paired_grid",
         include_str!("../../../../strategies/spot/paired_grid.toml"),
         include_str!("../../../../strategies/spot/paired_grid.lua"),
+    ),
+    (
+        "paired_grid_futures_long",
+        include_str!("../../../../strategies/futures/paired_grid_futures_long.toml"),
+        include_str!("../../../../strategies/futures/paired_grid_futures_long.lua"),
+    ),
+    (
+        "shannon_grid",
+        include_str!("../../../../strategies/spot/shannon_grid.toml"),
+        include_str!("../../../../strategies/spot/shannon_grid.lua"),
+    ),
+    (
+        "shannon_virtual_grid",
+        include_str!("../../../../strategies/spot/shannon_virtual_grid.toml"),
+        include_str!("../../../../strategies/spot/shannon_virtual_grid.lua"),
+    ),
+    (
+        "shannon_hedge_grid_futures",
+        include_str!("../../../../strategies/futures/shannon_hedge_grid_futures.toml"),
+        include_str!("../../../../strategies/futures/shannon_hedge_grid_futures.lua"),
+    ),
+    (
+        "shannon_grid_futures",
+        include_str!("../../../../strategies/futures/shannon_grid_futures.toml"),
+        include_str!("../../../../strategies/futures/shannon_grid_futures.lua"),
+    ),
+    (
+        "shannon_neutral_grid_futures",
+        include_str!("../../../../strategies/futures/shannon_neutral_grid_futures.toml"),
+        include_str!("../../../../strategies/futures/shannon_neutral_grid_futures.lua"),
+    ),
+    (
+        "shannon_short_grid_futures",
+        include_str!("../../../../strategies/futures/shannon_short_grid_futures.toml"),
+        include_str!("../../../../strategies/futures/shannon_short_grid_futures.lua"),
     ),
 ];
 
@@ -342,6 +383,9 @@ fn scan_user_in(strategies_dir: &std::path::Path) -> (Vec<CatalogEntry>, Vec<(St
                     suitable: None,
                     unsuitable: None,
                     params: Vec::new(),
+                    position_mode: None,
+                    default_leverage: None,
+                    backtest: None,
                 },
                 code,
                 source: Source::User,
@@ -457,6 +501,30 @@ options = ["u", "coin"]
     }
 
     #[test]
+    fn manifest_optional_fields_default_none() {
+        // 032: 旧清单(无 position_mode / default_leverage)必须照常解析, 两字段缺省 None。
+        let m = StrategyManifest::parse(MANIFEST).unwrap();
+        assert_eq!(m.position_mode, None);
+        assert_eq!(m.default_leverage, None);
+    }
+
+    #[test]
+    fn parse_manifest_with_position_mode_and_leverage() {
+        // 032: futures 清单声明 position_mode + default_leverage → 正确解析。
+        let src = r#"
+id = "paired_grid_futures"
+name = "合约双向配对网格"
+market = "futures"
+summary = "多空双向网格"
+position_mode = "hedge"
+default_leverage = 2.0
+"#;
+        let m = StrategyManifest::parse(src).unwrap();
+        assert_eq!(m.position_mode.as_deref(), Some("hedge"));
+        assert_eq!(m.default_leverage, Some(2.0));
+    }
+
+    #[test]
     fn parse_rejects_bad_type() {
         let bad = MANIFEST.replace("type = \"f64\"", "type = \"wat\"");
         assert!(StrategyManifest::parse(&bad).is_err());
@@ -492,18 +560,14 @@ options = ["u", "coin"]
         let entries = all();
         assert!(entries
             .iter()
-            .any(|e| e.manifest.id == "shannon_spot_grid" && e.source == Source::Builtin));
-        assert!(entries
-            .iter()
             .any(|e| e.manifest.id == "paired_grid" && e.source == Source::Builtin));
         assert!(entries
             .iter()
-            .any(|e| e.manifest.id == "shannon_spot_grid" && e.code.contains("on_tick")));
+            .any(|e| e.manifest.id == "paired_grid" && e.code.contains("on_tick")));
     }
 
     #[test]
     fn find_works() {
-        assert!(find("shannon_spot_grid").is_some());
         assert!(find("paired_grid").is_some());
         assert!(find("no-such-strategy").is_none());
     }

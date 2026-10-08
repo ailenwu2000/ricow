@@ -52,3 +52,4 @@ ricow 的 `need_klines` 与 `AddEquity` / `informative_pairs` 同构，方向正
 1. **订单事件可见性**（已落实，2026-09-24）：ricow 原缺拒单/撤单回传（审计 #3），已接线 `on_order_update`，超过 Freqtrade。
 2. **预热语义文档**（已落实）：`need_klines` 的 `min_bars` 是 tf 自身根数，已补"防 24 根 vs 24 小时陷阱"说明（lua-api.md）。
 3. **低成本小功能**（记录，暂不做）：Freqtrade 的 `version()` / `plot_annotations()`（策略自报版本号、可视化标注），符合"少而精"前提下再考虑。
+4. **事件驱动决策**（已落实，2026-09-26 / 034）：`on_fill` 可返回订单 + 引擎"成交→决策"有界递归闭环（深度 8），成交后零节流重挂，对齐 NautilusTrader 事件驱动语义；现有策略零改动（回测逐分不变）。竞品架构优势全景清单与后续优先级（启动对账 > 回测滑点/部分成交 > 实盘心跳兜底）见 `specs/changes/034-event-driven-onfill/plan.md` §五。

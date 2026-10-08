@@ -1,0 +1,123 @@
+# 合约香农网格 策略清单
+#
+# 清单是表现层数据(参数键不进引擎代码); 引擎/CLI/绑定层零策略参数名 ——
+# 本文件 [[params]] 的 key 不得与引擎按名读取的参数同名(leverage/mmr_pct 等),
+# 杠杆走清单顶层 default_leverage 字段, 由 resolve_builtin_script 回填 [backtest].leverage。
+
+id = "shannon_grid_futures"
+name = "合约香农网格"
+market = "futures"
+position_mode = "hedge"
+default_leverage = 2
+summary = "USDT-M 合约香农网格(纯多头, 无对冲腿): 总资金=投入×杠杆, 总资金一半开多建仓, 虚拟账本恒 1:1 再平衡, 平衡价 − 买间距 / + 卖间距挂开多/平多单(基础间距 = atr_mult×ATR 与下限取大); 方向 flag 驱动趋势侧间距指数放大(flag_spacing_mult, 默认 1.2); 爆仓价实时监控"
+description = """合约版香农网格(hedge 模式只下 LONG 侧, 无对冲腿): 杠杆 1~5 倍(默认 2),
+总资金 = 投入资金 × 杠杆。价格低于 start_price 激活, 用总资金一半市价开多建仓(成交价 = 第一平衡价格);
+以虚拟账本(虚拟现金 + 虚拟仓位, 仓位与实际一致)计算, 平衡价 − 买间距挂开多单、平衡价 + 卖间距挂平多单
+(基础间距 = max(atr_mult×ATR, 最小间距下限×价格)), 每笔挂单量按"成交后虚拟现金与虚拟仓位价值恰好恢复
+1:1"(含手续费修正)计算; 任一成交后成交价成为新平衡价格并全撤重挂两侧。虚拟现金隔离可用保证金随价格/浮盈亏的频繁波动; 虚拟买单超真实可用保证金时
+告警记录(挂单照常挂出)。
+方向 flag 间距放大(flag_spacing_mult, 默认 1.2): flag = 网格卖笔数 − 买笔数(建仓与强平不计);
+|flag|≥2 时趋势侧间距 × 系数^(|flag|−1) —— flag<0(净买、价格下探)放大买单间距,
+flag>0(净卖、价格上冲)放大卖单间距, 另一侧不变; 1.0 = 禁用放大。语义: 单边趋势下趋势方向成交自动变稀,
+回调方向收割不变, 回调成交即 flag 回退、放大自动收缩。买卖量随放大后间距自动跟随, 成交后仍精确回 1:1。
+爆仓价实时监控(距爆仓价 < 阈值告警, 只提示不动作), 运行期记录距爆仓最近的
+时刻(stat_liq_dist_min/ts/price); 真发生爆仓(引擎 LIQ- 强平成交)即停机不再交易, 损失单列 stat_liq_pnl。
+ATR 周期与 K 线周期可配(默认 1h K 线、14 周期、乘数 1.5), 间距随行情波动动态伸缩。无结束语义(公式自平衡)。
+统计导出 stat_flag/stat_flag_max/stat_flag_min/stat_eff_flag_spacing_mult。
+⚠ 合约有杠杆: 默认全仓(cross)清算 —— 半仓建仓有效杠杆 = 声明杠杆/2, 爆仓距离按有效杠杆走
+(5x 约 -40%, 2x 基本不会爆仓); 逐仓(--param margin_mode=isolated)只认划转钱包保证金, 爆仓距离
+≈ 1/声明杠杆(5x 约 -20%)。请关注 stat_liq_dist_min 告警。
+注意: cross 下单侧爆仓价无定义(pos_liq 显示 "-", 策略侧告警通道自动静默), 引擎按组合权益判定强平。"""
+suitable = "震荡市(双向再平衡收割)、宽幅波动; 单边趋势中希望趋势成交自动变稀、回调收割不变者; 愿意承担杠杆爆仓风险的网格交易者"
+unsuitable = "单边急跌(只做多将套牢且逼近爆仓价)、极低波动(间距低于成本门槛自动停机)"
+
+[[params]]
+key = "pair"
+name = "合约对"
+type = "string"
+desc = "USDT-M 合约交易对(如 SOLUSDT)"
+required = true
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "价格低于它才激活(必填; 回测请设为窗口起点价, 勿前视)"
+required = true
+
+[[params]]
+key = "invest_cash"
+name = "投入资金"
+type = "f64"
+desc = "投入资金(保证金, USDT); 总资金 = 投入 × 杠杆, 激活时用总资金一半市价开多。0 = 激活时 quote 余额全额"
+default = 0
+
+[[params]]
+key = "interval"
+name = "主时钟"
+type = "string"
+desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
+default = "1h"
+
+[[params]]
+key = "atr_interval"
+name = "ATR K 线周期"
+type = "string"
+desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
+default = "1h"
+
+[[params]]
+key = "atr_period"
+name = "ATR 周期"
+type = "i64"
+desc = "ATR 回看根数"
+default = 14
+
+[[params]]
+key = "atr_mult"
+name = "ATR 乘数"
+type = "f64"
+desc = "网格间距 = atr_mult × ATR"
+default = 1.5
+
+[[params]]
+key = "min_spacing_pct"
+name = "最小间距(价格占比)"
+type = "f64"
+desc = "间距下限(占价格比例, 0.002 = 0.2% = 4×合约费率; 负数 = 禁用下限); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损"
+default = 0.002
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额(合约 SOLUSDT fapi 最小名义 5)"
+default = 5
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "单边手续费率(0.0005 = 合约 taker 0.05%/边)"
+default = 0.0005
+
+[[params]]
+key = "flag_spacing_mult"
+name = "间距放大系数"
+type = "f64"
+desc = "方向 flag 驱动的网格间距指数放大系数, 默认 1.2: flag = 网格卖笔数 − 买笔数(建仓与强平不计); |flag|≥2 时趋势侧间距 × 系数^(|flag|−1)(flag<0 净买→放大买单间距, flag>0 净卖→放大卖单间距, 另一侧不变), 买卖量随间距自动跟随保持 1:1; 1.0 = 禁用放大(<1 按 1 处理)"
+default = 1.2
+
+[[params]]
+key = "liq_warn_ratio"
+name = "爆仓价告警阈值"
+type = "f64"
+desc = "小数(0.1=10%); 多头距爆仓价 < 该比例打 WARN(只告警不动作)。与引擎 014 的 liq_warn_pct(百分点)是两条通道"
+default = 0.1
+
+[backtest]
+# 全仓(cross): 投入资金整体作为该 pair 的清算缓冲 —— 网格留半仓补仓资金, 有效杠杆 = 名义/投入
+# (5x 声明只决定可开名义上限, 不代表清算口径), 爆仓距离按有效杠杆走(对齐币安全仓合并清算)。
+# 逐仓(isolated, CLI --param margin_mode=isolated) 只认名义/杠杆划转的钱包保证金, 闲置现金不参与
+# 清算 —— 半仓建仓的补仓资金救不了场, 与策略资金承诺语义不符(2026-10-01 SOL 5x 一年回测实证)。
+margin_mode = "cross"

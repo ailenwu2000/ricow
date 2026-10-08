@@ -96,9 +96,9 @@ pub fn is_allowed(name: &str) -> bool {
 /// 单个工具输出的字符上限(超出即截断并标记)。
 pub const MAX_OUTPUT_CHARS: usize = 8_000;
 
-/// 文档类输出(read_doc)的字符上限: 权威文档(lua-api.md≈14k / backtest.md≈13k)必须能整篇读到,
+/// 文档类输出(read_doc)的字符上限: 权威文档(lua-api.md≈20k / backtest.md≈22k)必须能整篇读到,
 /// 否则模型只能拿到前 60%, exec 组件与完整示例丢失(019 G1)。仍有界 + 显式截断标记。
-pub const DOC_MAX_OUTPUT_CHARS: usize = 20_000;
+pub const DOC_MAX_OUTPUT_CHARS: usize = 30_000;
 
 /// 截断输出: 字符级(不切坏多字节), 且必须显式标记被截掉的部分。
 pub fn clamp_output(text: impl Into<String>) -> String {
@@ -806,7 +806,7 @@ fn tool_read_template(_ctx: ToolCtx) -> DynamicTool {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "策略 id, 取值见 list_templates(如 shannon_spot_grid / paired_grid)" }
+                "name": { "type": "string", "description": "策略 id, 取值见 list_templates(如 paired_grid / shannon_grid)" }
             },
             "required": ["name"],
             "additionalProperties": false

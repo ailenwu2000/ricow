@@ -73,8 +73,6 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
         )?;
     }
 
-    let exchange = crate::commands::bn_exchange()?;
-
     // 判定: name 命中已部署 TOML → TOML 加载; 未命中 → 策略类型直跑 (向后兼容)。
     let strategies_dir = crate::commands::ensure_strategies_dir()?;
     let config = if strategies_dir.join(format!("{}.toml", args.strategy)).exists() {
@@ -256,6 +254,15 @@ pub async fn run(args: RunArgs) -> CoreResult<()> {
                 "启动策略 {} (Dry Run, 前台)。停机方式: stdin 输入 stop / 管道关闭 / Ctrl-C",
                 config.name
             );
+            // Dry Run 行情源按市场分支 (032 FR-008): 合约 = 公共 fapi 客户端 (免凭据,
+            // FuturesClient::new 不要求 key); 现货路径维持原 bn_exchange 不变。
+            let exchange = if config.market.eq_ignore_ascii_case("futures") {
+                Arc::new(
+                    ricow_binance::BnFuturesExchange::new(ricow_binance::FuturesClient::new()?),
+                ) as Arc<dyn ricow_core::Exchange>
+            } else {
+                crate::commands::bn_exchange()?
+            };
             let outcome = Engine::new()
                 .run_dry_run(config, exchange, initial_balance, Some(&db), Some(stop_rx), events)
                 .await?;
@@ -279,7 +286,14 @@ async fn build_exchange(
     let pair = config.get_str("pair").unwrap_or("ETHUSDT").to_string();
     if config.market.eq_ignore_ascii_case("futures") {
         let ex = crate::commands::bn_futures_signed_mode(mode)?;
-        let leverage = config.get_f64("leverage").unwrap_or(1.0).max(1.0) as u32;
+        // 杠杆来源: 显式 params.leverage > [backtest].leverage(清单 default_leverage 回填) > 1x。
+        // 040-L demo 实跑发现: 只读 params 会漏掉清单回填的杠杆, 交易所侧 1x 与策略口径脱节
+        // (cap_open/爆仓距离估算全按清单杠杆算), 必须对齐。
+        let leverage = config
+            .get_f64("leverage")
+            .or_else(|| config.backtest.as_ref().and_then(|b| b.leverage))
+            .unwrap_or(1.0)
+            .max(1.0) as u32;
         let isolated =
             config.get_str("margin_type").map(|s| !s.eq_ignore_ascii_case("cross")).unwrap_or(true);
         let hedge = config.position_mode.eq_ignore_ascii_case("hedge");
@@ -518,7 +532,7 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "shannon_spot_grid"
+type = "paired_grid"
 enabled = {enabled}
 exchange = "binance"
 

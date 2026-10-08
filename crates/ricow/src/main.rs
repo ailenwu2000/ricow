@@ -49,6 +49,8 @@ enum Command {
     Run(run::RunArgs),
     /// 命令行回测
     Backtest(backtest::BacktestArgs),
+    /// 参数优化 (044): 网格/随机搜索包回测 → 打分表 → 可选写回 TOML
+    Optimize(commands::optimize::OptimizeArgs),
     /// 实时行情
     Ticker(market::TickerArgs),
     /// 盘口
@@ -87,13 +89,21 @@ async fn main() {
 
     // 日志一律写 stderr: stdout 留给命令输出与 AI 对话(`ricow mcp` 的 stdout 是 JSON-RPC 协议通道)。
     // 默认静默 rig 的 INFO 噪声(它会逐轮打印对话/工具调用细节), 需要时用 RUST_LOG 打开。
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,rig=warn,rig_agent=warn,rig_core=warn".into()),
-        )
-        .init();
+    // 043: RICOW_LOG_FORMAT=json 时输出 JSON 行(结构化采集用); 其余值/缺省 = 纯文本不变。
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,rig=warn,rig_agent=warn,rig_core=warn".into());
+    let json_logs = std::env::var("RICOW_LOG_FORMAT")
+        .map(|v| v.trim().eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json_logs {
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter).init();
+    }
 
     let cli = Cli::parse();
     let result = match cli.command {
@@ -111,6 +121,7 @@ async fn main() {
         Some(Command::Daemon(args)) => daemon::run(args).await,
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Backtest(args)) => backtest::run(args).await,
+        Some(Command::Optimize(args)) => commands::optimize::run(args).await,
         Some(Command::Ticker(args)) => market::ticker(args).await,
         Some(Command::Orderbook(args)) => market::orderbook(args).await,
         Some(Command::Pairs(args)) => pairs::pairs(args).await,

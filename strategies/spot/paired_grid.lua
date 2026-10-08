@@ -1,4 +1,4 @@
--- 现货动态非对称网格 (paired_grid) -- v1 (2026-09-24)
+-- 现货动态非对称网格 (paired_grid) -- v2 (2026-09-28, 039 事件模型)
 --
 -- ═══ 一句话 ═══
 --   固定金额(order_amount)的现货动态非对称网格: 价格低于 start_price 激活, 以最近成交价为参考价上下各挂一单
@@ -26,6 +26,12 @@
 --   8) 追踪: 栈空(无待配对仓)且价格 ≥ ref_price + 上方间距 → ref_price 上移一个间距重挂, 让下方买单跟随上涨价格。
 --   9) 成本门槛: spacing_pct 必须 > 2×fee_side(0.2%, 配对往返 = 买+卖各 0.1%), 不满足 [FATAL] 停机。
 --  10) 结束: 无持仓且无待配对仓 → 结束(不再动作); 停机**不清仓**。
+--
+-- ═══ 039 事件模型(2026-09-28) ═══
+--   全撤重挂逻辑抽至共享 do_rehang(ctx); on_fill 记账后**直接返回重挂订单**(建仓成交同 bar
+--   拆格挂出、网格成交同 bar 再挂, 不等下一根 bar)。链内新挂限价单由引擎 038 R1 保证**次 bar
+--   生效**(不按当前 bar 回溯成交) —— 无乒乓链风险; 实盘限价单立即进交易所。语义 = "成交后立即
+--   重挂, 新单最早下根 bar 可成交"。finished(无仓无单)后不再产出任何订单(语义不变)。
 --
 -- ═══ 参数(全部可配, 默认值可直接回测) ═══
 --   pair              必填, 交易对(现货)
@@ -66,6 +72,9 @@ skip_notional = 0
 rehang_count = 0
 track_up_count = 0
 last_price = 0
+stall_bars = 0             -- 停摆可观测(035 工程约定): 重挂需求持续未满足的 bar 数(挂出/成交即清零)
+stall_bars_max = 0
+stall_reported = false     -- WARN 去重: 每段停摆只报一次
 coin_accumulated = 0       -- coin 模式配对积累的币(每笔卖出时, 栈顶 lot 未卖完的余额累积, 不再配对)
 quote_accumulated = 0       -- u 模式配对积累的计价币(每笔卖出回笼 − 配对买入本金 = 价差, 毛额未扣手续费)
 
@@ -171,6 +180,9 @@ function on_init(ctx)
     finished = false
     cost_checked = false
     last_bar_ts = nil
+    stall_bars = 0
+    stall_bars_max = 0
+    stall_reported = false
 
     -- 断点续接: 引擎已把上次会话的状态注入(表 strategy_state)
     local rp = ctx:state_get("ref_price")
@@ -208,6 +220,92 @@ function on_init(ctx)
         num(ctx, "initial_buy_amount", 0) > 0
             and string.format(", 激活后市价买入 %.2f %s(拆成多笔 order_amount 方便配对)", num(ctx, "initial_buy_amount", 0), quote_asset)
             or ", 不建初始仓"))
+end
+
+-- 全撤重挂(共享决策出口, 039 事件模型): on_fill 成交后与 on_tick 追踪/续接后共用。
+-- 逐行搬移自原 on_tick 重挂块, 语义零改动。返回订单表(含 cancel_pending)或 {}(无单可挂)。
+function do_rehang(ctx)
+    local pair = ctx:config_str("pair")
+    local spacing_pct = num(ctx, "spacing_pct", 0.01)
+    local order_amount = num(ctx, "order_amount", 10)
+    local direction_offset = num(ctx, "direction_offset", 0.2)
+    local accumulate_mode = cfg_str(ctx, "accumulate_mode", "u")
+    local min_notional = num(ctx, "min_notional", 5)
+    local fee_side = num(ctx, "fee_side", 0.001)
+    local fee_bps = fee_side * 10000
+    -- 配对保底最小价差: 卖价必须 ≥ 栈顶买入价 × (1+min_pair_profit)。默认 0 = 2×fee_side。
+    local min_pair_profit = num(ctx, "min_pair_profit", 0)
+    if min_pair_profit <= 0 then
+        min_pair_profit = 2 * fee_side
+    end
+
+    -- 重挂(全撤重挂): 撤旧单 + 下方买单 + 上方卖单(栈非空才挂)。等比: 买 ÷(1+down), 卖 ×(1+up)。
+    -- 现货语义(与合约 036 的差异): 卖价仍锚定 ref_price(最近成交价), 非栈顶成本。
+    local down_pct, up_pct = side_spacing(spacing_pct, flag, direction_offset)
+    local buy_px = ref_price / (1 + down_pct)
+    local sell_px = ref_price * (1 + up_pct)
+    -- 配对保底: 卖价必须 ≥ 栈顶买入价 × (1+min_pair_profit)。
+    -- 否则 V 型反转(先跌后涨)中, ref_price 从低位回弹、而栈顶是下跌中高位买入的 lot,
+    -- 卖价会被 ref_price 拉到买入价以下 → 买高卖低的亏损配对(违反"卖价>买价+最小间隔")。
+    if #lots > 0 then
+        local min_sell = lots[#lots].price * (1 + min_pair_profit)
+        if sell_px < min_sell then
+            sell_px = min_sell
+        end
+    end
+    local orders = { { pair = pair, action = "cancel_pending" } }
+
+    if buy_px > 0 then
+        local buy_size = cap_buy(ctx, order_amount / buy_px, buy_px, fee_bps)
+        if buy_size > 0 and buy_size * buy_px >= min_notional then
+            orders[#orders + 1] = {
+                pair = pair, side = "buy", size = buy_size, order_type = "limit", price = buy_px,
+            }
+        end
+    end
+
+    if #lots > 0 and sell_px > 0 then
+        local top = lots[#lots]
+        local sell_size
+        if accumulate_mode == "coin" then
+            sell_size = order_amount * (1 + 2 * fee_side) / sell_px
+        else
+            sell_size = top.qty
+        end
+        sell_size = cap_sell(ctx, pair, sell_size)
+        if sell_size > 0 and sell_size * sell_px >= min_notional then
+            orders[#orders + 1] = {
+                pair = pair, side = "sell", size = sell_size, order_type = "limit", price = sell_px,
+            }
+        end
+    end
+
+    -- 两手都没挂出(量太小/名义不足): 保持 need_rehang, 下一 tick 再试(防永久停摆) + 停摆可观测
+    if #orders <= 1 then
+        skip_notional = skip_notional + 1
+        stall_bars = stall_bars + 1
+        if stall_bars > stall_bars_max then
+            stall_bars_max = stall_bars
+        end
+        if not stall_reported and stall_bars >= 1440 then
+            stall_reported = true
+            ctx:log(string.format(
+                "[paired_grid] [WARN] 连续 %d 根 bar 挂单失败(小名义/资金不足), cash=%.2f",
+                stall_bars, ctx:balance(quote_asset) or 0))
+        end
+        return {}
+    end
+
+    stall_bars = 0
+    need_rehang = false
+    rehang_count = rehang_count + 1
+    save_state(ctx)
+    ctx:log(string.format(
+        "[paired_grid] 网格重挂 #%d: 参考价 %.4f 间距=%.2f%% 下间距=%.2f%% 上间距=%.2f%% flag=%d " ..
+        "待配对 %d 笔 -> 买 %.4f / 卖 %s",
+        rehang_count, ref_price, spacing_pct * 100, down_pct * 100, up_pct * 100, flag, #lots,
+        buy_px, #lots > 0 and string.format("%.4f", sell_px) or "无(无待配对仓)"))
+    return orders
 end
 
 function on_tick(ctx)
@@ -329,61 +427,8 @@ function on_tick(ctx)
         return {}
     end
 
-    -- 重挂(全撤重挂): 撤旧单 + 下方买单 + 上方卖单(栈非空才挂)。等比: 买 ÷(1+down), 卖 ×(1+up)。
-    down_pct, up_pct = side_spacing(spacing_pct, flag, direction_offset)
-    local buy_px = ref_price / (1 + down_pct)
-    local sell_px = ref_price * (1 + up_pct)
-    -- 配对保底: 卖价必须 ≥ 栈顶买入价 × (1+min_pair_profit)。
-    -- 否则 V 型反转(先跌后涨)中, ref_price 从低位回弹、而栈顶是下跌中高位买入的 lot,
-    -- 卖价会被 ref_price 拉到买入价以下 → 买高卖低的亏损配对(违反"卖价>买价+最小间隔")。
-    if #lots > 0 then
-        local min_sell = lots[#lots].price * (1 + min_pair_profit)
-        if sell_px < min_sell then
-            sell_px = min_sell
-        end
-    end
-    local orders = { { pair = pair, action = "cancel_pending" } }
-
-    if buy_px > 0 then
-        local buy_size = cap_buy(ctx, order_amount / buy_px, buy_px, fee_bps)
-        if buy_size > 0 and buy_size * buy_px >= min_notional then
-            orders[#orders + 1] = {
-                pair = pair, side = "buy", size = buy_size, order_type = "limit", price = buy_px,
-            }
-        end
-    end
-
-    if #lots > 0 and sell_px > 0 then
-        local top = lots[#lots]
-        local sell_size
-        if accumulate_mode == "coin" then
-            sell_size = order_amount * (1 + 2 * fee_side) / sell_px
-        else
-            sell_size = top.qty
-        end
-        sell_size = cap_sell(ctx, pair, sell_size)
-        if sell_size > 0 and sell_size * sell_px >= min_notional then
-            orders[#orders + 1] = {
-                pair = pair, side = "sell", size = sell_size, order_type = "limit", price = sell_px,
-            }
-        end
-    end
-
-    -- 两手都没挂出(量太小/名义不足): 保持 need_rehang, 下一 tick 再试(防永久停摆)
-    if #orders <= 1 then
-        skip_notional = skip_notional + 1
-        return {}
-    end
-
-    need_rehang = false
-    rehang_count = rehang_count + 1
-    save_state(ctx)
-    ctx:log(string.format(
-        "[paired_grid] 网格重挂 #%d: 参考价 %.4f 间距=%.2f%% 下间距=%.2f%% 上间距=%.2f%% flag=%d " ..
-        "待配对 %d 笔 -> 买 %.4f / 卖 %s",
-        rehang_count, ref_price, spacing_pct * 100, down_pct * 100, up_pct * 100, flag, #lots,
-        buy_px, #lots > 0 and string.format("%.4f", sell_px) or "无(无待配对仓)"))
-    return orders
+    -- 重挂出口(共享决策出口, 039 事件模型): 全撤重挂逻辑已抽至 do_rehang, 语义不变
+    return do_rehang(ctx)
 end
 
 function on_fill(ctx, fill)
@@ -408,7 +453,8 @@ function on_fill(ctx, fill)
         ctx:log(string.format(
             "[paired_grid] 建仓成交 %.6f @ %.4f -> 拆成 %d 笔配对仓(每笔约 %.2f %s), 参考价 := %.4f, flag 不变=%d",
             size, px, n, qty_per * px, quote_asset, ref_price, flag))
-        return
+        -- 039 事件模型: 建仓成交立即拆格重挂(同 bar 挂出配对单), 不等下一根 bar
+        return do_rehang(ctx)
     end
 
     -- 网格单成交: 更新 lot / flag / ref_price, 全撤重挂
@@ -444,6 +490,8 @@ function on_fill(ctx, fill)
     end
     fill_count = fill_count + 1
     need_rehang = true
+    stall_bars = 0
+    stall_reported = false
 
     -- 无持仓且无待配对仓 -> 结束
     local pos_now = ctx:position_size(pair) or 0
@@ -456,6 +504,14 @@ function on_fill(ctx, fill)
     ctx:log(string.format(
         "[FILL] #%d %s size=%.6f px=%.4f notional=%.2f | flag=%d 待配对=%d 参考价(新)=%.4f 持仓=%.6f 权益=%.2f",
         fill_count, fill.side, size, px, size * px, flag, #lots, ref_price, pos_now, ctx:equity() or 0))
+
+    -- 039 事件模型: 成交后立即全撤重挂(同 bar 决策), 不等下一根 bar;
+    -- 重挂单为 ref±spacing 限价单, 由 038 R1 保证次 bar 才可成交 → 无乒乓链。
+    -- finished(无仓无单, 结束语义)后不再产出任何订单。
+    if finished then
+        return {}
+    end
+    return do_rehang(ctx)
 end
 
 -- 拒单回传: 重挂防停摆。
@@ -477,10 +533,11 @@ end
 function on_stop(ctx)
     local pair = ctx:config_str("pair")
     local pos = ctx:position_size(pair) or 0
+    ctx:state_set("stat_stall_bars", string.format("%d", stall_bars_max))
     ctx:log(string.format(
-        "[paired_grid] 停机(**不清仓**): 成交 %d(买 %d 卖 %d) / 跳过(小名义 %d) / " ..
+        "[paired_grid] 停机(**不清仓**): 成交 %d(买 %d 卖 %d) / 跳过(小名义 %d) / 停摆峰值 %d / " ..
         "追踪上移 %d / flag=%d(峰值 +%d/%d) 待配对 %d 参考价 %s / %s / 期末持仓 %.6f 权益 %.2f / 积累币 %.6f / 积累U %.2f",
-        fill_count, buy_count, sell_count, skip_notional, track_up_count,
+        fill_count, buy_count, sell_count, skip_notional, stall_bars_max, track_up_count,
         flag, flag_max, flag_min, #lots, ref_price and string.format("%.4f", ref_price) or "nil",
         finished and "已结束" or (halted and "已停机(成本门槛)" or "正常运行"),
         pos, ctx:equity() or 0, coin_accumulated, quote_accumulated))

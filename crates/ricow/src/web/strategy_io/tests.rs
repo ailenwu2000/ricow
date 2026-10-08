@@ -219,10 +219,10 @@ async fn test_get_source_builtin_unknown_and_traversal_404() {
     let root = tmp_root("source");
     let port = boot(root).await;
 
-    let res = raw(port, "GET", "/api/strategies/shannon_spot_grid/source?token=tok-ok", None).await;
+    let res = raw(port, "GET", "/api/strategies/shannon_grid/source?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 200, "{res}");
     let body = body_of(&res);
-    assert!(body.contains(r#""id":"shannon_spot_grid""#), "{body}");
+    assert!(body.contains(r#""id":"shannon_grid""#), "{body}");
     assert!(body.contains(r#""market":"spot""#), "{body}");
     assert!(body.contains("on_tick"), "lua 为文件原文: {body}");
     assert!(body.contains(r#""instance_toml":null"#), "内置策略实例 TOML 必须为 null: {body}");
@@ -406,7 +406,7 @@ async fn test_post_save_roundtrip_compile_guard_and_conflicts() {
 /// manifest 参数摘要: 键名/类型/必填/枚举/默认都要来自清单数据(不硬编码参数名)。
 #[test]
 fn test_manifest_summary_renders_schema() {
-    let entry = catalog::find("shannon_spot_grid").expect("内置清单 shannon_spot_grid 必须存在");
+    let entry = catalog::find("shannon_grid").expect("内置清单 shannon_grid 必须存在");
     let s = manifest_summary(&entry.manifest);
     assert!(s.contains(&entry.manifest.id) && s.contains(&entry.manifest.name), "{s}");
     assert!(s.contains("键名") && s.contains("类型"), "{s}");
@@ -444,24 +444,16 @@ async fn test_ai_edit_validation_and_need_keys_offline() {
     let post = |ins: &str| format!(r#"{{"instruction":"{ins}"}}"#);
 
     // ① 空 / 纯空白指令 → 400(不触网、不查策略)。
-    let res = raw(
-        port,
-        "POST",
-        "/api/strategies/shannon_spot_grid/ai-edit?token=tok-ok",
-        Some(&post("   ")),
-    )
-    .await;
+    let res =
+        raw(port, "POST", "/api/strategies/shannon_grid/ai-edit?token=tok-ok", Some(&post("   ")))
+            .await;
     assert_eq!(status_of(&res), 400, "{res}");
     assert!(body_of(&res).contains("instruction"), "{res}");
 
     // ② 非 JSON → 400。
-    let res = raw(
-        port,
-        "POST",
-        "/api/strategies/shannon_spot_grid/ai-edit?token=tok-ok",
-        Some("{ not json"),
-    )
-    .await;
+    let res =
+        raw(port, "POST", "/api/strategies/shannon_grid/ai-edit?token=tok-ok", Some("{ not json"))
+            .await;
     assert_eq!(status_of(&res), 400, "{res}");
 
     // ③ 未知 id → 404(与 source 同口径, 先于任何 AI 调用)。
@@ -481,7 +473,7 @@ async fn test_ai_edit_validation_and_need_keys_offline() {
     let res = raw(
         port,
         "POST",
-        "/api/strategies/shannon_spot_grid/ai-edit?token=tok-ok",
+        "/api/strategies/shannon_grid/ai-edit?token=tok-ok",
         Some(&post(instruction)),
     )
     .await;
@@ -512,10 +504,10 @@ async fn test_get_detail_carries_instance_current_values() {
     let port = boot(root.clone()).await;
 
     // ① 内置: 清单字段照常(对话视图依赖扁平的 name/params), pair/current 必须为 null。
-    let res = raw(port, "GET", "/api/strategies/shannon_spot_grid?token=tok-ok", None).await;
+    let res = raw(port, "GET", "/api/strategies/shannon_grid?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 200, "{res}");
     let body = body_of(&res);
-    assert!(body.contains(r#""id":"shannon_spot_grid""#), "{body}");
+    assert!(body.contains(r#""id":"shannon_grid""#), "{body}");
     assert!(
         body.contains(r#""name":"#) && body.contains(r#""params":"#),
         "清单字段须扁平保留: {body}"
@@ -606,8 +598,7 @@ async fn test_ai_generate_validation_offline() {
 
     // ② 内置保留名 → 409 code=reserved。
     let res = post(
-        r#"{"name":"shannon_spot_grid","market":"spot","pair":"ETHUSDT","idea":"随便"}"#
-            .to_string(),
+        r#"{"name":"shannon_grid","market":"spot","pair":"ETHUSDT","idea":"随便"}"#.to_string(),
     )
     .await;
     assert_eq!(status_of(&res), 409, "{res}");
