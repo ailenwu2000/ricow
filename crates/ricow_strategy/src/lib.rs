@@ -3,8 +3,7 @@
 //! 平台不做投资风控(019-R5, 2026-09-16): 盈亏/仓位政策由策略自管;
 //! 仅保留固定 100 单/秒的 [`OrderGuard`] 工程护栏防程序失控。
 //!
-//! 策略层统一 Lua: 内置脚本(paired_grid 现货动态非对称网格 +
-//! shannon_grid 现货 香农网格)与用户策略
+//! 策略层统一 Lua: 内置脚本(linear_position_grid 现货线性仓位网格 + 合约网格系列)与用户策略
 //! 均为 Lua 脚本, 参考实现见 `strategies/spot/`, API 规范见 `specs/lua-api.md`。
 
 mod align;

@@ -771,7 +771,7 @@ mod tests {
         params.insert("pair".into(), ConfigValue::String("ETH".into()));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "paired_grid".into(),
+            strategy_type: "linear_position_grid".into(),
             enabled: true,
             exchange: "binance".into(),
             params,

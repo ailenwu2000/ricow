@@ -806,7 +806,7 @@ fn tool_read_template(_ctx: ToolCtx) -> DynamicTool {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "策略 id, 取值见 list_templates(如 paired_grid / shannon_grid)" }
+                "name": { "type": "string", "description": "策略 id, 取值见 list_templates(如 linear_position_grid)" }
             },
             "required": ["name"],
             "additionalProperties": false

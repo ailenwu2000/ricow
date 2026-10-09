@@ -8,7 +8,7 @@
 2. **线性网格**: `w(p)` 在 `[p_low,p_high]` 线性(p_low→pos_low_pct 默认 0.7, p_high→pos_high_pct 默认 0.3, 区间外钳制), `T(p)=w(p)×C0/p`; ref±Δ 两侧限价单(Δ=max(atr_mult×ATR, min_spacing_pct×价格), 钳进区间), 买量=T(买价)−Q、卖量=Q−T(卖价); 任一成交 ref:=成交价全撤重挂(039 事件模型, 038 R1 链内限价次 bar 生效)。
 3. **动态止盈**(可选): 网格阶段 peak 只升不降; `peak−price ≥ tp_dd_atr_mult×ATR`(默认 3) **且** `(equity−C0)/C0 ≥ tp_min_profit_pct`(默认 0.10) → 撤光+市价清仓+停机; `tp_min_profit_pct=0` 禁用。
 
-出界处理 `out_of_range`: "exit"(默认)撤单停机不清仓 / "wait"暂停等回界内(ref 重锚现价)。盈利沉淀: T(p) 恒用固定 C0, 差价转现金不再投入。
+出界处理 `out_of_range`: "exit"(默认)撤单停机不清仓 / "wait"暂停等回界内(ref 重锚现价)。实时估值: 落位恒按当前总权益计算(无沉淀资金), 差价即时进入现金侧参与后续仓位计算。
 
 ## 二、关键设计决策
 

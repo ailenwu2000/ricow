@@ -156,24 +156,9 @@ impl CatalogEntry {
 /// 内置示例(编译期嵌入): (策略 id, 清单 TOML, Lua 源码)。
 const BUILTIN: &[(&str, &str, &str)] = &[
     (
-        "paired_grid",
-        include_str!("../../../../strategies/spot/paired_grid.toml"),
-        include_str!("../../../../strategies/spot/paired_grid.lua"),
-    ),
-    (
         "paired_grid_futures_long",
         include_str!("../../../../strategies/futures/paired_grid_futures_long.toml"),
         include_str!("../../../../strategies/futures/paired_grid_futures_long.lua"),
-    ),
-    (
-        "shannon_grid",
-        include_str!("../../../../strategies/spot/shannon_grid.toml"),
-        include_str!("../../../../strategies/spot/shannon_grid.lua"),
-    ),
-    (
-        "shannon_virtual_grid",
-        include_str!("../../../../strategies/spot/shannon_virtual_grid.toml"),
-        include_str!("../../../../strategies/spot/shannon_virtual_grid.lua"),
     ),
     (
         "linear_position_grid",
@@ -443,10 +428,10 @@ mod tests {
     use super::*;
 
     const MANIFEST: &str = r#"
-id = "paired_grid"
-name = "现货动态非对称网格"
+id = "linear_position_grid"
+name = "现货线性仓位网格"
 market = "spot"
-summary = "固定金额配对网格"
+summary = "线性仓位网格"
 
 [[params]]
 key = "start_price"
@@ -481,8 +466,8 @@ options = ["u", "coin"]
     #[test]
     fn parse_full_manifest() {
         let m = StrategyManifest::parse(MANIFEST).unwrap();
-        assert_eq!(m.id, "paired_grid");
-        assert_eq!(m.name, "现货动态非对称网格");
+        assert_eq!(m.id, "linear_position_grid");
+        assert_eq!(m.name, "现货线性仓位网格");
         assert_eq!(m.market, "spot");
         assert_eq!(m.params.len(), 4);
 
@@ -537,7 +522,7 @@ default_leverage = 2.0
 
     #[test]
     fn parse_rejects_empty_id() {
-        let bad = MANIFEST.replace("id = \"paired_grid\"", "id = \"\"");
+        let bad = MANIFEST.replace("id = \"linear_position_grid\"", "id = \"\"");
         assert!(StrategyManifest::parse(&bad).unwrap_err().contains("id"));
     }
 
@@ -561,19 +546,19 @@ default_leverage = 2.0
     }
 
     #[test]
-    fn builtin_catalog_has_both_strategies() {
+    fn builtin_catalog_has_spot_strategy() {
         let entries = all();
         assert!(entries
             .iter()
-            .any(|e| e.manifest.id == "paired_grid" && e.source == Source::Builtin));
+            .any(|e| e.manifest.id == "linear_position_grid" && e.source == Source::Builtin));
         assert!(entries
             .iter()
-            .any(|e| e.manifest.id == "paired_grid" && e.code.contains("on_tick")));
+            .any(|e| e.manifest.id == "linear_position_grid" && e.code.contains("on_tick")));
     }
 
     #[test]
     fn find_works() {
-        assert!(find("paired_grid").is_some());
+        assert!(find("linear_position_grid").is_some());
         assert!(find("no-such-strategy").is_none());
     }
 

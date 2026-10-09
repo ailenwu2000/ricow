@@ -13,14 +13,6 @@ backup/
 strategies/*
 !strategies/spot/
 strategies/spot/*
-!strategies/spot/shannon_spot_grid.lua
-!strategies/spot/shannon_spot_grid.toml
-!strategies/spot/paired_grid.lua
-!strategies/spot/paired_grid.toml
-!strategies/spot/shannon_grid.lua
-!strategies/spot/shannon_grid.toml
-!strategies/spot/shannon_virtual_grid.lua
-!strategies/spot/shannon_virtual_grid.toml
 !strategies/spot/linear_position_grid.lua
 !strategies/spot/linear_position_grid.toml
 !strategies/futures/

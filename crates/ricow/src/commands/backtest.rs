@@ -2012,27 +2012,27 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "paired_grid"
+type = "linear_position_grid"
 enabled = true
 exchange = "binance"
 
 [strategy.params]
 pair = "ETH"
-order_size = 0.02
+atr_mult = 0.02
 "#,
         )
         .unwrap();
         let _exchange = crate::commands::bn_exchange().unwrap();
         let args = BacktestArgs {
             strategy: "demo".into(),
-            params: vec!["rebalance_band=0.01".into()],
+            params: vec!["min_spacing_pct=0.01".into()],
             ..Default::default()
         };
         let cfg = resolve_config(&args).unwrap();
         assert_eq!(cfg.strategy_type, "lua", "内置名 TOML 应 Lua 化");
         assert_eq!(cfg.get_str("pair"), Some("ETH"));
-        assert_eq!(cfg.get_f64("order_size"), Some(0.02));
-        assert_eq!(cfg.get_f64("rebalance_band"), Some(0.01), "--param 应覆盖 TOML");
+        assert_eq!(cfg.get_f64("atr_mult"), Some(0.02));
+        assert_eq!(cfg.get_f64("min_spacing_pct"), Some(0.01), "--param 应覆盖 TOML");
         assert!(cfg.get_str("script").unwrap().contains("on_tick"), "应注入内置脚本");
         std::env::remove_var("RICOW_ROOT");
     }
@@ -2049,7 +2049,7 @@ order_size = 0.02
             r#"
 [strategy]
 name = "nopair"
-type = "paired_grid"
+type = "linear_position_grid"
 enabled = true
 exchange = "binance"
 "#,

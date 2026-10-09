@@ -975,7 +975,7 @@ mod tests {
     async fn test_backtest_endpoints_require_token_offline() {
         let root = tmp_root("auth");
         let port = boot(root).await;
-        const MARK: &str = "BT-MARK-shannon_grid";
+        const MARK: &str = "BT-MARK-linear_position_grid";
         let body = format!(r#"{{"strategy":"{MARK}"}}"#);
 
         // POST 发起 / GET 查询都在 token 门禁之后: 无/错 token 一律 401 空体。
@@ -1019,20 +1019,20 @@ mod tests {
         assert!(body_of(&res).contains("没有策略"), "{res}");
 
         // ③ interval/days/market/数值/参数各类 400。
-        let res = post(r#"{"strategy":"shannon_grid","interval":"2h"}"#).await;
+        let res = post(r#"{"strategy":"linear_position_grid","interval":"2h"}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("interval"), "{res}");
-        let res = post(r#"{"strategy":"shannon_grid","days":0}"#).await;
+        let res = post(r#"{"strategy":"linear_position_grid","days":0}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("days"), "{res}");
-        let res = post(r#"{"strategy":"shannon_grid","market":"fx"}"#).await;
+        let res = post(r#"{"strategy":"linear_position_grid","market":"fx"}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
-        let res = post(r#"{"strategy":"shannon_grid","cash":-1}"#).await;
+        let res = post(r#"{"strategy":"linear_position_grid","cash":-1}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("cash"), "{res}");
-        let res = post(r#"{"strategy":"shannon_grid","leverage":0}"#).await;
+        let res = post(r#"{"strategy":"linear_position_grid","leverage":0}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
-        let res = post(r#"{"strategy":"shannon_grid","params":{"weird":null}}"#).await;
+        let res = post(r#"{"strategy":"linear_position_grid","params":{"weird":null}}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("weird"), "参数错误要带键名: {res}");
 
@@ -1053,59 +1053,59 @@ mod tests {
         };
 
         // ① 空 strategy → 400; 非法名 → 400 code=invalid_name。
-        let res = post(r#"{"strategy":"  ","param":"grid_step","values":[1,2]}"#).await;
+        let res = post(r#"{"strategy":"  ","param":"atr_mult","values":[1,2]}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
-        let res = post(r#"{"strategy":"../evil","param":"grid_step","values":[1,2]}"#).await;
+        let res = post(r#"{"strategy":"../evil","param":"atr_mult","values":[1,2]}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains(r#""code":"invalid_name""#), "{res}");
 
         // ② param 为空或引擎内部键 → 400。
         for bad in ["", "pair", "script", "script_path"] {
-            let json = format!(r#"{{"strategy":"shannon_grid","param":"{bad}","values":[1,2]}}"#);
+            let json = format!(r#"{{"strategy":"linear_position_grid","param":"{bad}","values":[1,2]}}"#);
             let res = raw(port, "POST", "/api/backtest/sweep?token=tok-ok", Some(&json)).await;
             assert_eq!(status_of(&res), 400, "param='{bad}': {res}");
             assert!(body_of(&res).contains("param"), "{res}");
         }
 
         // ③ values 档位数量越界(1 档 / 11 档)→ 400。
-        let res = post(r#"{"strategy":"shannon_grid","param":"grid_step","values":[1]}"#).await;
+        let res = post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1]}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("values"), "{res}");
         let eleven: String = (0..11).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
         let json =
-            format!(r#"{{"strategy":"shannon_grid","param":"grid_step","values":[{eleven}]}}"#);
+            format!(r#"{{"strategy":"linear_position_grid","param":"atr_mult","values":[{eleven}]}}"#);
         let res = raw(port, "POST", "/api/backtest/sweep?token=tok-ok", Some(&json)).await;
         assert_eq!(status_of(&res), 400, "{res}");
 
         // ④ 未知策略(名合法但既非内置也无 TOML)→ 404。
-        let res = post(r#"{"strategy":"no-such-xyz","param":"grid_step","values":[1,2]}"#).await;
+        let res = post(r#"{"strategy":"no-such-xyz","param":"atr_mult","values":[1,2]}"#).await;
         assert_eq!(status_of(&res), 404, "{res}");
         assert!(body_of(&res).contains("没有策略"), "{res}");
 
         // ⑤ interval / days / market / 数值 / 档位取值类型各类 400。
         let res = post(
-            r#"{"strategy":"shannon_grid","param":"grid_step","values":[1,2],"interval":"2h"}"#,
+            r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1,2],"interval":"2h"}"#,
         )
         .await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("interval"), "{res}");
         let res =
-            post(r#"{"strategy":"shannon_grid","param":"grid_step","values":[1,2],"days":0}"#)
+            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1,2],"days":0}"#)
                 .await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("days"), "{res}");
         let res =
-            post(r#"{"strategy":"shannon_grid","param":"grid_step","values":[1,2],"market":"fx"}"#)
+            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1,2],"market":"fx"}"#)
                 .await;
         assert_eq!(status_of(&res), 400, "{res}");
         let res =
-            post(r#"{"strategy":"shannon_grid","param":"grid_step","values":[1,2],"cash":-1}"#)
+            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1,2],"cash":-1}"#)
                 .await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("cash"), "{res}");
         // 档位取值不是标量(null/对象/数组)→ config_values 类型转换当场 400。
         let res =
-            post(r#"{"strategy":"shannon_grid","param":"grid_step","values":[null,2]}"#).await;
+            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[null,2]}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
 
         // ⑥ 非 JSON → 400。
@@ -1116,7 +1116,7 @@ mod tests {
         //    注意: 登记成功后会 spawn 后台逐档跑; 但 `#[tokio::test]` 是当前线程运行时,
         //    本测试函数一返回运行时即关闭、spawn 任务被丢弃 —— 不会真正取数(保持离线)。
         let res =
-            post(r#"{"strategy":"shannon_grid","param":"grid_step_pct","values":[0.5,1.0]}"#).await;
+            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[0.5,1.0]}"#).await;
         assert_eq!(status_of(&res), 202, "合法寻优应立即 202: {res}");
         let body = body_of(&res);
         let job_id = serde_json::from_str::<serde_json::Value>(body)
@@ -1145,7 +1145,7 @@ mod tests {
             "POST",
             "/api/backtest?token=tok-ok",
             // start 日期非法: 内核窗口解析(parse_ymd_ms)先于任何网络取数, 立即失败。
-            Some(r#"{"strategy":"shannon_grid","pair":"ETHUSDT","start":"not-a-date"}"#),
+            Some(r#"{"strategy":"linear_position_grid","pair":"ETHUSDT","start":"not-a-date"}"#),
         )
         .await;
         assert_eq!(status_of(&res), 202, "应立即 202: {res}");

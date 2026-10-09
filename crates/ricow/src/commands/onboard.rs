@@ -504,7 +504,7 @@ pub async fn run_if_needed(root: &Path, strict: bool) -> CoreResult<Outcome> {
              - 回测我刚部署的策略\n\
              随时输入 /help 看可用命令与边界。",
             "next: just start chatting, for example\n  \
-             - build an AAPL grid strategy from the paired_grid template\n  \
+             - build an AAPL grid strategy from the linear_position_grid template\n  \
              - write a brand-new TWAP strategy\n  \
              - backtest the strategy I just deployed\n\
              Type /help anytime to see available commands and boundaries."

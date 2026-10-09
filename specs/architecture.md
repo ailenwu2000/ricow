@@ -76,8 +76,9 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   - **on_init 幂等约定**: 声明阶段(`on_init` 里的 `need_klines`)只依赖 config, 不依赖 balance/K 线; 回测装配会先跑一次 `on_init` 收集声明再拉数, 故 `on_init` 必须可重复调用。
 - **exec.\*** 执行组件(引擎内置 Rust 实现, 加载时注册全局表, 脚本内可覆盖): `levels` / `pullback_triggered` / `detect_quote` / `ticks_per` / `slice_due` / `side_order`
 - 内置示例(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/strategies/catalog.rs`; 031 起内置与用户策略统一由 catalog 管理, 现货/合约分 `spot/`/`futures/` 目录):
-  - `strategies/spot/shannon_spot_grid.lua` — 香农现货网格(030): 虚拟账本(本金 × 杠杆 1~5, `v_cap` 动态 = 币×现价+现金)决定目标持币量; `start_price` 触发激活(可选 `initial_buy_amount` 建初始仓); 平衡价 ± `atr_mult×ATR` 双边限价网格, 成交即以该价为新平衡价并重挂两侧; 挂单量 = 使账本在该价回到 `target_ratio` 权重; 卖量受真实持仓兜底; 趋势门控可选(`trend_gate`, 默认关); 成本门槛硬校验(R7) + `strategy_state` 断点续接; 仓位清空即结束
-  - `strategies/spot/paired_grid.lua` — 现货动态非对称网格(2026-09-24): 固定金额(`order_amount`)配对网格; 价格低于 `start_price` 激活; 以最近成交价为参考价上下各挂一单(下方固定金额买单、上方配对卖单, 配对 = LIFO 保证卖价恒 > 买价); 方向标志(买 −1 / 卖 +1)驱动上下间距不对称放大 `1+|flag|×direction_offset`, 抑制单向成交; 可选建仓(不计 flag)与 `accumulate_mode`(u 积累 U / coin 积累币); 成交全撤重挂 + 追踪(栈空时买单跟随上涨价格); 成本门槛(间距 > 2×单边费) + 断点续接; 仓位清空即结束
+  - `strategies/spot/linear_position_grid.lua` — 现货线性仓位网格(051): 仓位 = 币市值÷总权益随价格线性分布(`[p_low,p_high]` 内 `w(p)` 线性, 区间外钳制); 逐步建仓(低于 `start_price` 分批市价买) → 事件模型限价网格(ref±Δ 两侧挂单, 任一成交全撤重挂, Δ=max(`atr_mult×ATR`, `min_spacing_pct×价格`)) → 可选动态止盈; 落位恒按当前总权益实时计算(无沉淀资金); 出界 `out_of_range`(exit 撤单停机 / wait 暂停等回界)
+  - `strategies/futures/` — 合约网格系列: `paired_grid_futures_long`(配对做多) / `shannon_hedge_grid_futures`(对冲网格) / `shannon_grid_futures`(纯多头) / `shannon_neutral_grid_futures`(中性) / `shannon_short_grid_futures`(做空)
+  - ~~现货 `shannon_spot_grid` / `paired_grid` / `shannon_grid` / `shannon_virtual_grid`~~ — **已于 2026-10-09 删除**(现货只保留 linear_position_grid)
   - ~~`strategies/builtin/bs_momentum.lua`~~ — **已于 2026-09-11 删除** (真实 bStock 成交轨期望 ≈0:
     spot 91 天 每 bar −0.0198% / futures 220 天 +0.0367%; 七年 R1 数字含幸存者偏误不作证据);
     同批删除的还有 `bs_intraday_top5.lua`(日内 Top5, 成本算术否决)。证据见 specs/research/。
@@ -193,7 +194,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   - 数据缺口校验(038 P1-D): 取数后按周期步长扫 `open_time` 连续性, 有缺口即**硬报错**(列前 5 处 + 如实说明"另有 N 处未列出"),
     不再拿稀疏 K 线静默回测出一份看着正常的报告
   - 数据源按市场分支: 现货走交易所 REST; 合约 (futures) 走 fapi 公共数据源 (K 线; MMR 按 symbol 内置首档表,表外回落 1.0%)
-  - 直跑模式: `--strategy {shannon_spot_grid|paired_grid|lua}` — 内置脚本经 BUILTIN_SCRIPTS 常量表注入(需 --pair)
+  - 直跑模式: `--strategy {linear_position_grid|lua}` — 内置脚本经 BUILTIN 常量表注入(需 --pair)
   - 部署模式: `--strategy <name>` 命中 `strategies/<name>.toml` 加载(`script_path` 引用文件或内嵌 `script`)
 - 启动: `ricow start <name>`(经 daemon 后台运行) / `ricow run <name>`(前台调试; 默认 Dry Run, TOML `enabled=false` 拒绝启动)
 - ~~选币: `ricow scan …`~~ —— **已于 2026-09-15 删除**(020-platform-scope-trim: 选币/研究入口与"运行策略的平台"定位正交; 用户拍板删除, 不留废弃代码)
@@ -301,7 +302,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   Dry Run / 回测 / 沙箱不受此门禁影响。
 - **平台不做投资判断**(2026-09-16, 019-R5; 宪法 §安全要求已同步修订) —— 赚赔政策属于策略, 平台只做执行 + 数据 + 门禁 + 状态:
   - **已删除**: `risk.rs` 的四条静态限额规则(最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点)、`RiskSettings` / `RiskEngine` 装配器、`config.rs` 的 `RiskConfig` 与 `validate_risk()`、死模块 `scheduler.rs`; 老策略 TOML 残留的 `[risk]` 段与 `risk_*` 参数被 serde 忽略(**不再生效**, 装载不报错), 不做迁移脚本。
-  - 策略自管: 用只读 `ctx:net_pnl()` / `ctx:equity()` 实现止损/回撤/仓位政策(内置 `shannon_grid` 的 `dd_stop_pct` 为参考写法, 默认关闭); ~~平台级两级亏损熔断~~ 已于 2026-09-15 删除(020)。
+  - 策略自管: 用只读 `ctx:net_pnl()` / `ctx:equity()` 实现止损/回撤/仓位政策(内置 `linear_position_grid` 的动态止盈为参考写法); ~~平台级两级亏损熔断~~ 已于 2026-09-15 删除(020)。
   - **保留**: 固定工程护栏 `ricow_strategy::order_guard` —— 三条 `place_order` 顶部统一拦截**下单频率上限**(滑动窗口 1s, 固定 100/s, 回测 / Dry Run / 实盘同一装配, 计数对全部 pair 共享), 防 bug 风暴下单被交易所限流封禁; **固定常量、不读任何配置、无配置面**。
   - 被拒请求返回 `Rejected` ack(与资金不足同形)并计入回测报告"拒单次数", 同时 `tracing::warn!(target: "order_guard")` 输出关键数值; 策略循环不中断。详见 `specs/backtest.md` §二.6 与 `specs/changes/019-ai-assistant/spec.md` §七 R5。
   - > 修正记录(2026-09-12): 004 之前 RiskEngine 的唯一调用点是无消费者的 `StrategyScheduler`, 三条真实下单路径**均未过风控** —— 即四条静态规则当时实际从未生效; 已随 004 接入, 又随 2026-09-16 R5 整体删除。

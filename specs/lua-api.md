@@ -368,20 +368,20 @@ TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝�
 目录定位:默认取**当前工作目录**(在项目根运行 `ricow`);从其他目录运行可设
 `RICOW_ROOT=<项目根>`;数据库路径可单独用 `RICOW_DB=<path>` 覆盖。
 
-内置策略(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格 + shannon_grid 香农网格)均为 Lua 脚本, 按市场分目录
+内置策略均为 Lua 脚本, 按市场分目录
 `strategies/spot/`(现货)与 `strategies/futures/`(合约), 每策略 = `<id>.lua`(逻辑) + `<id>.toml`(清单: 中文名/说明/参数 schema),
 参考实现见 `strategies/spot/`(git 跟踪, 与用户策略同目录, 复制即自定义):
 
-- `strategies/spot/shannon_spot_grid.lua`(+ `shannon_spot_grid.toml`) — 香农现货网格(虚拟账本权重再平衡 + ATR 间距, 详见 §九)
-- `strategies/spot/paired_grid.lua`(+ `paired_grid.toml`) — 现货动态非对称网格(固定金额 + 配对卖价恒>买价 + 方向偏移, 详见 §九)
-- `strategies/spot/shannon_grid.lua`(+ `shannon_grid.toml`) — 香农网格(真实账本 1:1 权重模拟 + 动态 ATR 间距 + 最小间距下限, 033; 建仓/成交后按含费修正量恢复现金与仓位价值 1:1)
+- `strategies/spot/linear_position_grid.lua`(+ `linear_position_grid.toml`) — 现货线性仓位网格(仓位 = 币市值÷总权益随价格线性分布, 逐步建仓 + 事件模型限价网格 + 动态止盈, 落位恒按当前总权益实时计算)
+
+合约内置策略见 `strategies/futures/`(paired_grid_futures_long / shannon_hedge_grid_futures / shannon_grid_futures / shannon_neutral_grid_futures / shannon_short_grid_futures)。
 
 **内置脚本为编译期嵌入(include_str!), 直接改文件不重编译不生效**;
 自定义请复制 `strategies/spot/` 下的 `.lua` + `.toml` 到新 id 再改。
 
-直接 `ricow backtest --strategy shannon_spot_grid --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
+直接 `ricow backtest --strategy linear_position_grid --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
 **交易对必须带报价币**, 现货用 `ETHUSDT` 而非 `ETH`, 否则交易所返回 `Invalid symbol`);
-复制 `strategies/spot/` 下的 `.lua` + `.toml`(如 `shannon_spot_grid` / `paired_grid` / `shannon_grid`)到
+复制 `strategies/spot/` 下的 `.lua` + `.toml`(如 `linear_position_grid`)到
 新 `<id>`, 改清单里的 `id` 即自定义(`strategies/{spot,futures}/` 下除内置示例外均被 git 忽略,
 用户策略默认私有;想入库自行调整 `.gitignore`)。
 

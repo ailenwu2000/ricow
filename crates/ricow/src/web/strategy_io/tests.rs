@@ -71,7 +71,7 @@ fn test_decide_allow_replace_matrix() {
     assert!(decide_allow_replace("eth", &existing, false, false, false).is_err());
 
     // ③ 内置保留名 → 409 reserved(即使 overwrite 也拒)。
-    let r = decide_allow_replace("paired_grid", &[], false, true, false).unwrap_err();
+    let r = decide_allow_replace("linear_position_grid", &[], false, true, false).unwrap_err();
     assert_eq!(r.code, "reserved");
 
     // ④ 运行中实例 → 409 running(优先级高于 overwrite)。
@@ -155,8 +155,8 @@ async fn test_strategy_endpoints_require_token_offline() {
     .to_string();
 
     for probe in [
-        "/api/strategies/paired_grid/source".to_string(),
-        "/api/strategies/paired_grid/source?token=wrong".to_string(),
+        "/api/strategies/linear_position_grid/source".to_string(),
+        "/api/strategies/linear_position_grid/source?token=wrong".to_string(),
         "/api/strategies".to_string(),
         "/api/strategies?token=wrong".to_string(),
     ] {
@@ -173,8 +173,8 @@ async fn test_strategy_endpoints_require_token_offline() {
     // AI 改 Lua 同样在 token 门禁之后: 无/错 token 401 空体, 不回显指令。
     let ai_body = format!(r#"{{"instruction":"{MARK}"}}"#);
     for probe in [
-        "/api/strategies/paired_grid/ai-edit".to_string(),
-        "/api/strategies/paired_grid/ai-edit?token=wrong".to_string(),
+        "/api/strategies/linear_position_grid/ai-edit".to_string(),
+        "/api/strategies/linear_position_grid/ai-edit?token=wrong".to_string(),
     ] {
         let res = raw(port, "POST", &probe, Some(&ai_body)).await;
         assert!(res.starts_with("HTTP/1.1 401"), "{probe} 应 401, 实际: {res}");
@@ -198,8 +198,8 @@ async fn test_strategy_endpoints_require_token_offline() {
     // 用户策略清单保存 (P2-8) 同样在 token 门禁之后。
     let mf_body = format!(r#"{{"name":"{MARK}","params":[]}}"#);
     for probe in [
-        "/api/strategies/paired_grid/manifest".to_string(),
-        "/api/strategies/paired_grid/manifest?token=wrong".to_string(),
+        "/api/strategies/linear_position_grid/manifest".to_string(),
+        "/api/strategies/linear_position_grid/manifest?token=wrong".to_string(),
     ] {
         let res = raw(port, "POST", &probe, Some(&mf_body)).await;
         assert!(res.starts_with("HTTP/1.1 401"), "{probe} 应 401, 实际: {res}");
@@ -208,7 +208,7 @@ async fn test_strategy_endpoints_require_token_offline() {
     }
 
     // 对 token 取得到内置源码(证明拦的不是"路由不存在")。
-    let res = raw(port, "GET", "/api/strategies/paired_grid/source?token=tok-ok", None).await;
+    let res = raw(port, "GET", "/api/strategies/linear_position_grid/source?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 200);
     assert!(body_of(&res).contains("on_tick"));
 }
@@ -219,10 +219,10 @@ async fn test_get_source_builtin_unknown_and_traversal_404() {
     let root = tmp_root("source");
     let port = boot(root).await;
 
-    let res = raw(port, "GET", "/api/strategies/shannon_grid/source?token=tok-ok", None).await;
+    let res = raw(port, "GET", "/api/strategies/linear_position_grid/source?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 200, "{res}");
     let body = body_of(&res);
-    assert!(body.contains(r#""id":"shannon_grid""#), "{body}");
+    assert!(body.contains(r#""id":"linear_position_grid""#), "{body}");
     assert!(body.contains(r#""market":"spot""#), "{body}");
     assert!(body.contains("on_tick"), "lua 为文件原文: {body}");
     assert!(body.contains(r#""instance_toml":null"#), "内置策略实例 TOML 必须为 null: {body}");
@@ -356,7 +356,7 @@ async fn test_post_save_roundtrip_compile_guard_and_conflicts() {
         port,
         "POST",
         "/api/strategies?token=tok-ok",
-        Some(&post("paired_grid", "spot", code, false)),
+        Some(&post("linear_position_grid", "spot", code, false)),
     )
     .await;
     assert_eq!(status_of(&res), 409, "{res}");
@@ -406,7 +406,7 @@ async fn test_post_save_roundtrip_compile_guard_and_conflicts() {
 /// manifest 参数摘要: 键名/类型/必填/枚举/默认都要来自清单数据(不硬编码参数名)。
 #[test]
 fn test_manifest_summary_renders_schema() {
-    let entry = catalog::find("shannon_grid").expect("内置清单 shannon_grid 必须存在");
+    let entry = catalog::find("linear_position_grid").expect("内置清单 linear_position_grid 必须存在");
     let s = manifest_summary(&entry.manifest);
     assert!(s.contains(&entry.manifest.id) && s.contains(&entry.manifest.name), "{s}");
     assert!(s.contains("键名") && s.contains("类型"), "{s}");
@@ -445,14 +445,14 @@ async fn test_ai_edit_validation_and_need_keys_offline() {
 
     // ① 空 / 纯空白指令 → 400(不触网、不查策略)。
     let res =
-        raw(port, "POST", "/api/strategies/shannon_grid/ai-edit?token=tok-ok", Some(&post("   ")))
+        raw(port, "POST", "/api/strategies/linear_position_grid/ai-edit?token=tok-ok", Some(&post("   ")))
             .await;
     assert_eq!(status_of(&res), 400, "{res}");
     assert!(body_of(&res).contains("instruction"), "{res}");
 
     // ② 非 JSON → 400。
     let res =
-        raw(port, "POST", "/api/strategies/shannon_grid/ai-edit?token=tok-ok", Some("{ not json"))
+        raw(port, "POST", "/api/strategies/linear_position_grid/ai-edit?token=tok-ok", Some("{ not json"))
             .await;
     assert_eq!(status_of(&res), 400, "{res}");
 
@@ -473,7 +473,7 @@ async fn test_ai_edit_validation_and_need_keys_offline() {
     let res = raw(
         port,
         "POST",
-        "/api/strategies/shannon_grid/ai-edit?token=tok-ok",
+        "/api/strategies/linear_position_grid/ai-edit?token=tok-ok",
         Some(&post(instruction)),
     )
     .await;
@@ -504,10 +504,10 @@ async fn test_get_detail_carries_instance_current_values() {
     let port = boot(root.clone()).await;
 
     // ① 内置: 清单字段照常(对话视图依赖扁平的 name/params), pair/current 必须为 null。
-    let res = raw(port, "GET", "/api/strategies/shannon_grid?token=tok-ok", None).await;
+    let res = raw(port, "GET", "/api/strategies/linear_position_grid?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 200, "{res}");
     let body = body_of(&res);
-    assert!(body.contains(r#""id":"shannon_grid""#), "{body}");
+    assert!(body.contains(r#""id":"linear_position_grid""#), "{body}");
     assert!(
         body.contains(r#""name":"#) && body.contains(r#""params":"#),
         "清单字段须扁平保留: {body}"
@@ -598,7 +598,7 @@ async fn test_ai_generate_validation_offline() {
 
     // ② 内置保留名 → 409 code=reserved。
     let res = post(
-        r#"{"name":"shannon_grid","market":"spot","pair":"ETHUSDT","idea":"随便"}"#.to_string(),
+        r#"{"name":"linear_position_grid","market":"spot","pair":"ETHUSDT","idea":"随便"}"#.to_string(),
     )
     .await;
     assert_eq!(status_of(&res), 409, "{res}");
@@ -800,7 +800,7 @@ async fn test_manifest_save_roundtrip_and_guards() {
     let res = raw(
         port,
         "POST",
-        "/api/strategies/paired_grid/manifest?token=tok-ok",
+        "/api/strategies/linear_position_grid/manifest?token=tok-ok",
         Some(&manifest.to_string()),
     )
     .await;

@@ -532,7 +532,7 @@ mod tests {
             r#"
 [strategy]
 name = "demo"
-type = "paired_grid"
+type = "linear_position_grid"
 enabled = {enabled}
 exchange = "binance"
 
