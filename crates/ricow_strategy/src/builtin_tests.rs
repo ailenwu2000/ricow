@@ -2528,3 +2528,356 @@ fn test_short_grid_state_snapshot() {
         "重建核对累计项应持久化"
     );
 }
+
+// ============================================================================
+// 现货线性仓位网格 (linear_position_grid) 集成测试
+// 三阶段: 逐步建仓(低于 start_price 分批市价买) → 信号网格(主时钟 EMA3/6 金叉/死叉 +
+// 现价距上次成交价 > 门控间距 → 市价落位线性仓位, 不挂限价单) → 可选动态止盈。
+// tf 用 tf_bars(TR 恒 2 → ATR=2, 1h 序列在主 bar15 起满 15 根可见 → ATR 就绪),
+// 门控间距 = atr_mult×ATR = 1×2 = 2。主 bar 每小时一根(bar_at_f, ts 差 3600s →
+// build_interval_hours=1 每根一批; 建仓不依赖 ATR/EMA)。
+// ============================================================================
+
+const LINEAR_POSITION_GRID: &str =
+    include_str!("../../../strategies/spot/linear_position_grid.lua");
+
+fn lgrid_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![
+        ("pair", ConfigValue::String("ETHUSDT".into())),
+        ("start_price", ConfigValue::Float(100.0)),
+        ("p_low", ConfigValue::Float(80.0)),
+        ("p_high", ConfigValue::Float(120.0)),
+        ("pos_low_pct", ConfigValue::Float(0.7)),
+        ("pos_high_pct", ConfigValue::Float(0.3)),
+        ("invest_cash", ConfigValue::Float(10000.0)),
+        ("build_steps", ConfigValue::Integer(10)),
+        ("build_interval_hours", ConfigValue::Float(1.0)),
+        ("interval", ConfigValue::String("1m".into())),
+        ("ema_fast", ConfigValue::Integer(3)),
+        ("ema_slow", ConfigValue::Integer(6)),
+        ("atr_interval", ConfigValue::String("1h".into())),
+        ("atr_period", ConfigValue::Integer(14)),
+        ("atr_mult", ConfigValue::Float(1.0)),
+        ("min_spacing_pct", ConfigValue::Float(0.004)),
+        ("min_notional", ConfigValue::Float(5.0)),
+        ("fee_side", ConfigValue::Float(0.001)),
+        ("out_of_range", ConfigValue::String("exit".into())),
+        ("tp_min_profit_pct", ConfigValue::Float(0.1)),
+        ("tp_dd_atr_mult", ConfigValue::Float(3.0)),
+    ];
+    params.extend_from_slice(extra);
+    config(LINEAR_POSITION_GRID, &params)
+}
+
+/// 价格序列 → 每小时一根平 bar。
+fn lgrid_main(prices: &[f64]) -> Vec<Kline> {
+    prices.iter().enumerate().map(|(h, p)| bar_at_f(h as i64, *p)).collect()
+}
+
+/// 取某 bar 全部批次里首个满足条件的下单(限价/市价、方向)。
+fn lgrid_order(
+    out: &[Vec<Vec<OrderRequest>>],
+    bar: usize,
+    side: OrderSide,
+    ty: OrderType,
+) -> Option<OrderRequest> {
+    out[bar]
+        .iter()
+        .flatten()
+        .find(|o| o.action == OrderAction::Place && o.side == side && o.order_type == ty)
+        .cloned()
+}
+
+/// 布尔状态经 _RICOW_STATE 快照读取(save_state 持久化 "1"/"0")。
+fn lgrid_state(st: &LuaStrategy, key: &str) -> Option<String> {
+    st.state_snapshot().into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+#[test]
+fn test_linear_grid_param_fatal() {
+    // 区间非法 p_low≥p_high → FATAL 零单。
+    let (orders, _ctx, st) = run_univ2(
+        lgrid_cfg(&[("p_low", ConfigValue::Float(130.0))]),
+        &lgrid_main(&[99.0; 20]),
+        Some(tf_bars(64)),
+    );
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "p_low≥p_high 应 FATAL");
+    assert!(orders.iter().all(|b| b.iter().all(|x| x.is_empty())), "FATAL 后不得下单");
+}
+
+#[test]
+fn test_linear_grid_start_price_out_of_range_fatal() {
+    // start_price 不在区间内 → FATAL。
+    let (orders, _ctx, st) = run_univ2(
+        lgrid_cfg(&[("start_price", ConfigValue::Float(150.0))]),
+        &lgrid_main(&[99.0; 20]),
+        Some(tf_bars(64)),
+    );
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "start_price 越界应 FATAL");
+    assert!(orders.iter().all(|b| b.iter().all(|x| x.is_empty())));
+}
+
+#[test]
+fn test_linear_grid_pct_inverted_fatal() {
+    // pos_high_pct ≥ pos_low_pct → FATAL。
+    let (orders, _ctx, st) = run_univ2(
+        lgrid_cfg(&[("pos_high_pct", ConfigValue::Float(0.8))]),
+        &lgrid_main(&[99.0; 20]),
+        Some(tf_bars(64)),
+    );
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "仓位占比倒置应 FATAL");
+    assert!(orders.iter().all(|b| b.iter().all(|x| x.is_empty())));
+}
+
+#[test]
+fn test_linear_grid_thin_spacing_halts() {
+    // atr_mult≈0 + 禁用下限 → 生效间距 < 4×费率 → 成本门槛 FATAL(建满后首次重挂时判)。
+    let (_orders, _ctx, st) = run_univ2(
+        lgrid_cfg(&[
+            ("atr_mult", ConfigValue::Float(0.0001)),
+            ("min_spacing_pct", ConfigValue::Float(-1.0)),
+        ]),
+        &lgrid_main(&[99.0; 16]),
+        Some(tf_bars(64)),
+    );
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "间距低于成本门槛 → 停机");
+    assert_eq!(lgrid_state(&st, "built").as_deref(), Some("1"), "停机前已建满");
+    assert_eq!(st.global_f64("sell_count"), Some(0.0), "网格从未挂出");
+}
+
+#[test]
+fn test_linear_grid_no_build_when_price_above_start() {
+    // 价格 ≥ start_price 不建仓(独立建仓门槛)。
+    let (orders, _ctx, st) =
+        run_univ2(lgrid_cfg(&[]), &lgrid_main(&[105.0; 20]), Some(tf_bars(64)));
+    assert!(orders.iter().all(|b| b.iter().all(|x| x.is_empty())), "价高于 start 不建仓");
+    assert_eq!(st.global_f64("fill_count"), Some(0.0));
+    assert_eq!(st.global_f64("build_done_steps"), Some(0.0));
+}
+
+#[test]
+fn test_linear_grid_build_one_batch_per_bar_and_no_grid_orders_before_atr() {
+    // 99<100: 每小时一批; 建仓期(bar0~8)只发市价买、不挂任何限价网格单; 10 批建满。
+    let (out, _ctx, st) = run_univ2(lgrid_cfg(&[]), &lgrid_main(&[99.0; 15]), Some(tf_bars(64)));
+    assert_eq!(st.global_f64("build_done_steps"), Some(10.0), "应建满 10 批");
+    assert_eq!(st.global_f64("buy_count"), Some(10.0), "建仓 10 笔市价买");
+    assert_eq!(st.global_f64("sell_count"), Some(0.0), "建仓期不卖");
+    assert_eq!(lgrid_state(&st, "built").as_deref(), Some("1"));
+    // 建仓期(bar0~8)不得出现限价单。
+    for (b, batches) in out.iter().enumerate().take(9) {
+        for batch in batches {
+            for o in batch {
+                assert_ne!(o.order_type, OrderType::Limit, "建仓期(bar{b})不得挂限价网格单");
+            }
+        }
+    }
+    // 建仓目标: w(100)=0.5 → T=0.5×10000/100=50 币, 每批 5 币。
+    let q = st.global_f64("build_filled_qty").unwrap();
+    assert!((q - 50.0).abs() < 1e-6, "建仓总量应=50 币: {q}");
+}
+
+#[test]
+fn test_linear_grid_build_interval_defer() {
+    // build_interval_hours=2: 相邻 bar(间隔 1h)不足 2h → 该批顺延: bar0,2,...,14 → 8 批。
+    let (_out, _ctx, st) = run_univ2(
+        lgrid_cfg(&[("build_interval_hours", ConfigValue::Float(2.0))]),
+        &lgrid_main(&[99.0; 15]),
+        Some(tf_bars(64)),
+    );
+    assert_eq!(st.global_f64("build_done_steps"), Some(8.0), "间隔 2h 应顺延至 8 批");
+    assert_eq!(lgrid_state(&st, "built").as_deref(), Some("0"), "未满 10 批不进网格");
+}
+
+#[test]
+fn test_linear_grid_rehang_prices_and_sizes() {
+    // 建满(bar9, 10批×5币@99 → Q=50, 现金=10000−10×(495+0.495)=5045.05)。ATR 就绪(bar15)重挂:
+    // ref=99, Δ=1×2=2 → 买@97 / 卖@101。落位公式(腿价估值, w(97)=0.7−0.4×17/40=0.53, w(101)=0.49):
+    //   买 q=(w·E−Q·p)/(p(1+wf)): E=50×97+5045.05=9895.05 → q=(5244.38−4850)/(97×1.00053)=4.0636;
+    //   卖 q=(Q·p−w·E)/(p(1−wf)): E=50×101+5045.05=10095.05 → q=(5050−4946.57)/(101×0.99951)=1.0245。
+    let (out, _ctx, _st) = run_univ2(lgrid_cfg(&[]), &lgrid_main(&[99.0; 16]), Some(tf_bars(64)));
+    let buy = lgrid_order(&out, 15, OrderSide::Buy, OrderType::Limit).expect("bar15 应挂限价买单");
+    let sell =
+        lgrid_order(&out, 15, OrderSide::Sell, OrderType::Limit).expect("bar15 应挂限价卖单");
+    assert!((buy.price.unwrap().to_f64().unwrap() - 97.0).abs() < 1e-6, "买=ref99−Δ2=97");
+    assert!((sell.price.unwrap().to_f64().unwrap() - 101.0).abs() < 1e-6, "卖=ref99+Δ2=101");
+    assert!((buy.size.to_f64().unwrap() - 4.0636).abs() < 5e-3, "买量=落位公式: {}", buy.size);
+    assert!((sell.size.to_f64().unwrap() - 1.0245).abs() < 5e-3, "卖量=落位公式: {}", sell.size);
+}
+
+#[test]
+fn test_linear_grid_buy_fill_updates_ref_and_rehangs() {
+    // 重挂后(bar15 买@97)价格下探 97 触及买腿 → 成交, ref:=97, 全撤重挂(新买@95/卖@99)。
+    let mut prices = vec![99.0; 17];
+    prices.push(97.0); // bar17 触及买腿
+    prices.push(97.0);
+    let (out, _ctx, st) = run_univ2(lgrid_cfg(&[]), &lgrid_main(&prices), Some(tf_bars(64)));
+    let buy = lgrid_order(&out, 17, OrderSide::Buy, OrderType::Limit).expect("bar17 应重挂买单");
+    assert!((buy.price.unwrap().to_f64().unwrap() - 95.0).abs() < 1e-6, "新买=97−2=95");
+    assert!((st.global_f64("ref_price").unwrap() - 97.0).abs() < 1e-6, "ref := 成交价 97");
+}
+
+#[test]
+fn test_linear_grid_uptrend_no_deadlock() {
+    // 单边上涨死锁回归(用户报"成交量少了很多"真因): 建满@99 后价格持续上行(步长 2 > Δ=ATR×1),
+    // 纯成交驱动重挂会死锁(卖腿被穿越守卫抑制、再无成交事件) → 整段零成交。
+    // 修复后偏离触发重挂 + 重锚: 上行段必须持续成交(网格跟随价格上移 + 线性减仓)。
+    let mut prices = vec![99.0; 17]; // bar0~9 建满, bar10~16 稳住(ATR bar15 就绪)
+    for p in (101..140).step_by(2) {
+        prices.push(p as f64); // bar17~ 单边上行 101→139
+    }
+    let (_out, _ctx, st) = run_univ2(lgrid_cfg(&[]), &lgrid_main(&prices), Some(tf_bars(64)));
+    let sells = st.global_f64("sell_count").unwrap();
+    assert!(sells > 5.0, "单边上行段网格必须持续成交减仓(旧版死锁=0 卖): sells={sells}");
+    assert!(st.global_f64("halted").is_none_or(|h| h == 0.0), "上行段不得停机");
+}
+
+#[test]
+fn test_linear_grid_position_invariant_every_fill() {
+    // 用户核心口径回归: 建满@99 稳住(bar15 ATR 就绪挂腿)后渐变 98→96(触发买@97 成交)回升 97→…→101
+    // (触发卖成交), 断言落位最大误差 < 1e-6 + 现金未到 p_low 不耗尽。
+    let mut prices = vec![99.0; 17];
+    for p in [
+        98.0, 97.0, 96.0, 95.0, 96.0, 97.0, 98.0, 99.0, 100.0, 101.0, 102.0, 101.0, 100.0, 99.0,
+        98.0, 97.0, 96.0,
+    ] {
+        prices.push(p);
+    }
+    let (_out, mut ctx, _st) = run_univ2(
+        lgrid_cfg(&[
+            ("p_low", ConfigValue::Float(10.0)),
+            ("p_high", ConfigValue::Float(400.0)),
+            ("pos_low_pct", ConfigValue::Float(1.0)),
+            ("pos_high_pct", ConfigValue::Float(0.1)),
+        ]),
+        &lgrid_main(&prices),
+        Some(tf_bars(64)),
+    );
+    let mut st = _st;
+    st.on_stop(&mut ctx);
+    let snap: HashMap<String, String> = st.state_snapshot().into_iter().collect();
+    let err: f64 = snap.get("stat_pos_err_max").unwrap().parse().unwrap();
+    let cash: f64 = snap.get("stat_cash_final").unwrap().parse().unwrap();
+    let fills: f64 = snap.get("stat_fill_count").unwrap().parse().unwrap();
+    assert!(fills > 14.0, "渐变路径应产生多笔网格成交(>10 建仓笔): {fills}");
+    assert!(err < 1e-6, "每次成交后落位误差须≈0(用户口径), 实际 {err}");
+    assert!(cash > 0.0, "价格未到 10 现金绝不耗尽: cash={cash}");
+}
+
+#[test]
+fn test_linear_grid_exit_out_of_range_halts_keeps_position() {
+    // 建仓期(bar3)价格 79 < p_low 80 → exit 停机, 撤单不清仓, 保留已建 3 批持仓。
+    let mut prices = vec![99.0; 3];
+    prices.push(79.0);
+    prices.extend(vec![79.0; 5]);
+    let (out, _ctx, st) = run_univ2(lgrid_cfg(&[]), &lgrid_main(&prices), Some(tf_bars(64)));
+    assert_eq!(lgrid_state(&st, "halted").as_deref(), Some("1"), "出界 exit 应停机");
+    assert_eq!(st.global_f64("build_done_steps"), Some(3.0), "停机前建 3 批");
+    assert!(
+        out[3].iter().flatten().any(|o| o.action == OrderAction::CancelPending),
+        "exit 应撤光在途挂单"
+    );
+    for (b, batches) in out.iter().enumerate().skip(4) {
+        assert!(
+            batches.iter().flatten().all(|o| o.action != OrderAction::Place),
+            "停机后不再下单(bar{b})"
+        );
+    }
+    // 不清仓: 已建 3 批持仓保留(每批 5 币)。
+    assert!((st.global_f64("m_pos").unwrap() - 15.0).abs() < 1e-6, "exit 不得清仓");
+}
+
+#[test]
+fn test_linear_grid_wait_out_of_range_resumes_and_reanchors() {
+    // wait: 出界暂停, 回界内恢复 + ref 重锚现价。建满(bar0~9)后 bar10/11 出界, bar12 回界内。
+    let mut prices = vec![99.0; 10];
+    prices.push(79.0); // bar10 出界 → wait 暂停
+    prices.push(79.0); // bar11 仍界外
+    prices.push(95.0); // bar12 回界内 → 恢复
+    prices.push(95.0);
+    let (_out, _ctx, st) = run_univ2(
+        lgrid_cfg(&[("out_of_range", ConfigValue::String("wait".into()))]),
+        &lgrid_main(&prices),
+        Some(tf_bars(64)),
+    );
+    assert_eq!(lgrid_state(&st, "halted").as_deref(), Some("0"), "wait 不得停机");
+    assert_eq!(lgrid_state(&st, "paused").as_deref(), Some("0"), "回界内应解除暂停");
+    assert!((st.global_f64("ref_price").unwrap() - 95.0).abs() < 1e-6, "ref 重锚现价 95");
+}
+
+#[test]
+fn test_linear_grid_dynamic_take_profit_clears() {
+    // 宽区间 + 高仓位(几乎不减仓) → 冲高 380 积累巨额浮盈; 回撤到 370(dd=10 ≥ 3×ATR=6)
+    // 且 ATR 就绪(bar15) → 止盈: 撤光 + 市价清仓 + 停机。
+    let mut prices = vec![99.0; 10];
+    prices.extend(vec![380.0; 5]); // bar10~14 冲高(区间内), peak=380
+    prices.push(370.0); // bar15 ATR 就绪 + 回撤达标 + 盈利达标 → 止盈
+    prices.push(370.0);
+    let (out, _ctx, st) = run_univ2(
+        lgrid_cfg(&[
+            ("p_high", ConfigValue::Float(400.0)),
+            ("pos_low_pct", ConfigValue::Float(0.95)),
+            ("pos_high_pct", ConfigValue::Float(0.9)),
+        ]),
+        &lgrid_main(&prices),
+        Some(tf_bars(64)),
+    );
+    assert_eq!(lgrid_state(&st, "tp_closed").as_deref(), Some("1"), "动态止盈应触发清仓");
+    assert_eq!(lgrid_state(&st, "halted").as_deref(), Some("1"), "止盈后停机");
+    assert!((st.global_f64("peak_price").unwrap() - 380.0).abs() < 1e-6, "peak 记录最高价");
+    assert!(
+        out[15].iter().flatten().any(|o| o.action == OrderAction::Place
+            && o.side == OrderSide::Sell
+            && o.order_type == OrderType::Market),
+        "止盈应市价清仓"
+    );
+    // 清仓成交照常入账(halted 后只记账不产单): 模型持仓应归零。
+    assert!(st.global_f64("m_pos").unwrap() < 1e-6, "止盈清仓后持仓应归零");
+}
+
+#[test]
+fn test_linear_grid_take_profit_profit_gate_blocks() {
+    // 回撤达标但盈利未达 10%(建仓期手续费磨损 ≈ −0.5%) → 不止盈。
+    let mut prices = vec![99.0; 10];
+    prices.extend(vec![100.0; 6]); // 微涨: 盈利远小于 10%
+    prices.push(93.0); // bar16: dd=7 ≥ 6 但盈利不足 → 不触发
+    let (_out, _ctx, st) = run_univ2(lgrid_cfg(&[]), &lgrid_main(&prices), Some(tf_bars(64)));
+    assert_eq!(lgrid_state(&st, "tp_closed").as_deref(), Some("0"), "盈利不达标不得止盈");
+}
+
+#[test]
+fn test_linear_grid_take_profit_disabled() {
+    // tp_min_profit_pct=0 → 禁用止盈, 同样冲高回撤也不清仓。
+    let mut prices = vec![99.0; 10];
+    prices.extend(vec![380.0; 5]);
+    prices.push(370.0);
+    prices.push(370.0);
+    let (_out, _ctx, st) = run_univ2(
+        lgrid_cfg(&[
+            ("p_high", ConfigValue::Float(400.0)),
+            ("pos_low_pct", ConfigValue::Float(0.95)),
+            ("pos_high_pct", ConfigValue::Float(0.9)),
+            ("tp_min_profit_pct", ConfigValue::Float(0.0)),
+        ]),
+        &lgrid_main(&prices),
+        Some(tf_bars(64)),
+    );
+    assert_eq!(lgrid_state(&st, "tp_closed").as_deref(), Some("0"), "止盈禁用不得清仓");
+}
+
+#[test]
+fn test_linear_grid_ledger_and_snapshot() {
+    // 账本交叉核对(误差<0.01) + 断点续接键持久化。
+    let (_out, mut ctx, st) =
+        run_univ2(lgrid_cfg(&[]), &lgrid_main(&[99.0; 16]), Some(tf_bars(64)));
+    let mut st = st;
+    st.on_stop(&mut ctx);
+    let snap: HashMap<String, String> = st.state_snapshot().into_iter().collect();
+    let dc: f64 = snap.get("stat_ledger_diff_cash").unwrap().parse().unwrap();
+    let dp: f64 = snap.get("stat_ledger_diff_pos").unwrap().parse().unwrap();
+    assert!(dc.abs() < 0.01 && dp.abs() < 0.01, "账本与引擎逐分对齐: cash差{dc} 仓差{dp}");
+    assert!(snap.contains_key("ref_price"), "ref_price 应持久化");
+    assert!(snap.contains_key("peak_price"), "peak_price 应持久化");
+    assert_eq!(snap.get("built").map(|s| s.as_str()), Some("1"), "built 应持久化");
+    assert!(snap.contains_key("build_done_steps"), "build_done_steps 应持久化");
+    assert!(snap.contains_key("last_step_ts"), "last_step_ts 应持久化");
+}

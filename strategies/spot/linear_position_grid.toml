@@ -1,0 +1,145 @@
+# 策略清单(manifest): 展示元数据 + 参数 schema。仅供 UI/CLI/AI, 引擎不读(架构铁律)。
+id = "linear_position_grid"
+name = "现货线性仓位网格"
+market = "spot"
+summary = "价格区间内仓位占比(币市值÷总权益)随价格线性分布(低价 70%、高价 30%): 分批逐步建仓 → 成交价上下 1×ATR 全撤重挂限价网格 → 盈利沉淀现金; 出界可退出或等待, 可选动态止盈"
+description = """
+线性仓位网格: 在 [p_low, p_high] 区间内, 仓位占比 = 币市值 ÷ 总权益(币市值+现金) 随价格线性变化(p_low 处 pos_low_pct、p_high 处 pos_high_pct)。**每次买卖成交后, 按成交价实算仓位精确等于理论 w(成交价) —— 什么价格就是什么仓位**(含费修正落位公式: 买 q=(w·E−Q·p)/(p(1+wf)), 卖 q=(Q·p−w·E)/(p(1−wf)), E=Q·p+现金按腿价估值)。w<1 时成交后现金恒 =(1−w)·E>0, 价格不到 p_low 现金绝不耗尽。三阶段运行: ①逐步建仓 —— 目标总量 T(start_price) 均分 build_steps 批, 价格低于 start_price 且距上批 ≥ build_interval_hours 小时才市价买入一批, 建仓期间不挂网格单; ②网格 —— 建仓完成后在成交价上下 atr_mult×ATR 两侧挂限价单(买卖价钳在区间内), 任一成交即全撤重挂; 现价偏离 ref 超一个间距时重锚 ref := 现价并重挂(防单边死锁); ③动态止盈(可选) —— 网格阶段追踪最高价, 回撤 ≥ tp_dd_atr_mult×ATR 且盈利 ≥ tp_min_profit_pct 时清仓停机。总权益随交易盈利增长, 现金部分自然沉淀。出界处理 out_of_range: exit(默认, 撤单停机不清仓)/wait(暂停等回界内)。
+⚠ 启用动态止盈后, 单边上涨行情中首次回撤即触发清仓离场, 可能"提前下车"错过后续涨幅 —— 止盈以落袋为安换取趋势延续收益。
+"""
+suitable = "区间震荡市(线性仓位随价摆动自动加减仓)、希望分批入场摊平成本、需要落袋止盈的稳健网格"
+unsuitable = "单边急跌(出界 exit 满仓套牢或持续接刀)、单边急涨(动态止盈提前下车跑输持有)、极低波动(间距低于成本门槛自动停机)"
+
+[[params]]
+key = "pair"
+name = "交易对"
+type = "string"
+desc = "现货交易对(如 SOLUSDT)"
+required = true
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "建仓触发价: 价格低于它才逐步建仓; 建仓目标总量 = T(start_price)(须落在区间内)"
+required = true
+
+[[params]]
+key = "p_low"
+name = "价格下限"
+type = "f64"
+desc = "线性仓位区间下限(此处仓位 = pos_low_pct)"
+required = true
+
+[[params]]
+key = "p_high"
+name = "价格上限"
+type = "f64"
+desc = "线性仓位区间上限(此处仓位 = pos_high_pct)"
+required = true
+
+[[params]]
+key = "pos_low_pct"
+name = "下限仓位占比"
+type = "f64"
+desc = "价格下限处仓位占比(币市值÷总权益, 0.7 = 70%)"
+default = 0.7
+
+[[params]]
+key = "pos_high_pct"
+name = "上限仓位占比"
+type = "f64"
+desc = "价格上限处仓位占比(币市值÷总权益, 0.3 = 30%; 0 = 涨到顶清仓)"
+default = 0.3
+
+[[params]]
+key = "invest_cash"
+name = "投入资金"
+type = "f64"
+desc = "投入资金 C0(收益与仓位基准, 固定不变); 0 = 首次建仓时 quote 余额全额"
+default = 0
+
+[[params]]
+key = "build_steps"
+name = "建仓批数"
+type = "i64"
+desc = "逐步建仓分几批买入"
+default = 10
+
+[[params]]
+key = "build_interval_hours"
+name = "建仓间隔(小时)"
+type = "f64"
+desc = "相邻两批建仓的最小时间间隔(小时)"
+default = 1
+
+[[params]]
+key = "interval"
+name = "主时钟"
+type = "string"
+desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
+default = "1m"
+
+[[params]]
+key = "atr_interval"
+name = "ATR K 线周期"
+type = "string"
+desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
+default = "1h"
+
+[[params]]
+key = "atr_period"
+name = "ATR 周期"
+type = "i64"
+desc = "ATR 回看根数"
+default = 14
+
+[[params]]
+key = "atr_mult"
+name = "ATR 乘数"
+type = "f64"
+desc = "网格间距 = atr_mult × ATR"
+default = 1
+
+[[params]]
+key = "min_spacing_pct"
+name = "最小间距(价格占比)"
+type = "f64"
+desc = "间距下限(占价格比例, 0.004 = 0.4%); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损; 负数 = 禁用下限"
+default = 0.004
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额"
+default = 5
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "单边手续费率(0.001 = 现货 0.1%/边)"
+default = 0.001
+
+[[params]]
+key = "out_of_range"
+name = "出界处理"
+type = "enum"
+desc = "exit = 价格出区间撤单停机(不清仓); wait = 暂停挂单等价格回界内"
+default = "exit"
+options = ["exit", "wait"]
+
+[[params]]
+key = "tp_min_profit_pct"
+name = "止盈最小盈利"
+type = "f64"
+desc = "动态止盈最小盈利比例(0.10 = 10%); 0 = 禁用止盈"
+default = 0.1
+
+[[params]]
+key = "tp_dd_atr_mult"
+name = "止盈回撤 ATR 倍数"
+type = "f64"
+desc = "最高点回撤 ≥ 该倍数 × ATR 且盈利达标时清仓止盈"
+default = 3

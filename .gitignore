@@ -21,6 +21,8 @@ strategies/spot/*
 !strategies/spot/shannon_grid.toml
 !strategies/spot/shannon_virtual_grid.lua
 !strategies/spot/shannon_virtual_grid.toml
+!strategies/spot/linear_position_grid.lua
+!strategies/spot/linear_position_grid.toml
 !strategies/futures/
 strategies/futures/*
 !strategies/futures/.gitkeep

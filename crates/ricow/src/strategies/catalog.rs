@@ -176,6 +176,11 @@ const BUILTIN: &[(&str, &str, &str)] = &[
         include_str!("../../../../strategies/spot/shannon_virtual_grid.lua"),
     ),
     (
+        "linear_position_grid",
+        include_str!("../../../../strategies/spot/linear_position_grid.toml"),
+        include_str!("../../../../strategies/spot/linear_position_grid.lua"),
+    ),
+    (
         "shannon_hedge_grid_futures",
         include_str!("../../../../strategies/futures/shannon_hedge_grid_futures.toml"),
         include_str!("../../../../strategies/futures/shannon_hedge_grid_futures.lua"),
