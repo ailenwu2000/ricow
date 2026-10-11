@@ -191,6 +191,25 @@ fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// "要么给结果、要么给错误文本"的**唯一保险丝**(051 复核 B1) —— 三个回测端点的作业体都走它。
+///
+/// 关键在于**整段**(内核 + 报告/指标/图表/日志生成)都在 `catch_unwind` 之内。只要有一句留在
+/// 外面, 那句 panic 就会逃出 tokio 任务, `finish_*` 永不执行 → 该策略的作业**卡在 running**
+/// 直到 [`RUNNING_TIMEOUT`] 的 60 分钟兜底。此前单次回测正是"只包住了内核"的那一种
+/// (指标 `to_f64` 链路与图表抽稀恰是内核注释自陈的溢出源, 却都在 catch 之外)。
+///
+/// 抽出成独立函数的目的就是**可单测**: 一个 `panic!` 掉进去, 必须变成 `Err(文本)`
+/// 而不是把 panic 交给 tokio(见 `test_guarded_turns_panic_into_error`)。
+async fn guarded<F, T>(f: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(f)).await {
+        Ok(v) => Ok(v),
+        Err(p) => Err(panic_message(p.as_ref())),
+    }
+}
+
 impl JobStore {
     pub(super) fn new() -> Self {
         Self { inner: Mutex::new(HashMap::new()) }
@@ -395,6 +414,41 @@ fn check_non_negative(field: &str, v: f64) -> Result<(), String> {
     }
 }
 
+/// 引擎**内部键**: 不是策略参数, 而是装配层读的入口(`pair` 选标的、`script`/`script_path`
+/// 定位脚本源码)。它们只能由引擎按策略名自行解析 —— 一旦允许从参数面覆盖, `script_path`
+/// 就成了一条"让引擎去读任意路径"的通道。
+///
+/// 回测 / 单参数扫描 / 多维寻优三个端点共用本判据(051 统一: 此前 `start_backtest` 漏了这道闸,
+/// 同一个参数面出现两套规则)。
+const ENGINE_INTERNAL_KEYS: [&str; 3] = ["pair", "script", "script_path"];
+
+/// 拒绝来自参数面的引擎内部键(纯函数)。见 [`ENGINE_INTERNAL_KEYS`]。
+fn reject_internal_param_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<(), WebError> {
+    for k in keys {
+        if ENGINE_INTERNAL_KEYS.contains(&k) {
+            return Err(WebError::bad_request(format!(
+                "参数键不能是引擎内部键({}), 收到: '{k}'",
+                ENGINE_INTERNAL_KEYS.join("/")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 051 复核 B10: 把错误文本里出现的**数据根目录绝对路径**替换为 `<root>` 再回给客户端。
+/// 内核的错误信息(如"创建策略目录 <绝对路径> 失败: 拒绝访问")保留"哪一步失败/为什么"(诚实性口径),
+/// 但不在 HTTP 响应里暴露本机目录布局; **原文仍进服务端日志**(见各 `tracing::error!`/`warn!`),
+/// 本机排查不受影响。留一处残余: 用户在 TOML 里自填的 `script_path` 若为绝对路径, 不在根目录下,
+/// 那道口的路径是**用户自己的声明**, 不属内部信息。
+fn redact_root(msg: &str, root: &std::path::Path) -> String {
+    let r = root.to_string_lossy();
+    if r.is_empty() {
+        msg.to_string()
+    } else {
+        msg.replace(r.as_ref(), "<root>")
+    }
+}
+
 /// 去空白并过滤空串。
 fn clean(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
@@ -468,6 +522,8 @@ pub(super) async fn start_backtest(
         }
     }
     // 参数值类型与保存端点同一套转换(键名错误带键名 400)。
+    // 051 复核 B9: 先拒引擎内部键 —— 与 sweep/optimize 同判据(此前只有本端点漏了)。
+    reject_internal_param_keys(req.params.keys().map(String::as_str))?;
     let params = config_values(&req.params).map_err(WebError::bad_request)?;
 
     // ---- 组装内核输入(与 CLI from_cli_args 同结构) ----
@@ -517,34 +573,43 @@ pub(super) async fn start_backtest(
     let jobs = Arc::clone(&state.jobs);
     let id = job_id.clone();
     let strategy_name = strategy.to_string();
+    let job_root = Arc::clone(&state.root);
     tokio::spawn(async move {
-        // 审计 H-5: 内核 panic (如 rust_decimal 96-bit 溢出) 若不捕获, finish 永不执行,
-        // 该策略的作业永久 running → 回测 409 直到重启。捕获后转 error 释放 busy。
-        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-            run_backtest_full(spec).await
-        }))
+        // 审计 H-5 + 051 B1: **整段**(内核 + 报告/指标/图表/日志)都在 [`guarded`] 里 ——
+        // panic 一律转 error 释放 busy, 不再有"后处理 panic → 作业卡 running 60 分钟"。
+        let result = guarded(async {
+            match run_backtest_full(spec).await {
+                Ok(out) => {
+                    let text = format_backtest_report(
+                        &out.report,
+                        &out.header(&strategy_name),
+                        out.initial_cash,
+                        out.is_futures,
+                        &out.test_params(),
+                    );
+                    let metrics = serde_json::to_value(out.metrics()).ok();
+                    let chart = serde_json::to_value(out.chart()).ok();
+                    // 策略运行期日志 (ctx:log): 裁剪后回传, 让"0 成交/停机"有可解释原因。
+                    let logs = cap_strategy_logs(out.report.strategy_logs.clone());
+                    Ok((text, metrics, chart, logs))
+                }
+                // CoreError 的中文 Display 直接作为 error 文本(含"预热段不足/窗口日期非法"等)。
+                Err(e) => Err(redact_root(&e.to_string(), &job_root)),
+            }
+        })
         .await;
         match result {
-            Ok(Ok(out)) => {
-                let text = format_backtest_report(
-                    &out.report,
-                    &out.header(&strategy_name),
-                    out.initial_cash,
-                    out.is_futures,
-                    &out.test_params(),
-                );
-                let metrics = serde_json::to_value(out.metrics()).ok();
-                let chart = serde_json::to_value(out.chart()).ok();
-                // 策略运行期日志 (ctx:log): 裁剪后回传, 让"0 成交/停机"有可解释原因。
-                let logs = cap_strategy_logs(out.report.strategy_logs.clone());
+            Ok(Ok((text, metrics, chart, logs))) => {
                 jobs.finish_done_full(&id, text, metrics, chart, logs, Utc::now());
             }
-            // CoreError 的中文 Display 直接作为 error 文本(含"预热段不足/窗口日期非法"等)。
-            Ok(Err(e)) => jobs.finish_error(&id, e.to_string(), Utc::now()),
-            Err(panic) => {
-                let msg = panic_message(panic.as_ref());
+            Ok(Err(msg)) => jobs.finish_error(&id, msg, Utc::now()),
+            Err(msg) => {
                 tracing::error!(target: "web", strategy = %strategy_name, "回测内核 panic: {msg}");
-                jobs.finish_error(&id, format!("回测内核异常退出 (panic): {msg}"), Utc::now());
+                jobs.finish_error(
+                    &id,
+                    format!("回测内核异常退出 (panic): {}", redact_root(&msg, &job_root)),
+                    Utc::now(),
+                );
             }
         }
     });
@@ -625,11 +690,11 @@ pub(super) async fn start_sweep(
         )));
     }
     let param = req.param.trim().to_string();
-    if param.is_empty() || param == "pair" || param == "script" || param == "script_path" {
-        return Err(WebError::bad_request(format!(
-            "param(参数键)非法: 不能为空, 也不能是引擎内部键(pair/script/script_path), 收到: '{param}'"
-        )));
+    if param.is_empty() {
+        return Err(WebError::bad_request("param(参数键)不能为空"));
     }
+    // 051 复核 B9: 内部键判据统一到 helper(与回测/optimize 同一条路)。
+    reject_internal_param_keys(std::iter::once(param.as_str()))?;
     if !(2..=10).contains(&req.values.len()) {
         return Err(WebError::bad_request(format!(
             "values(档位取值)需要 2..=10 个, 收到: {}",
@@ -684,8 +749,8 @@ pub(super) async fn start_sweep(
     let days = req.days;
     let interval_explicit = req.interval.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
     tokio::spawn(async move {
-        // 审计 H-5: 与单次回测同口径, panic 转 error 释放 busy (不锁死该参数键)。
-        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        // 审计 H-5 + 051 B1: 与单次回测共用同一道 [`guarded`] 保险丝。
+        let result = guarded(async {
             let mut rows: Vec<SweepRow> = Vec::with_capacity(ladders.len());
             for (raw, cv) in ladders {
                 let mut params: HashMap<String, ConfigValue> = HashMap::new();
@@ -725,23 +790,27 @@ pub(super) async fn start_sweep(
                     }),
                     Err(e) => rows.push(SweepRow {
                         value: raw,
-                        error: Some(e.to_string()),
+                        // 051 复核 B10: 单档错误同样脱敏根目录(它随 report JSON 回客户端)。
+                        error: Some(redact_root(&e.to_string(), &root)),
                         metrics: None,
                     }),
                 }
             }
             rows
-        }))
+        })
         .await;
         match result {
             Ok(rows) => {
                 let report = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
                 jobs.finish_done(&id, report, Utc::now());
             }
-            Err(panic) => {
-                let msg = panic_message(panic.as_ref());
+            Err(msg) => {
                 tracing::error!(target: "web", strategy = %strategy_owned, param = %param_owned, "寻优内核 panic: {msg}");
-                jobs.finish_error(&id, format!("寻优内核异常退出 (panic): {msg}"), Utc::now());
+                jobs.finish_error(
+                    &id,
+                    format!("寻优内核异常退出 (panic): {}", redact_root(&msg, &root)),
+                    Utc::now(),
+                );
             }
         }
     });
@@ -889,11 +958,8 @@ pub(super) async fn start_optimize(
         if key.is_empty() {
             return Err(WebError::bad_request("params 里有参数键为空"));
         }
-        if matches!(key, "pair" | "script" | "script_path") {
-            return Err(WebError::bad_request(format!(
-                "params 里的键不能是引擎内部键(pair/script/script_path), 收到: '{key}'"
-            )));
-        }
+        // 051 复核 B9: 内部键判据统一到 helper(与回测/单参数扫描同一条路)。
+        reject_internal_param_keys(std::iter::once(key))?;
         if seen_keys.contains(&key) {
             return Err(WebError::bad_request(format!("参数键重复: '{key}'")));
         }
@@ -980,8 +1046,8 @@ pub(super) async fn start_optimize(
     let interval_explicit = req.interval.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
     let total = combos.len();
     tokio::spawn(async move {
-        // 审计 H-5: 与单次回测同口径, panic 转 error 释放 busy (不锁死这组参数键)。
-        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        // 审计 H-5 + 051 B1: 与单次回测共用同一道 [`guarded`] 保险丝。
+        let result = guarded(async {
             let mut rows: Vec<OptimizeRow> = Vec::with_capacity(total);
             // 先报一条 0/total: 否则从发起到第一组跑完之间, 界面只有"运行中"三个字。
             jobs.set_progress(&id, 0, total);
@@ -1027,7 +1093,8 @@ pub(super) async fn start_optimize(
                     }),
                     Err(e) => rows.push(OptimizeRow {
                         combo: cells,
-                        error: Some(e.to_string()),
+                        // 051 复核 B10: 单组错误同样脱敏根目录(它随 report JSON 回客户端)。
+                        error: Some(redact_root(&e.to_string(), &root)),
                         metrics: None,
                     }),
                 }
@@ -1035,17 +1102,20 @@ pub(super) async fn start_optimize(
                 jobs.set_progress(&id, idx + 1, total);
             }
             rows
-        }))
+        })
         .await;
         match result {
             Ok(rows) => {
                 let report = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
                 jobs.finish_done(&id, report, Utc::now());
             }
-            Err(panic) => {
-                let msg = panic_message(panic.as_ref());
+            Err(msg) => {
                 tracing::error!(target: "web", strategy = %strategy_owned, "多维寻优内核 panic: {msg}");
-                jobs.finish_error(&id, format!("寻优内核异常退出 (panic): {msg}"), Utc::now());
+                jobs.finish_error(
+                    &id,
+                    format!("寻优内核异常退出 (panic): {}", redact_root(&msg, &root)),
+                    Utc::now(),
+                );
             }
         }
     });
@@ -1237,6 +1307,42 @@ mod tests {
         assert_eq!(clean(None), None);
     }
 
+    /// 051 复核 B1: 保险丝本体 —— 一个 panic 必须变成 `Err(文本)`, 而不是逃给 tokio。
+    /// 这正是"后处理 panic 不再让作业卡 running 60 分钟"所依赖的那一条机制。
+    #[tokio::test]
+    async fn test_guarded_turns_panic_into_error() {
+        // 正常路径原样透传(不吞值、不改类型)。
+        assert_eq!(guarded(async { 7u8 }).await, Ok(7));
+        // panic → Err(可读文本)。
+        let err = guarded(async { panic!("boom-in-post-processing") })
+            .await
+            .expect_err("panic 必须被转成 Err");
+        assert!(err.contains("boom-in-post-processing"), "应保留 panic 原文: {err}");
+    }
+
+    /// 051 复核 B10: 回给客户端的错误文本里不得出现数据根目录的绝对路径。
+    #[test]
+    fn test_redact_root_strips_data_dir() {
+        let root = PathBuf::from("/data/ricow-root");
+        let msg = "创建策略目录 /data/ricow-root/strategies 失败: 拒绝访问";
+        let out = redact_root(msg, &root);
+        assert!(!out.contains("/data/ricow-root"), "不得泄漏根目录: {out}");
+        assert!(out.contains("<root>"), "应替换为占位符: {out}");
+        assert!(out.contains("拒绝访问"), "原因必须保留(诚实性口径): {out}");
+        // 根目录为空时不做事(避免 `replace("", ...)` 把每处都插上占位符)。
+        assert_eq!(redact_root("随便什么", PathBuf::from("").as_path()), "随便什么");
+    }
+
+    /// 051 复核 B9: 内部键判据三端点共用 —— 直接测纯函数(端到端另有用例)。
+    #[test]
+    fn test_reject_internal_param_keys() {
+        for k in ["pair", "script", "script_path"] {
+            let e = reject_internal_param_keys(std::iter::once(k)).expect_err("内部键必须被拒");
+            assert!(e.body.error.contains(k), "要点名该键: {}", e.body.error);
+        }
+        assert!(reject_internal_param_keys(["grid_step", "stop_pct"]).is_ok());
+    }
+
     // ---- 端到端(真实回环套接字; 全程离线: 用坏日期让内核在任何取数前失败) ----
 
     fn tmp_root(tag: &str) -> PathBuf {
@@ -1322,6 +1428,14 @@ mod tests {
             assert!(res.starts_with("HTTP/1.1 401"), "{probe}: {res}");
             assert!(body_of(&res).is_empty());
         }
+        // 051 复核 C5: 多维寻优端点是**后加的**, 早先的 401 矩阵把它漏了 ——
+        // 新端点上新门禁必须逐条补进同表, 否则"人人都测了"其实是"老的那些测了"。
+        for probe in ["/api/backtest/optimize", "/api/backtest/optimize?token=wrong"] {
+            let res = raw(port, "POST", probe, Some(&body)).await;
+            assert!(res.starts_with("HTTP/1.1 401"), "{probe}: {res}");
+            assert!(body_of(&res).is_empty());
+            assert!(!res.contains(MARK), "401 不得回显请求体: {res}");
+        }
         for probe in ["/api/backtest/abc", "/api/backtest/abc?token=wrong"] {
             let res = raw(port, "GET", probe, None).await;
             assert!(res.starts_with("HTTP/1.1 401"), "{probe}: {res}");
@@ -1367,6 +1481,20 @@ mod tests {
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("weird"), "参数错误要带键名: {res}");
 
+        // ③' 051 复核 B9: 回测端点的参数面同样拒**引擎内部键** —— 与 sweep/optimize 同一条
+        //     判据。此前只有本端点漏了这道闸, 同一参数面出现两套规则(`script_path` 尤其危险:
+        //     它是一条"让引擎去读任意路径"的通道)。
+        for bad in ["pair", "script", "script_path"] {
+            let json =
+                format!(r#"{{"strategy":"shannon_grid","params":{{"{bad}":"/etc/passwd"}}}}"#);
+            let res = raw(port, "POST", "/api/backtest?token=tok-ok", Some(&json)).await;
+            assert_eq!(status_of(&res), 400, "内部键 '{bad}': {res}");
+            assert!(body_of(&res).contains(bad), "错误要点名该键: {res}");
+        }
+        // 对照: 普通参数键不被这道闸误伤(仍 202)。
+        let res = post(r#"{"strategy":"shannon_grid","params":{"grid_step_pct":1}}"#).await;
+        assert_eq!(status_of(&res), 202, "普通参数键应照常接受: {res}");
+
         // ④ 非 JSON → 400。
         let res = post("{oops").await;
         assert_eq!(status_of(&res), 400, "{res}");
@@ -1391,11 +1519,18 @@ mod tests {
         assert!(body_of(&res).contains(r#""code":"invalid_name""#), "{res}");
 
         // ② param 为空或引擎内部键 → 400。
+        // 051 复核 B9: 内部键判据统一到 helper 后文案改为"引擎内部键(...), 收到: 'x'",
+        // 故断言从"含 param 字样"改成**更强**的"点名内部键 + 回显收到的键"(空键仍走原分支)。
         for bad in ["", "pair", "script", "script_path"] {
             let json = format!(r#"{{"strategy":"shannon_grid","param":"{bad}","values":[1,2]}}"#);
             let res = raw(port, "POST", "/api/backtest/sweep?token=tok-ok", Some(&json)).await;
             assert_eq!(status_of(&res), 400, "param='{bad}': {res}");
-            assert!(body_of(&res).contains("param"), "{res}");
+            if bad.is_empty() {
+                assert!(body_of(&res).contains("param"), "{res}");
+            } else {
+                assert!(body_of(&res).contains("内部键"), "{res}");
+                assert!(body_of(&res).contains(bad), "要点名收到的键: {res}");
+            }
         }
 
         // ③ values 档位数量越界(1 档 / 11 档)→ 400。
@@ -1515,15 +1650,37 @@ mod tests {
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains(r#""code":"invalid_name""#), "{res}");
 
-        // ② params 为空数组 → 400; 维度里出现引擎内部键(pair/script) → 400。
+        // ② params 为空数组 → 400; 维度里出现引擎内部键(pair/script/script_path) → 400。
         let res = post(r#"{"strategy":"shannon_grid","params":[]}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
+        for bad in ["pair", "script", "script_path"] {
+            let json = format!(
+                r#"{{"strategy":"shannon_grid","params":[{{"key":"{bad}","values":["BTCUSDT","ETHUSDT"]}}]}}"#
+            );
+            let res = raw(port, "POST", "/api/backtest/optimize?token=tok-ok", Some(&json)).await;
+            assert_eq!(status_of(&res), 400, "内部键 '{bad}': {res}");
+            assert!(body_of(&res).contains(bad), "错误要点名该键: {res}");
+        }
+
+        // ②' 051 复核 C5: **维度上限**与**重复键**是 MAX_OPTIMIZE_DIMS / seen_keys 的直接判据,
+        //     早先只测了内部键 —— 把上限常量改大、或删掉去重, 都不会有测试变红。
+        let five: String = (0..5)
+            .map(|i| format!(r#"{{"key":"k{i}","values":[1,2]}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"strategy":"shannon_grid","params":[{five}]}}"#);
+        let res = raw(port, "POST", "/api/backtest/optimize?token=tok-ok", Some(&json)).await;
+        assert_eq!(status_of(&res), 400, "5 维应超上限: {res}");
+        assert!(body_of(&res).contains("4"), "错误要点明上限值: {res}");
+
         let res = post(
-            r#"{"strategy":"shannon_grid","params":[{"key":"pair","values":["BTCUSDT","ETHUSDT"]}]}"#,
+            r#"{"strategy":"shannon_grid","params":[
+                {"key":"grid_step","values":[1,2]},
+                {"key":"grid_step","values":[3,4]}]}"#,
         )
         .await;
-        assert_eq!(status_of(&res), 400, "{res}");
-        assert!(body_of(&res).contains("pair"), "{res}");
+        assert_eq!(status_of(&res), 400, "重复键应被拒: {res}");
+        assert!(body_of(&res).contains("重复"), "{res}");
 
         // ③ 每维档位数量越界(1 档)→ 400。
         let res =

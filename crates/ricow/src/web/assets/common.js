@@ -169,14 +169,28 @@
   /// 重开的是新对象 —— 故记录最后一帧的 id, 重开时拼进 `last_event_id` 查询参数
   /// (日志流服务端读它续传, 会话流忽略之)。`url` 须已带查询串(`?token=...`), 追加用 `&`。
   /// 连续失败 5 次(1s → 2s → 4s → 8s 封顶, ±20% 抖动)放弃并回调 `onfail` 一次;
-  /// 任一次连上(`onopen`)即清零重计。返回 `{ close() }`。
+  /// **连上并稳定存活 `STABLE_MS` 才算健康**并清零重计(见下)。返回 `{ close() }`。
   R.sse = function (url, handlers) {
     const MAX_RETRIES = 5;
+    // 051 复核 B5: 早先"一 `onopen` 就清零"会把**半死服务端**(握手 200 后立即 EOF)变成
+    // 永久 ~1s 忙重连 —— 每轮都触发 `onopen` 清零, 退避永远封不了顶、`onfail` 也永不回调。
+    // 改为"连上并**稳定存活** `STABLE_MS` 才算一次成功连接": 稳定期内掉线继续累计 attempts
+    // (退避照常封顶到 `onfail` 止损)。判据用**时间**而非"收到消息": 盘口/日志流可能长时间
+    // 静默但连接是健康的, 拿"有没有消息"当健康信号会误杀静默流。
+    const STABLE_MS = 10000;
     let es = null;
     let attempts = 0;
     let lastId = null;
     let timer = null;
+    let stableTimer = null;
     let closed = false;
+
+    function clearStable() {
+      if (stableTimer) {
+        clearTimeout(stableTimer);
+        stableTimer = null;
+      }
+    }
 
     function open() {
       if (closed) return;
@@ -184,7 +198,10 @@
         lastId === null ? url : url + "&last_event_id=" + encodeURIComponent(lastId);
       es = new EventSource(target);
       es.onopen = () => {
-        attempts = 0;
+        clearStable();
+        stableTimer = setTimeout(() => {
+          attempts = 0;
+        }, STABLE_MS);
         if (handlers.onopen) handlers.onopen();
       };
       es.onmessage = (ev) => {
@@ -192,6 +209,7 @@
         if (handlers.onmessage) handlers.onmessage(ev);
       };
       es.onerror = () => {
+        clearStable();
         es.close();
         es = null;
         if (attempts >= MAX_RETRIES) {
@@ -208,6 +226,7 @@
     return {
       close() {
         closed = true;
+        clearStable();
         if (timer) clearTimeout(timer);
         if (es) es.close();
         es = null;
@@ -301,6 +320,20 @@
       minute: "2-digit",
       second: "2-digit",
     };
+    /// 去尾零(**纯字符串, 不经过 `Number`**): `"0.30000000"` → `"0.3"`、`"100.00000000"` → `"100"`、
+    /// `"0.00000000"` → `"0"`; 无小数点(含 `1e+21` 这类指数形态)原样返回。
+    function stripTrailingZeros(s) {
+      if (s.indexOf(".") < 0) return s;
+      let out = s.replace(/0+$/, "");
+      if (out.endsWith(".")) out = out.slice(0, -1);
+      return out === "" || out === "-" ? "0" : out;
+    }
+    /// 本地化日期串; 超出 `Date` 可表示范围时返回 `null`(调用方按"缺值"处理, 绝不吐 "Invalid Date")。
+    function localStamp(ms, opts) {
+      const d = new Date(ms);
+      if (isNaN(d.getTime())) return null;
+      return d.toLocaleString(locale(), opts);
+    }
     return {
       /// 无符号数字: 按 `digits` 位截断再去尾零(`0.30000000000000004` → `0.3`)。
       /// 缺值 / 非有限 → `—`(绝不把 NaN / Infinity 显示出去)。
@@ -308,7 +341,10 @@
         const n = Number(v);
         if (v == null || !Number.isFinite(n)) return "—";
         const d = typeof digits === "number" ? digits : 8;
-        return String(Number(n.toFixed(d)));
+        // 051 复核 B2: 早先 `String(Number(n.toFixed(d)))` 的往返会把 `1e-7` 这样的**小数**
+        // 变回科学计数法 `"1e-7"`(低价币现价/盘口会直接把它画进界面)。改为与 `signed` 对齐的
+        // **纯字符串去尾零**, 不经过 `Number` 往返。
+        return stripTrailingZeros(n.toFixed(d));
       },
       /// 带符号数字(盈亏类): 正数补 `+`; 位数随量级(≥100 两位 / ≥1 四位 / 其余六位)。
       signed: function (v) {
@@ -340,12 +376,21 @@
       /// `withSeconds` 为真时多给秒 —— 对话里的成交 / 挂单时间戳要按秒区分先后。
       time: function (ms, withSeconds) {
         if (!Number.isFinite(ms)) return "—";
-        return new Date(ms).toLocaleString(locale(), withSeconds ? stampOptsSec : stampOpts);
+        // 051 复核 B3: 有限但超 `Date` 范围(如 `1e300`)会得到 Invalid Date, 而
+        // `toLocaleString` 对它返回字面量 `"Invalid Date"` —— 契约是"缺值给 —", 这里补上。
+        const s = localStamp(ms, withSeconds ? stampOptsSec : stampOpts);
+        return s === null ? "—" : s;
       },
       /// 秒级时间戳 → 本地化展示串(会话列表的 `updated_at`)。缺值 → `""`。
       timeSec: function (ts) {
+        // 051 复核 B3: 早先 `if (!ts) return "";` 之后直接乘 1000 —— `"abc"` 是 truthy,
+        // `"abc" * 1000 = NaN` → `"Invalid Date"`。改为先做数值合法性判定(仍保留 0/""/null
+        // 这些 falsy 值 → `""` 的既有语义)。
         if (!ts) return "";
-        return new Date(ts * 1000).toLocaleString(locale(), stampOpts);
+        const n = Number(ts);
+        if (!Number.isFinite(n)) return "";
+        const s = localStamp(n * 1000, stampOpts);
+        return s === null ? "" : s;
       },
     };
   })();
@@ -390,6 +435,12 @@
   //
   // 只用于**成功 / 中性**一路; 错误留在原地(msg 区)显示 —— 错误是"这一屏此刻的状态",
   // 需要贴着出错的控件看, 飘到右下角反而不对。
+  //
+  // 051 复核 B4 —— **唯一例外, 且只有一处**: 发起动作的控件是"**点完即关的一次性浮层**"
+  // (命令面板 `palette.js`)时, 动作失败时浮层已收起、**没有原位可贴** —— 该处错误退回本通知
+  // (`kind="err"`), 因为"完全没有提示"比"提示位置不理想"更糟。除此之外一律原地显示;
+  // 这条例外由 `scripts/web_frontend_check.mjs` 的静态检查锁住(只允许 palette.js 用 err toast),
+  // 防止它悄悄扩散到别的视图。
   // `aria-live="polite"` 保住可访问性; 点一下即收, 到点自动收。
   let toastHost = null;
   const TOAST_MS = 4000;
@@ -435,6 +486,10 @@
       pending = R.api("/api/terms").then((rows) => {
         const keys = [];
         for (const term of rows) {
+          // 051 复核 B6: **跳过空 key** —— 空串会进匹配式成为一个"零长分支",
+          // 在任意位置匹配成功且不前进, 令 `decorate` 的扫描循环死循环。
+          // 这里做第一道闸, `decorate` 里另有一道零长保护(双保险)。
+          if (!term || typeof term.key !== "string" || term.key === "") continue;
           index.set(term.key, term);
           keys.push(term.key);
         }
@@ -573,6 +628,13 @@
         const frag = document.createDocumentFragment();
         let last = 0;
         while (matched) {
+          // 051 复核 B6: 零长匹配保护 —— 若匹配式里混进空分支(如空 key), `exec` 会在同一
+          // 位置反复返回零长匹配, `last` 永不前进 → 死循环。手动推进 `lastIndex` 后继续。
+          if (matched[0].length === 0) {
+            re.lastIndex = matched.index + 1;
+            matched = re.exec(raw);
+            continue;
+          }
           if (matched.index > last) {
             frag.appendChild(document.createTextNode(raw.slice(last, matched.index)));
           }

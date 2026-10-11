@@ -277,7 +277,6 @@
     sgMaxDd: "最大回撤",
     sgWinRate: "胜率",
     sgTrades: "成交",
-    sgFees: "手续费",
     sgSharpe: "夏普",
     sgRejected: "拒单",
     sgReportFull: "完整文本报告",
@@ -324,8 +323,6 @@
     sgMfType: "类型",
     sgMfDefault: "默认值",
     sgMfRequired: "必填",
-    sgMfDescCol: "说明",
-    sgMfOptions: "可选值(逗号分隔)",
     sgMfAdd: "添加参数",
     sgMfSave: "保存清单",
     sgMfSaved: "清单已保存, 参数表单已更新。",
@@ -347,7 +344,6 @@
     sgOpt: "多维寻优",
     sgOptHint:
       "沿多个参数同时扫: 每组 = 一次完整回测, 组合数上限 100。维度越多组合数涨得越快, 建议先 2 维。",
-    sgOptKey: "参数键",
     sgOptValues: "候选值(逗号分隔, 2–10 个)",
     sgOptAdd: "添加维度",
     sgOptDel: "删除该维度",
@@ -362,7 +358,6 @@
     sgOptErrRow: "该组失败",
     sgWarnings: "静态检查提示",
     sgApiRef: "ctx API 速查",
-    sgJumpErr: "定位错误行",
     sgSavedWithWarn: "已保存(附静态检查提示)",
   });
   Object.assign(R.TEXT.en, {
@@ -469,7 +464,6 @@
     sgMaxDd: "Max drawdown",
     sgWinRate: "Win rate",
     sgTrades: "Trades",
-    sgFees: "Fees",
     sgSharpe: "Sharpe",
     sgRejected: "Rejected",
     sgReportFull: "Full text report",
@@ -516,8 +510,6 @@
     sgMfType: "Type",
     sgMfDefault: "Default",
     sgMfRequired: "Required",
-    sgMfDescCol: "Description",
-    sgMfOptions: "Options (comma separated)",
     sgMfAdd: "Add param",
     sgMfSave: "Save manifest",
     sgMfSaved: "Manifest saved; params form updated.",
@@ -539,7 +531,6 @@
     sgOpt: "Multi-param search",
     sgOptHint:
       "Sweep several params at once: each combo is a full backtest, capped at 100 combos. Combos grow fast — start with 2 dims.",
-    sgOptKey: "Param key",
     sgOptValues: "Candidates (comma separated, 2–10)",
     sgOptAdd: "Add dim",
     sgOptDel: "Remove this dim",
@@ -554,7 +545,6 @@
     sgOptErrRow: "This combo failed",
     sgWarnings: "Static check hints",
     sgApiRef: "ctx API reference",
-    sgJumpErr: "Go to error line",
     sgSavedWithWarn: "Saved (with static check hints)",
   });
 

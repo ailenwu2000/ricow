@@ -830,6 +830,20 @@ impl BacktestOutcome {
     }
 }
 
+/// 在同步 CPU 段(见审反复核 B11)尽量不占住 axum worker: 多线程运行时用 `tokio::task::block_in_place`
+/// 把本 worker 上的其他任务挪到别处, 当前线程运行时(测试)直接内联执行。
+///
+/// **必须按 flavor 分支**: `block_in_place` 在 `current_thread` 运行时上会 panic,
+/// 而 `#[tokio::test]` 默认就是 current_thread —— 不分支持会让单测一跑就炸。
+fn block_in_place_if_multithread<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// 回测内核 (032 T025): 窗口计算 → 装载策略(TOML/直跑)→ 三层回测参数 → warmup 声明收集 →
 /// 分页拉 K 线(与 CLI 同一数据源, 035 起优先命中本地缓存)→ 引擎撮合 → 结构化结果。
 ///
@@ -1136,8 +1150,14 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
     let closes: Vec<f64> = klines.iter().map(|k| k.close.to_f64().unwrap_or(0.0)).collect();
     let close_times_ms: Vec<i64> = klines.iter().map(|k| k.close_time.timestamp_millis()).collect();
     let t_engine0 = t_total.elapsed();
-    let report =
-        Engine::new().backtest(config.clone(), initial_balance, &klines, spec.close_at_end)?;
+    // 051 复核 B11: 引擎回放是**纯同步 CPU 段**(重采样 / 撮合 / Lua 决策, 段内无 await),
+    // 直接放在 async fn 里会占住 axum 的 worker 线程 —— 并发寻优(最多 100 组 × 长窗口)时可能
+    // 拖慢同进程的其他端点。生产运行时是 `#[tokio::main]` 多线程, 用 `block_in_place` 把本 worker
+    // 上的其他任务挪走; 当前线程运行时(`#[tokio::test]` 默认)上 `block_in_place` **会 panic**,
+    // 故按 flavor 分支 —— 非多线程时原样内联(测试语义一字不变)。
+    let report = block_in_place_if_multithread(|| {
+        Engine::new().backtest(config.clone(), initial_balance, &klines, spec.close_at_end)
+    })?;
     eprintln!(
         "[timing] 引擎回放 = {:.2}s ({} 根 bar, 含重采样/撮合/Lua 决策)",
         (t_total.elapsed() - t_engine0).as_secs_f64(),
@@ -1819,6 +1839,32 @@ mod tests {
     use super::*;
     use crate::commands::display_width;
     use crate::commands::test_util::ENV_LOCK;
+
+    /// 051 复核 B11: 引擎回放的 CPU 段包装 —— **两种运行时形态都必须给出同样的结果**。
+    /// 生产是 `#[tokio::main]` 多线程(走 `block_in_place`); `#[tokio::test]` 是当前线程运行时,
+    /// 那里 `block_in_place` **会 panic**, 故必须走内联分支。这个用例就是钉住这条分支 ——
+    /// 少了它, 一次"顺手改成无条件 block_in_place"会让全部回测单测当场炸掉, 而且崩因离现场很远。
+    #[tokio::test]
+    async fn test_block_in_place_helper_works_on_current_thread_runtime() {
+        // 当前线程运行时: 走内联分支, 值照常传回。
+        assert_eq!(block_in_place_if_multithread(|| 1 + 1), 2);
+        let s = block_in_place_if_multithread(|| String::from("ok"));
+        assert_eq!(s, "ok");
+    }
+
+    /// 具名多线程运行时: 走 `block_in_place` 分支, 结果一致且不 panic。
+    #[test]
+    fn test_block_in_place_helper_works_on_multithread_runtime() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("建多线程运行时");
+        let got = rt.block_on(async { block_in_place_if_multithread(|| "mt") });
+        assert_eq!(got, "mt");
+        // 运行时之外(无 current handle)也要能跑 —— 走内联分支。
+        assert_eq!(block_in_place_if_multithread(|| 42), 42);
+    }
 
     /// 审计 低危 #4: 根数上限校验 —— 常规窗口放行, 越界窗口报错且文案点名建议。
     #[test]

@@ -255,6 +255,19 @@ fn render_index(template: &str, token: &str) -> String {
 mod tests {
     use super::*;
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // 这份用例集合是**防手抄漂移的门禁**(051 C4 明确表述边界), 不是行为验证。
+    //
+    // 它们断言的是"某个字面量/结构仍在源码里" —— 例如 `assert!(common.contains("R.emptyState = function"))`。
+    // 价值在于: 清单、加载顺序、禁用 API、只读红线这些**结构性约定**一旦被手滑改掉就立刻变红。
+    // **不要**把它们当成"功能被验证了": 重构只要保留那些字符串就全绿, 改个变量名反而可能假红。
+    //
+    // 真正验行为的只有两处, 分工不同:
+    //   · `scripts/web_frontend_check.mjs` —— 静态一致性(双语键、逐标签配对、死文案、err toast 口径、parseHash 纯函数表);
+    //   · `scripts/probe_web_ui.mjs` —— **真机**(CDP 驱动真浏览器: 逐视图激活 + 未捕获异常 + 窄屏抽屉 + 主题)。
+    // 042 的 `S.onUndo` 漏导出教训就是: 上面几道静态门全绿, 而页面整片 ReferenceError。
+    // ─────────────────────────────────────────────────────────────────────────────
+
     /// 按名取资产的**内嵌**副本(测试里断言具体内容用)。
     fn src_of(name: &str) -> &'static str {
         ASSETS.iter().find(|a| a.name == name).expect("资产表里有这份").embedded
@@ -796,7 +809,15 @@ mod tests {
     /// 放行任何一条, 用户看到的就是"服务起来了但页面白屏", 得自己去猜目录哪里不对。
     #[test]
     fn test_resolve_assets_dir_rejects_bad_dirs() {
-        let base = std::env::temp_dir().join(format!("ricow-assets-dir-{}", std::process::id()));
+        // 051 复核 B13: 目录名里带**纳秒时间戳** —— 早先只用 `process::id()`, 而 Windows 会复用
+        // pid, 于是上一轮残留的目录会让开头的 `remove_dir_all` 变成一次真实删除(冷启动 +
+        // 实时防护扫描时实测可拖到 ~60s)。带上时间戳后永远是"新目录", 开头那句退化成快路径。
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("ricow-assets-dir-{}-{stamp}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("建临时目录");
 

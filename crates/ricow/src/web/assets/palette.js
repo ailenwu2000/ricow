@@ -174,13 +174,21 @@
 
   // ---------- 动作 ----------
 
+  /// 051 复核 B4: 命令面板是"**点完即关的一次性浮层**" —— 动作失败时面板已收起, **没有原位
+  /// 可贴**, 故这里的错误走 `R.toast(..., "err")`。这是 `common.js` 里显式记录过的**唯一例外**
+  /// (别处错误一律留在原地的 msg 区), 并由 `scripts/web_frontend_check.mjs` 锁住: 只允许本文件
+  /// 使用 err toast, 防止例外悄悄扩散。
+  function reportActionError(err) {
+    R.toast(t("failed") + (err && err.message), "err");
+  }
+
   async function switchLang(code) {
     if ((code === "en" ? "en" : "zh") === R.lang) return;
     try {
       const info = await R.api("/api/lang", { method: "POST", body: { lang: code } });
       R.applyLang(info.lang);
     } catch (err) {
-      R.toast(t("failed") + (err && err.message), "err");
+      reportActionError(err);
     }
   }
 
@@ -190,7 +198,7 @@
       const info = await R.api("/api/theme", { method: "POST", body: { theme: theme } });
       R.applyTheme(info.theme);
     } catch (err) {
-      R.toast(t("failed") + (err && err.message), "err");
+      reportActionError(err);
     }
   }
 
@@ -315,7 +323,7 @@
     try {
       item.run();
     } catch (err) {
-      R.toast(t("failed") + (err && err.message), "err");
+      reportActionError(err);
     }
   }
 

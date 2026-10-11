@@ -18,6 +18,14 @@
   /// 当前路由: `{ name, param }`, 首次跳转前为 null。
   let current = null;
 
+  /// 当前一级视图名(**唯一真相**: 只由本文件在 `applyRoute` 里写)。
+  ///
+  /// 051 复核 B12: 早先 `help.js` 另有一份 `syncCurrentView()` 直接从 `location.hash` 取首段,
+  /// 与这里形成两份真相 —— 首屏落在非法 hash(`#nope`)时, help 读到 `"nope"`, 随后 `applyRoute`
+  /// 用 `history.replaceState("#chat")` 纠正(**不触发 hashchange**), 而 help 那份再也不会更新,
+  /// 帮助抽屉的「当前视图」高亮就错位。现在写入口唯一, 读方(help.js)只读不写。
+  R.currentView = null;
+
   /// 解析 `location.hash` → `{ name, param, invalid }`。
   /// 空 hash 当作 chat(默认页); 二级段做一次 decodeURIComponent(畸形转义不抛错, 原样给)。
   function parseHash() {
@@ -73,6 +81,9 @@
       route.name = "chat";
       route.param = null;
     }
+    // 051 复核 B12: 在校正之后写 `R.currentView`(唯一真相), 且写在早退判断**之前** ——
+    // 否则非法 hash 回退这条路径上, 读方会一直拿着校正前的旧值。
+    R.currentView = route.name;
     if (current && current.name === route.name && current.param === route.param) return;
     if (current) {
       const oldView = R.views[current.name];

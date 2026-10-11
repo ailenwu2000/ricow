@@ -22,9 +22,7 @@
 
   // ---------- 文案(并入公共字典; 静态标签走 data-zh/data-en) ----------
   Object.assign(R.TEXT.zh, {
-    helpBtnTitle: "帮助",
     helpTitle: "帮助",
-    helpClose: "关闭",
     helpIntro:
       "随时点顶栏这个按钮回来。也可以直接问 —— 左侧「对话」里用大白话就行, 不必记命令。",
     helpStart: "5 分钟上手",
@@ -41,9 +39,7 @@
     onboardClose: "知道了, 先收起",
   });
   Object.assign(R.TEXT.en, {
-    helpBtnTitle: "Help",
     helpTitle: "Help",
-    helpClose: "Close",
     helpIntro:
       "Click this button any time to come back. You can also just ask — plain language works in the Chat view; no commands to memorise.",
     helpStart: "Get started in 5 minutes",
@@ -311,7 +307,7 @@
     const terms = section(body, "terms", "helpTerms");
     renderTerms(terms);
 
-    const ctx = CONTEXT[R.currentView || ""];
+    const ctx = CONTEXT[currentViewName()];
     body.scrollTop = 0;
     if (ctx) {
       const target = $("help-sec-" + ctx);
@@ -471,11 +467,11 @@
     });
   }
 
-  /// 当前一级视图名(与 router.js 的 hash 解析同口径, 但**只读不写** —— 不碰路由状态)。
-  function syncCurrentView() {
-    const body = (location.hash || "").replace(/^#/, "");
-    const name = body.split("/")[0] || "chat";
-    R.currentView = name;
+  /// 当前一级视图名: **读 `router.js` 维护的唯一真相** `R.currentView`(051 复核 B12)。
+  /// 早先这里另有一份从 `location.hash` 抠首段的副本, 与路由的校正(replaceState 回退 #chat)
+  /// 不同步 —— 非法 hash 首屏会让帮助抽屉的「当前视图」高亮错位。现在只读不写。
+  function currentViewName() {
+    return R.currentView || "chat";
   }
 
   R.help = { open: open, close: close };
@@ -501,6 +497,5 @@
   } else {
     wire();
   }
-  window.addEventListener("hashchange", syncCurrentView);
-  syncCurrentView();
+  // 051 复核 B12: 不再在这里监听 hashchange 维护副本 —— `R.currentView` 由 router.js 独家维护。
 })();

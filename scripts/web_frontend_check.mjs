@@ -166,16 +166,26 @@ if (zhAll.size === 0) {
 }
 
 // ---------------------------------------------------------------------------
-// C. 引用完整性: `t("literal")` / `R.TEXT.zh.xxx` 都必须有定义。
+// C. 引用完整性: `t("literal")` / `R.TEXT.zh.xxx` 都必须有定义; 反向也查"定义了但没用"。
 // ---------------------------------------------------------------------------
 console.log("");
 console.log("=".repeat(78));
-console.log("C. 文案引用 (t(\"key\") / R.TEXT.*.key)");
+console.log("C. 文案引用 (t(\"key\") / R.TEXT.*.key / 反向死文案)");
 console.log("=".repeat(78));
+
+// 051 复核 C3: 早先只认**双引号** `t("key")`, 单引号 / 模板串 / 变量形全在盲区 ——
+// 一旦有人用单引号写新文案, 缺键就会**静默通过**。这里三种字面量形态都收。
+const CALL_FORMS = [
+  /\bt\(\s*"([A-Za-z_$][\w$]*)"\s*\)/g,
+  /\bt\(\s*'([A-Za-z_$][\w$]*)'\s*\)/g,
+  /\bt\(\s*`([A-Za-z_$][\w$]*)`\s*\)/g,
+];
 const used = new Map(); // key → 第一个引用它的文件
 for (const [name, src] of sources) {
-  for (const m of src.matchAll(/\bt\(\s*"([A-Za-z_$][\w$]*)"\s*\)/g)) {
-    if (!used.has(m[1])) used.set(m[1], name);
+  for (const re of CALL_FORMS) {
+    for (const m of src.matchAll(re)) {
+      if (!used.has(m[1])) used.set(m[1], name);
+    }
   }
   for (const m of src.matchAll(/R\.TEXT\.(?:zh|en)\.([A-Za-z_$][\w$]*)/g)) {
     if (!used.has(m[1])) used.set(m[1], name);
@@ -191,27 +201,71 @@ if (dangling.length) {
   pass(`静态引用的 ${used.size} 个文案键都有中英定义`);
 }
 
+// 反向: 定义了但**在任何地方都没被引用**的键 = 死文案(切了语言也永远不显示)。
+// 判据刻意保守, 只把"除了自己的定义块之外, 整个源码里连这个名字都不出现"的键判为死 ——
+// 动态取值(`R.TEXT[lang][someVar]`)拿不到静态引用, 故不据此判死(避免假红线)。
+const wholeWordCount = (src, key) => {
+  const re = new RegExp(`\\b${key}\\b`, "g");
+  return (src.match(re) || []).length;
+};
+const defCounts = new Map();
+const allSrc = [...sources.values()].join("\n");
+for (const [name, src] of sources) {
+  for (const lang of ["zh", "en"]) {
+    const re = new RegExp(`R\\.TEXT\\.${lang}\\s*[,=]?\\s*\\{`, "g");
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      const block = sliceBraced(src, m.index + m[0].length - 1);
+      if (!block) continue;
+      for (const k of keysOfBlock(block)) defCounts.set(k, (defCounts.get(k) || 0) + 1);
+    }
+  }
+}
+const dead = [...zhAll.keys()].filter((k) => wholeWordCount(allSrc, k) <= (defCounts.get(k) || 0));
+if (dead.length) {
+  fail(
+    `${dead.length} 个文案键定义了却从未被引用(死文案)`,
+    dead.map((k) => `${k}  (定义于 ${zhAll.get(k)})`).join("\n")
+  );
+} else {
+  pass("没有「定义了但没人用」的死文案");
+}
+
 // ---------------------------------------------------------------------------
-// D. 首页静态标签: `data-zh` / `data-en` 必须成对, 且与运行时字典不冲突。
+// D. 首页静态标签: `data-zh` / `data-en` 必须**逐标签**成对。
 // ---------------------------------------------------------------------------
 console.log("");
 console.log("=".repeat(78));
-console.log("D. 首页静态标签 (data-zh / data-en)");
+console.log("D. 首页静态标签 (data-zh / data-en, 逐标签配对)");
 console.log("=".repeat(78));
-const zhAttrs = [...html.matchAll(/data-zh="([^"]*)"/g)].map((m) => m[1]);
-const enAttrs = [...html.matchAll(/data-en="([^"]*)"/g)].map((m) => m[1]);
-if (zhAttrs.length !== enAttrs.length) {
-  fail(
-    `data-zh (${zhAttrs.length}) 与 data-en (${enAttrs.length}) 数量不等`,
-    "某一个标签只给了一种语言 → `R.applyLang` 切过去会把它清成空字符串(dataset 取到 undefined)。"
-  );
-} else {
-  pass(`首页 ${zhAttrs.length} 组静态标签双语成对`);
+
+// 051 复核 C2: 早先只比 `data-zh` 与 `data-en` 的**总数量** —— 一个只带 data-zh 的标签
+// 配另一个只带 data-en 的标签能"凑够数量"而通过, 但运行时前者在英文下被清成空字符串。
+// 现在**按标签切片**比对: 含 `data-zh` 的标签必须同时含 `data-en`(placeholder 同理)。
+const attrPresent = (tag, attr) => new RegExp(`\\s${attr}\\s*=`).test(tag);
+const unpaired = [];
+let zhTags = 0;
+let enTags = 0;
+let phZhTags = 0;
+let phEnTags = 0;
+for (const m of html.matchAll(/<[a-zA-Z][^>]*>/g)) {
+  const tag = m[0];
+  const z = attrPresent(tag, "data-zh");
+  const e = attrPresent(tag, "data-en");
+  const pz = attrPresent(tag, "data-zh-placeholder");
+  const pe = attrPresent(tag, "data-en-placeholder");
+  if (z) zhTags += 1;
+  if (e) enTags += 1;
+  if (pz) phZhTags += 1;
+  if (pe) phEnTags += 1;
+  if (z !== e) unpaired.push(`data-zh/en 不成对: ${tag.slice(0, 140)}`);
+  if (pz !== pe) unpaired.push(`data-zh/en-placeholder 不成对: ${tag.slice(0, 140)}`);
 }
-const phZh = [...html.matchAll(/data-zh-placeholder="([^"]*)"/g)].length;
-const phEn = [...html.matchAll(/data-en-placeholder="([^"]*)"/g)].length;
-if (phZh !== phEn) fail(`data-zh-placeholder (${phZh}) 与 data-en-placeholder (${phEn}) 数量不等`, "");
-else pass(`首页 ${phZh} 组 placeholder 双语成对`);
+if (unpaired.length) {
+  fail(`${unpaired.length} 处静态标签双语属性不成对`, unpaired.join("\n"));
+} else {
+  pass(`首页 ${zhTags} 个标签逐标签成对 (含 ${phZhTags} 组 placeholder)`);
+}
 
 // ---------------------------------------------------------------------------
 // E. 纯函数: router 的 hash 解析 (喂表, 不依赖浏览器)。
@@ -270,6 +324,34 @@ if (parseHash) {
   }
   if (bad.length) fail(`parseHash ${bad.length}/${cases.length} 条不符`, bad.join("\n"));
   else pass(`parseHash ${cases.length} 条边界全对 (空 hash / 未知视图 / 解码 / 多段)`);
+}
+
+// ---------------------------------------------------------------------------
+// F. toast 错误口径: `R.toast(..., "err")` **只允许**出现在命令面板。
+// ---------------------------------------------------------------------------
+console.log("");
+console.log("=".repeat(78));
+console.log("F. toast 错误口径 (err toast 只准命令面板用)");
+console.log("=".repeat(78));
+
+// 051 复核 B4: `common.js` 的约定是"toast 只承载成功/中性, 错误留在原地", 唯一例外是
+// 命令面板(点完即关的一次性浮层, 动作失败时没有原位可贴)。这条例外必须有护栏 —— 否则
+// 下一个人会照着 palette.js 抄, 例外悄悄变成常态。这里把"允许名单"钉死。
+const ERR_TOAST_ALLOWED = new Set(["palette.js"]);
+const errToastFiles = [];
+for (const [name, src] of sources) {
+  if (/R\.toast\([^;]*?"err"\s*\)/s.test(src)) errToastFiles.push(name);
+}
+const illegal = errToastFiles.filter((f) => !ERR_TOAST_ALLOWED.has(f));
+if (illegal.length) {
+  fail(
+    `${illegal.length} 个文件在错误路径上用了 err toast (违反 toast 口径)`,
+    illegal
+      .map((f) => `${f}: 错误应留在原地的 msg 区; 只有命令面板这一处例外(见 common.js 的 R.toast 注释)`)
+      .join("\n")
+  );
+} else {
+  pass(`err toast 仅出现在允许名单内 (${errToastFiles.join(", ") || "无"})`);
 }
 
 console.log("");
