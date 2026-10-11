@@ -68,8 +68,10 @@ pub(super) fn current_lang(root: &Path) -> ricow_core::CoreResult<Lang> {
     Ok(crate::i18n::resolve(&config_file::load(root)?))
 }
 
-/// 可选主题(单一来源: 前端主题选择控件按它渲染; 白名单与 `config_file` 的 `[ui].theme` 一致)。
-const SUPPORTED_THEMES: [&str; 3] = ["dark", "light", "red"];
+/// 可选主题(**单一来源**: `config_file::SUPPORTED_THEMES`, 即 `[ui].theme` 的白名单)。
+/// `auto`(D14) = 跟随系统的深 / 浅色偏好 —— 由前端按 `prefers-color-scheme` 落到 dark / light,
+/// 落盘存的仍是用户的**选择**(`auto`), 而不是那一刻恰好生效的那一档。
+pub(super) const SUPPORTED_THEMES: [&str; 4] = config_file::SUPPORTED_THEMES;
 
 #[derive(serde::Serialize)]
 struct ThemeReply {
@@ -173,11 +175,20 @@ mod tests {
         let toml_text = std::fs::read_to_string(config_file::path(&root)).expect("读 ricow.toml");
         assert!(toml_text.contains("theme = \"light\""), "配置应落盘: {toml_text}");
 
+        // D14: "跟随系统" 也是一个**可落盘的偏好**(前端再按 prefers-color-scheme 解成某档) ——
+        // 落盘存的必须是 auto 本身, 而不是它此刻恰好解出来的 light/dark, 否则刷新就丢了选择。
+        let res = post(port, "/api/theme?token=tok-ok", r#"{"theme":"auto"}"#).await;
+        assert!(res.starts_with("HTTP/1.1 200"), "POST auto 应 200, 实际: {res}");
+        let res = get(port, "/api/theme?token=tok-ok").await;
+        assert!(body_of(&res).contains(r#""theme":"auto""#), "auto 应原样回读: {res}");
+        let toml_text = std::fs::read_to_string(config_file::path(&root)).expect("读 ricow.toml");
+        assert!(toml_text.contains("theme = \"auto\""), "auto 必须落盘: {toml_text}");
+
         // 非法值: 400, 且不得覆盖已有主题。
         let res = post(port, "/api/theme?token=tok-ok", r#"{"theme":"blue"}"#).await;
         assert!(res.starts_with("HTTP/1.1 400"), "非法主题应 400, 实际: {res}");
         let res = get(port, "/api/theme?token=tok-ok").await;
-        assert!(body_of(&res).contains(r#""theme":"light""#), "非法值不得覆盖已有主题: {res}");
+        assert!(body_of(&res).contains(r#""theme":"auto""#), "非法值不得覆盖已有主题: {res}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

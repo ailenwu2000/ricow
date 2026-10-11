@@ -36,6 +36,17 @@
     return { name: name, param: param, invalid: body !== "" && rawName !== name };
   }
 
+  /// 导出一份(可传 hash 覆盖 `location.hash`)供 **纯逻辑单测** 用 —— `scripts/web_frontend_check.mjs`
+  /// 在 node 里只喂一个 `{hash}` 桩就能把路由解析的表/边界一次跑完, 不必起浏览器。
+  R.parseHash = function (hash) {
+    if (hash === undefined) return parseHash();
+    const saved = location.hash;
+    location.hash = hash;
+    const out = parseHash();
+    location.hash = saved;
+    return out;
+  };
+
   /// 同步左侧导航高亮: 高亮目标等于当前一级视图的那一项。
   function renderNav(name) {
     for (const a of document.querySelectorAll("#nav a")) {

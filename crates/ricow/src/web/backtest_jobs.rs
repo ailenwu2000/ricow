@@ -23,6 +23,9 @@ use super::strategy_io::{config_values, parse_market};
 use super::{WebError, WebState};
 use crate::commands::backtest::{run_backtest_full, BacktestRunSpec};
 use crate::commands::format_backtest_report;
+// C8: 多维寻优的网格展开与组合数护栏**直接复用 CLI `ricow optimize` 那一份**,
+// 不在 Web 层另抄一段笛卡尔积 —— 两处口径分叉时"网页能跑、CLI 报错"最难查。
+use crate::commands::optimize::{expand_grid, MAX_COMBOS};
 use ricow_strategy::ConfigValue;
 
 /// done/error 结果保留时长(data-model §7: 5 分钟后惰性删除)。
@@ -68,6 +71,12 @@ pub(super) struct BacktestJob {
     chart: Option<Value>,
     /// 策略运行期日志(`ctx:log`, 已按上限裁剪; done 才有, 空则 None)。
     logs: Option<Vec<String>>,
+    /// C8: 运行中作业的进度(`{done, total}`, 仅多维寻优会设)。
+    ///
+    /// 单次回测的"进度"只有 0/1 两态, 报它没有信息量; 而一次 100 组的多维寻优可能跑十几分钟,
+    /// 只回 `running` 会让用户以为卡死。**只增不改**: 没设过的作业该字段保持 `None`, 响应里
+    /// 直接不出现, 所以普通回测 / 单参数扫描的对外形状**一字未变**。
+    progress: Option<Value>,
     error: Option<String>,
     // 登记时刻(规格 §7 作业字段; 清理以 finished_at 为准, 此字段留作观测/审计, 单测会断言)。
     #[allow(dead_code)]
@@ -94,6 +103,9 @@ pub(super) struct JobReply {
     /// 策略日志(`ctx:log`; 空/无则字段不出现)。供前端在回测详情展示策略自检与停机原因。
     #[serde(skip_serializing_if = "Option::is_none")]
     logs: Option<Vec<String>>,
+    /// C8: 运行中进度(`{done, total}`; 只有多维寻优会带)。已完成的作业不需要它。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -106,6 +118,7 @@ impl From<&BacktestJob> for JobReply {
             metrics: j.metrics.clone(),
             chart: j.chart.clone(),
             logs: j.logs.clone(),
+            progress: j.progress.clone(),
             error: j.error.clone(),
         }
     }
@@ -233,6 +246,7 @@ impl JobStore {
                 metrics: None,
                 chart: None,
                 logs: None,
+                progress: None,
                 error: None,
                 created_at: now,
                 finished_at: None,
@@ -295,6 +309,19 @@ impl JobStore {
         let mut map = lock_or_recover(&self.inner);
         Self::prune(&mut map, now);
         map.get(job_id).map(JobReply::from)
+    }
+
+    /// C8: 运行中作业写一次进度(`{done, total}`)。
+    ///
+    /// 只在 `Running` 时写 —— 已 done/error 的记录(maybe 已过期)不该被一个迟到的进度帧改回
+    /// "像在跑"。**不触发 prune**: 这是高频写的旁路, 不该顺带做清理(清理在查询入口照常发生)。
+    pub(super) fn set_progress(&self, job_id: &str, done: usize, total: usize) {
+        let mut map = lock_or_recover(&self.inner);
+        if let Some(job) = map.get_mut(job_id) {
+            if job.status == JobStatus::Running {
+                job.progress = Some(serde_json::json!({ "done": done, "total": total }));
+            }
+        }
     }
 }
 
@@ -722,6 +749,310 @@ pub(super) async fn start_sweep(
     Ok((StatusCode::ACCEPTED, Json(StartedReply { job_id })))
 }
 
+// ---- 多维参数寻优 (C8): 多参数网格 ----
+//
+// 与单参数扫描 (P2-7) 的关系: 同一个内核 (逐组 [`run_backtest_full`]), 同一个生命周期
+// (轮询 / 5 分钟保留 / 惰性清理), 同一个组合数护栏 ([`MAX_COMBOS`], 复用 CLI 那份)。
+// 差别只有两点: ① 维度从 1 到多 (笛卡尔积, 用 CLI 的 [`expand_grid`]); ② 运行中报进度。
+// 不引第三方优化器, 也不做智能搜索 —— 与 CLI 的口径一致 (Freqtrade hyperopt 简化版的定位)。
+
+/// 一个扫描维度: 参数键 + 候选值(2..=10 个, 与单参数扫描同一纪律)。
+#[derive(Debug, Deserialize)]
+pub(super) struct OptimizeDim {
+    key: String,
+    values: Vec<Value>,
+}
+
+/// `POST /api/backtest/optimize` 请求(C8): 沿**多个**参数键做笛卡尔积网格, 逐组回测。
+#[derive(Debug, Deserialize)]
+pub(super) struct OptimizeRequest {
+    /// 策略名(内置 id 或已部署用户策略名)。
+    strategy: String,
+    /// 扫描维度(至少 1 维, 至多 [`MAX_OPTIMIZE_DIMS`] 维)。
+    params: Vec<OptimizeDim>,
+    #[serde(default)]
+    pair: Option<String>,
+    #[serde(default)]
+    market: Option<String>,
+    #[serde(default)]
+    interval: Option<String>,
+    #[serde(default)]
+    days: Option<u32>,
+    #[serde(default)]
+    fee: Option<f64>,
+    #[serde(default)]
+    cash: Option<f64>,
+    #[serde(default)]
+    leverage: Option<f64>,
+}
+
+/// 维度上限(与组合数护栏互补)。
+///
+/// 组合数护栏只挡住"总量", 挡不住"总量没超但维度太多": 6 维 × 2 值 = 64 组能过护栏, 可结果表
+/// 每个维度占一列, 6 个参数列在 1366 宽的屏上已经没法看。所以这里按**可读性**另设一条上限。
+/// (CLI 不限维度是因为终端输出的是一行 `k=v,k=v` 字符串, 超长会被 `truncate` 折叠。)
+const MAX_OPTIMIZE_DIMS: usize = 4;
+
+/// 一组组合的键值对(按请求的维度顺序)。
+#[derive(Debug, Serialize)]
+struct OptimizeCell {
+    key: String,
+    value: Value,
+}
+
+/// 各维在展开序里的"步长"(末维最快): `strides[i]` = 第 i 维之后所有维的长度之积。
+///
+/// 有了它, 组合序号 k 就能还原成各维下标 `(k / strides[i]) % len(dims[i])` —— 于是结果行里
+/// 摆的是**用户原始填的那个 JSON 值**, 而不必重新把 `ConfigValue` 渲染成字符串
+/// (那会引入"1.0 还是 1"这类与用户输入对不上的漂移)。
+///
+/// **前提**: 展开序必须与 CLI `expand_grid` 一致(先列出的维最慢、最后列出的维最快)——
+/// 两者一旦不一致, 表头写的参数和下面的数字就串位了, 而这种错位在界面上**看不出来**。
+/// `test_combo_cells_align_with_cli_expand_order` 就是钉这个。
+fn combo_strides(dims: &[(String, Vec<Value>)]) -> Vec<usize> {
+    let mut strides: Vec<usize> = vec![1; dims.len()];
+    for i in (0..dims.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * dims[i + 1].1.len();
+    }
+    strides
+}
+
+/// 组合序号 → 该组的原始参数(按维度序)。越界由调用方保证不发生(序号必 < 组合总数)。
+fn combo_cells(dims: &[(String, Vec<Value>)], strides: &[usize], idx: usize) -> Vec<OptimizeCell> {
+    dims.iter()
+        .enumerate()
+        .map(|(i, (key, vals))| OptimizeCell {
+            key: key.clone(),
+            value: vals[idx / strides[i] % vals.len()].clone(),
+        })
+        .collect()
+}
+
+/// 多维寻优结果的一行: 该组参数 + 该组指标(或该组失败原因)。
+#[derive(Debug, Serialize)]
+struct OptimizeRow {
+    /// 这一组用到的参数(原始 JSON 值, 与用户填的逐字一致 —— 不做字符串格式化)。
+    combo: Vec<OptimizeCell>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<crate::commands::backtest::MetricsSummary>,
+}
+
+/// `POST /api/backtest/optimize`: 同步校验 + 登记作业, 内核在 tokio 任务里**逐组串行**跑。
+///
+/// busy 判定键 = `strategy|optimize|<排序后的参数键>`: 同一组参数的两份寻优互斥, 而不相干的
+/// 参数组合可并行(与单参数扫描同一思路, 只是键从"一个参数"扩成"参数集合")。
+pub(super) async fn start_optimize(
+    State(state): State<WebState>,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Result<(StatusCode, Json<StartedReply>), WebError> {
+    let Json(body) =
+        payload.map_err(|e| WebError::bad_request(format!("请求体不是合法 JSON: {e}")))?;
+    let req: OptimizeRequest = serde_json::from_value(body).map_err(|e| {
+        WebError::bad_request(format!(
+            "请求体字段非法: 需要 strategy 字符串、params 数组(每项 {{key, values[2..=10]}}), \
+             pair/interval 可选字符串, days 整数, fee/cash/leverage 数值: {e}"
+        ))
+    })?;
+
+    // ---- 同步校验(与单参数扫描同口径) ----
+    let strategy = req.strategy.trim();
+    if strategy.is_empty() {
+        return Err(WebError::bad_request("strategy(策略名)不能为空"));
+    }
+    ricow_strategy::validate_strategy_name(strategy)
+        .map_err(|e| WebError::bad_request_code(e, "invalid_name"))?;
+    reject_unavailable(strategy)?;
+    let known = crate::strategies::catalog::is_builtin_id(strategy)
+        || state.root.join("strategies").join(format!("{strategy}.toml")).is_file();
+    if !known {
+        return Err(WebError::not_found(format!(
+            "没有策略 {strategy}: 寻优只接受内置策略或已保存的用户策略"
+        )));
+    }
+
+    // ---- 维度校验: 键合法且不重复 / 每维 2..=10 档 / 维数不超上限 ----
+    if req.params.is_empty() {
+        return Err(WebError::bad_request("params 至少要有一个参数维度"));
+    }
+    if req.params.len() > MAX_OPTIMIZE_DIMS {
+        return Err(WebError::bad_request(format!(
+            "params 至多 {MAX_OPTIMIZE_DIMS} 个维度(每个维度占结果表一列, 再多就看不过来了), \
+             收到: {}",
+            req.params.len()
+        )));
+    }
+    let mut seen_keys: Vec<&str> = Vec::with_capacity(req.params.len());
+    for dim in &req.params {
+        let key = dim.key.trim();
+        if key.is_empty() {
+            return Err(WebError::bad_request("params 里有参数键为空"));
+        }
+        if matches!(key, "pair" | "script" | "script_path") {
+            return Err(WebError::bad_request(format!(
+                "params 里的键不能是引擎内部键(pair/script/script_path), 收到: '{key}'"
+            )));
+        }
+        if seen_keys.contains(&key) {
+            return Err(WebError::bad_request(format!("参数键重复: '{key}'")));
+        }
+        seen_keys.push(key);
+        if !(2..=10).contains(&dim.values.len()) {
+            return Err(WebError::bad_request(format!(
+                "参数 '{key}' 的候选值需要 2..=10 个, 收到: {}",
+                dim.values.len()
+            )));
+        }
+    }
+    // 逐维把候选值转成引擎 ConfigValue(与保存/回测同一套转换, 类型错误当场 400)。
+    let mut dims_cv: Vec<(String, Vec<ConfigValue>)> = Vec::with_capacity(req.params.len());
+    for dim in &req.params {
+        let key = dim.key.trim().to_string();
+        let mut cands: Vec<ConfigValue> = Vec::with_capacity(dim.values.len());
+        for v in &dim.values {
+            let mut one = HashMap::new();
+            one.insert(key.clone(), v.clone());
+            let mut cv = config_values(&one).map_err(WebError::bad_request)?;
+            cands.push(cv.remove(&key).expect("config_values 必回同键"));
+        }
+        dims_cv.push((key, cands));
+    }
+
+    let interval = parse_interval(req.interval.as_deref()).map_err(WebError::bad_request)?;
+    if let Some(d) = req.days {
+        if !(1..=3650).contains(&d) {
+            return Err(WebError::bad_request(format!("days 必须是 1..=3650 的整数, 收到: {d}")));
+        }
+    }
+    let market = match req.market.as_deref() {
+        Some(m) => Some(parse_market(m).map_err(WebError::bad_request)?),
+        None => None,
+    };
+    check_non_negative("fee", req.fee.unwrap_or(0.0)).map_err(WebError::bad_request)?;
+    check_non_negative("cash", req.cash.unwrap_or(0.0)).map_err(WebError::bad_request)?;
+    if let Some(lv) = req.leverage {
+        if !lv.is_finite() || lv <= 0.0 {
+            return Err(WebError::bad_request(format!(
+                "leverage 必须是大于 0 的有限数, 收到: {lv}"
+            )));
+        }
+    }
+
+    // ---- 网格展开(复用 CLI `ricow optimize` 的内核) + 组合数护栏 ----
+    let combos = expand_grid(&dims_cv);
+    if combos.len() > MAX_COMBOS {
+        return Err(WebError::bad_request(format!(
+            "组合数 {} 超过护栏 {MAX_COMBOS} (每组 = 一次全窗口回测) —— 请收窄候选值或减少维度",
+            combos.len()
+        )));
+    }
+
+    // 每维在展开序里的"步长"(末维最快): 用来把组合序号还原成各维的下标,
+    // 从而取出**用户原始填的那个 JSON 值**放进结果行(而不是重新渲染一遍字符串)。
+    let dims_raw: Vec<(String, Vec<Value>)> =
+        req.params.iter().map(|d| (d.key.trim().to_string(), d.values.clone())).collect();
+    let strides = combo_strides(&dims_raw);
+
+    // ---- 登记作业(busy 键含整组参数键: 同一组参数互斥, 不同组可并行) ----
+    let mut key_list: Vec<&str> = seen_keys.clone();
+    key_list.sort_unstable();
+    let busy_key = format!("{strategy}|optimize|{}", key_list.join("+"));
+    let job_id = state.jobs.start(&busy_key, Utc::now()).map_err(|_busy| {
+        WebError::conflict(
+            format!("参数组合 {} 已有寻优在运行: 请等当前作业结束后再发起", key_list.join(" + ")),
+            "busy",
+        )
+    })?;
+
+    // ---- 后台逐组串行跑(共享币安限频, 串行最稳; 每组互不影响, 单组失败记入该行) ----
+    let jobs = Arc::clone(&state.jobs);
+    let root = Arc::clone(&state.root);
+    let id = job_id.clone();
+    let strategy_owned = strategy.to_string();
+    let pair = clean(req.pair);
+    let market_owned = market.map(str::to_string);
+    let fee = req.fee;
+    let cash = req.cash;
+    let leverage = req.leverage;
+    let days = req.days;
+    let interval_owned = interval.to_string();
+    let interval_explicit = req.interval.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
+    let total = combos.len();
+    tokio::spawn(async move {
+        // 审计 H-5: 与单次回测同口径, panic 转 error 释放 busy (不锁死这组参数键)。
+        let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+            let mut rows: Vec<OptimizeRow> = Vec::with_capacity(total);
+            // 先报一条 0/total: 否则从发起到第一组跑完之间, 界面只有"运行中"三个字。
+            jobs.set_progress(&id, 0, total);
+            for (idx, combo) in combos.iter().enumerate() {
+                let mut params: HashMap<String, ConfigValue> = HashMap::new();
+                for (k, v) in combo {
+                    params.insert(k.clone(), v.clone());
+                }
+                let spec = BacktestRunSpec {
+                    root: (*root).clone(),
+                    strategy: strategy_owned.clone(),
+                    pair: pair.clone(),
+                    days: days.unwrap_or(90),
+                    interval: interval_owned.clone(),
+                    start: None,
+                    end: None,
+                    market: market_owned.clone(),
+                    position_mode: None,
+                    params,
+                    script_path: None,
+                    fee,
+                    fee_maker: None,
+                    fee_taker: None,
+                    slippage_bps: None,
+                    limit_fill_penetration_bps: None,
+                    cash,
+                    leverage,
+                    max_leverage: None,
+                    mmr_pct: None,
+                    funding_rate: None,
+                    klines_market: None,
+                    interval_explicit,
+                    close_at_end: false,
+                    export_dir: None,
+                };
+                // 这一组的原始参数(按维度序, 序号经步长还原)。expand_grid 保证 len 与维度对齐。
+                let cells = combo_cells(&dims_raw, &strides, idx);
+                match run_backtest_full(spec).await {
+                    Ok(out) => rows.push(OptimizeRow {
+                        combo: cells,
+                        error: None,
+                        metrics: Some(out.metrics()),
+                    }),
+                    Err(e) => rows.push(OptimizeRow {
+                        combo: cells,
+                        error: Some(e.to_string()),
+                        metrics: None,
+                    }),
+                }
+                // 每跑完一组报一次: 用户看得到"第 N/M 组", 不会以为卡死。
+                jobs.set_progress(&id, idx + 1, total);
+            }
+            rows
+        }))
+        .await;
+        match result {
+            Ok(rows) => {
+                let report = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+                jobs.finish_done(&id, report, Utc::now());
+            }
+            Err(panic) => {
+                let msg = panic_message(panic.as_ref());
+                tracing::error!(target: "web", strategy = %strategy_owned, "多维寻优内核 panic: {msg}");
+                jobs.finish_error(&id, format!("寻优内核异常退出 (panic): {msg}"), Utc::now());
+            }
+        }
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(StartedReply { job_id })))
+}
+
 /// `GET /api/backtest/{job_id}`: running/done/error 三态;未知或已过期清理 → 404。
 pub(super) async fn get_backtest(
     State(state): State<WebState>,
@@ -1134,7 +1465,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 202 发起 → job_id 可查 → 内核在取数前因坏日期失败 → GET 转 error(全程零网络)。
+    /// C8: `combo_cells` 按序号还原的**原始 JSON 值**必须与 `expand_grid`(CLI 同款展开序,
+    /// 末维最快)逐一对齐 —— 结果表里每行的参数取值要是用户当初填的那一个, 不能错位。
+    #[test]
+    fn test_combo_cells_align_with_cli_expand_order() {
+        let dims = vec![
+            ("a".to_string(), vec![Value::from(1), Value::from(2)]),
+            ("b".to_string(), vec![Value::from("x"), Value::from("y"), Value::from("z")]),
+        ];
+        let strides = combo_strides(&dims);
+        assert_eq!(strides, vec![3, 1], "末维(3 档)最快, 首维步长 = 3");
+
+        // expand_grid 吃 ConfigValue: 把同样的档位手工转过去, 逐组比对。
+        let cv = |v: i64| ConfigValue::Integer(v);
+        let dims_cv = vec![
+            ("a".to_string(), vec![cv(1), cv(2)]),
+            ("b".to_string(), vec![cv(0), cv(0), cv(0)]), // 只对齐"序", 值用占位
+        ];
+        let combos = expand_grid(&dims_cv);
+        assert_eq!(combos.len(), 6);
+        for (idx, combo) in combos.iter().enumerate() {
+            let cells = combo_cells(&dims, &strides, idx);
+            assert_eq!(cells.len(), combo.len());
+            for (cell, (key, _)) in cells.iter().zip(combo) {
+                assert_eq!(cell.key, *key);
+            }
+        }
+        // 关键两格抽查: idx=1 应是 a=1,b=y; idx=3 应是 a=2,b=x(末维先走完)。
+        assert_eq!(combo_cells(&dims, &strides, 1)[1].value, Value::from("y"));
+        assert_eq!(combo_cells(&dims, &strides, 3)[0].value, Value::from(2));
+        assert_eq!(combo_cells(&dims, &strides, 3)[1].value, Value::from("x"));
+    }
+
+    /// `POST /api/backtest/optimize` 离线校验: 与单参数 sweep 同一套纪律, 另加
+    /// 维度数量 / 组合数护栏两类 400。全程零网络。
+    #[tokio::test]
+    async fn test_start_optimize_validation_offline() {
+        let root = tmp_root("optimize-validate");
+        let port = boot(root.clone()).await;
+        let post = |json: &'static str| async move {
+            raw(port, "POST", "/api/backtest/optimize?token=tok-ok", Some(json)).await
+        };
+
+        // ① 空 strategy / 非法名 → 400 code=invalid_name。
+        let res = post(r#"{"strategy":"  ","params":[{"key":"grid_step","values":[1,2]}]}"#).await;
+        assert_eq!(status_of(&res), 400, "{res}");
+        let res =
+            post(r#"{"strategy":"../evil","params":[{"key":"grid_step","values":[1,2]}]}"#).await;
+        assert_eq!(status_of(&res), 400, "{res}");
+        assert!(body_of(&res).contains(r#""code":"invalid_name""#), "{res}");
+
+        // ② params 为空数组 → 400; 维度里出现引擎内部键(pair/script) → 400。
+        let res = post(r#"{"strategy":"shannon_grid","params":[]}"#).await;
+        assert_eq!(status_of(&res), 400, "{res}");
+        let res = post(
+            r#"{"strategy":"shannon_grid","params":[{"key":"pair","values":["BTCUSDT","ETHUSDT"]}]}"#,
+        )
+        .await;
+        assert_eq!(status_of(&res), 400, "{res}");
+        assert!(body_of(&res).contains("pair"), "{res}");
+
+        // ③ 每维档位数量越界(1 档)→ 400。
+        let res =
+            post(r#"{"strategy":"shannon_grid","params":[{"key":"grid_step","values":[1]}]}"#)
+                .await;
+        assert_eq!(status_of(&res), 400, "{res}");
+        assert!(body_of(&res).contains("2..=10"), "{res}");
+
+        // ④ 组合数超护栏(5×5×5 = 125 > 100)→ 400 且点名护栏。
+        let res = post(
+            r#"{"strategy":"shannon_grid","params":[
+                {"key":"a","values":[1,2,3,4,5]},
+                {"key":"b","values":[1,2,3,4,5]},
+                {"key":"c","values":[1,2,3,4,5]}]}"#,
+        )
+        .await;
+        assert_eq!(status_of(&res), 400, "{res}");
+        assert!(body_of(&res).contains("护栏"), "{res}");
+
+        // ⑤ 未知策略 → 404; days 非法 → 400。
+        let res =
+            post(r#"{"strategy":"no-such-xyz","params":[{"key":"grid_step","values":[1,2]}]}"#)
+                .await;
+        assert_eq!(status_of(&res), 404, "{res}");
+        let res = post(
+            r#"{"strategy":"shannon_grid","params":[{"key":"grid_step","values":[1,2]}],"days":0}"#,
+        )
+        .await;
+        assert_eq!(status_of(&res), 400, "{res}");
+        assert!(body_of(&res).contains("days"), "{res}");
+
+        // ⑥ 非 JSON → 400。
+        let res = post("{oops").await;
+        assert_eq!(status_of(&res), 400, "{res}");
+
+        // ⑦ 合法请求(2 维 × 2 档 = 4 组): 立即 202 拿 job_id; 后台任务随当前线程
+        //    运行时关闭被丢弃, 不会真正取数(保持离线, 同 sweep 测试的注)。
+        let res = post(
+            r#"{"strategy":"shannon_grid","params":[
+                {"key":"grid_step_pct","values":[0.5,1.0]},
+                {"key":"stop_pct","values":[2,3]}]}"#,
+        )
+        .await;
+        assert_eq!(status_of(&res), 202, "合法多维寻优应立即 202: {res}");
+        let job_id = serde_json::from_str::<serde_json::Value>(body_of(&res))
+            .expect("202 体应为 JSON")
+            .get("job_id")
+            .and_then(|v| v.as_str())
+            .expect("含 job_id")
+            .to_string();
+        assert!(!job_id.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[tokio::test]
     async fn test_backtest_job_accepted_then_error_without_network() {
         let root = tmp_root("job");

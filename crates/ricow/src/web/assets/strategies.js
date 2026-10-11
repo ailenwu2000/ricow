@@ -162,6 +162,9 @@
   const onAiEdit = (...a) => S.onAiEdit(...a);
   const onBacktest = (...a) => S.onBacktest(...a);
   const onSweep = (...a) => S.onSweep(...a);
+  // C8: 多维寻优的维度行在表单子文件里建/读(键列表与单参数下拉同源), 发起与结果在回测子文件里。
+  const addOptDim = (...a) => S.addOptDim(...a);
+  const onOptimize = (...a) => S.onOptimize(...a);
   const renderJob = (...a) => S.renderJob(...a);
   const renderHistory = (...a) => S.renderHistory(...a);
   const destroyBtChart = (...a) => S.destroyBtChart(...a);
@@ -174,6 +177,8 @@
     sgOpen: "打开",
     sgBuiltin: "内置",
     sgUser: "我的",
+    sgNoUserHint: "还没有自己的策略 —— 内置策略要先「复制」才能改; 也可以直接新建空白。",
+    sgCopiedName: "已复制为 ",
     sgLoading: "加载中…",
     sgLoadFailed: "加载失败: ",
     sgRetry: "重试",
@@ -244,6 +249,16 @@
     sgAiCompilePrefix: "AI 草稿未通过编译,编辑器内容没有替换:",
     sgCompilePrefix: "编译未通过:",
     sgNoSummary: "—",
+    // 适用性卡片(帮助计划第 7 条): 清单里早就写好 适用/不适用 场景, 此前只在「清单编辑器」
+    // (新建/复制时)可见, 只读详情页一个字都不显示 —— 8 个内置策略只能靠名字猜。
+    // 这里把同一份数据在**只读**详情页展示出来, 数据源 = GET /api/strategies/{id} 的 manifest,
+    // 后端零改动。
+    sgDetail: "详情",
+    sgFit: "适用性",
+    sgFitSummary: "一句话说明",
+    sgFitDesc: "长说明",
+    sgFitSuitable: "适用场景",
+    sgFitUnsuitable: "不适用场景",
     sgAiNew: "+ AI 生成",
     sgAiNewTitle: "AI 生成新策略",
     sgTpl: "从模板新建",
@@ -284,6 +299,13 @@
     sgHistoryTime: "时间",
     sgHistoryWindow: "窗口",
     sgHistoryEmpty: "还没有完成的回测。",
+    // C9: 与同策略同窗口的上一次结果并排对比(仅会话内, 服务端不存归档)。
+    sgCmpTitle: "与上次对比",
+    sgCmpHint: "同一策略、同一窗口: 本次与上一次并排 —— 变化按涨红跌绿着色。",
+    sgCmpMetric: "指标",
+    sgCmpPrev: "上次",
+    sgCmpNow: "本次",
+    sgCmpDelta: "变化",
     sgZeroTradeHint:
       "本次回测零成交：常见原因是必填参数未填(如 start_price)、预热段不足或入场条件从未触发 —— 请展开下方「策略日志」查看策略自检与停机原因。",
     sgStrategyLogs: "策略日志",
@@ -321,6 +343,23 @@
     sgSweepRunning: "寻优运行中…",
     sgSweepValue: "档位",
     sgSweepEmpty: "先填写参数键与档位取值。",
+    // C8: 多维寻优(多参数笛卡尔积)。与单参数扫描并列, 但进的是另一个端点。
+    sgOpt: "多维寻优",
+    sgOptHint:
+      "沿多个参数同时扫: 每组 = 一次完整回测, 组合数上限 100。维度越多组合数涨得越快, 建议先 2 维。",
+    sgOptKey: "参数键",
+    sgOptValues: "候选值(逗号分隔, 2–10 个)",
+    sgOptAdd: "添加维度",
+    sgOptDel: "删除该维度",
+    sgOptGo: "开始寻优",
+    sgOptRunning: "寻优运行中…",
+    sgOptEmpty: "至少填一个维度: 参数键 + 候选值。",
+    sgOptMaxDims: "最多 4 个维度。",
+    sgOptProgress: "进度",
+    sgOptBest: "最优(按",
+    sgOptBestSuffix: ")",
+    sgOptSortHint: "点表头排序; 失败的行始终排在最后。",
+    sgOptErrRow: "该组失败",
     sgWarnings: "静态检查提示",
     sgApiRef: "ctx API 速查",
     sgJumpErr: "定位错误行",
@@ -333,6 +372,9 @@
     sgOpen: "Open",
     sgBuiltin: "Built-in",
     sgUser: "Mine",
+    sgNoUserHint:
+      "No strategies of your own yet — copy a built-in to modify it, or start from a blank one.",
+    sgCopiedName: "Copied as ",
     sgLoading: "Loading…",
     sgLoadFailed: "Load failed: ",
     sgRetry: "Retry",
@@ -403,6 +445,12 @@
     sgAiCompilePrefix: "AI draft failed the compile gate; the editor was not changed:",
     sgCompilePrefix: "Compile failed:",
     sgNoSummary: "—",
+    sgDetail: "Details",
+    sgFit: "Suitability",
+    sgFitSummary: "Summary",
+    sgFitDesc: "Description",
+    sgFitSuitable: "Good for",
+    sgFitUnsuitable: "Not suitable for",
     sgAiNew: "+ AI generate",
     sgAiNewTitle: "Generate strategy with AI",
     sgTpl: "New from template",
@@ -442,6 +490,14 @@
     sgHistoryTime: "Time",
     sgHistoryWindow: "Window",
     sgHistoryEmpty: "No finished backtest yet.",
+    // C9: side-by-side vs. the previous run of the same strategy + window (session-only).
+    sgCmpTitle: "Compared with last run",
+    sgCmpHint:
+      "Same strategy and window: this run side by side with the previous one — deltas follow up=red / down=green.",
+    sgCmpMetric: "Metric",
+    sgCmpPrev: "Previous",
+    sgCmpNow: "This run",
+    sgCmpDelta: "Change",
     sgZeroTradeHint:
       "No trades in this backtest: usually a missing required param (e.g. start_price), insufficient warmup, or entry conditions never met — expand Strategy logs below to see the strategy's own checks and halt reason.",
     sgStrategyLogs: "Strategy logs",
@@ -479,6 +535,23 @@
     sgSweepRunning: "Sweep running…",
     sgSweepValue: "Value",
     sgSweepEmpty: "Fill in the param key and values first.",
+    // C8: multi-param grid search (Cartesian product).
+    sgOpt: "Multi-param search",
+    sgOptHint:
+      "Sweep several params at once: each combo is a full backtest, capped at 100 combos. Combos grow fast — start with 2 dims.",
+    sgOptKey: "Param key",
+    sgOptValues: "Candidates (comma separated, 2–10)",
+    sgOptAdd: "Add dim",
+    sgOptDel: "Remove this dim",
+    sgOptGo: "Run search",
+    sgOptRunning: "Search running…",
+    sgOptEmpty: "Fill at least one dim: param key + candidates.",
+    sgOptMaxDims: "At most 4 dims.",
+    sgOptProgress: "Progress",
+    sgOptBest: "Best by ",
+    sgOptBestSuffix: "",
+    sgOptSortHint: "Click a header to sort; failed rows always sink to the bottom.",
+    sgOptErrRow: "This combo failed",
     sgWarnings: "Static check hints",
     sgApiRef: "ctx API reference",
     sgJumpErr: "Go to error line",
@@ -511,6 +584,11 @@
       // 诚实性提示(2026-10-05): 未声明参数清单 / 与内置脚本逐字相同 —— 文案由 renderDeclHint 填。
       '<div id="sg-decl-hint" class="sg-hint" hidden></div>' +
       '<div id="sg-d-loadmsg"></div>' +
+      // 适用性卡片(帮助计划第 7 条): 内容由 renderDetail → renderFit 填(数据取自 manifest);
+      // 清单没写这几栏时整卡隐藏, 不占位。
+      '<section class="sg-card sg-fit-card" id="sg-fit-card" hidden>' +
+      '<div class="sg-card-head"><span' + bi("sgFit") + ">" + R.TEXT.zh.sgFit + "</span></div>" +
+      '<div class="sg-card-body" id="sg-fit-body"></div></section>' +
       '<div class="sg-detail-grid">' +
       // 参数
       '<section class="sg-card"><div class="sg-card-head"><span' + bi("sgParams") + ">" +
@@ -603,6 +681,17 @@
       bi("sgSweepGo") + ">" + R.TEXT.zh.sgSweepGo + "</button></div>" +
       '<div id="sg-sw-msg" class="sg-msg" aria-live="polite"></div>' +
       '<div id="sg-sw-result"></div></details>' +
+      // C8 多维寻优: 维度行由 JS 动态建(可增删), 键选项与上面的单参数下拉同源。
+      '<details class="sg-advanced sg-sweep-box" id="sg-opt-box"><summary' + bi("sgOpt") + ">" +
+      R.TEXT.zh.sgOpt + "</summary>" +
+      "<div class='sg-opt-hint'" + bi("sgOptHint") + ">" + R.TEXT.zh.sgOptHint + "</div>" +
+      '<div id="sg-opt-dims"></div>' +
+      '<div class="sg-row-right"><button id="sg-opt-add" class="sg-btn sg-btn-mini" type="button"' +
+      bi("sgOptAdd") + ">" + R.TEXT.zh.sgOptAdd + "</button>" +
+      '<button id="sg-opt-go" class="sg-btn" type="button"' +
+      bi("sgOptGo") + ">" + R.TEXT.zh.sgOptGo + "</button></div>" +
+      '<div id="sg-opt-msg" class="sg-msg" aria-live="polite"></div>' +
+      '<div id="sg-opt-result"></div></details>' +
       '<div id="sg-bt-history"></div></div></section>' +
       "</div></div>" +
       // 弹窗层(新建/复制)
@@ -638,6 +727,10 @@
     $("sg-ai-go").addEventListener("click", onAiEdit);
     $("sg-bt-go").addEventListener("click", onBacktest);
     $("sg-sw-go").addEventListener("click", onSweep);
+    // C8: 维度行**不在这里铺** —— 挂载时还没读策略详情, 参数清单是空的。等详情渲染后再
+    // 按真实参数铺(syncOptDims, 见 strategy_form.js 的 renderDetail / refreshSchema)。
+    $("sg-opt-add").addEventListener("click", () => addOptDim());
+    $("sg-opt-go").addEventListener("click", onOptimize);
     $("sg-mf-add").addEventListener("click", () => {
       addManifestRow(null);
       setMsg($("sg-mf-msg"), "", "");
@@ -735,6 +828,17 @@
       sec.appendChild(box);
       body.appendChild(sec);
     }
+    // B4: 一个自己的策略都没有时补一条"下一步"。四组里「内置」那两组**永远是满的**, 光看它们
+    // 会得出"反正都有了"的错觉 —— 而用户最常卡住的恰恰是"想改内置策略, 却不知道得先复制"。
+    if (!data.some((s) => s.source === "user")) {
+      const hint = h("div", "sg-firststep");
+      hint.appendChild(h("span", "sg-firststep-t", t("sgNoUserHint")));
+      const btn = h("button", "sg-btn sg-btn-mini", t("sgNew"));
+      btn.type = "button";
+      btn.addEventListener("click", openNewModal);
+      hint.appendChild(btn);
+      body.appendChild(hint);
+    }
   }
 
   function renderRow(s) {
@@ -759,12 +863,19 @@
     );
     const act = h("div", "sg-row-actions");
     if (s.source === "builtin") {
-      // 内置: 只能复制后再改。
+      // 内置: 可看详情(适用性 + 参数 + 直接回测), 但**不能直接改** —— 改要先「复制」。
+      // 帮助计划第 7 条: 此前内置行只有「复制」一个入口, 详情页虽然后端早就支持
+      // (`#strategies/{id}`, 清单里的 description/suitable/unsuitable 都在里面), 但用户
+      // 根本走不进去 —— 列表主点击被绑成了"复制"。
+      const view = h("button", "sg-btn sg-btn-mini", t("sgDetail"));
+      view.type = "button";
+      view.addEventListener("click", () => openDetail(s.id));
+      act.appendChild(view);
       const btn = h("button", "sg-btn sg-btn-mini", t("sgCopy"));
       btn.type = "button";
       btn.addEventListener("click", () => onCopy(s).catch(strategyErr));
       act.appendChild(btn);
-      main.addEventListener("click", () => onCopy(s).catch(strategyErr));
+      main.addEventListener("click", () => openDetail(s.id));
     } else {
       // 用户: 打开详情编辑。
       const btn = h("button", "sg-btn sg-btn-mini", t("sgOpen"));
@@ -1191,6 +1302,9 @@
           },
         });
         close();
+        // B6: 这里会**从列表切到详情** —— 提示若写进列表的 msg 区, 用户刚好就看不到它。
+        // 全局 toast 挂在 body 上, 跟着用户走过这次跳转。
+        R.toast(t("sgCopiedName") + name, "ok");
         openDetail(name);
       } catch (err) {
         errLine.textContent = (err && err.message) || String(err);

@@ -19,6 +19,7 @@
     rnPollHint: "每 5 秒自动刷新;页面切到后台时暂停。",
     rnNoInstances: "暂无策略实例(到策略页保存实例配置后会出现在这里)。",
     rnNoStrategies: "还没有任何策略,先到策略页创建。",
+    rnGoStrategies: "去策略页",
     rnLoadFailed: "加载失败: ",
     rnRetry: "重试",
     rnLoading: "加载中…",
@@ -72,6 +73,7 @@
     rnPollHint: "Auto-refreshes every 5s; paused while the page is hidden.",
     rnNoInstances: "No strategy instances yet (save one in Strategies and it shows up here).",
     rnNoStrategies: "No strategies yet — create one in Strategies first.",
+    rnGoStrategies: "Go to Strategies",
     rnLoadFailed: "Load failed: ",
     rnRetry: "Retry",
     rnLoading: "Loading…",
@@ -287,8 +289,12 @@
     if (!listData || !listData.length) {
       const tr = document.createElement("tr");
       tr.className = "rn-empty";
-      const td = h("td", null, t("rnNoInstances"));
+      // B4: 空表不该只有一句"暂无实例" —— 给一个去策略页的入口(实例是在那里配的)。
+      const td = h("td", null);
       td.colSpan = NUM_COLS;
+      td.appendChild(
+        R.emptyState(t("rnNoInstances"), { label: t("rnGoStrategies"), view: "strategies" })
+      );
       tr.appendChild(td);
       tbody.appendChild(tr);
       return;
@@ -369,18 +375,9 @@
     return t("rnSrcNoneTip");
   }
 
-  /// 秒数 → 紧凑时长; null → "--"。
+  /// 秒数 → 紧凑时长; null → "--"。C11: 实现统一到 `R.fmt.dur`, 调用点不变。
   function fmtUptime(secs) {
-    if (secs === null || secs === undefined) return "--";
-    const s = Number(secs);
-    const d = Math.floor(s / 86400);
-    const hh = Math.floor((s % 86400) / 3600);
-    const mm = Math.floor((s % 3600) / 60);
-    const ss = s % 60;
-    if (d > 0) return d + "d " + hh + "h";
-    if (hh > 0) return hh + "h " + mm + "m";
-    if (mm > 0) return mm + "m " + ss + "s";
-    return ss + "s";
+    return R.fmt.dur(secs);
   }
 
   // ---------- 行内日志面板(SSE, 只读; 与对话视图各一条独立流) ----------

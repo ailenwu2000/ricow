@@ -124,7 +124,7 @@
         body: { updates: [{ section: "market", key: "show_all_pairs", value_bool: wanted }] },
       });
       if (lastData) lastData.market.show_all_pairs = wanted;
-      showMsg(t("marketSaved"), true);
+      R.toast(t("marketSaved"), "ok"); // B6: 成功走全局 toast; 失败留在原地(要贴着开关看)
     } catch (err) {
       cb.checked = !wanted;
       showMsg(t("marketFailed") + (err && err.message), false);

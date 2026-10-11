@@ -41,8 +41,23 @@
     setMsg($("sg-ai-msg"), "", "");
     setMsg($("sg-bt-msg"), "", "");
     $("sg-bt-result").innerHTML = "";
+    // 参数扫描 / 多维寻优的结果是**按当前策略的参数**算出来的 —— 换策略必须一并清掉: 详情骨架
+    // 只在 mount 时建一次, 不清就是上一份内容留在原地, A 策略的结果会挂到 B 名下(真机走查复现)。
+    setMsg($("sg-sw-msg"), "", "");
+    $("sg-sw-result").innerHTML = "";
+    $("sg-sw-values").value = "";
+    setMsg($("sg-opt-msg"), "", "");
+    $("sg-opt-result").innerHTML = "";
+    $("sg-opt-dims").innerHTML = ""; // 维度行随策略重建(键下拉取自该策略的参数清单)
+    syncOptAddBtn(); // 行数清零后「添加维度」钮回到可用
+    // 两个折叠框复位收起: 展开着的空框看着像"还在跑", 也让用户以为上一份结果还在。
+    $("sg-sweep-box").open = false;
+    $("sg-opt-box").open = false;
     $("sg-dirty").hidden = true;
     $("sg-builtin-hint").hidden = true;
+    // 适用性卡片: 装载前先清掉上一份的残留, 免得点 A 看 B 时先闪一眼旧文案。
+    $("sg-fit-card").hidden = true;
+    $("sg-fit-body").innerHTML = "";
     syncSaveBtn("idle");
     syncAiBtn(false);
     syncBtBtn(false);
@@ -95,6 +110,7 @@
     $("sg-d-name").textContent = detail.name || id;
     renderBadges(detail, source);
     renderDeclHint(detail);
+    renderFit(detail);
 
     // 内置只读提示 + 编辑/AI 控件收起(回测保留)。
     const builtin = st.detailCtx.builtin;
@@ -123,6 +139,8 @@
 
     // 参数寻优下拉(P2-7): 参数键来自清单注册表 + 实例当前值(去重)。
     fillSweepParams();
+    // C8: 多维寻优的维度行(同一份参数键; 空则铺两条)。
+    syncOptDims();
     // 编辑器高亮层(P1-4)随内容初始化。
     refreshHighlight();
     $("sg-warnlist").hidden = true;
@@ -164,6 +182,43 @@
     if (detail.duplicate_of) parts.push(t("sgDupHint") + " " + detail.duplicate_of + "。");
     box.textContent = parts.join(" ");
     box.hidden = parts.length === 0;
+  }
+
+  /// 适用性卡片(帮助计划第 7 条): 清单里的 `summary / description / suitable / unsuitable`
+  /// 此前只在「清单编辑器」可见(新建/复制时才展开), 只读详情页一个字都不显示 —— 用户面对
+  /// 8 个内置策略只能靠名字猜该选哪个。这里把同一份数据原样展示在只读详情页, **只展示不编辑**
+  /// (编辑仍在清单编辑器, 仅用户策略可用)。
+  ///
+  /// 数据源 = `GET /api/strategies/{id}` 的 manifest, 后端零改动。清单文本是**作者中文原文**
+  /// (随策略 TOML 发布), 不随界面语言翻译 —— 与列表里的 `summary` 同一口径, 不另立第二套。
+  /// 四栏全空时整卡隐藏(不给一张空壳卡)。
+  function renderFit(detail) {
+    const card = $("sg-fit-card");
+    const body = $("sg-fit-body");
+    body.innerHTML = "";
+    const rows = [];
+    if (detail.summary) rows.push({ k: "sgFitSummary", v: detail.summary });
+    if (detail.description) rows.push({ k: "sgFitDesc", v: detail.description });
+    if (detail.suitable) rows.push({ k: "sgFitSuitable", v: detail.suitable, kind: "fit-good" });
+    if (detail.unsuitable) {
+      rows.push({ k: "sgFitUnsuitable", v: detail.unsuitable, kind: "fit-bad" });
+    }
+    if (!rows.length) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    for (const r of rows) {
+      const row = h("div", "sg-fit-row" + (r.kind ? " " + r.kind : ""));
+      const label = h("span", "sg-fit-label", t(r.k));
+      // 双语走既有 data-zh/data-en 机制(applyLang 直接刷 textContent)。
+      label.setAttribute("data-zh", R.TEXT.zh[r.k]);
+      label.setAttribute("data-en", R.TEXT.en[r.k]);
+      // 服务端文本一律 textContent(见 h()); description 里的换行由 CSS `pre-wrap` 呈现。
+      row.appendChild(label);
+      row.appendChild(h("div", "sg-fit-value", r.v));
+      body.appendChild(row);
+    }
   }
 
   // ---------- 参数表单 ----------
@@ -474,6 +529,7 @@
     $("sg-pair").value = detail.pair || $("sg-pair").value || DEFAULT_PAIR;
     renderManifestEditor(detail);
     fillSweepParams();
+    fillOptDims();
   }
 
   /// 寻优参数下拉: 键来自当前参数表单(清单 + 实例值), 去重。
@@ -482,16 +538,133 @@
     if (!sel) return;
     const prev = sel.value;
     sel.innerHTML = "";
+    for (const key of paramKeys()) {
+      const o = document.createElement("option");
+      o.value = key;
+      o.textContent = key;
+      sel.appendChild(o);
+    }
+    if (prev && paramKeys().includes(prev)) sel.value = prev;
+  }
+
+  // ---------- C8 多维寻优: 维度行 ----------
+
+  /// 维度上限 —— **必须与后端 `web::backtest_jobs::MAX_OPTIMIZE_DIMS` 一致**(4)。
+  /// 后端那道是权威(超了会 400); 这道只是提前把按钮按掉, 免得用户填完 5 行才被拒。
+  const OPT_MAX_DIMS = 4;
+
+  /// 参数键列表(清单 + 实例值, 去重)。单参数下拉与多维寻优的维度行**共用这一份** ——
+  /// 否则两处会各自列表, 加了个参数只在一处出现。
+  function paramKeys() {
     const seen = new Set();
+    const out = [];
     for (const p of st.paramInputs) {
       if (seen.has(p.key)) continue;
       seen.add(p.key);
+      out.push(p.key);
+    }
+    return out;
+  }
+
+  /// 选中项优先保留(重刷时别把用户刚选的键弹掉), 找不到才退回第一项。
+  function fillSelect(sel, keys) {
+    const prev = sel.value;
+    sel.textContent = "";
+    for (const key of keys) {
       const o = document.createElement("option");
-      o.value = p.key;
-      o.textContent = p.key;
+      o.value = key;
+      o.textContent = key;
       sel.appendChild(o);
     }
-    if (prev && seen.has(prev)) sel.value = prev;
+    if (prev && keys.includes(prev)) sel.value = prev;
+  }
+
+  /// 重刷所有维度行的键下拉(参数清单变了之后调用, 与 `fillSweepParams` 同时机)。
+  function fillOptDims() {
+    const box = $("sg-opt-dims");
+    if (!box) return;
+    const keys = paramKeys();
+    for (const sel of box.querySelectorAll(".sg-opt-key")) fillSelect(sel, keys);
+  }
+
+  /// 详情渲染后调用: 一条维度行都没有就先铺两条(默认就是"两个参数比一比"的场景),
+  /// 然后刷新所有键下拉。**不放在 mount 里** —— 那时策略详情还没读, 参数清单是空的。
+  function syncOptDims() {
+    const box = $("sg-opt-dims");
+    if (!box) return;
+    if (!box.querySelectorAll(".sg-opt-dim").length && paramKeys().length) {
+      addOptDim();
+      addOptDim();
+    }
+    fillOptDims();
+  }
+
+  /// 维度行满了就把「添加维度」按掉 —— 按钮禁用比点了报错更早一步。
+  function syncOptAddBtn() {
+    const box = $("sg-opt-dims");
+    const btn = $("sg-opt-add");
+    if (!box || !btn) return;
+    btn.disabled = box.querySelectorAll(".sg-opt-dim").length >= OPT_MAX_DIMS;
+  }
+
+  /// 新增一条维度行: 键下拉 + 候选值输入 + 删除。空装置(没有任何参数)时给一条提示, 不静默加空行。
+  function addOptDim() {
+    const box = $("sg-opt-dims");
+    if (!box) return;
+    if (box.querySelectorAll(".sg-opt-dim").length >= OPT_MAX_DIMS) {
+      setMsg($("sg-opt-msg"), t("sgOptMaxDims"), "err");
+      return;
+    }
+    const keys = paramKeys();
+    if (!keys.length) {
+      setMsg($("sg-opt-msg"), t("sgSweepEmpty"), "err");
+      return;
+    }
+    const row = h("div", "sg-opt-dim");
+    const sel = h("select", "sg-input sg-opt-key");
+    fillSelect(sel, keys);
+    row.appendChild(sel);
+    const vals = h("input", "sg-input sg-opt-values");
+    // 输入框的 `type` 用 setAttribute 设(直接属性赋值会被前端纪律扫描当成 `<textarea>.type=`)。
+    vals.setAttribute("type", "text");
+    vals.setAttribute("autocomplete", "off");
+    vals.setAttribute("data-zh-placeholder", R.TEXT.zh.sgOptValues);
+    vals.setAttribute("data-en-placeholder", R.TEXT.en.sgOptValues);
+    vals.placeholder = t("sgOptValues");
+    row.appendChild(vals);
+    const del = h("button", "sg-btn sg-btn-mini sg-opt-del", t("sgOptDel"));
+    del.type = "button";
+    del.setAttribute("data-zh", R.TEXT.zh.sgOptDel);
+    del.setAttribute("data-en", R.TEXT.en.sgOptDel);
+    del.addEventListener("click", () => {
+      row.remove();
+      syncOptAddBtn();
+    });
+    row.appendChild(del);
+    box.appendChild(row);
+    syncOptAddBtn();
+  }
+
+  /// 读回维度行 → 请求体的 `params` 数组。空键/空值当场报错(别把一个空维度发上去等后端拒)。
+  /// 值按"像数字就当数字"解析 —— 与单参数扫描同一手感(后端按策略清单的声明类型兜底)。
+  function readOptDims() {
+    const box = $("sg-opt-dims");
+    const out = [];
+    if (!box) return out;
+    for (const row of box.querySelectorAll(".sg-opt-dim")) {
+      const key = row.querySelector(".sg-opt-key").value.trim();
+      const raw = row.querySelector(".sg-opt-values").value.trim();
+      if (!key || !raw) return null;
+      out.push({
+        key: key,
+        values: raw
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map((s) => (Number.isFinite(Number(s)) && s !== "" ? Number(s) : s)),
+      });
+    }
+    return out;
   }
 
   // ---------- 对外(外壳与其它子文件调用) ----------
@@ -503,4 +676,9 @@
   S.addManifestRow = addManifestRow;
   S.onSaveManifest = onSaveManifest;
   S.gatherParams = gatherParams;
+  // C8: 维度行的建 / 刷 / 读 —— 外壳 mount 用 addOptDim, 回测子文件用 readOptDims。
+  S.addOptDim = addOptDim;
+  S.fillOptDims = fillOptDims;
+  S.syncOptDims = syncOptDims;
+  S.readOptDims = readOptDims;
 })();

@@ -12,7 +12,10 @@ use ricow_strategy::ConfigValue;
 use crate::commands::backtest::{parse_param, BacktestArgs, BacktestRunSpec};
 
 /// 单组合组合数护栏: 每组 = 一次全窗口回测, 超 100 组拒绝 (提示收窄网格)。
-const MAX_COMBOS: usize = 100;
+///
+/// C8: Web 的多维寻优端点**复用这一个常量**(`web::backtest_jobs`), 不另设一份 ——
+/// 否则"CLI 拒 101 组、网页放行 101 组"这种口径分叉迟早发生。
+pub(crate) const MAX_COMBOS: usize = 100;
 
 #[derive(Args)]
 pub struct OptimizeArgs {

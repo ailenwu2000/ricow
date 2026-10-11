@@ -63,6 +63,8 @@
       required: "必填",
       suitable: "适合: ",
       unsuitable: "不适合: ",
+      emptySessions: "还没有会话 —— 用大白话问我任何事就行, 不必记命令。",
+      goStrategies: "去策略页",
     },
     en: {
       thinking: "thinking…",
@@ -102,6 +104,8 @@
       required: "required",
       suitable: "Fits: ",
       unsuitable: "Unfits: ",
+      emptySessions: "No sessions yet — just ask me anything in plain language; no commands to memorise.",
+      goStrategies: "Go to Strategies",
     },
   };
 
@@ -230,35 +234,357 @@
     for (const node of document.querySelectorAll("[data-zh-placeholder]")) {
       node.placeholder = node.dataset[suffix + "Placeholder"];
     }
+    // 解释浮层开着就地换语言, 不必关掉重开(它是全局单例, 见下面的 R.glossary)。
+    if (R.glossary) R.glossary.refresh();
   };
 
   // ---------- 纯工具 ----------
 
-  // ---------- 主题(034) ----------
-  // 当前主题: 单一来源在 `ricow.toml` 的 `[ui].theme`(由 chat.js 的 boot 写入)。
-  // CSS 侧 `:root` = 深色兜底, `[data-theme="light"]` / `[data-theme="red"]` 各覆盖一份变量;
-  // 切换即换 `<html data-theme>`, 全站组件跟着变量走, 无需逐个重渲染。
-  R.theme = "dark";
+  // ---------- 主题(034 / D14) ----------
+  // 两个概念要分清, 混起来就会出现"选了跟随系统, 关掉页面再打开又变回深色":
+  //   · `R.theme` = **偏好**(落盘在 `ricow.toml` 的 `[ui].theme`): dark / light / red / **auto**;
+  //   · `<html data-theme>` = **实际生效的配色**: dark / light / red —— `auto` 在这里按系统的
+  //     `prefers-color-scheme` 解成 dark 或 light。
+  //
+  // 为什么不给 `auto` 单独写一份 CSS 变量: 那等于把浅色那套维护两遍, 系统一换色两边迟早分叉。
+  // 解成既有值之后, CSS 侧**一行都不用动**(`:root` 深色 + light / red 两个覆盖块照旧)。
+  const prefersLight =
+    window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
+
+  /// 偏好 → 实际生效的配色。
+  function resolveTheme(pref) {
+    if (pref === "light" || pref === "red") return pref;
+    if (pref === "auto") return prefersLight && prefersLight.matches ? "light" : "dark";
+    return "dark";
+  }
+
+  R.theme = "dark"; // 偏好(单一来源: ricow.toml 的 [ui].theme)
 
   R.applyTheme = function (theme) {
-    R.theme = theme === "light" || theme === "red" ? theme : "dark";
-    document.documentElement.dataset.theme = R.theme;
+    R.theme = theme === "light" || theme === "red" || theme === "auto" ? theme : "dark";
+    const applied = resolveTheme(R.theme);
+    document.documentElement.dataset.theme = applied;
     const sel = document.getElementById("theme-select");
-    if (sel) sel.value = R.theme;
-    // 广播给关心外观的模块(如 markets.js 的 K 线图要按新变量重取配色)。
-    window.dispatchEvent(new CustomEvent("ricow:theme", { detail: R.theme }));
+    if (sel) sel.value = R.theme; // 控件显示**偏好**(选了"跟随系统"就一直显示它)
+    // 广播给关心外观的模块(如 markets.js 的 K 线图要按新变量重取配色); 传的是**实际配色**,
+    // 因为消费者读的是 CSS 变量。
+    window.dispatchEvent(new CustomEvent("ricow:theme", { detail: applied }));
   };
 
-  /// 秒级时间戳(会话列表的 `updated_at`)→ 展示串。交易端点的毫秒级时间戳不用这个,
-  /// 由对话视图自己的 `formatStamp` 处理(口径不同, 不能合并)。
-  R.formatTime = function (ts) {
-    if (!ts) return "";
-    const locale = R.lang === "en" ? "en-US" : "zh-CN";
-    return new Date(ts * 1000).toLocaleString(locale, {
+  // 系统深/浅色变了: 只有"跟随系统"这一档需要重画(另外三档与此无关)。
+  if (prefersLight) {
+    const onScheme = () => {
+      if (R.theme === "auto") R.applyTheme("auto");
+    };
+    if (prefersLight.addEventListener) prefersLight.addEventListener("change", onScheme);
+    else if (prefersLight.addListener) prefersLight.addListener(onScheme); // 老引擎
+  }
+
+  // ---------- 格式化: 全站唯一出口 (C11) ----------
+  //
+  // 原本 `formatNum`(市场盘口) / `fmtPct`·`fmtNum`·`fmtMs`(回测) / `formatStamp`(对话) /
+  // `R.formatTime`(会话列表) 各写一份, 口径分歧只靠"记得别用错那个"来维持 —— 迟早出错。
+  // 现在统一到这里: **差异用不同方法表达**(num / signed / pct / time / timeSec), 而不是
+  // 让每个调用点各写一遍。各视图的局部函数(若有)一律改成委托, 调用点不变。
+  //
+  // 两条口径**故意不合并**(合并就会把一种场景显示错):
+  //   · `timeSec`(秒级, 会话列表) 缺值 → `""`(列表项不显示时间); `time`(毫秒, 交易明细)
+  //     缺值 → `"—"`(表格里空着会被当成数据缺失)。
+  //   · 金融数字一律用**点**作小数点, 不引千分位 —— 表格按位对齐比好看更要紧。
+  R.fmt = (function () {
+    const locale = () => (R.lang === "en" ? "en-US" : "zh-CN");
+    const stampOpts = { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" };
+    const stampOptsSec = {
       month: "numeric",
       day: "numeric",
       hour: "2-digit",
       minute: "2-digit",
-    });
+      second: "2-digit",
+    };
+    return {
+      /// 无符号数字: 按 `digits` 位截断再去尾零(`0.30000000000000004` → `0.3`)。
+      /// 缺值 / 非有限 → `—`(绝不把 NaN / Infinity 显示出去)。
+      num: function (v, digits) {
+        const n = Number(v);
+        if (v == null || !Number.isFinite(n)) return "—";
+        const d = typeof digits === "number" ? digits : 8;
+        return String(Number(n.toFixed(d)));
+      },
+      /// 带符号数字(盈亏类): 正数补 `+`; 位数随量级(≥100 两位 / ≥1 四位 / 其余六位)。
+      signed: function (v) {
+        if (v == null || !Number.isFinite(v)) return "—";
+        const abs = Math.abs(v);
+        const digits = abs >= 100 ? 2 : abs >= 1 ? 4 : 6;
+        return (v > 0 ? "+" : "") + v.toFixed(digits).replace(/\.?0+$/, "");
+      },
+      /// 百分比(收益率类): 带符号 + 两位小数 + `%`。
+      pct: function (v) {
+        if (v == null || !Number.isFinite(v)) return "—";
+        return (v > 0 ? "+" : "") + v.toFixed(2) + "%";
+      },
+      /// 秒数 → 紧凑时长(`3d 4h` / `2h 5m` / `7m 12s` / `42s`)。缺值 → `--`。
+      dur: function (secs) {
+        if (secs === null || secs === undefined) return "--";
+        const s = Number(secs);
+        if (!Number.isFinite(s)) return "--";
+        const d = Math.floor(s / 86400);
+        const hh = Math.floor((s % 86400) / 3600);
+        const mm = Math.floor((s % 3600) / 60);
+        const ss = s % 60;
+        if (d > 0) return d + "d " + hh + "h";
+        if (hh > 0) return hh + "h " + mm + "m";
+        if (mm > 0) return mm + "m " + ss + "s";
+        return ss + "s";
+      },
+      /// 毫秒时间戳 → 本地化展示串(交易明细 / 平仓明细)。非有限 → `—`。
+      /// `withSeconds` 为真时多给秒 —— 对话里的成交 / 挂单时间戳要按秒区分先后。
+      time: function (ms, withSeconds) {
+        if (!Number.isFinite(ms)) return "—";
+        return new Date(ms).toLocaleString(locale(), withSeconds ? stampOptsSec : stampOpts);
+      },
+      /// 秒级时间戳 → 本地化展示串(会话列表的 `updated_at`)。缺值 → `""`。
+      timeSec: function (ts) {
+        if (!ts) return "";
+        return new Date(ts * 1000).toLocaleString(locale(), stampOpts);
+      },
+    };
+  })();
+
+  /// 兼容既有调用: `R.formatTime` 就是秒级口径(C11 起由 `R.fmt.timeSec` 提供)。
+  R.formatTime = function (ts) {
+    return R.fmt.timeSec(ts);
   };
+
+  // ---------- 空状态 ----------
+  //
+  // B4: 空状态最容易做成的样子是一行灰字("无策略" / "—" / "无"), 用户看完还是不知道该干嘛。
+  // 统一收在这里: 一句说明 + 一个「下一步」按钮。
+  //
+  // 按钮只做**导航 / 打开已有入口**, 绝不替用户写入(与"写动作必须本人确认"同一姿态);
+  // 没有 `cta` 时**原样返回一个 `.empty` 灰字块** —— 调用点不必为"有没有下一步"分两套代码。
+  R.emptyState = function (text, cta) {
+    const note = document.createElement("div");
+    note.className = "empty";
+    note.textContent = text;
+    if (!cta || !cta.label) return note;
+    const box = document.createElement("div");
+    box.className = "empty-cta";
+    box.appendChild(note);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "empty-cta-btn";
+    btn.textContent = cta.label;
+    btn.addEventListener("click", () => {
+      if (cta.onClick) cta.onClick();
+      else if (cta.view) R.navigate(cta.view);
+    });
+    box.appendChild(btn);
+    return box;
+  };
+
+  // ---------- 全局通知(toast) ----------
+  //
+  // B6: 各视图原先各自把提示写进自己的 msg 区 —— 一旦**跨视图**(复制完自动打开详情、
+  // 保存完回列表), 提示就随旧 DOM 一起没了, 用户会以为"是不是没保存上"。这里给一个挂在
+  // `document.body` 上的**单一出口**: 切视图 / 重渲染都不影响它。
+  //
+  // 只用于**成功 / 中性**一路; 错误留在原地(msg 区)显示 —— 错误是"这一屏此刻的状态",
+  // 需要贴着出错的控件看, 飘到右下角反而不对。
+  // `aria-live="polite"` 保住可访问性; 点一下即收, 到点自动收。
+  let toastHost = null;
+  const TOAST_MS = 4000;
+
+  R.toast = function (msg, kind) {
+    if (!msg) return;
+    if (!toastHost) {
+      toastHost = document.createElement("div");
+      toastHost.className = "toast-host";
+      toastHost.setAttribute("role", "status");
+      toastHost.setAttribute("aria-live", "polite");
+      document.body.appendChild(toastHost);
+    }
+    const item = document.createElement("div");
+    item.className = "toast toast-" + (kind || "info");
+    item.textContent = msg; // 服务端文本只走 textContent(与全站同一条红线)
+    item.addEventListener("click", () => item.remove());
+    toastHost.appendChild(item);
+    setTimeout(() => item.remove(), TOAST_MS);
+  };
+
+  // ---------- 术语表: 全局单例 ----------
+  //
+  // 术语解释**只有一份来源**: `GET /api/terms`(后端 `web/terms.rs`)。此前只有对话视图取它,
+  // 也只把解释挂在自己的气泡上 —— 同一个「最大回撤」在回测指标卡上就点不了。取数 / 索引 /
+  // 解释浮层都收在这里, 各视图一律 `R.glossary.decorate(root)` 挂载, 前端**不另立第二份定义**:
+  // 匹配用的就是术语表自己的 key(与后端报告指标名逐字同源), 所以只有**真在术语表里的名字**
+  // 会变成可点词条, 其余文本一字不动。
+  //
+  // 安全: 服务端文本只走 `textContent`; 无内联事件; 不碰浏览器存储。
+  R.glossary = (function () {
+    const index = new Map(); // key → {key, zh, en}
+    let re = null; // 全部 key 拼成的匹配式(长名优先)
+    let pending = null; // 取数中的 promise(并发调用共用一次请求)
+    let pop = null; // 解释浮层(单例, 首次用到才建)
+    let current = null; // 浮层当前显示的 key
+
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    /// 取一次并建索引(`/api/terms` 已把中英两份一起给全, 切语言不重取)。失败不粘住, 可重试。
+    function load() {
+      if (pending) return pending;
+      pending = R.api("/api/terms").then((rows) => {
+        const keys = [];
+        for (const term of rows) {
+          index.set(term.key, term);
+          keys.push(term.key);
+        }
+        // 长名优先: `手续费占比` 不该被 `手续费` 从中间截断。
+        keys.sort((a, b) => b.length - a.length);
+        re = keys.length ? new RegExp(keys.map(escapeRe).join("|"), "g") : null;
+        return rows;
+      });
+      pending.catch(() => {
+        pending = null;
+      });
+      return pending;
+    }
+
+    const has = (key) => index.has(key);
+    const all = () => Array.from(index.values()); // 保持服务端顺序
+    const text = (key) => {
+      const term = index.get(key);
+      return term ? (R.lang === "en" ? term.en : term.zh) : "";
+    };
+
+    /// 术语按钮: 词条名 + 点击开解释。`class="term"` 既是既有样式, 也是"已装饰"的标记。
+    function button(key) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "term";
+      btn.textContent = key;
+      btn.title = R.t("termHint");
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation(); // 点术语是"看解释", 不该顺带触发展开 / 跳转
+        open(key, btn);
+      });
+      return btn;
+    }
+
+    function ensurePop() {
+      if (pop) return pop;
+      pop = document.createElement("div");
+      pop.className = "term-pop";
+      pop.hidden = true;
+      document.body.appendChild(pop);
+      // 关闭手势: 点浮层外 / Esc / 改窗宽 / 任何滚动(滚动后位置不再贴合)。
+      // 捕获阶段听滚动 —— 元素上的 scroll 不冒泡, 但捕获阶段仍会经过 window, 故一个监听覆盖全站。
+      document.addEventListener("click", (ev) => {
+        if (pop.contains(ev.target)) return; // 浮层内的点击(选文字)不该关掉它
+        close();
+      });
+      document.addEventListener("keydown", (ev) => {
+        if (ev.key === "Escape") close();
+      });
+      window.addEventListener("resize", close);
+      window.addEventListener("scroll", close, { capture: true, passive: true });
+      return pop;
+    }
+
+    function render() {
+      const term = index.get(current);
+      if (!term) return;
+      pop.textContent = "";
+      const name = document.createElement("div");
+      name.className = "term-name";
+      name.textContent = term.key;
+      const body = document.createElement("div");
+      body.className = "term-body";
+      body.textContent = R.lang === "en" ? term.en : term.zh;
+      const hint = document.createElement("div");
+      hint.className = "term-hint";
+      hint.textContent = R.t("termClose");
+      pop.appendChild(name);
+      pop.appendChild(body);
+      pop.appendChild(hint);
+    }
+
+    /// 贴在词条下方; 下方放不下就翻到上方, 并夹在视口内。
+    function place(anchor) {
+      const rect = anchor.getBoundingClientRect();
+      let left = Math.min(rect.left, window.innerWidth - pop.offsetWidth - 8);
+      left = Math.max(8, left);
+      let top = rect.bottom + 6;
+      if (top + pop.offsetHeight > window.innerHeight - 8) {
+        top = Math.max(8, rect.top - pop.offsetHeight - 6);
+      }
+      pop.style.left = left + "px";
+      pop.style.top = top + "px";
+    }
+
+    function open(key, anchor) {
+      if (!index.has(key)) return;
+      current = key;
+      ensurePop();
+      render();
+      pop.hidden = false;
+      place(anchor);
+    }
+
+    function close() {
+      if (!pop || pop.hidden) return;
+      pop.hidden = true;
+      current = null;
+    }
+
+    /// 浮层开着时按新语言重画(`R.applyLang` 会调)。
+    function refresh() {
+      if (pop && !pop.hidden) render();
+    }
+
+    /// 把 root 里出现的术语包成可点词条。
+    ///
+    /// 默认**跳过 `pre` / `code`**: AI 气泡里的代码块是标识符或字面量, 挂术语会误导(044)。
+    /// 但回测的"完整文本报告"整体在 `<pre>` 里 —— 那是**报告**不是代码, 故视图可显式
+    /// `decorate(pre, { allowPre: true })` 打开。
+    ///
+    /// 术语表还没取到时先记下, 取回后若这块 DOM 仍在文档里就补一次(视图换掉就不补)。
+    function decorate(root, opts) {
+      if (!root) return;
+      if (!re) {
+        load()
+          .then(() => {
+            if (root.isConnected) decorate(root, opts);
+          })
+          .catch(() => {});
+        return;
+      }
+      const skip = opts && opts.allowPre ? "code" : "pre, code";
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      for (const node of nodes) {
+        const parent = node.parentElement;
+        if (!parent) continue;
+        if (parent.classList.contains("term") || parent.closest(skip)) continue;
+        const raw = node.nodeValue;
+        re.lastIndex = 0;
+        let matched = re.exec(raw);
+        if (!matched) continue;
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        while (matched) {
+          if (matched.index > last) {
+            frag.appendChild(document.createTextNode(raw.slice(last, matched.index)));
+          }
+          frag.appendChild(button(matched[0]));
+          last = matched.index + matched[0].length;
+          matched = re.exec(raw);
+        }
+        if (last < raw.length) frag.appendChild(document.createTextNode(raw.slice(last)));
+        node.parentNode.replaceChild(frag, node);
+      }
+    }
+
+    return { load, has, all, text, button, decorate, close, refresh };
+  })();
 })();

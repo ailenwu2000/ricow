@@ -298,6 +298,8 @@ pub fn router(state: WebState) -> Router {
         // 回测异步作业 (032 US3 / FR-019): POST 202 拿 job_id 后台跑 CLI 同一内核, GET 轮询结果。
         // 参数寻优 (P2-7): 单参数网格扫描, 作业生命周期与轮询端点复用。
         .route("/api/backtest/sweep", axum::routing::post(backtest_jobs::start_sweep))
+        // 多维参数寻优 (C8): 多参数笛卡尔积, 复用 CLI `ricow optimize` 的展开与护栏, 运行中报进度。
+        .route("/api/backtest/optimize", axum::routing::post(backtest_jobs::start_optimize))
         .route("/api/backtest", axum::routing::post(backtest_jobs::start_backtest))
         .route("/api/backtest/{job_id}", get(backtest_jobs::get_backtest))
         // 交易面板数据(026 FR-010 / FR-012): 全部**只读**, 数据来自与引擎同一份本地库(D1)。

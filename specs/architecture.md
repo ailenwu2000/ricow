@@ -126,10 +126,12 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 **UI 主题 + 现代字体 + 历史消息折叠(034, 2026-10-03)**: 纯前端 + 一个只读配置项, 无新表、无新确认渠道。
 
-- **主题三选一**: 顶栏(语言钮旁) `#theme-select` 下拉, `dark`(默认)/`light`(白色)/`red`(红色);
+- **主题四选一**: 顶栏(语言钮旁) `#theme-select` 下拉, `dark`(默认)/`light`(白色)/`red`(红色)/`auto`(跟随系统, D14);
   值存 `ricow.toml` 的 `[ui].theme`(`UiSection.theme`, 白名单 `UI_KEYS`/`WRITABLE` 各加一项, 非法值硬失败),
   新端点 `GET/POST /api/theme`(镜像 `/api/lang`, 但**不**给会话线程送控制行 —— 纯外观);
   `common.js` 的 `R.applyTheme` 切 `<html data-theme>` 并广播 `ricow:theme` 事件。
+  `auto` 存的是**偏好**, 实际生效的 `data-theme` 由 `matchMedia("(prefers-color-scheme: light)")` 解出
+  —— 故 CSS 侧仍是三份变量, 系统换色时只重解一次, 不新增第四份配色。
 - **CSS 全面变量化**: `:root` = 深色兜底, `[data-theme="light"]` / `[data-theme="red"]` 各覆盖一份变量;
   034 收敛了此前写死的 20 处颜色(`#1d232b`×16 / `#06231b`×4 / 7 处 rgba)为新变量
   `--raised / --on-accent / --accent-soft(-2) / --danger-border / --overlay / --raise-1/2`,

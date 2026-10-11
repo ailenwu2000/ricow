@@ -24,6 +24,7 @@
     mkToggleFailed: "视野切换失败: ",
     mkRetry: "重试",
     mkEmpty: "无",
+    mkEmptySymbols: "当前视野里没有交易对。",
     mkBack: "‹ 返回市场",
     mkLastPrice: "现价(买卖盘中间价)",
     mkNoBook: "暂无盘口",
@@ -58,6 +59,7 @@
     mkToggleFailed: "Failed to switch view: ",
     mkRetry: "Retry",
     mkEmpty: "None",
+    mkEmptySymbols: "No pairs in the current view.",
     mkBack: "‹ Back to markets",
     mkLastPrice: "Last price (order-book mid)",
     mkNoBook: "Order book unavailable",
@@ -275,7 +277,19 @@
     sec.appendChild(head);
     const rows = h("div", "mk-symrows");
     if (!symbols.length) {
-      rows.appendChild(h("div", "mk-empty", t("mkEmpty")));
+      // B4: "无" 太干 —— 视野里没东西时, 下一步就是"看全部交易对"(与顶部开关同一动作)。
+      rows.appendChild(
+        R.emptyState(t("mkEmptySymbols"), {
+          label: t("mkShowAll"),
+          onClick: () => {
+            const cb = $("mk-show-all");
+            if (cb && !cb.checked) {
+              cb.checked = true;
+              onToggleShowAll();
+            }
+          },
+        })
+      );
     } else {
       for (const symbol of symbols) {
         const row = h("button", "mk-row", symbol);
@@ -430,6 +444,10 @@
     }
   }
 
+  /// 单侧盘口表(bids / asks)。C10: 每行按**累计量**铺一条深度条 —— 一眼看出哪一档堆得多。
+  /// 条宽 = 从最优价累加到该档的量 / 本侧前 20 档总量(两侧各自归一化, 否则薄的一侧全是细线)。
+  /// 颜色走 CSS 变量(买 `--error` 红 / 卖 `--accent` 绿 —— 国内行情惯例, 也与全站"红 = 多头
+  /// 力量"自洽); JS 只负责算出 `--depth-w`, 具体颜色与过渡交给样式表。
   function bookTable(titleText, levels, cls) {
     const wrap = h("div", "mk-book-col " + cls);
     wrap.appendChild(h("div", "mk-book-subhead", titleText));
@@ -448,8 +466,15 @@
       tr.appendChild(td);
       tbody.appendChild(tr);
     } else {
-      for (const lv of levels.slice(0, 20)) {
-        const tr = h("tr");
+      const shown = levels.slice(0, 20);
+      let total = 0;
+      for (const lv of shown) total += Number(lv.size) || 0;
+      let cum = 0;
+      for (const lv of shown) {
+        cum += Number(lv.size) || 0;
+        const tr = h("tr", "mk-book-row");
+        const ratio = total > 0 ? Math.min(1, cum / total) : 0;
+        tr.style.setProperty("--depth-w", (ratio * 100).toFixed(2) + "%");
         tr.appendChild(h("td", "num", lv.price));
         tr.appendChild(h("td", "num", lv.size));
         tbody.appendChild(tr);
@@ -874,9 +899,10 @@
   }
 
   /// 数值展示规整: 截掉浮点尾差与多余尾零(仅用于现价均值 / 图表坐标, 盘口价仍显原始字符串)。
+  /// C11: 实现统一到 `R.fmt.num`; 缺值在这里给 `"--"`(盘口的占位符, 与表格的 `"—"` 有别)。
   function formatNum(v) {
     if (!Number.isFinite(v)) return "--";
-    return String(Number(v.toFixed(8)));
+    return R.fmt.num(v);
   }
 
   // 切语言时动态文本(视野标注)立即换; 其余静态标签由公共 applyLang 的 data-zh/data-en 覆盖。

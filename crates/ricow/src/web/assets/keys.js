@@ -39,6 +39,8 @@
     keysLblAlias: "别名",
     keysPhAlias: "如「工作号 DeepSeek」「备用 Kimi」",
     keysLblProvider: "服务商 (provider)",
+    keysLblModel: "模型 (model)",
+    keysLblBaseUrl: "接入地址 (base_url)",
     keysLblEnv: "环境",
     keysEnvLive: "实盘主网 (live)",
     keysEnvDemo: "测试网 demo",
@@ -104,6 +106,8 @@
     keysLblAlias: "Alias",
     keysPhAlias: "e.g. Work DeepSeek, Backup Kimi",
     keysLblProvider: "Provider",
+    keysLblModel: "Model",
+    keysLblBaseUrl: "Base URL",
     keysLblEnv: "Environment",
     keysEnvLive: "Mainnet (live)",
     keysEnvDemo: "Testnet demo",
@@ -528,12 +532,13 @@
   }
 
   /// 统一的"发请求 → 刷新 → 报结果"收尾; 失败时错误文案照实显示。
+  /// 成功一路走**全局 toast**(B6): 提示挂在 body 上, 离开密钥页也还在。
   async function run(req, okText, failPrefix) {
     busy = true;
     try {
       await req();
       await refresh();
-      showMsg(okText, true);
+      R.toast(okText, "ok");
     } catch (err) {
       showMsg(failPrefix + (err && err.message), false);
     } finally {
@@ -570,7 +575,7 @@
         sel.ai = alias;
         draft.ai = false;
         await refresh();
-        showMsg(t("keysSaved"), true);
+        R.toast(t("keysSaved"), "ok");
       } catch (err) {
         showMsg(t("keysSaveFailed") + (err && err.message), false);
       } finally {
@@ -598,7 +603,7 @@
       sel.exchange = alias;
       draft.exchange = false;
       await refresh();
-      showMsg(t("keysSaved"), true);
+      R.toast(t("keysSaved"), "ok");
     } catch (err) {
       showMsg(t("keysSaveFailed") + (err && err.message), false);
     } finally {

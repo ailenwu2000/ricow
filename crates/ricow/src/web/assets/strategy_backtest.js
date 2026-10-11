@@ -108,11 +108,14 @@
   }
 
   /// 1s 轮询; 离开视图 / 切策略由 deactivate 或代际令牌停表, 绝不在旧视图上改 DOM。
-  /// `strategy` 可以是策略 id(普通回测)或 id + "#sweep"(寻优作业, P2-7)。
+  /// `strategy` 可以是策略 id(普通回测)或 id + 后缀(寻优作业: `#sweep` 单参数 / `#opt` 多维)。
   function startPolling(strategy, jobId, g) {
     if (st.pollTimer) clearInterval(st.pollTimer);
     const stillHere = () =>
-      !!st.detailCtx && (st.detailCtx.id === strategy || strategy === st.detailCtx.id + "#sweep");
+      !!st.detailCtx &&
+      (strategy === st.detailCtx.id ||
+        strategy === st.detailCtx.id + "#sweep" ||
+        strategy === st.detailCtx.id + "#opt");
     const tick = async () => {
       let info;
       try {
@@ -143,6 +146,8 @@
       job.chart = info.chart || null;
       job.logs = info.logs || null;
       job.error = info.error || null;
+      // C8: 多维寻优才有 progress(`{done,total}`); 其余作业该字段不出现 → 保持 null。
+      job.progress = info.progress || null;
       renderJob(job);
       if (info.status !== "running" && st.pollTimer) clearInterval(st.pollTimer);
     };
@@ -152,13 +157,17 @@
   }
 
   /// 三态渲染: running 转圈 / done 指标卡+权益曲线+可折叠文本报告 / error 原因+重试。
-  /// 寻优作业(kind==="sweep")另走对比表渲染。
+  /// 寻优作业另走对比表渲染 (`kind==="sweep"` 单参数 / `"optimize"` 多维)。
   function renderJob(job) {
     const box = $("sg-bt-result");
     destroyBtChart();
     box.innerHTML = "";
     if (job.kind === "sweep") {
       renderSweepResult(job);
+      return;
+    }
+    if (job.kind === "optimize") {
+      renderOptimizeResult(job);
       return;
     }
     if (job.status === "running") {
@@ -172,8 +181,11 @@
       box.appendChild(h("div", "sg-job-head sg-ok", t("sgBtDone")));
       const m = job.metrics;
       if (m) {
+        const label = job.strategyLabel || (st.detailCtx && st.detailCtx.id) || "";
         renderMetricCards(box, m);
-        pushHistory(m, job.strategyLabel || (st.detailCtx && st.detailCtx.id) || "");
+        // C9: 与"同策略同窗口"的上一次结果并排(会话内); 首次跑时不出现。
+        renderCompare(box, m, label);
+        pushHistory(m, label);
         // 零成交不是"策略不好", 多为配置/条件问题 —— 明说, 不让用户对着平线猜。
         if ((m.total_trades ?? 0) === 0) {
           box.appendChild(h("div", "sg-hint", t("sgZeroTradeHint")));
@@ -195,6 +207,10 @@
       det.appendChild(sum);
       const pre = h("pre", "sg-report");
       pre.textContent = job.report || "";
+      // A2: 完整报告里的每一个指标名都可点出解释 —— 这份报告与 CLI 逐字同源, 术语表的
+      // key 就是照它的指标名建的, 命中率最高。**要显式 allowPre**: 默认跳过 `<pre>`
+      // 是为了不把 AI 气泡里的代码块当术语(那是标识符), 而这里装的是报告不是代码。
+      R.glossary.decorate(pre, { allowPre: true });
       det.appendChild(pre);
       box.appendChild(det);
       // 回测闭环(P0-3): 一键把结论带给 AI 修改卡。
@@ -260,11 +276,15 @@
       [t("sgWinRate"), fmtPct(m.win_rate), "flat", ""],
       [t("sgTrades"), String(m.total_trades ?? 0), "flat",
         (m.rejected_count > 0 ? t("sgRejected") + " " + m.rejected_count : "")],
-      [t("sgSharpe"), m.sharpe != null ? m.sharpe.toFixed(2) : "—", "flat", ""],
+      [t("sgSharpe"), R.fmt.num(m.sharpe, 2), "flat", ""],
     ];
     for (const [label, value, cls, sub] of cards) {
       const card = h("div", "sg-mcard");
-      card.appendChild(h("span", "sg-mcard-label", label));
+      // A2: 指标名挂术语(A2 起术语索引是全局单例) —— **命中术语表的才变可点**, 其余原样。
+      // 于是"最大回撤 / 净盈亏 / 胜率"在指标卡上就能点出解释, 不必回对话里问。
+      const lbl = h("span", "sg-mcard-label", label);
+      R.glossary.decorate(lbl);
+      card.appendChild(lbl);
       const v = h("span", "sg-mcard-value" + (cls ? " " + cls : ""), value);
       card.appendChild(v);
       if (sub) card.appendChild(h("span", "sg-mcard-sub", sub));
@@ -285,7 +305,10 @@
       ["lg-bench", "sgLegBench"],
       ["lg-dd", "sgLegDd"],
     ]) {
-      legend.appendChild(h("span", "lg " + cls, t(key)));
+      const item = h("span", "lg " + cls, t(key));
+      // A2: 图例名也挂术语 —— "标的价格"是词条, "回撤"不是(术语表里叫"最大回撤"), 命中才变可点。
+      R.glossary.decorate(item);
+      legend.appendChild(item);
     }
     wrap.appendChild(legend);
     const div = h("div", "sg-bt-chart");
@@ -403,7 +426,10 @@
     const thead = h("thead");
     const hr = h("tr");
     hr.appendChild(h("th", null, t("sgClosedThTime")));
-    hr.appendChild(h("th", null, t("sgClosedThPnl")));
+    // A2: 表头"已实现盈亏"是术语表词条 —— 点一下就知道它和"净盈亏"差在哪。
+    const thPnl = h("th", null, t("sgClosedThPnl"));
+    R.glossary.decorate(thPnl);
+    hr.appendChild(thPnl);
     thead.appendChild(hr);
     tbl.appendChild(thead);
     const tbody = h("tbody");
@@ -433,7 +459,9 @@
         note += " · " + t("sgClosedMismatch") + fmtNum(m.realized_pnl) + ")";
       }
     }
-    box.appendChild(h("div", "sg-closed-sub", note));
+    const sub = h("div", "sg-closed-sub", note);
+    R.glossary.decorate(sub); // A2: 这行说明里的指标名(如"已实现盈亏")同样可点
+    box.appendChild(sub);
   }
 
   function destroyBtChart() {
@@ -449,29 +477,20 @@
     return v || fallback;
   }
 
+  // C11: 以下三个格式化函数的**实现**统一到 `R.fmt`, 调用点与签名不变(委托形态) ——
+  // 出口只有一个, 但各视图仍用自己读得懂的名字。
   function fmtPct(v) {
-    if (v == null || !Number.isFinite(v)) return "—";
-    return (v > 0 ? "+" : "") + v.toFixed(2) + "%";
+    return R.fmt.pct(v);
   }
 
   function fmtNum(v) {
-    if (v == null || !Number.isFinite(v)) return "—";
-    const abs = Math.abs(v);
-    const digits = abs >= 100 ? 2 : abs >= 1 ? 4 : 6;
-    return (v > 0 ? "+" : "") + v.toFixed(digits).replace(/\.?0+$/, "");
+    return R.fmt.signed(v);
   }
 
-  /// 毫秒时间戳 → 展示串 (平仓明细用)。会话列表的秒级口径走 `R.formatTime`, 两者不可混
-  /// (与 chat.js 的 `formatStamp` 同款格式, 但各视图各持一份 —— 那两份本来就不同口径)。
+  /// 毫秒时间戳 → 展示串 (平仓明细用)。会话列表的秒级口径走 `R.formatTime`(= `R.fmt.timeSec`),
+  /// 两者口径不同(缺值一个是 `—` 一个是空), 在 `R.fmt` 里是**两个方法**, 不是一份实现。
   function fmtMs(ms) {
-    if (!Number.isFinite(ms)) return "—";
-    const locale = R.lang === "en" ? "en-US" : "zh-CN";
-    return new Date(ms).toLocaleString(locale, {
-      month: "numeric",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    return R.fmt.time(ms);
   }
 
   function signCls(v) {
@@ -485,7 +504,7 @@
       "刚完成的回测结果: 权益变化 " + fmtPct(m.equity_change_pct),
       "买入持有基准 " + (m.benchmark_return_pct != null ? fmtPct(m.benchmark_return_pct) : "无"),
       "最大回撤 " + fmtPct(Math.abs(m.max_drawdown_pct || 0)),
-      "夏普 " + (m.sharpe != null ? m.sharpe.toFixed(2) : "无"),
+      "夏普 " + (m.sharpe != null ? R.fmt.num(m.sharpe, 2) : "无"),
       "胜率 " + fmtPct(m.win_rate),
       "成交 " + (m.total_trades ?? 0) + " 笔",
     ];
@@ -493,6 +512,81 @@
     ta.value = parts.join(", ") + "。请基于这份结果改进策略(例如先提高收益/降低回撤/减少无效交易)。";
     ta.scrollIntoView({ block: "center" });
     ta.focus();
+  }
+
+  // ---------- C9: 与上次结果对比 ----------
+
+  /// 找"同策略 + 同交易对 + 同周期 + 同窗口"的上一次结果(仅本次会话的内存)。
+  /// 窗口不同**不比** —— 拿 7 天与 30 天的收益比大小是误导, 宁可不说。
+  function findPrev(m, label) {
+    if (!label) return null;
+    for (const r of st.jobHistory) {
+      if (
+        r.strategy === label &&
+        r.pair === m.pair &&
+        r.interval === m.interval &&
+        r.days === m.days
+      ) {
+        return r;
+      }
+    }
+    return null;
+  }
+
+  /// C9: 关键指标并排(上次 / 本次 / 变化), 变化按**涨红跌绿**着色(与指标卡同一套 `signCls`)。
+  /// 数据源是会话内历史(`st.jobHistory`), **服务端不存回测归档** —— 刷新页面即清空, 这一条
+  /// 也在文案里说清("本次会话"口径), 不假装是长期对比。
+  function renderCompare(box, m, label) {
+    const prev = findPrev(m, label);
+    if (!prev) return;
+    const fmtVal = (v, kind) => {
+      if (v == null || !Number.isFinite(Number(v))) return "—";
+      if (kind === "int") return String(v);
+      if (kind === "num") return R.fmt.num(v, 2);
+      return R.fmt.pct(v);
+    };
+    const fmtDelta = (d, kind) => {
+      if (d == null) return "—";
+      if (kind === "int") return (d > 0 ? "+" : "") + String(d);
+      if (kind === "num") return R.fmt.signed(d);
+      return R.fmt.pct(d);
+    };
+    const rows = [
+      ["sgEqVsBench", prev.equity_change_pct, m.equity_change_pct, "pct"],
+      // 回撤取负(指标卡同款: 更深的回撤数值更小), 这样"变化"的正负语义与其它指标一致。
+      ["sgMaxDd", -Math.abs(prev.max_drawdown_pct || 0), -Math.abs(m.max_drawdown_pct || 0), "pct"],
+      ["sgSharpe", prev.sharpe, m.sharpe, "num"],
+      ["sgWinRate", prev.win_rate, m.win_rate, "pct"],
+      ["sgTrades", prev.total_trades, m.total_trades, "int"],
+    ];
+    const card = h("section", "sg-card");
+    card.appendChild(h("div", "sg-card-head", t("sgCmpTitle")));
+    const cbody = h("div", "sg-card-body");
+    cbody.appendChild(h("div", "sg-hint", t("sgCmpHint")));
+    const table = h("table", "sg-hist-table sg-cmp-table");
+    const thead = h("thead");
+    const hr = h("tr");
+    for (const k of ["sgCmpMetric", "sgCmpPrev", "sgCmpNow", "sgCmpDelta"]) {
+      hr.appendChild(h("th", null, t(k)));
+    }
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    const tbody = h("tbody");
+    for (const [key, pv, nv, kind] of rows) {
+      const tr = h("tr");
+      tr.appendChild(h("td", null, t(key)));
+      tr.appendChild(h("td", "num", fmtVal(pv, kind)));
+      tr.appendChild(h("td", "num", fmtVal(nv, kind)));
+      const both =
+        pv != null && nv != null && Number.isFinite(Number(pv)) && Number.isFinite(Number(nv));
+      const delta = both ? Number(nv) - Number(pv) : null;
+      tr.appendChild(h("td", "num " + signCls(delta), fmtDelta(delta, kind)));
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    cbody.appendChild(table);
+    card.appendChild(cbody);
+    box.appendChild(card);
   }
 
   // ---------- 回测历史对比 (P1-6) ----------
@@ -548,7 +642,7 @@
         r.pair + " " + r.interval + " " + r.days + "d",
         fmtPct(r.equity_change_pct),
         fmtPct(Math.abs(r.max_drawdown_pct || 0)),
-        r.sharpe != null ? r.sharpe.toFixed(2) : "—",
+        R.fmt.num(r.sharpe, 2),
         fmtPct(r.win_rate),
         String(r.total_trades ?? 0),
       ];
@@ -668,7 +762,7 @@
           fmtPct(m.equity_change_pct),
           fmtNum(m.net_pnl),
           fmtPct(Math.abs(m.max_drawdown_pct || 0)),
-          m.sharpe != null ? m.sharpe.toFixed(2) : "—",
+          R.fmt.num(m.sharpe, 2),
           fmtPct(m.win_rate),
           String(m.total_trades ?? 0),
         ];
@@ -683,6 +777,201 @@
     table.appendChild(tbody);
     box.appendChild(table);
     setMsg($("sg-sw-msg"), t("sgBtDone"), "ok");
+  }
+
+  // ---------- C8: 多维参数寻优 ----------
+
+  /// 结果表里可排序的指标列。`dir` = 该指标"更优"的方向(回撤越小越好, 所以是 +1)。
+  /// 复用指标卡那套文案键, 不另起一套名字 —— 同一个数字在页面上只有一个说法。
+  const OPT_COLS = [
+    { key: "equity_change_pct", label: "sgEqVsBench", kind: "pct", dir: -1 },
+    { key: "net_pnl", label: "sgNetPnl", kind: "num", dir: -1 },
+    { key: "max_drawdown_pct", label: "sgMaxDd", kind: "pct", dir: 1 },
+    { key: "sharpe", label: "sgSharpe", kind: "num", dir: -1 },
+    { key: "total_trades", label: "sgTrades", kind: "int", dir: -1 },
+  ];
+
+  /// 当前排序(模块级: 只影响这一屏怎么摆, 不进 `st`)。默认按权益变化从高到低。
+  let optSort = { key: "equity_change_pct" };
+  /// 上一次解析出的结果行 —— 点表头排序时不必再问服务端(结果是一次性的, 过期就 404 了)。
+  let optRows = null;
+
+  /// 取某行的某指标(回撤取绝对值 —— 服务端给的是负数, 直接摆出来会被当成"亏损")。
+  /// 算不出(失败行 / 缺值) → null。
+  function optVal(row, key) {
+    const m = row.metrics;
+    if (!m) return null;
+    let v = m[key];
+    if (key === "max_drawdown_pct") v = Math.abs(v || 0);
+    return Number.isFinite(v) ? v : null;
+  }
+
+  /// 按当前排序规则摆行: 失败行**恒定沉底**(它们没有指标, 混在中间会让人误以为"这一档很差")。
+  function sortOptRows(rows) {
+    const col = OPT_COLS.find((c) => c.key === optSort.key) || OPT_COLS[0];
+    const sign = col.dir;
+    const copy = rows.slice();
+    copy.sort((a, b) => {
+      const va = optVal(a, col.key);
+      const vb = optVal(b, col.key);
+      if (va === null && vb === null) return 0;
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      return sign * (vb - va);
+    });
+    return copy;
+  }
+
+  /// 画结果表: 每个维度一列(参数组合) + 指标列(表头可点排序) + 最优行高亮。
+  function paintOptTable() {
+    const box = $("sg-opt-result");
+    if (!box || !optRows) return;
+    box.textContent = "";
+    if (!optRows.length) return;
+    const dims = (optRows[0].combo || []).map((c) => c.key);
+    const sorted = sortOptRows(optRows);
+    const col = OPT_COLS.find((c) => c.key === optSort.key) || OPT_COLS[0];
+    const best = sorted.find((r) => r.metrics && optVal(r, col.key) !== null) || null;
+
+    const cap = h(
+      "div",
+      "sg-opt-cap",
+      t("sgOptBest") + t(col.label) + t("sgOptBestSuffix")
+    );
+    box.appendChild(cap);
+
+    const table = h("table", "sg-hist-table sg-opt-table");
+    const thead = h("thead");
+    const hr = h("tr");
+    for (const key of dims) hr.appendChild(h("th", null, key));
+    for (const c of OPT_COLS) {
+      const th = h("th", "sg-opt-sort", t(c.label) + (c.key === optSort.key ? " ▾" : ""));
+      th.title = t("sgOptSortHint");
+      th.addEventListener("click", () => {
+        optSort = { key: c.key };
+        paintOptTable();
+      });
+      hr.appendChild(th);
+    }
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    const tbody = h("tbody");
+    let shown = 0; // 失败行数(如实报数, 不静默丢)
+    for (const r of sorted) {
+      const tr = h("tr");
+      if (r === best) tr.classList.add("sg-best");
+      for (const cell of r.combo || []) {
+        tr.appendChild(h("td", "num", String(cell.value)));
+      }
+      if (r.error) {
+        shown += 1;
+        const td = h("td", "sg-msg err", r.error);
+        td.colSpan = OPT_COLS.length;
+        tr.appendChild(td);
+      } else {
+        for (const c of OPT_COLS) {
+          const v = optVal(r, c.key);
+          const text =
+            v === null
+              ? "—"
+              : c.kind === "pct"
+                ? fmtPct(v)
+                : c.kind === "int"
+                  ? String(v)
+                  : fmtNum(v);
+          const td = h("td", "num", text);
+          if (c.kind === "pct" || c.kind === "num") td.classList.add(signCls(v));
+          tr.appendChild(td);
+        }
+      }
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    box.appendChild(table);
+    if (shown > 0) {
+      box.appendChild(h("div", "sg-hint", t("sgOptErrRow") + ": " + shown));
+    }
+  }
+
+  /// 发起多维寻优: 维度行由表单子文件读回, 组合数由后端兜底(超 100 会 400, 原样显示原因)。
+  async function onOptimize() {
+    if (!st.detailCtx) return;
+    const params = S.readOptDims();
+    if (!params || !params.length) {
+      setMsg($("sg-opt-msg"), t("sgOptEmpty"), "err");
+      return;
+    }
+    const body = {
+      strategy: st.detailCtx.id,
+      params: params,
+      pair: $("sg-bt-pair").value.trim() || $("sg-pair").value.trim(),
+      interval: $("sg-bt-interval").value,
+      days: Number($("sg-bt-days").value.trim()) || 90,
+    };
+    const fee = Number($("sg-bt-fee").value.trim());
+    if (Number.isFinite(fee) && $("sg-bt-fee").value.trim() !== "") body.fee = fee;
+    const cash = Number($("sg-bt-cash").value.trim());
+    if (Number.isFinite(cash) && $("sg-bt-cash").value.trim() !== "") body.cash = cash;
+    const leverage = Number($("sg-bt-leverage").value.trim());
+    if (Number.isFinite(leverage) && $("sg-bt-leverage").value.trim() !== "") {
+      body.leverage = leverage;
+    }
+
+    const g = st.gen;
+    const btn = $("sg-opt-go");
+    btn.disabled = true;
+    setMsg($("sg-opt-msg"), "", "");
+    try {
+      const reply = await R.api("/api/backtest/optimize", { method: "POST", body: body });
+      if (g !== st.gen) return;
+      const key = st.detailCtx.id + "#opt";
+      optRows = null;
+      st.jobs.set(key, { jobId: reply.job_id, status: "running", kind: "optimize", body: body });
+      startPolling(key, reply.job_id, g);
+    } catch (err) {
+      if (g !== st.gen) return;
+      setMsg($("sg-opt-msg"), (err && err.message) || String(err), "err");
+    } finally {
+      if (g === st.gen) btn.disabled = false;
+    }
+  }
+
+  /// 多维寻优三态: 跑 → 进度条(done/total) / 完 → 可排序对比表 + 最优行 / 错 → 原因。
+  function renderOptimizeResult(job) {
+    const box = $("sg-opt-result");
+    if (!box) return;
+    box.textContent = "";
+    if (job.status === "running") {
+      const row = h("div", "sg-job running");
+      row.appendChild(h("span", "sg-spinner"));
+      row.appendChild(h("span", null, t("sgOptRunning")));
+      const p = job.progress;
+      if (p && p.total) {
+        row.appendChild(
+          h("span", "sg-opt-progtext", t("sgOptProgress") + " " + p.done + "/" + p.total)
+        );
+        const bar = h("div", "sg-opt-prog");
+        const fill = h("div", "sg-opt-prog-fill");
+        fill.style.width = ((100 * p.done) / p.total).toFixed(1) + "%";
+        bar.appendChild(fill);
+        row.appendChild(bar);
+      }
+      box.appendChild(row);
+      return;
+    }
+    if (job.status === "error") {
+      box.appendChild(h("div", "sg-msg err", job.error || ""));
+      return;
+    }
+    try {
+      optRows = JSON.parse(job.report || "[]");
+    } catch (_) {
+      optRows = [];
+    }
+    if (!optRows.length) return;
+    paintOptTable();
+    setMsg($("sg-opt-msg"), t("sgBtDone"), "ok");
   }
 
   /// 用发起时的同一份参数重新发起(错误态一键重试)。
@@ -715,6 +1004,7 @@
   S.renderJob = renderJob;
   S.onBacktest = onBacktest;
   S.onSweep = onSweep;
+  S.onOptimize = onOptimize;
   S.syncBtBtn = syncBtBtn;
   S.startPolling = startPolling;
 })();

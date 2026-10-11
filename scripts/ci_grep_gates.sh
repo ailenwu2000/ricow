@@ -9,6 +9,11 @@
 # 用法:
 #   bash scripts/ci_grep_gates.sh          # 退出码 0 = 全绿
 #
+# 姊妹脚本(不在这里调用, 需要 node):
+#   node scripts/web_frontend_check.mjs    # 前端静态检查: 双语键一一对应 / 文案引用完整性 /
+#                                          # 首页 data-zh↔data-en 配对 / router.parseHash 边界
+#   它**故意不进 `cargo test`** —— 那会给 CI 多绑一个 node 运行时。前端改动时手动跑一次即可。
+#
 # 新增红线时: 先想清楚"违反它的代价"与"误报概率"。宁可少一条, 不要留一条天天误报的。
 set -uo pipefail
 

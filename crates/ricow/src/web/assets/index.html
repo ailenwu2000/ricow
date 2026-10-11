@@ -43,19 +43,65 @@
         <ul id="session-list"></ul>
       </aside>
 
+      <!-- C12: 窄屏抽屉遮罩。侧栏是"盖上来"的一层, 点它以外的地方要能收起 -->
+      <div id="side-scrim" class="side-scrim"></div>
+
       <main id="main">
         <!-- 全视图共享的顶栏: 语言切换钮在任何视图都可见可用(FR-029)。 -->
         <header id="topbar">
+          <!-- C12: 窄屏导航开合(≤900px 才显示)。宽屏下隐藏 —— 侧栏本就常驻, 不需要它。 -->
+          <button
+            id="side-toggle"
+            class="ghost-btn side-toggle"
+            type="button"
+            aria-label="导航 / Menu"
+            aria-expanded="false"
+            title="导航 / Menu"
+          >
+            ☰
+          </button>
           <span id="session-title" class="muted"></span>
           <span id="status" class="status"></span>
-          <!-- 034: 主题切换, 值存 ricow.toml 的 [ui].theme(与语言同一来源)。 -->
+          <!-- 034: 主题切换, 值存 ricow.toml 的 [ui].theme(与语言同一来源)。
+               D14: "跟随系统" 是**偏好**; 实际生效的配色由前端按 prefers-color-scheme 解出
+               (auto + 系统浅色 → light), 故 CSS 侧不需要第三份变量。 -->
           <select id="theme-select" class="mini-select" title="主题 / Theme">
             <option value="dark" data-zh="深色" data-en="Dark">深色</option>
             <option value="light" data-zh="白色" data-en="Light">白色</option>
             <option value="red" data-zh="红色" data-en="Red">红色</option>
+            <option value="auto" data-zh="跟随系统" data-en="Auto">跟随系统</option>
           </select>
           <button id="lang-toggle" class="ghost-btn" type="button" title="中 / EN">EN</button>
+          <!-- 帮助计划第 1 条: 常驻帮助入口。打开的是**按当前视图**组织的帮助(help.js)。 -->
+          <button
+            id="help-btn"
+            class="ghost-btn help-btn"
+            type="button"
+            title="帮助 / Help"
+            aria-label="帮助 / Help"
+            data-zh="帮助"
+            data-en="Help"
+          >
+            帮助
+          </button>
+          <!-- B7: 命令面板入口。键盘 Ctrl/⌘+K 同样能开 —— 这个按钮主要是**可发现性**
+               (不给提示的话, 没人会去试一个看不见的快捷键)。 -->
+          <button
+            id="palette-btn"
+            class="ghost-btn palette-btn"
+            type="button"
+            title="命令面板 (Ctrl/⌘ + K) / Command palette"
+            aria-label="命令面板 / Command palette"
+            aria-haspopup="dialog"
+            aria-expanded="false"
+          >
+            ⌘K
+          </button>
         </header>
+
+        <!-- B5: 首次引导条。骨架常驻(默认 hidden); 出不出现、里面写什么, 全由 help.js 的探针按
+             **服务端事实**(零密钥 / 零会话 / 零自有策略 / 零实例)决定 —— 不写浏览器存储。 -->
+        <div id="onboard-bar" class="onboard" hidden></div>
 
         <!-- 032: 视图容器, 同一时间只有一个 .view.active(router.js 切换)。 -->
 
@@ -177,6 +223,70 @@
           <h2 class="placeholder-title" data-zh="设置" data-en="Settings">设置</h2>
         </section>
       </main>
+
+      <!--
+        帮助抽屉(帮助计划第 1 条): 盖在当前视图上的一层, 不参与 hash 路由 —— 由 help.js
+        按当前视图 + 当前语言重画内容。骨架放这里(静态), 内容全部由 JS 建, 服务端文本一律
+        textContent。注意: 这块在 `<aside id="panels">` **之后**, 只读红线扫描取的是
+        panels 那一段, 不会把这里的控件算进去。
+      -->
+      <div id="help-drawer" class="help-drawer" hidden>
+        <div id="help-overlay" class="help-overlay"></div>
+        <aside
+          id="help-panel"
+          class="help-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="help-title"
+        >
+          <div class="help-head">
+            <span id="help-title" class="help-title">帮助</span>
+            <button id="help-close" class="icon-btn" type="button" aria-label="关闭 / Close">
+              ×
+            </button>
+          </div>
+          <div id="help-body" class="help-body"></div>
+        </aside>
+      </div>
+
+      <!-- B7: 命令面板骨架(Ctrl/⌘+K)。条目由 palette.js 按**现有数据源**填:
+           导航项取左侧 `<nav>` 的双语标签(不抄第二份文案)、语言/主题复用切换接口、
+           术语走公共件的全局单例 `R.glossary`、策略走 `/api/strategies`。 -->
+      <div id="palette" class="palette" hidden>
+        <div id="palette-overlay" class="palette-overlay"></div>
+        <div
+          id="palette-panel"
+          class="palette-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-label="命令面板 / Command palette"
+        >
+          <input
+            id="palette-input"
+            class="palette-input"
+            type="text"
+            role="combobox"
+            aria-expanded="true"
+            aria-controls="palette-list"
+            aria-autocomplete="list"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="输入命令、视图、术语或策略…"
+            data-zh-placeholder="输入命令、视图、术语或策略…"
+            data-en-placeholder="Type a command, view, term or strategy…"
+          />
+          <div id="palette-list" class="palette-list" role="listbox" aria-label="命令"></div>
+          <!-- 术语条目选中后在这里就地给出解释(服务端文本走 textContent), 不必再开一层浮层。 -->
+          <div id="palette-detail" class="palette-detail" hidden></div>
+          <div id="palette-empty" class="palette-empty muted" hidden></div>
+          <div id="palette-foot" class="palette-foot">
+            <span id="palette-count" class="palette-count" role="status" aria-live="polite"></span>
+            <span class="palette-keys">
+              <kbd>↑</kbd><kbd>↓</kbd> 选择 · <kbd>Enter</kbd> 执行 · <kbd>Esc</kbd> 关闭
+            </span>
+          </div>
+        </div>
+      </div>
     </div>
     <!-- 032: 脚本按依赖顺序加载, 全部走 token 查询串鉴权; common.js 必须先于视图文件。 -->
     <script src="/lightweight-charts.js?token=__RICOW_TOKEN__"></script>
@@ -195,6 +305,12 @@
     <script src="/strategy_editor.js?token=__RICOW_TOKEN__"></script>
     <script src="/strategy_backtest.js?token=__RICOW_TOKEN__"></script>
     <script src="/runs.js?token=__RICOW_TOKEN__"></script>
+    <!-- 帮助计划第 1 条: 帮助抽屉。放在各视图之后、app.js(入口)之前 —— 它只绑顶栏按钮,
+         不注册视图, 但要用到公共件与 R.navigate, 故必须晚于 common.js。 -->
+    <script src="/help.js?token=__RICOW_TOKEN__"></script>
+    <!-- B7: 命令面板。与 help.js 同一位置约束(用公共件 / R.navigate / R.glossary, 不注册视图),
+         且要能跳策略详情, 故排在 help.js 之后、app.js(入口)之前。 -->
+    <script src="/palette.js?token=__RICOW_TOKEN__"></script>
     <script src="/app.js?token=__RICOW_TOKEN__"></script>
   </body>
 </html>

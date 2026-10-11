@@ -177,11 +177,11 @@
       st.aiDraft = false;
       updateDirty();
       refreshHighlight();
-      setMsg(
-        $("sg-savemsg"),
-        reply && reply.warnings && reply.warnings.length ? t("sgSavedWithWarn") : t("sgSaved"),
-        "ok"
-      );
+      // B6: 成功走**全局 toast** —— 在详情页保存完回列表时, 提示不至于随详情 DOM 一起消失
+      // (保存钮本身的"已变灰/未改动"状态也在, 但它说不清"刚才那次到底成没成")。
+      const savedMsg =
+        reply && reply.warnings && reply.warnings.length ? t("sgSavedWithWarn") : t("sgSaved");
+      R.toast(savedMsg, "ok");
       renderWarnings(reply && reply.warnings);
       syncSaveBtn("idle");
       refreshListQuietly();
