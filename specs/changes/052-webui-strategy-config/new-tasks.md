@@ -298,9 +298,11 @@
 - `cargo fmt --all -- --check` 0 差异 · `cargo clippy --workspace --all-targets -- -D warnings` **exit 0**
   （只剩已知 Windows 增量锁 `os error 5` 噪声）· `bash scripts/ci_grep_gates.sh` 五条红线全绿 ·
   `node scripts/web_frontend_check.mjs` 全绿（B 双语 **463·463** / C 416 键零缺零死 / **G 两段新增**）。
-- `e2e_web.py`（干净 root `tmp/verify-053c`）**372 PASS / 0 FAIL**（329 → +43），新增断言字样逐条 `grep` 均为 1。
-  **余 9 条 FAIL 全部是同一条 `network error: K 线第 0 片拉取失败`** —— 本机 `curl https://api.binance.com/api/v3/ping`
-  返回 `000`，**环境不可达、非代码缺陷**，留作既有遗留项。
+- `e2e_web.py`（干净 root `tmp/verify-054b` + `show_all_pairs=true`）**381 PASS / 0 FAIL**（329 → 381，+52），
+  新增断言字样逐条 `grep` 均为 1。**零 FAIL**：此前那版 372 PASS / 9 FAIL 是**两个**根因叠着 ——
+  ① 本机 `curl https://api.binance.com/api/v3/ping` 返回 `000`，网络不可达
+  ② `show_all_pairs=false` 时 `ETHUSDT` **不在当前视野**（默认视野仅股票类），回测在联网前就被拒。
+  网络恢复 + 视野放开后 9 条**全部翻绿**，与代码无关。
 - `scripts/probe_web_ui.mjs`（headless Edge Edg/155 + Node 22 内建 `WebSocket`，零依赖）**75 PASS / 0 FAIL**（65 → +10）。
 
 ### 顺手修掉的 3 条**冒烟脚本自身**的错断言（不是产品缺陷）

@@ -76,5 +76,5 @@
 | `cargo test --workspace --no-fail-fast` | **1000 passed / 0 failed / 22 ignored**（983 → 1000，**+17**，增量全在 `ricow` bin 482 → 499） |
 | `ci_grep_gates.sh` | 五条红线全绿 |
 | `web_frontend_check.mjs` | 全绿（双语 **463·463** / C 416 键 / **G 段两段新增**） |
-| `e2e_web.py`（干净 root `tmp/verify-053c`） | **372 PASS / 9 FAIL**（329 → 372，+43；**余 9 条全是同一条 `K 线第 0 片拉取失败`**，本机 `api.binance.com` 不可达，环境问题） |
+| `e2e_web.py`（干净 root `tmp/verify-054b` + `show_all_pairs=true`） | **381 PASS / 0 FAIL**（329 → 381，+52）—— **零 FAIL**；此前 372 PASS / 9 FAIL 的两个根因（本机 `api.binance.com` 不可达 + `show_all_pairs=false` 时 `ETHUSDT` 不在视野）在网络恢复与视野放开后全部翻绿 |
 | `probe_web_ui.mjs`（CDP 真机） | **75 PASS / 0 FAIL**（65 → 75，+10） |

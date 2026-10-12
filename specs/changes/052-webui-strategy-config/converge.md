@@ -194,7 +194,13 @@ N2-C 的 `sg-mf-name` **按钮与输入框撞 id** —— `getElementById` 只�
 
 ### 7.5 遗留
 
-- **9 条 `e2e_web.py` FAIL 全部是同一条 `network error: K 线第 0 片拉取失败`**：本机
-  `curl https://api.binance.com/api/v3/ping` 返回 `000`，**环境不可达、非代码缺陷**，留作既有遗留项。
+- ~~**9 条 `e2e_web.py` FAIL 全部是同一条 `network error: K 线第 0 片拉取失败`**~~ **已销项（2026-10-12 晚，网络恢复后复跑）**。
+  当时判的"网络不可达"**只对了一半** —— 实际是**两个根因叠着**：
+  ① 本机 `curl https://api.binance.com/api/v3/ping` 返回 `000`，网络不可达；
+  ② 即便网络恢复，`show_all_pairs=false` 时 `ETHUSDT` **不在当前视野**（默认视野仅股票类），
+  回测在联网之前就被 `invalid argument` 拒掉 —— 这一条被 ① 盖住，直到网络通了才露出来。
+  网络恢复 + 视野放开后复跑：**381 PASS / 0 FAIL**（372 + 9 全部翻绿）。
+  **教训**：成串的回测类 FAIL 要**按层排查**，别在第一个根因上就停手；判"环境问题"前
+  先确认"排除了环境之后还有没有下一层"。
 - 与 §六 同款：AI 的真实上游调用仍无端到端（干净 root 无密钥，只能断言到 403 `need_keys`）；
   N3 新增的 `advice` / `changed` / `ai-assess` 解析与守卫由离线单测覆盖。
