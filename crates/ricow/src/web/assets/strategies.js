@@ -230,6 +230,15 @@
     sgReload: "重新载入",
     sgDirty: "有未保存的修改",
     sgAiDirty: "AI 草稿未保存,请检查后保存",
+    // 053: 参数侧未保存提示 + 改动对比。三句分开是因为「只改了代码」「只改了参数」「两个都改了」
+    // 是三件事 —— 合成一句用户就不知道该点哪张卡上的保存(其实保存是同一个按钮, 但得说清改了什么)。
+    sgParamDirty: "参数有未保存的修改",
+    sgDirtyBoth: "代码与参数都有未保存修改",
+    sgParamChangesTitle: "改动对比(未保存)",
+    sgParamFrom: "原",
+    sgParamTo: "改为",
+    sgParamEmpty: "(空)",
+    sgParamRevert: "还原参数",
     sgUndo: "撤销",
     sgAi: "AI 修改",
     // N3 (2026-10-12): 「调整参数」从"把一句话翻译成键值"改成**多轮对话 + 说意图**。
@@ -494,6 +503,13 @@
     sgReload: "Reload",
     sgDirty: "Unsaved changes",
     sgAiDirty: "AI draft not saved — review then save",
+    sgParamDirty: "Unsaved parameter changes",
+    sgDirtyBoth: "Unsaved changes in code and parameters",
+    sgParamChangesTitle: "Changed values (not saved yet)",
+    sgParamFrom: "was",
+    sgParamTo: "now",
+    sgParamEmpty: "(empty)",
+    sgParamRevert: "Revert parameters",
     sgUndo: "Undo",
     sgAi: "AI edit",
     sgAiPhParams: "Describe the effect you want, e.g. “more conservative” or “I expect range-bound markets” — no need to name a parameter or a value",
@@ -728,7 +744,14 @@
       '<div class="sg-detail-grid">' +
       // 参数
       '<section class="sg-card"><div class="sg-card-head"><span' + bi("sgParams") + ">" +
-      R.TEXT.zh.sgParams + "</span></div>" +
+      R.TEXT.zh.sgParams + "</span>" +
+      // 053: 参数改了也要亮「未保存」。此前 `updateDirty` 只比代码编辑器, 改参数(手动或 AI 改)
+      // 界面一声不吭 —— 用户看不出"这组值还没落盘"(回测能用表单值跑, 更让人以为已保存)。
+      '<span id="sg-params-dirty" class="sg-dirty" hidden><span id="sg-params-dirty-text"></span>' +
+      "</span></div>" +
+      // 改动对比面板: 列出「原值 → 新值」并给一键还原。必须放在 `#sg-params` **外面** ——
+      // renderParams 每次 `innerHTML = ""` 会把它一起抹掉(与引导卡同一个坑)。
+      '<div id="sg-param-changes" class="sg-param-changes" hidden></div>' +
       // 052 方案4: 清单为空时, 表单只能画出交易对 —— 用户看到"就一个框"却不知该干什么。
       // 这块引导卡由 strategy_form.js::renderParamsGuide 按**服务端事实**(manifest.params 为空)决定显隐,
       // 两个按钮分别把用户引到"从脚本识别参数"与"问 AI 怎么配"。清单里有参数时整块隐藏, 不占位。

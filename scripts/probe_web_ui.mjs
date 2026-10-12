@@ -575,6 +575,95 @@ async function main() {
     JSON.stringify(copyLabels).slice(0, 140)
   );
 
+  // ---- ⑨ 053: 改参数必须亮「未保存」+ 给出改动前后对比 ----
+  //
+  // 这条复刻用户报的场景: "AI 修改策略以后, 修改后的参数反映在哪里, 需要点击保存吗?"
+  // 修之前 `updateDirty` 只比代码编辑器, 参数改了(手动或 AI 改)界面一声不吭; 而回测又能拿
+  // 表单值跑, 于是用户合理地以为已经改好了。以下逐条锁死修复后的行为。
+  const beforeVal = await ev(
+    "(() => { const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
+      " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
+      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " if (!row) return 'no-row'; const ctl = row.querySelector('input, select');" +
+      " if (!ctl) return 'no-input'; const v = ctl.value;" +
+      " ctl.value = '0.05';" +
+      " ctl.dispatchEvent(new Event('input', { bubbles: true }));" +
+      " ctl.dispatchEvent(new Event('change', { bubbles: true }));" +
+      " return v; })()"
+  );
+  check(
+    "053 改参数: 找到 spacing_pct 输入框并改了值",
+    typeof beforeVal === "string" && beforeVal !== "no-row" && beforeVal !== "no-input",
+    String(beforeVal)
+  );
+  const pDirty = await ev("document.getElementById('sg-params-dirty').hidden");
+  check("053 改参数后「参数未保存」提示亮起(修复前恒不亮)", pDirty === false, String(pDirty));
+  const pDirtyText = await ev("document.getElementById('sg-params-dirty-text').textContent");
+  check(
+    "053 参数提示文案是「参数有未保存的修改」",
+    pDirtyText === "参数有未保存的修改",
+    String(pDirtyText)
+  );
+  // 只改了参数、没动代码 —— 代码卡那条不该亮(否则用户以为代码也被改了)。
+  const codeDirty = await ev("document.getElementById('sg-dirty').hidden");
+  check("053 只改参数时代码卡不误报未保存", codeDirty === true, String(codeDirty));
+  const chgHidden = await ev("document.getElementById('sg-param-changes').hidden");
+  check("053 改动对比面板出现", chgHidden === false, String(chgHidden));
+  const chgText = await ev("document.getElementById('sg-param-changes').textContent");
+  check(
+    "053 改动面板同时给出改前值与改后值",
+    String(chgText).indexOf(beforeVal) >= 0 && String(chgText).indexOf("0.05") >= 0,
+    String(chgText).slice(0, 160)
+  );
+  check(
+    "053 改动面板用中文名(不是裸键)",
+    typeof wantLabel === "string" && String(chgText).indexOf(wantLabel) >= 0,
+    String(chgText).slice(0, 120)
+  );
+  // 行内标记: 参数行自己也要标出「原 X → 改为 Y」, 参数多时面板会滚出视野。
+  const inlineDiff = await ev(
+    "(() => { const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
+      " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
+      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " if (!row) return 'no-row'; const d = row.querySelector('.sg-param-diff');" +
+      " return d ? (d.hidden ? 'hidden' : d.textContent) : 'no-diff'; })()"
+  );
+  check(
+    "053 参数行行内标出「原 X → 改为 Y」",
+    String(inlineDiff).indexOf(beforeVal) >= 0 && String(inlineDiff).indexOf("0.05") >= 0,
+    String(inlineDiff)
+  );
+  // 一键还原: 改完能退回去, 且提示随之消失(否则"对比"给了却没法反悔)。
+  const reverted = await ev(
+    "(() => { const b = document.getElementById('sg-param-revert');" +
+      " if (!b) return 'no-btn'; b.click();" +
+      " const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
+      " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
+      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " return row.querySelector('input, select').value; })()"
+  );
+  check("053 一键还原把值退回改前", reverted === beforeVal, String(reverted) + " 期望 " + beforeVal);
+  const dirtyAfterRevert = await ev("document.getElementById('sg-params-dirty').hidden");
+  check("053 还原后未保存提示消失", dirtyAfterRevert === true, String(dirtyAfterRevert));
+  // 切英文后文案要跟着换(动态建的文字没有 data-zh 可依赖, 靠 refreshDynamic → updateDirty 重建)。
+  await ev("window.Ricow.applyLang('en')");
+  await sleep(400);
+  await ev(
+    "(() => { const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
+      " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
+      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " const ctl = row.querySelector('input, select'); ctl.value = '0.07';" +
+      " ctl.dispatchEvent(new Event('input', { bubbles: true })); return 'ok'; })()"
+  );
+  const enDirtyText = await ev("document.getElementById('sg-params-dirty-text').textContent");
+  check(
+    "053 切英文后未保存提示换成英文",
+    enDirtyText === "Unsaved parameter changes",
+    String(enDirtyText)
+  );
+  await ev("window.Ricow.applyLang('zh')");
+  await sleep(300);
+
   checkNoErrors("052 模式 chip / 引导卡 / 识别参数 / 复制带清单");
 
   // ---- ⑩ 全局收口: 全程零未捕获异常 ----

@@ -35,6 +35,8 @@
   async function enterDetail(id, g) {
     st.detailCtx = null;
     st.paramInputs = [];
+    // 053: 交易对基线一并清零 —— 它与参数共用一套"改没改"判据。
+    st.savedPair = "";
     st.savedCode = "";
     st.aiDraft = false;
     st.saveLocked = false;
@@ -131,6 +133,8 @@
 
     renderParams(detail);
     $("sg-pair").value = detail.pair || DEFAULT_PAIR;
+    // 053: 交易对基线必须等上面赋完值再记 —— renderParams 建输入框那会儿它还是空的。
+    st.savedPair = $("sg-pair").value;
     // 参数清单编辑器(P2-8): 用户策略可声明/维护参数 schema; 内置策略该卡隐藏。
     renderManifestEditor(detail);
 
@@ -300,6 +304,135 @@
     return { label: label, input: ctl };
   }
 
+  /// 053: 参数行登记项。除了原有的 key/ty/required/input, 多带三样:
+  ///   - `name`: 改动清单里显示中文名(没有就回退键名, 与行内标签同一口径);
+  ///   - `base`: 基线值(渲染时的字符串), 与当前值比才知道"改没改";
+  ///   - `diff`: 行内「原 X → 改为 Y」的容器, 挂在 label 末尾, 未改动时 hidden。
+  /// 监听绑 `input` 与 `change` 两个事件: 文本框/数字框两个都发, 下拉与复选框只发 `change`。
+  function paramEntry(key, name, ty, required, built) {
+    const diff = h("div", "sg-param-diff");
+    diff.hidden = true;
+    built.label.appendChild(diff);
+    built.input.addEventListener("input", onParamInput);
+    built.input.addEventListener("change", onParamInput);
+    const entry = { key: key, name: name || key, ty: ty, required: !!required, input: built.input, diff: diff, base: "" };
+    entry.base = paramTextOf(entry);
+    return entry;
+  }
+
+  /// 053: 控件当前值的**字符串**表示 —— 参数是否改动一律按字符串比, 不转 Number。
+  ///
+  /// 为什么用字符串: ① `1` 与 `1.0` 对用户是同一个值, 转数字再比会误报改动;
+  /// ② 用户正在输入 `0.` 这种半成品时 `Number()` 得到 NaN, 转数字会把"还在打字"判成改动;
+  /// ③ 非法输入会在 `readParam` 里抛错, 而标脏不该抛错。字符串比只看"你看到的是不是变了"。
+  function paramTextOf(p) {
+    return p.ty === "bool" ? String(!!p.input.checked) : String(p.input.value);
+  }
+
+  /// 053: 空值显示成"(空)"而不是一片空白 —— 否则「原 (空) → 1000」看起来像界面漏渲染了。
+  function fmtParamVal(v) {
+    return v === "" ? t("sgParamEmpty") : v;
+  }
+
+  /// 053: 当前表单里**真的变了**的项(参数行 + 交易对)。
+  ///
+  /// 基线 `p.base` 在渲染时取一次, 保存成功后刷新(`markParamBaseline`) —— 所以"改了又改回去"
+  /// 不算改动, 与代码侧的 `savedCode` 同一口径。交易对同样只在保存时落盘, 一并纳入。
+  function paramDiffs() {
+    const out = [];
+    for (const p of st.paramInputs) {
+      if (!p.input) continue;
+      const now = paramTextOf(p);
+      if (now === p.base) continue;
+      out.push({ key: p.key, name: p.name || p.key, before: p.base, after: now });
+    }
+    const pairEl = $("sg-pair");
+    if (pairEl && typeof st.savedPair === "string" && pairEl.value !== st.savedPair) {
+      out.push({ key: "pair", name: t("sgPair"), before: st.savedPair, after: pairEl.value });
+    }
+    return out;
+  }
+
+  /// 053: 保存成功后把基线推进到"刚落盘的那组值" —— 否则保存完还亮着未保存提示。
+  function markParamBaseline() {
+    for (const p of st.paramInputs) {
+      if (p.input) p.base = paramTextOf(p);
+    }
+    const pairEl = $("sg-pair");
+    if (pairEl) st.savedPair = pairEl.value;
+  }
+
+  /// 053: 改动对比。两处一起刷 —— 参数行**行内**标出「原 X → 改为 Y」(改哪项一眼看到),
+  /// 卡片顶部另给一份**汇总清单**(参数多时要滚屏, 行内会看不见) + 一键还原。
+  function renderParamDiff() {
+    const diffs = paramDiffs();
+    const byKey = new Map();
+    for (const d of diffs) byKey.set(d.key, d);
+    for (const p of st.paramInputs) {
+      if (!p.diff) continue;
+      const d = byKey.get(p.key);
+      p.diff.textContent = "";
+      if (!d) {
+        p.diff.hidden = true;
+        continue;
+      }
+      p.diff.hidden = false;
+      p.diff.appendChild(h("span", "sg-diff-old", t("sgParamFrom") + " " + fmtParamVal(d.before)));
+      p.diff.appendChild(h("span", "sg-diff-arrow", "→"));
+      p.diff.appendChild(h("span", "sg-diff-new", t("sgParamTo") + " " + fmtParamVal(d.after)));
+    }
+    renderChangesPanel(diffs);
+  }
+
+  function renderChangesPanel(diffs) {
+    const box = $("sg-param-changes");
+    if (!box) return;
+    box.innerHTML = "";
+    if (!diffs.length) {
+      box.hidden = true;
+      return;
+    }
+    box.appendChild(h("div", "sg-changes-title", t("sgParamChangesTitle")));
+    const list = h("div", "sg-changes-list");
+    for (const d of diffs) {
+      const row = h("div", "sg-change-row");
+      row.appendChild(h("span", "sg-change-name", d.name));
+      row.appendChild(h("span", "sg-change-key", d.key));
+      const val = h("span", "sg-change-val");
+      val.appendChild(h("span", "sg-diff-old", fmtParamVal(d.before)));
+      val.appendChild(h("span", "sg-diff-arrow", " → "));
+      val.appendChild(h("span", "sg-diff-new", fmtParamVal(d.after)));
+      row.appendChild(val);
+      list.appendChild(row);
+    }
+    box.appendChild(list);
+    const btn = h("button", "sg-btn sg-btn-mini", t("sgParamRevert"));
+    btn.type = "button";
+    btn.id = "sg-param-revert";
+    btn.addEventListener("click", onRevertParams);
+    box.appendChild(btn);
+    box.hidden = false;
+  }
+
+  /// 053: 把参数(含交易对)还原到**基线**。代码另有「撤销」按钮, 各管各的 ——
+  /// 混成一次撤销会让用户以为顺手把代码也退回了(或反过来)。
+  function onRevertParams() {
+    for (const p of st.paramInputs) {
+      if (!p.input) continue;
+      if (p.ty === "bool") p.input.checked = p.base === "true";
+      else p.input.value = p.base;
+    }
+    const pairEl = $("sg-pair");
+    if (pairEl && typeof st.savedPair === "string") pairEl.value = st.savedPair;
+    updateDirty();
+  }
+
+  /// 053: 参数控件改动 → 重算未保存状态。此前只有代码编辑器有 `keydown`/`refreshHighlight`
+  /// 触发标脏, 参数框改值**没有任何监听** —— 这是"改了参数界面不吭声"的直接原因。
+  function onParamInput() {
+    updateDirty();
+  }
+
   function renderParams(detail) {
     st.paramInputs = [];
     const box = $("sg-params");
@@ -312,6 +445,7 @@
     pairInput.id = "sg-pair";
     pairInput.type = "text";
     pairInput.autocomplete = "off";
+    pairInput.addEventListener("input", onParamInput);
     pairField.appendChild(pairInput);
     box.appendChild(pairField);
 
@@ -326,7 +460,7 @@
       const built = p.ty === "string" ? stringRow(p, current[p.key] !== undefined ? current[p.key] : p.default)
         : paramRow(p, current[p.key] !== undefined ? current[p.key] : p.default);
       box.appendChild(built.label);
-      st.paramInputs.push({ key: p.key, ty: p.ty, required: !!p.required, input: built.input });
+      st.paramInputs.push(paramEntry(p.key, p.name, p.ty, p.required, built));
     }
 
     // 实例里存在但清单没声明的键(网页保存的 lua 策略没有清单): 也给可编辑行, 避免保存时黑箱丢失
@@ -343,7 +477,7 @@
         const spec0 = { key: key, name: key, ty: extraInputFor(current[key]).kind, desc: "", required: false, options: null };
         const built = spec0.ty === "string" ? stringRow(spec0, current[key]) : paramRow(spec0, current[key]);
         box.appendChild(built.label);
-        st.paramInputs.push({ key: key, ty: spec0.ty, required: false, input: built.input });
+        st.paramInputs.push(paramEntry(key, key, spec0.ty, false, built));
       }
     }
 
@@ -730,6 +864,8 @@
     st.detailCtx.detail = detail;
     renderParams(detail);
     $("sg-pair").value = detail.pair || $("sg-pair").value || DEFAULT_PAIR;
+    // 053: 同上 —— 重画表单后基线要跟着服务端这份值重记(保存清单后参数键可能整批换过)。
+    st.savedPair = $("sg-pair").value;
     renderManifestEditor(detail);
     fillSweepParams();
     fillOptDims();
@@ -886,6 +1022,11 @@
   // 052: 切语言时外壳要就地重建引导卡(它的文字是动态建的), 故一并导出。
   S.renderParamsGuide = renderParamsGuide;
   S.gatherParams = gatherParams;
+  // 053: 参数侧标脏三件套 —— editor 子文件的 `updateDirty` 要问"参数改没改", 保存成功后要
+  // 把基线推进到刚落盘那组值, 两者都只经这三个入口, 不直接碰 `st.paramInputs`。
+  S.paramDiffs = paramDiffs;
+  S.markParamBaseline = markParamBaseline;
+  S.renderParamDiff = renderParamDiff;
   // C8: 维度行的建 / 刷 / 读 —— 外壳 mount 用 addOptDim, 回测子文件用 readOptDims。
   S.addOptDim = addOptDim;
   S.fillOptDims = fillOptDims;

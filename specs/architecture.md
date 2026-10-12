@@ -358,7 +358,20 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-10-12, 052 策略配置断层修复 + N1/N2/N3 追加需求后实跑)**: `cargo test --workspace --no-fail-fast` = **1000 passed / 0 failed / 22 ignored**(全目标零失败)。
+- **基线(2026-10-12, 053 改参数未保存提示 + 改动前后对比后实跑)**: `cargo test --workspace --no-fail-fast` = **1001 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+1**, 与本轮同源: `ricow` bin **499 → 500**(`ai::provider::tests::test_assess_preamble_states_benchmark_and_ratio_caveats` ——
+  锁住评估提示词里「基准从首次成交起算」「成交极少时比率指标失真」两条口径); 其余 target 一字未变
+  (`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 282 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。
+  同口径真机: 官方冒烟 `e2e_web.py`(干净 root + `show_all_pairs=true`) **388 PASS / 0 FAIL**(较 052 的 381 **+7**, 新增 7 条
+  053 静态断言); CDP 真机走查 `scripts/probe_web_ui.mjs` **86 PASS / 0 FAIL**(较 75 **+11**; 053 段为**行为级**断言:
+  真把参数值改掉并派发 `input` 事件, 再断言「参数未保存」提示亮起、改动面板同时含改前改后值、一键还原后值退回且提示消失)。
+  本轮两件事: ① **修缺陷** —— `updateDirty` 此前只比代码编辑器, 改了参数(手动或 AI 改)**界面完全不提示**,
+  而回测又能拿表单值跑出结果(用户原话「AI 修改策略以后…需要点击保存吗」即由此而来)。修法 = 参数基线(渲染时取、
+  保存后推进)+ 行内「原 X → 改为 Y」+ 卡片顶部改动对比清单(放 `#sg-params` 外, 免被 `innerHTML=""` 抹掉)+ 一键还原;
+  判据统一为**与基线比字符串**。② **真跑后修提示词** —— 用真实密钥跑通 N3 多轮改参 + 影响评估后发现 `ai-assess`
+  把「两次基准收益不同」误判成「数据口径不一致」, 实为**设计**(基准从**首次成交**起算, 见 `ricow_strategy/src/backtest.rs:1491-1495`),
+  且把成交 3 笔时失真的夏普 −737 当成重大恶化; 两条口径已写进 `AI_ASSESS_PREAMBLE`。见 `specs/changes/053-param-unsaved-hint/`。
+- **前基线(2026-10-12, 052 策略配置断层修复 + N1/N2/N3 追加需求后实跑)**: `cargo test --workspace --no-fail-fast` = **1000 passed / 0 failed / 22 ignored**(全目标零失败)。
   增量 = **+17**, 与本轮同源: `ricow` bin **482 → 499**(`web::strategy_io::tests` 的 N1 删除候选集合 + N2 留空可保存 + N3 `cap_history` / `split_advice_and_json` / `diff_params` / `metrics_brief` / `changed_lines` / `ai_assess` 离线守卫 / `ai_edit_params` 接受 `history` 等); 其余 target 一字未变
   (`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 282 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。
   同口径真机: 官方冒烟 `e2e_web.py`(干净 root + `show_all_pairs=true`) **381 PASS / 0 FAIL**(较 052 第一批的 329 **+52**, 新增断言字样逐条 `grep` 均为 1; **零 FAIL** —— 此前 372 PASS / 9 FAIL 的**两个**根因(本机 `api.binance.com` 不可达 + `show_all_pairs=false` 时 `ETHUSDT` 不在视野)在网络恢复与视野放开后**全部翻绿**, 与代码无关); CDP 真机走查 `scripts/probe_web_ui.mjs` **75 PASS / 0 FAIL**(较 65 **+10**)。

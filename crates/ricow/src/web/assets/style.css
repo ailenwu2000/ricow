@@ -1766,6 +1766,74 @@ body {
   font-weight: 600;
 }
 
+/* 053: 改动对比 —— 参数行**行内**的「原 X → 改为 Y」。
+   旧值用 muted + 删除线(它是要被换掉的那个), 新值用 warn(与「未保存」提示同色, 一眼连起来)。 */
+.sg-param-diff {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 0.76rem;
+}
+.sg-param-diff[hidden] {
+  display: none;
+}
+.sg-diff-old {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+.sg-diff-arrow {
+  color: var(--muted);
+}
+.sg-diff-new {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* 053: 改动对比汇总面板。参数多时行内标记会滚出视野, 这里给一份完整清单 + 一键还原。 */
+.sg-param-changes {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--raise-1);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+}
+.sg-param-changes[hidden] {
+  display: none;
+}
+.sg-changes-title {
+  margin-bottom: 6px;
+  color: var(--warn);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.sg-changes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.sg-change-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+.sg-change-name {
+  color: var(--fg);
+  font-weight: 600;
+}
+.sg-change-key {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.74rem;
+}
+/* 值贴右对齐: 名字长短不一时, 「原 → 新」这一列仍然竖直对齐, 扫读更快。 */
+.sg-change-val {
+  margin-left: auto;
+  font-size: 0.78rem;
+}
 /* 052 方案 4: 空参数表单的引导卡。放在「参数」卡里、`#sg-params` 之上, 清单为空时才出现。 */
 .sg-params-guide {
   margin-bottom: 12px;

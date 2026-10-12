@@ -19,6 +19,10 @@
   const enterDetail = (...a) => S.enterDetail(...a);
   // N3-B: 两次回测 + 评估的编排在回测子文件里(它管 `/api/backtest` 的作业语义)。
   const runParamAssess = (...a) => S.runParamAssess(...a);
+  // 053: 参数侧标脏 —— 定义都在 strategy_form.js(表单与基线归它管), 这里只问结果。
+  const paramDiffs = (...a) => S.paramDiffs(...a);
+  const renderParamDiff = (...a) => S.renderParamDiff(...a);
+  const markParamBaseline = (...a) => S.markParamBaseline(...a);
 
   // ---------- 编辑器脏状态 / 高亮 / Tab / 撤销 (P1-4) ----------
 
@@ -88,11 +92,27 @@
     box.hidden = false;
   }
 
+  /// 053: 未保存状态 = 代码 **或** 参数(含交易对)任一改过。
+  ///
+  /// 此前只比代码编辑器, 参数改了界面一声不吭 —— 而回测又能用表单值跑出结果, 于是用户
+  /// 合理地以为"已经改好了", 刷新后才发现没落盘。现在两侧各有一条提示, 都改时代码那条
+  /// 明说"两个都改了", 免得用户以为只改了代码。
+  /// 判据一律是**与基线比字符串**: 改了又改回去不算改动(与 `savedCode` 同一口径)。
   function updateDirty() {
     const codeEl = $("sg-code");
-    const dirty = codeEl.value !== st.savedCode;
-    $("sg-dirty").hidden = !dirty;
-    $("sg-dirty-text").textContent = st.aiDraft ? t("sgAiDirty") : t("sgDirty");
+    const codeDirty = codeEl.value !== st.savedCode;
+    const paramDirty = paramDiffs().length > 0;
+    $("sg-dirty").hidden = !codeDirty;
+    $("sg-dirty-text").textContent = st.aiDraft
+      ? t("sgAiDirty")
+      : paramDirty ? t("sgDirtyBoth") : t("sgDirty");
+    const pbox = $("sg-params-dirty");
+    if (pbox) {
+      pbox.hidden = !paramDirty;
+      if (paramDirty) $("sg-params-dirty-text").textContent = t("sgParamDirty");
+    }
+    // 行内「原 X → 改为 Y」与顶部改动清单同源, 一次算完一起刷。
+    renderParamDiff();
   }
 
   function onCodeKeydown(ev) {
@@ -177,6 +197,9 @@
       });
       st.savedCode = code;
       st.aiDraft = false;
+      // 053: 参数基线推进到"刚落盘的那组值" —— 否则保存成功后「参数有未保存修改」还亮着。
+      // 必须在 `updateDirty()` 之前(它拿基线比当前值), 且与 savedCode 同一处、同一口径。
+      markParamBaseline();
       // N3-B: "保存成功了"就等于"实例 TOML 现在是这些值" —— 把 detailCtx 里的当前值同步过去。
       // 不同步的话, 评估面板的「改前」会一直是**进页面时**读到的那份(可能是好几轮改动之前),
       // 对比出来的数字看着像实测, 其实比错了对象。
@@ -362,7 +385,9 @@
       if (g !== st.gen) return;
       if (mode === "params") {
         // 只填参数表单: 代码不动, 用户核对后点「保存」才写盘。
+        // 053: 填完必须标脏 —— AI 改的就是参数, 若界面不提示"未保存", 用户会以为 AI 已经改好了。
         const filled = fillParamInputs(reply.params || {});
+        updateDirty();
         thread().push({
           role: "ai",
           advice: reply.advice || "",
