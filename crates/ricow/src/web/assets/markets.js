@@ -46,7 +46,6 @@
     mkLiveStale: "秒未更新",
     mkScopeKline: "K 线",
     mkScopeDepth: "盘口",
-    mkRetry: "重试",
   });
   Object.assign(R.TEXT.en, {
     mkTitle: "Markets",
@@ -80,7 +79,6 @@
     mkLiveStale: "s since update",
     mkScopeKline: "Candles",
     mkScopeDepth: "Order book",
-    mkRetry: "Retry",
   });
 
   // K 线周期按钮(默认 1h; 不含 1m/5m —— 视图契约只要 15m/1h/4h/1d)。

@@ -127,6 +127,15 @@
     paramInputs: [],
     savedCode: "", // 进入时/上次保存成功的代码(撤销目标)
     aiDraft: false, // 编辑器当前是否装着未落盘的 AI 草稿
+    // 052: AI 卡当前模式 —— "params"(默认, 只填参数表单、不碰代码) / "code"(改写 Lua)。
+    // 放状态袋而非只读 DOM, 是为了让"切语言 / 离开再回来"重建时仍保持同一模式。
+    aiMode: "params",
+    // N3: AI 对话线程(**两个模式各一条**, 切换模式不互相污染: 一个聊的是"参数取值该多少",
+    // 一个聊的是"代码逻辑怎么改", 混在一条历史里会把对方的上下文带错)。
+    // 每条是 { role:"user"|"ai", text / advice / changed / warnings, ... } 的数组。
+    // 只活在内存: 刷新页面、切策略都清空 —— 服务端不存会话(端点是纯一次问答), 这一点在
+    // 卡片上如实写着, 不让用户以为对话被记住了。
+    aiThreads: { params: [], code: [] },
     saveLocked: false, // 服务端 409 running 后锁定保存钮
     // 回测作业台账(模块变量, 不跨刷新): strategyId -> { jobId, status, report, error, body }。
     jobs: new Map(),
@@ -151,15 +160,20 @@
   const stringRow = (...a) => S.stringRow(...a);
   const addManifestRow = (...a) => S.addManifestRow(...a);
   const onSaveManifest = (...a) => S.onSaveManifest(...a);
+  const onExtractParams = (...a) => S.onExtractParams(...a);
+  const renderParamsGuide = (...a) => S.renderParamsGuide(...a);
   const updateDirty = (...a) => S.updateDirty(...a);
   const refreshHighlight = (...a) => S.refreshHighlight(...a);
   const syncSaveBtn = (...a) => S.syncSaveBtn(...a);
   const syncAiBtn = (...a) => S.syncAiBtn(...a);
+  const setAiMode = (...a) => S.setAiMode(...a);
   const syncBtBtn = (...a) => S.syncBtBtn(...a);
   const onCodeKeydown = (...a) => S.onCodeKeydown(...a);
   const onUndo = (...a) => S.onUndo(...a);
   const onSave = (...a) => S.onSave(...a);
   const onAiEdit = (...a) => S.onAiEdit(...a);
+  // N3: 清空对话线程(历史只在前端, 见 strategy_editor.js)。
+  const onAiClearThread = (...a) => S.onAiClearThread(...a);
   const onBacktest = (...a) => S.onBacktest(...a);
   const onSweep = (...a) => S.onSweep(...a);
   // C8: 多维寻优的维度行在表单子文件里建/读(键列表与单参数下拉同源), 发起与结果在回测子文件里。
@@ -174,6 +188,18 @@
     sgTitle: "策略",
     sgNew: "+ 新建空白",
     sgCopy: "复制",
+    // N1 删除自定义策略。文案刻意把"保留什么"分开列 —— 删一个策略不该抹掉它的历史,
+    // 但用户会以为"删干净了", 所以必须写在确认按钮之前。
+    sgDelete: "删除",
+    sgDeleteTitle: "删除策略",
+    sgDeleteBody: "确定删除这个策略吗? 此操作不可撤销(脚本、实例配置、参数清单一起删掉)。",
+    sgDeleteWhich: "策略: ",
+    sgDeleteKeep: "下面这些会保留 —— 删策略不等于抹掉历史:",
+    sgDeleteKeepBacktest: "回测历史(run/backtest/ 下的报告)",
+    sgDeleteKeepLedger: "台账与成交记录(ricow.db)",
+    sgDeleteOk: "确认删除",
+    sgDeleting: "删除中…",
+    sgDeleteDone: "已删除",
     sgOpen: "打开",
     sgBuiltin: "内置",
     sgUser: "我的",
@@ -206,10 +232,73 @@
     sgAiDirty: "AI 草稿未保存,请检查后保存",
     sgUndo: "撤销",
     sgAi: "AI 修改",
-    sgAiPh: "用一句话说明要改什么,例如:把网格间距改成 ATR 三倍",
-    sgAiGo: "AI 修改",
-    sgAiBusy: "AI 修改中…",
+    // N3 (2026-10-12): 「调整参数」从"把一句话翻译成键值"改成**多轮对话 + 说意图**。
+    // 占位文字也按模式分开了 —— 参数模式提示的是"说效果"(用户本来就不该被迫说出参数名),
+    // 代码模式提示的才是"说逻辑"。两者共用一句占位会误导其中一个模式。
+    sgAiPhParams: "说说你想要的效果, 例如「保守一点」「更看好震荡行情」—— 不需要指定改哪个参数、改成多少",
+    sgAiPhCode: "用一句话说明策略逻辑怎么改, 例如「加一个跌破均线就清仓」",
+    sgAiEmpty: "先说说你想达到什么效果。",
+    sgAiBusy: "AI 处理中…",
     sgAiOk: "AI 草稿已生成(通过编译),确认无误后点「保存」才会落盘。",
+    // 052: AI 卡分两种模式 —— 「调参数」只填参数表单, 「改代码逻辑」才动 Lua。
+    // 默认「调参数」: 用户的困惑正是"不知道该配什么", 那就默认走**不碰代码**的那条路。
+    sgAiModeParams: "调整参数",
+    sgAiModeCode: "改代码逻辑",
+    sgAiModeHintParams:
+      "多轮对话: 你只说想要的效果(如「保守点」「更看好震荡行情」), AI 自己判断该动哪些参数、动到什么程度, 并讲清理由与代价; 它只填上面的参数表单、不改代码, 核对后点「保存」才写盘。",
+    sgAiModeHintCode:
+      "用一句话说明策略逻辑怎么改,例如「加一个跌破均线就清仓」—— AI 会改写下面的 Lua 代码(仍是草稿, 保存才落盘)。",
+    sgAiGoParams: "按意图调参",
+    sgAiGoCode: "改代码逻辑",
+    sgAiParamsOk: "已按 AI 的建议填进上面的参数表单(那只是草稿)—— 核对后点「保存」才会写入。",
+    sgAiParamsEmpty:
+      "AI 建议的参数都落在本页参数表单之外(可能指向脚本本身), 没有可填的内容 —— 换一种说法再试。",
+    // N3 对话线程与改动对照。
+    // (注: 字典块里的注释**不能**写成 `N3:` 这种「标识符+冒号」形态 ——
+    //  前端检查脚本会把注释也当字典键解析, 于是凭空多出一个只缺英文定义的假键。)
+    sgAiThreadNote: "对话只留在当前页面: 刷新页面或切换策略后不再保留。",
+    sgAiClear: "清空对话",
+    sgAiUserLabel: "你",
+    sgAiBotLabel: "AI",
+    sgAiChangedTitle: "这次改了",
+    sgAiChangedNone: "这次没有改动任何取值 —— 上面的说明就是结论, 参数保持原样。",
+    sgAiChangedDefault: "改前值只是清单默认值(你还没有保存过它)",
+    // N3 B 段 —— 自动评估改动影响(两次同窗口回测 + 实测指标解读)。
+    sgAiAssessTitle: "评估这次改动的实际影响",
+    sgAiAssessBody:
+      "用默认窗口(90 天 · 1h)把「改前: 上次保存的参数」与「改后: 表单里现在这些」各跑一次回测, 再让 AI 按两份实测指标讲清影响 —— 两次同窗口才可比。",
+    sgAiAssessRun: "跑回测评估影响",
+    sgAiAssessRunningBase: "正在回测「改前」参数…",
+    sgAiAssessRunningNew: "正在回测「改后」参数…",
+    sgAiAssessAssessing: "两次回测都完成, AI 正在读结果…",
+    sgAiAssessTimeout: "等待回测超时(10 分钟): 作业可能还在跑, 可到下方回测卡继续看结果。",
+    sgAiAssessWindow: "回测窗口: 90 天 · 1h",
+    sgAiAssessFailed: "评估没做成: ",
+    sgAiAssessBusy: "这个策略已经有回测在跑: 等它结束后再试(同一策略同时只允许一个回测作业)。",
+    sgAiAssessStale: "页面已切换(换了策略或离开了本页), 本次评估中止。",
+    // 052: 未声明清单时的参数引导(只有一句结论的红字, 用户不知道该干什么)。
+    sgParamsGuideTitle: "这个策略还没声明参数",
+    sgParamsGuideBody:
+      "参数表单是照「参数清单」画的, 而这份策略还没有清单 —— 每个参数都没有中文名和说明, 所以这里基本是空的。可以从脚本里把参数认出来(键 / 类型 / 默认值自动填好), 或者先补好清单再让 AI 告诉你怎么配。",
+    sgParamsGuideExtract: "从脚本识别参数",
+    sgParamsGuideAskAi: "问 AI 怎么配",
+    sgParamsGuideAskAiFirst:
+      "AI 得先有一份参数清单, 才能告诉你每个参数该怎么配。请点左边「从脚本识别参数」, 核对后点「保存清单」, 再回来问它。",
+    sgOtherParamsHint: "来自实例 TOML, 未在清单里声明 —— 「从脚本识别参数」可以把它们变成正式声明的参数。",
+    sgMfExtract: "从脚本识别参数",
+    sgMfExtracting: "识别中…",
+    // N2 (2026-10-12): 这条文案改口了。原先写"请补上中文名与说明" —— 那正是用户抱怨的负担
+    // (他是脚本的使用者, 不是作者, 不可能知道作者把旋钮叫什么)。现在中文名可以留空。
+    sgMfExtractOk: "已识别出参数(键 / 类型 / 默认值已填好); 脚本注释里写过的说明也一并带出。中文名留空也能保存 —— 想要更好的名字, 可点「让 AI 起中文名」。",
+    sgMfExtractNone: "这份脚本里没识别到参数读取(它可能不读任何参数)。",
+    // N2-C 复核: 这四条原先叫 `sgMfName*` —— 与下面清单卡的「策略名」字段**同名**。
+    // JS 对象字面量里重名的键后者胜, 于是按钮与回写文案都变成了「策略中文名」那个值;
+    // 顺带 `id="sg-mf-name"` 也与那个文本输入重了(取到的是先渲染的那个 input, 按钮反而没绑上)。
+    // 改名前缀为 `sgMfAutoName*` 一并解决两处撞车。
+    sgMfAutoName: "让 AI 起中文名",
+    sgMfAutoNaming: "起名中…",
+    sgMfNameOk: "AI 已按脚本代码填上中文名与说明(只填空位, 你填过的没动), 核对后点「保存清单」。",
+    sgMfNameNone: "没有可填的空位 —— 这些参数的中文名/说明都已经有了。",
     sgNeedKeys: "AI 还没有可用密钥,先到密钥页添加一套后再试。",
     sgGoSettings: "去密钥页添加",
     sgBacktest: "回测",
@@ -364,6 +453,16 @@
     sgTitle: "Strategies",
     sgNew: "+ New blank",
     sgCopy: "Copy",
+    sgDelete: "Delete",
+    sgDeleteTitle: "Delete strategy",
+    sgDeleteBody: "Delete this strategy? This cannot be undone (script, instance config and parameter manifest are all removed).",
+    sgDeleteWhich: "Strategy: ",
+    sgDeleteKeep: "The following is kept — deleting a strategy does not erase its history:",
+    sgDeleteKeepBacktest: "Backtest history (reports under run/backtest/)",
+    sgDeleteKeepLedger: "Ledger and fills (ricow.db)",
+    sgDeleteOk: "Delete",
+    sgDeleting: "Deleting…",
+    sgDeleteDone: "Deleted",
     sgOpen: "Open",
     sgBuiltin: "Built-in",
     sgUser: "Mine",
@@ -397,10 +496,57 @@
     sgAiDirty: "AI draft not saved — review then save",
     sgUndo: "Undo",
     sgAi: "AI edit",
-    sgAiPh: "Say what to change in one sentence, e.g. triple the grid spacing via ATR",
-    sgAiGo: "Edit with AI",
+    sgAiPhParams: "Describe the effect you want, e.g. “more conservative” or “I expect range-bound markets” — no need to name a parameter or a value",
+    sgAiPhCode: "Say what to change in the strategy logic, e.g. “exit when price breaks below the moving average”",
+    sgAiEmpty: "First say what you want to achieve.",
     sgAiBusy: "AI working…",
     sgAiOk: "AI draft ready (compiles). Press Save to write it to disk.",
+    sgAiModeParams: "Tune parameters",
+    sgAiModeCode: "Change code",
+    sgAiModeHintParams:
+      "Multi-turn chat: describe the effect you want (e.g. “more conservative”, “I expect range-bound markets”). The AI decides which parameters to move, by how much, and explains the reasoning and the cost. It only fills the parameter form above — never the code. Press Save to write.",
+    sgAiModeHintCode:
+      "Describe the logic change in one sentence, e.g. “exit all when price drops below the moving average”. The AI rewrites the Lua below (still a draft; save to write it).",
+    sgAiGoParams: "Adjust by intent",
+    sgAiGoCode: "Change code",
+    sgAiParamsOk: "AI suggestions are filled into the parameter form above (a draft) — review them and press Save to write.",
+    sgAiParamsEmpty:
+      "The AI's suggested parameters all fall outside this page's parameter form (they may point at the script itself), so there is nothing to fill in — try rephrasing.",
+    sgAiThreadNote: "This conversation lives in the current page only: a refresh or switching strategies clears it.",
+    sgAiClear: "Clear chat",
+    sgAiUserLabel: "You",
+    sgAiBotLabel: "AI",
+    sgAiChangedTitle: "Changed this round",
+    sgAiChangedNone: "No value was changed this round — the note above is the conclusion; the parameters stay as they are.",
+    sgAiChangedDefault: "the “before” value is only the manifest default (you never saved it)",
+    sgAiAssessTitle: "Measure the real impact of this change",
+    sgAiAssessBody:
+      "Run two backtests over the default window (90 days · 1h) — “before: last saved parameters” and “after: the values currently in the form” — then let the AI read both measured metric sets. The shared window is what makes them comparable.",
+    sgAiAssessRun: "Backtest and assess",
+    sgAiAssessRunningBase: "Backtesting the “before” parameters…",
+    sgAiAssessRunningNew: "Backtesting the “after” parameters…",
+    sgAiAssessAssessing: "Both backtests finished — the AI is reading the results…",
+    sgAiAssessTimeout: "Timed out waiting for the backtests (10 minutes): they may still be running — check the backtest card below.",
+    sgAiAssessWindow: "Backtest window: 90 days · 1h",
+    sgAiAssessFailed: "The assessment did not happen: ",
+    sgAiAssessBusy: "A backtest is already running for this strategy. Wait for it to finish and try again (only one backtest job per strategy at a time).",
+    sgAiAssessStale: "the page changed (different strategy or left this view), so this assessment stopped.",
+    sgParamsGuideTitle: "This strategy declares no parameters",
+    sgParamsGuideBody:
+      "The parameter form is drawn from the strategy manifest, and this strategy has no manifest yet — so the parameters have no names or descriptions and the form is basically empty. You can detect them from the script (keys / types / defaults filled in automatically), or fill in the manifest first and then ask the AI how to configure it.",
+    sgParamsGuideExtract: "Detect parameters from script",
+    sgParamsGuideAskAi: "Ask the AI how to configure",
+    sgParamsGuideAskAiFirst:
+      "The AI needs a parameter manifest before it can tell you how to configure each parameter. Click “Detect parameters from script”, review, press “Save manifest”, then come back and ask.",
+    sgOtherParamsHint: "From the instance TOML, not declared in the manifest — “Detect parameters from script” can promote them to declared parameters.",
+    sgMfExtract: "Detect from script",
+    sgMfExtracting: "Detecting…",
+    sgMfExtractOk: "Parameters detected (keys / types / defaults filled in); descriptions written in script comments come along too. Names may be left blank — press \"Name them with AI\" if you want better ones.",
+    sgMfExtractNone: "No parameter reads were detected in this script (it may not read any parameters).",
+    sgMfAutoName: "Name them with AI",
+    sgMfAutoNaming: "Naming…",
+    sgMfNameOk: "AI filled in names and descriptions from the script code (blank fields only; your own entries were left alone). Review, then press Save manifest.",
+    sgMfNameNone: "Nothing to fill — every parameter already has a name or description.",
     sgNeedKeys: "No AI key is configured yet. Add one on the Keys page, then try again.",
     sgGoSettings: "Go to Keys",
     sgBacktest: "Backtest",
@@ -582,7 +728,13 @@
       '<div class="sg-detail-grid">' +
       // 参数
       '<section class="sg-card"><div class="sg-card-head"><span' + bi("sgParams") + ">" +
-      R.TEXT.zh.sgParams + "</span></div><div id='sg-params' class='sg-card-body'></div></section>" +
+      R.TEXT.zh.sgParams + "</span></div>" +
+      // 052 方案4: 清单为空时, 表单只能画出交易对 —— 用户看到"就一个框"却不知该干什么。
+      // 这块引导卡由 strategy_form.js::renderParamsGuide 按**服务端事实**(manifest.params 为空)决定显隐,
+      // 两个按钮分别把用户引到"从脚本识别参数"与"问 AI 怎么配"。清单里有参数时整块隐藏, 不占位。
+      // 注意: 必须放在 `#sg-params` **外面** —— renderParams 每次 `innerHTML = ""` 会把它一起抹掉。
+      '<div id="sg-params-guide" class="sg-params-guide" hidden></div>' +
+      "<div id='sg-params' class='sg-card-body'></div></section>" +
       // 参数清单编辑(P2-8): 仅用户策略可见(内置清单随代码发布, 由 renderDetail 决定显隐)。
       '<section class="sg-card" id="sg-manifest-card" hidden>' +
       '<details class="sg-advanced sg-manifest"><summary' + bi("sgManifest") + ">" +
@@ -604,7 +756,15 @@
       "</span><span" + bi("sgMfDefault") + ">" + R.TEXT.zh.sgMfDefault + "</span>" +
       "<span" + bi("sgMfRequired") + ">" + R.TEXT.zh.sgMfRequired + "</span><span></span></div>" +
       '<div id="sg-mf-params" class="sg-mf-params"></div>' +
-      '<div class="sg-row-right"><button id="sg-mf-add" class="sg-btn sg-btn-mini" type="button"' +
+      '<div class="sg-row-right">' +
+      // 052 方案2: 从 Lua 静态提取读取到的参数键, 一键预填上面这些行 —— 用户不必手动对着代码抄。
+      '<button id="sg-mf-extract" class="sg-btn sg-btn-mini" type="button"' +
+      bi("sgMfExtract") + ">" + R.TEXT.zh.sgMfExtract + "</button>" +
+      // N2-C: 让 AI 按**脚本代码**给这些键起中文名与写说明。同样不落盘 —— 只填进上面的行,
+      // 用户核对后点「保存清单」才写。
+      '<button id="sg-mf-autoname" class="sg-btn sg-btn-mini" type="button"' +
+      bi("sgMfAutoName") + ">" + R.TEXT.zh.sgMfAutoName + "</button>" +
+      '<button id="sg-mf-add" class="sg-btn sg-btn-mini" type="button"' +
       bi("sgMfAdd") + ">" + R.TEXT.zh.sgMfAdd + "</button>" +
       '<button id="sg-mf-save" class="sg-btn sg-btn-mini sg-btn-primary" type="button"' +
       bi("sgMfSave") + ">" + R.TEXT.zh.sgMfSave + "</button></div>" +
@@ -629,12 +789,35 @@
       // AI
       '<section class="sg-card" id="sg-ai-card"><div class="sg-card-head"><span' + bi("sgAi") + ">" +
       R.TEXT.zh.sgAi + "</span></div>" +
+      // 052: AI 卡分两种模式 —— 「调参数」只填上面的参数表单(不碰代码)、「改代码逻辑」才动 Lua。
+      // 默认停在「调参数」: 用户的困惑正是"不知道该配什么", 先给一条**不动代码**的路。
+      // 模式 chip 的静态标签直接走 `bi()`; 「执行」按钮与提示语的文案随模式变 —— 由
+      // strategy_editor.js::setAiMode 同时改写 data-zh/data-en(否则切语言会被旧模式文案盖回去)。
+      '<div class="sg-seg" id="sg-ai-modes" role="group">' +
+      '<button id="sg-ai-mode-params" class="sg-seg-btn on" type="button"' +
+      bi("sgAiModeParams") + ">" + R.TEXT.zh.sgAiModeParams + "</button>" +
+      '<button id="sg-ai-mode-code" class="sg-seg-btn" type="button"' +
+      bi("sgAiModeCode") + ">" + R.TEXT.zh.sgAiModeCode + "</button></div>" +
+      '<div id="sg-ai-mode-hint" class="sg-ai-hint"></div>' +
+      // N3: 对话线程(用户气泡 / AI 气泡 + 改动对照)。历史只在这个 DOM 里, 也只在内存里 ——
+      // 服务端不存会话(见 strategy_editor.js 的说明), 所以下面那行提示必须如实写明"刷新即失"。
+      '<div id="sg-ai-thread" class="sg-ai-thread"></div>' +
+      '<div id="sg-ai-thread-note" class="sg-hint"' + bi("sgAiThreadNote") + ">" +
+      R.TEXT.zh.sgAiThreadNote + "</div>" +
       '<textarea id="sg-ai-instr" class="sg-ai-instr" rows="3" spellcheck="false"' +
-      ' data-zh-placeholder="' + R.TEXT.zh.sgAiPh + '" data-en-placeholder="' +
-      R.TEXT.en.sgAiPh + '"></textarea>' +
-      '<div class="sg-row-right"><button id="sg-ai-go" class="sg-btn" type="button"' +
-      bi("sgAiGo") + ">" + R.TEXT.zh.sgAiGo + "</button></div>" +
-      '<div id="sg-ai-msg" class="sg-msg" aria-live="polite"></div></section>' +
+      // 占位文字随模式变 —— 由 setAiMode 一并改写(与按钮文案同一纪律: data 属性也要写, 否则
+      // 切语言时 applyLang 会把它换回初始模式那一句)。
+      ' data-zh-placeholder="' + R.TEXT.zh.sgAiPhParams + '" data-en-placeholder="' +
+      R.TEXT.en.sgAiPhParams + '"></textarea>' +
+      '<div class="sg-row-right">' +
+      '<button id="sg-ai-clear" class="sg-btn sg-btn-mini" type="button"' +
+      bi("sgAiClear") + ">" + R.TEXT.zh.sgAiClear + "</button>" +
+      '<button id="sg-ai-go" class="sg-btn" type="button">' +
+      R.TEXT.zh.sgAiGoParams + "</button></div>" +
+      '<div id="sg-ai-msg" class="sg-msg" aria-live="polite"></div>' +
+      // N3-B: 改动影响评估面板。默认收起 —— 只有"这次真的改了值"时才由
+      // strategy_editor.js 展开(没改动却摆一个按钮, 用户点了只会得到 400)。
+      '<div id="sg-ai-assess" class="sg-ai-assess" hidden></div></section>' +
       // 回测
       '<section class="sg-card"><div class="sg-card-head"><span' + bi("sgBacktest") + ">" +
       R.TEXT.zh.sgBacktest + "</span></div><div class='sg-card-body'>" +
@@ -715,6 +898,13 @@
     $("sg-save").addEventListener("click", onSave);
     $("sg-save-top").addEventListener("click", onSave);
     $("sg-ai-go").addEventListener("click", onAiEdit);
+    // N3: 清空当前模式的对话线程(历史全在前端, 服务端没有可清的东西)。
+    $("sg-ai-clear").addEventListener("click", () => onAiClearThread());
+    // 052: AI 卡的模式 chip(默认「调参数」)。初始化必须走 setAiMode ——
+    // 它同时把 chip 高亮 / 「执行」按钮标签 / 一行提示按 zh 或 en 写成一致的一套。
+    $("sg-ai-mode-params").addEventListener("click", () => setAiMode("params"));
+    $("sg-ai-mode-code").addEventListener("click", () => setAiMode("code"));
+    setAiMode(st.aiMode);
     $("sg-bt-go").addEventListener("click", onBacktest);
     $("sg-sw-go").addEventListener("click", onSweep);
     // C8: 维度行**不在这里铺** —— 挂载时还没读策略详情, 参数清单是空的。等详情渲染后再
@@ -726,6 +916,10 @@
       setMsg($("sg-mf-msg"), "", "");
     });
     $("sg-mf-save").addEventListener("click", onSaveManifest);
+    // 052 方案 2: 从编辑器里的 Lua 静态识别参数键 → 预填清单行(不落盘, 用户核对后保存清单)。
+    $("sg-mf-extract").addEventListener("click", () => onExtractParams());
+    // N2-C: 让 AI 按脚本代码给参数键起中文名与写说明(不落盘, 用户核对后保存清单)。
+    $("sg-mf-autoname").addEventListener("click", () => onAiNameParams());
     st.mounted = true;
   }
 
@@ -872,6 +1066,12 @@
       btn.type = "button";
       btn.addEventListener("click", () => openDetail(s.id));
       act.appendChild(btn);
+      // N1 自定义策略可删。内置行**没有**这个按钮 —— 服务端也会 409 reserved(双保险),
+      // 但入口本身就不该出现: 让人点了才知道不行, 是无谓的往返。
+      const del = h("button", "sg-btn sg-btn-mini sg-btn-danger", t("sgDelete"));
+      del.type = "button";
+      del.addEventListener("click", () => onDelete(s));
+      act.appendChild(del);
       main.addEventListener("click", () => openDetail(s.id));
     }
     row.appendChild(main);
@@ -960,7 +1160,7 @@
     const { cancel, primary } = modalActions(card, "sgCreate");
     cancel.addEventListener("click", close);
 
-    // 模板状态: 选中内置后缓存 {market, lua, detail}。
+    // 模板状态: 选中内置后缓存 {id, market, lua, detail}。
     let tpl = null;
     let tplReq = 0;
 
@@ -979,7 +1179,7 @@
           R.api("/api/strategies/" + encodeURIComponent(id) + "/source"),
         ]);
         if (req !== tplReq) return;
-        tpl = { market: detail.market, lua: source.lua, detail: detail };
+        tpl = { id: id, market: detail.market, lua: source.lua, detail: detail };
         marketSel.value = detail.market;
         marketSel.disabled = true;
         // 参数表单: 清单 schema + 默认值预填(必填无默认的留空由用户填)。
@@ -1020,17 +1220,19 @@
       primary.disabled = true;
       primary.textContent = t("sgCreating");
       try {
-        await R.api("/api/strategies", {
-          method: "POST",
-          body: {
-            name: name,
-            market: tpl ? tpl.market : marketSel.value,
-            pair: pair,
-            code: tpl ? tpl.lua : BLANK_LUA,
-            params: params,
-            overwrite: false,
-          },
-        });
+        // 052 方案 1: 选了模板就带 `copy_from` —— 让模板的**参数清单**随副本一起落盘。
+        // 否则模板的参数只存在于内置清单里: 副本页面画不出参数行, 用户就"不知道该配什么"。
+        // 空白骨架没有来源, 自然不带(tpl 为 null)。
+        const body = {
+          name: name,
+          market: tpl ? tpl.market : marketSel.value,
+          pair: pair,
+          code: tpl ? tpl.lua : BLANK_LUA,
+          params: params,
+          overwrite: false,
+        };
+        if (tpl) body.copy_from = tpl.id;
+        await R.api("/api/strategies", { method: "POST", body: body });
         close();
         openDetail(name);
       } catch (err) {
@@ -1199,6 +1401,52 @@
     el.appendChild(go);
   }
 
+  // ---------- 删除自定义策略(N1, 2026-10-12) ----------
+
+  /// 删除一个自定义策略: 弹确认框, 并**如实写明保留什么**。
+  ///
+  /// 保留项必须写在确认按钮**之前**: 回测历史与台账**不会**跟着删 —— 删一个策略不该顺手抹掉
+  /// 它的历史, 那会让总收益这类统计跟着变。用户有权在点之前知道, 而不是删完才发现。
+  function onDelete(s) {
+    const { card, close } = openModal(t("sgDeleteTitle"));
+    const form = h("div", "sg-modal-form");
+    form.appendChild(h("div", "sg-modal-hint", t("sgDeleteBody")));
+    const which = h("div", "sg-copy-from");
+    which.appendChild(h("span", "sg-muted", t("sgDeleteWhich")));
+    which.appendChild(h("span", null, s.name)); // 服务端数据只走 textContent, 绝不拼 HTML
+    form.appendChild(which);
+    form.appendChild(h("div", "sg-muted", t("sgDeleteKeep")));
+    const keep = h("ul", "sg-del-keep");
+    keep.appendChild(h("li", null, t("sgDeleteKeepBacktest")));
+    keep.appendChild(h("li", null, t("sgDeleteKeepLedger")));
+    form.appendChild(keep);
+    const errLine = h("div", "sg-msg");
+    form.appendChild(errLine);
+    card.appendChild(form);
+
+    const { cancel, primary } = modalActions(card, "sgDeleteOk");
+    primary.classList.add("sg-btn-danger");
+    cancel.addEventListener("click", close);
+    primary.addEventListener("click", async () => {
+      primary.disabled = true;
+      cancel.disabled = true;
+      primary.textContent = t("sgDeleting");
+      try {
+        await R.api("/api/strategies/" + encodeURIComponent(s.id), { method: "DELETE" });
+        close();
+        R.toast(t("sgDeleteDone"), "ok");
+        // 重新拉列表: 让服务端说"现在还剩什么", 不在本地猜着删 DOM。
+        await enterList(st.gen);
+      } catch (err) {
+        errLine.className = "sg-msg err";
+        errLine.textContent = (err && err.message) || String(err);
+        primary.disabled = false;
+        cancel.disabled = false;
+        primary.textContent = t("sgDeleteOk");
+      }
+    });
+  }
+
   // ---------- 复制内置 ----------
 
   /// 先取 Lua 原文(不弹空窗), 再开命名弹窗; 交易对缺省 BTCUSDT(内置无实例 TOML)。
@@ -1279,18 +1527,21 @@
       primary.disabled = true;
       primary.textContent = t("sgCopying");
       try {
-        await R.api("/api/strategies", {
-          method: "POST",
-          // 副本是全新用户策略: 原样复制 Lua, 参数留空(用 Lua 内 fallback 默认), overwrite=false。
-          body: {
-            name: name,
-            market: s.market,
-            pair: pair,
-            code: lua,
-            params: {},
-            overwrite: false,
-          },
-        });
+        // 052 方案 1: 带上 `copy_from` —— 服务端会把源策略的**参数清单**派生成副本自己的清单,
+        // 否则副本只是一份裸 .lua: 参数表单画不出任何一行, 用户回到"不知道该配什么"。
+        // 只有源**确实声明了清单**时才带(裸 .lua 的源服务端会 400 拒绝 —— 那种情况退回旧行为,
+        // 让副本页的引导卡把用户引到「从脚本识别参数」)。
+        const body = {
+          name: name,
+          market: s.market,
+          pair: pair,
+          code: lua,
+          // 参数留空: 清单随行落盘后, 表单会按清单里的默认值预填(不再依赖 Lua 内 fallback)。
+          params: {},
+          overwrite: false,
+        };
+        if (s.declared) body.copy_from = s.id;
+        await R.api("/api/strategies", { method: "POST", body: body });
         close();
         // B6: 这里会**从列表切到详情** —— 提示若写进列表的 msg 区, 用户刚好就看不到它。
         // 全局 toast 挂在 body 上, 跟着用户走过这次跳转。
@@ -1317,6 +1568,9 @@
     if (st.detailCtx) {
       renderBadges(st.detailCtx.detail, st.detailCtx.source);
       $("sg-builtin-hint").textContent = t("sgBuiltinHint");
+      // 052: 参数引导卡的文字是动态建的(没有 data-zh 可换), 切语言要就地重建一次。
+      // 只重建这块 —— 参数行/清单行重建会把用户填了一半的值抹掉。
+      renderParamsGuide(st.detailCtx.detail);
       updateDirty();
       syncSaveBtn(st.saveLocked ? "locked" : "idle");
       syncAiBtn(false);

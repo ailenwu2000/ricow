@@ -68,7 +68,7 @@
       },
       {
         h: "选策略",
-        p: "「策略」页点开任一策略的「详情」, 先看它的**适用 / 不适用场景**, 再决定要不要用。",
+        p: "「策略」页点开任一策略的「详情」, 先看它的**适用 / 不适用场景**, 再决定要不要用。要改成自己的就用列表里的「复制」—— 参数表会一起复制过来; 参数表空着就点「从脚本识别参数」。AI 修改框默认只改参数, 不动代码。",
       },
       {
         h: "先回测",
@@ -90,7 +90,7 @@
       },
       {
         h: "Pick a strategy",
-        p: "On the Strategies page, open any strategy's Details and read its **good for / not suitable for** notes before choosing.",
+        p: "On the Strategies page, open any strategy's Details and read its **good for / not suitable for** notes before choosing. To make it your own, use Copy in the list — the parameter form comes with it; if it is empty, click “Detect parameters from script”. The AI box tunes parameters by default and leaves the code alone.",
       },
       {
         h: "Backtest first",

@@ -354,6 +354,147 @@ if (illegal.length) {
   pass(`err toast 仅出现在允许名单内 (${errToastFiles.join(", ") || "无"})`);
 }
 
+// ---------------------------------------------------------------------------
+// G. 同名碰撞: 同一字典块里重复的文案键 / 同一文件里重复的 DOM id 字面量。
+// ---------------------------------------------------------------------------
+console.log("");
+console.log("=".repeat(78));
+console.log("G. 同名碰撞 (字典重复键 / DOM id 重复字面量)");
+console.log("=".repeat(78));
+
+// 052 N2-C 复核时发现的真事: 「让 AI 起中文名」按钮与清单卡的「策略中文名」字段**撞名** ——
+// 文案键都叫 `sgMfName`, DOM id 都叫 `sg-mf-name`。JS 对象字面量后者胜 → 按钮显示成"策略中文名";
+// `getElementById` 返回先渲染的那个 input → 按钮的 click 挂到了文本框上, 按钮本身点了没反应。
+// 这种错误 A/B/C/D/E/F 六节**一条都抓不到**: 语法合法、双语键齐全、引用也有定义 —— 值就是错的。
+// 只有在浏览器里点一下才看得见, 而"按钮点了没反应"最容易被当成"功能还没做"。
+/// 同一块字典里重复出现的键(后者静默胜出)。
+function dupeKeysOfBlock(block) {
+  const seen = new Set();
+  const dup = [];
+  for (const k of keysOfBlock(block)) {
+    if (seen.has(k)) dup.push(k);
+    else seen.add(k);
+  }
+  return dup;
+}
+
+/// 去掉 `//` 行注释与 `/* … */` 块注释(逐字符走, 字符串字面量里的 `//` 不动)。
+///
+/// 为什么需要: 「同名碰撞」查的是**真代码**里的重名, 而注释里写一句"原先 id 叫 sg-x"完全合法,
+/// 却会被当成第二次定义。假红线比漏报更伤 —— 一旦 lint 有假阳性就没人再看了。
+/// 已知边界: 正则字面量里出现 `//`(如 `/a\/\/b/`)会被误当注释, 顶多**漏报**一行, 不会误报;
+/// 本仓库资产里没有这种写法。
+function stripComments(src) {
+  let out = "";
+  let inStr = null;
+  let inLine = false;
+  let inBlock = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    const nx = src[i + 1];
+    if (inLine) {
+      if (ch === "\n") {
+        inLine = false;
+        out += ch;
+      }
+      continue;
+    }
+    if (inBlock) {
+      if (ch === "*" && nx === "/") {
+        inBlock = false;
+        i += 1;
+      }
+      continue;
+    }
+    if (inStr) {
+      out += ch;
+      if (ch === "\\") {
+        out += nx || "";
+        i += 1;
+      } else if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inStr = ch;
+      out += ch;
+      continue;
+    }
+    if (ch === "/" && nx === "/") {
+      inLine = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && nx === "*") {
+      inBlock = true;
+      i += 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+// 注释一律先剥掉再扫: 注释里出现的键名 / id 不是定义。
+const stripped = new Map([...sources].map(([n, s]) => [n, stripComments(s)]));
+const htmlStripped = html.replace(/<!--[\s\S]*?-->/g, "");
+
+const dupeTextKeys = [];
+for (const [name, src] of stripped) {
+  for (const lang of ["zh", "en"]) {
+    const blocks = [];
+    const re = new RegExp(`R\\.TEXT\\.${lang}\\s*[,=]?\\s*\\{`, "g");
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      const block = sliceBraced(src, m.index + m[0].length - 1);
+      if (block) blocks.push(block);
+    }
+    const baseRe = /R\.TEXT\s*=\s*\{/g;
+    let b;
+    while ((b = baseRe.exec(src)) !== null) {
+      const base = sliceBraced(src, b.index + b[0].length - 1);
+      if (!base) continue;
+      const subRe = new RegExp(`(?:^|[,{\\s])${lang}\\s*:\\s*\\{`, "g");
+      let s;
+      while ((s = subRe.exec(base)) !== null) {
+        const sub = sliceBraced(base, base.indexOf("{", s.index));
+        if (sub) blocks.push(sub);
+      }
+    }
+    for (const k of new Set(blocks.flatMap(dupeKeysOfBlock))) {
+      dupeTextKeys.push(`${name}: R.TEXT.${lang}.${k} 定义了两次(后者胜出, 前者永远读不到)`);
+    }
+  }
+}
+if (dupeTextKeys.length) {
+  fail(`${dupeTextKeys.length} 个文案键在同一个字典块里重复定义`, dupeTextKeys.join("\n"));
+} else {
+  pass("双语字典块内无重复键");
+}
+
+// DOM id: 同一文件里同一 id **字面量**出现两次 = 骨架里铺了两个同 id 元素,
+// `getElementById` 只认第一个, 第二个上的事件监听永远收不到点击。
+// 只查"字面量重复"(同一文件内), 不跨文件 —— 不同视图的骨架各建各的, 跨文件同名不算错。
+function idLiterals(src) {
+  const out = [];
+  for (const m of src.matchAll(/\bid\s*[=:]\s*(["'])([A-Za-z][\w-]*)\1/g)) out.push(m[2]);
+  return out;
+}
+function collectDupeIds(name, src, into) {
+  const seen = new Set();
+  for (const id of idLiterals(src)) {
+    if (seen.has(id)) into.push(`${name}: id="${id}" 在同一文件里出现了两次`);
+    else seen.add(id);
+  }
+}
+const dupeIds = [];
+for (const [name, src] of stripped) collectDupeIds(name, src, dupeIds);
+collectDupeIds("index.html", htmlStripped, dupeIds);
+if (dupeIds.length) {
+  fail(`${dupeIds.length} 个 DOM id 字面量在同一文件里重复`, dupeIds.join("\n"));
+} else {
+  pass("同一文件内无重复 DOM id 字面量");
+}
+
 console.log("");
 if (failed === 0) {
   console.log("前端静态检查: 全绿");

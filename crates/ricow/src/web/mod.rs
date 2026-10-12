@@ -283,8 +283,15 @@ pub fn router(state: WebState) -> Router {
         // 策略源码读取与页面保存(032 US3 / FR-015 ~ FR-017): 读 Lua/实例 TOML 原文;
         // POST 保存走命名校验链 → 编译门禁 → 引擎同一落盘内核(免 preview, FR-028)。
         .route("/api/strategies", axum::routing::post(strategy_io::save_strategy))
+        // 删除用户策略(N1, 2026-10-12): 只删策略本体(实例 TOML + 脚本 + 清单 + 备份);
+        // **回测历史与台账保留**, 前端确认框会如实写明。内置 409 reserved / 运行中 409 running。
+        .route("/api/strategies/{id}", axum::routing::delete(strategy_io::delete_strategy))
         .route("/api/strategies/{id}/source", get(strategy_io::get_strategy_source))
         .route("/api/strategies/{id}/ai-edit", axum::routing::post(strategy_io::ai_edit_strategy))
+        // 评估一组参数改动的**实际**影响(N3-B, 2026-10-12): 前端拿着同一窗口下改前/改后两次
+        // 真实回测的指标来问, 后端只做"把两份实测指标讲成大白话"。**不接受任何回测请求参数** ——
+        // 这里不跑回测(那是 `/api/backtest` 的事), 只是把实测数字读给人听。
+        .route("/api/strategies/{id}/ai-assess", axum::routing::post(strategy_io::ai_assess_params))
         // 用户策略清单(manifest)编辑(P2-8): 声明/维护参数 schema, 点亮参数表单。
         .route(
             "/api/strategies/{id}/manifest",
@@ -295,6 +302,13 @@ pub fn router(state: WebState) -> Router {
             "/api/strategies/ai-generate",
             axum::routing::post(strategy_io::ai_generate_strategy),
         )
+        // 从 Lua 源码静态提取参数骨架(052 方案 2): **无状态**(只吃请求里的代码), 不读盘、
+        // 不落盘、不碰 AI —— 供未声明清单的策略一键列出"它读了哪些参数"。
+        // 静态段必须先于 `/api/strategies/{id}` 之外的同层动态段声明; matchit 会给静态段更高优先级。
+        .route("/api/strategies/extract-params", axum::routing::post(strategy_io::extract_params))
+        // 给参数起中文名(N2-C, 2026-10-12): **无状态**, 吃编辑器里的草稿; 键集合由**静态提取**
+        // 决定(不让模型自己列键 —— 那会多出编造的键), AI 只负责起名与写说明, 全程不落盘。
+        .route("/api/strategies/ai-name-params", axum::routing::post(strategy_io::ai_name_params))
         // 回测异步作业 (032 US3 / FR-019): POST 202 拿 job_id 后台跑 CLI 同一内核, GET 轮询结果。
         // 参数寻优 (P2-7): 单参数网格扫描, 作业生命周期与轮询端点复用。
         .route("/api/backtest/sweep", axum::routing::post(backtest_jobs::start_sweep))

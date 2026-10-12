@@ -394,17 +394,62 @@ pub(crate) fn update_strategy_params_in(
     Ok(diffs)
 }
 
-/// 删除策略文件(023 FR-024): 只删 `strategies/{name}.toml` 与 `strategies/{name}.lua`(存在才删)。
+/// 删除一个策略时要处理的**候选文件**(不保证存在)。
+///
+/// 031 FR-006 起策略源码落在**市场子目录**(`strategies/{market}/{name}.lua`, 见
+/// `ricow_engine::write_strategy_files`), 而 023 FR-024 的删除最初只认根目录 —— 两者一叠加,
+/// "删除策略"就**删不掉脚本**: 实例 TOML 没了、脚本还在, 策略仍在列表里(加载路径照样扫到它)。
+/// 这里以**名字**圈定全部可能位置, 把两条入口(CLI/AI 对话 与 Web UI)统一到同一份判据:
+///
+/// - `strategies/{name}.toml` —— 实例 TOML(留根, 向后兼容);
+/// - `strategies/{name}.lua` —— 031 之前的旧布局, 兼容老工作区;
+/// - `strategies/{spot,futures}/{name}.lua` —— 脚本;
+/// - `strategies/{spot,futures}/{name}.toml` —— 清单(可选, 裸脚本没有);
+/// - 上述目录里该 name 的 `*.bak` —— 覆盖保存留下的备份。
+///
+/// `.bak` 的前缀判定用 `{name}.`(**带点**): 否则删 `grid` 会顺手删掉 `grid_futures.lua.<ts>.bak`,
+/// 而备份是用户唯一的回退手段。目录不存在就整体跳过(不产出"注定不存在"的目标)。
+pub(crate) fn strategy_file_candidates(
+    root: &std::path::Path,
+    name: &str,
+) -> Vec<std::path::PathBuf> {
+    let dir = root.join("strategies");
+    let prefix = format!("{name}.");
+    let mut out = vec![dir.join(format!("{name}.toml")), dir.join(format!("{name}.lua"))];
+    let mut dirs: Vec<std::path::PathBuf> = vec![dir.clone()];
+    for market in ["spot", "futures"] {
+        dirs.push(dir.join(market));
+    }
+    for (i, d) in dirs.iter().enumerate() {
+        let Ok(rd) = std::fs::read_dir(d) else {
+            continue;
+        };
+        if i > 0 {
+            // 市场目录里才有清单(脚本已在上面的基础候选里按目录枚举)。
+            out.push(d.join(format!("{name}.lua")));
+            out.push(d.join(format!("{name}.toml")));
+        }
+        for e in rd.flatten() {
+            let fname = e.file_name().to_string_lossy().to_string();
+            if fname.ends_with(".bak") && fname.starts_with(&prefix) {
+                out.push(d.join(fname));
+            }
+        }
+    }
+    out
+}
+
+/// 删除策略文件(023 FR-024): 删该策略在磁盘上的**全部文件**(位置见
+/// [`strategy_file_candidates`]), 只删存在的。
 ///
 /// **不动 `logs/`**: 停机与成交留痕要保留, 供事后追溯。返回被删文件的文件名列表。
-/// 前置校验全在删除之前完成(名字/至少命中一个文件), 避免"删了一半才发现名字非法"。
+/// 前置校验全在删除之前完成(名字格式 / 至少命中一个文件), 避免"删了一半才发现名字非法"。
 pub(crate) fn delete_strategy_files_in(
     root: &std::path::Path,
     name: &str,
 ) -> CoreResult<Vec<String>> {
     safe_strategy_file_stem(name)?;
-    let dir = root.join("strategies");
-    let candidates = [dir.join(format!("{name}.toml")), dir.join(format!("{name}.lua"))];
+    let candidates = strategy_file_candidates(root, name);
     let existing: Vec<&std::path::PathBuf> = candidates.iter().filter(|p| p.is_file()).collect();
     if existing.is_empty() {
         return Err(CoreError::InvalidArgument(format!("策略 {name} 不存在(没有找到 .toml/.lua)")));
@@ -416,6 +461,8 @@ pub(crate) fn delete_strategy_files_in(
         removed.push(p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
     }
     removed.sort();
+    // 同名文件出现在多个位置(旧布局残留)时回执只列一次, 免得用户以为删了两份。
+    removed.dedup();
     Ok(removed)
 }
 

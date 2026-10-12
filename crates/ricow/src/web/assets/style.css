@@ -1422,6 +1422,24 @@ body {
   background: var(--accent);
   border-color: var(--accent);
 }
+/* N1: 危险动作(删除)。用 --error 与常规 --accent 按钮分开 —— 这一步不可逆, 得一眼看出来。 */
+.sg-btn-danger {
+  border-color: var(--error);
+  color: var(--error);
+}
+.sg-btn-danger:hover {
+  background: var(--error);
+  border-color: var(--error);
+  color: var(--on-accent);
+}
+/* 删除确认框里"会保留什么"的清单: 写在确认按钮之前, 让用户点之前就看见。 */
+.sg-del-keep {
+  margin: 6px 0 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.7;
+}
 .sg-btn-mini {
   padding: 2px 10px;
   font-size: 0.76rem;
@@ -1747,6 +1765,71 @@ body {
   font-size: 0.8rem;
   font-weight: 600;
 }
+
+/* 052 方案 4: 空参数表单的引导卡。放在「参数」卡里、`#sg-params` 之上, 清单为空时才出现。 */
+.sg-params-guide {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-dim);
+  border-radius: 8px;
+}
+.sg-params-guide[hidden] {
+  display: none;
+}
+.sg-guide-title {
+  margin-bottom: 4px;
+  color: var(--fg);
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+.sg-guide-body {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+.sg-guide-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* 052 方案 3: AI 卡的模式 chip(分段控件)。`.on` = 当前选中的那一档。 */
+.sg-seg {
+  display: inline-flex;
+  margin-bottom: 8px;
+  padding: 2px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.sg-seg-btn {
+  padding: 4px 12px;
+  background: none;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.sg-seg-btn:hover {
+  color: var(--fg);
+}
+.sg-seg-btn.on {
+  background: var(--accent-dim);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+/* 模式提示: 一句话说明当前模式, 比通用 `.sg-hint`(黄底警示)轻一档 —— 它不是警告。 */
+.sg-ai-hint {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
 .sg-input {
   width: 100%;
   padding: 7px 10px;
@@ -1780,14 +1863,122 @@ body {
   outline: none;
 }
 
+/* N3: AI 对话线程 —— 用户气泡靠右、AI 气泡靠左(与常见聊天一致, 一眼分得清谁说的)。
+   气泡里的正文一律 `pre-wrap`: 后端回的是带换行的多段中文, 按 HTML 折叠会把"逐项理由"
+   挤成一坨。 */
+.sg-ai-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.sg-ai-thread[hidden] {
+  display: none;
+}
+.sg-ai-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 88%;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.sg-ai-turn-user {
+  align-self: flex-end;
+  background: var(--raise-2);
+}
+.sg-ai-turn-bot {
+  align-self: flex-start;
+  border-left: 3px solid var(--accent-dim);
+}
+.sg-ai-who {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.sg-ai-body {
+  color: var(--fg);
+  font-size: 0.84rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.sg-ai-note {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+/* 改动对照: 只列真变了的键, 所以这张表通常很短 —— 它的价值就是"能一眼看完"。 */
+.sg-ai-changed {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+.sg-ai-changed-title {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+.sg-ai-change-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+.sg-ai-change-name {
+  color: var(--muted);
+}
+.sg-ai-change-num {
+  color: var(--fg);
+  font-family: var(--mono);
+}
+/* 「改前值只是清单默认值」这句提示不是装饰: 它区分"这组参数真的在跑"与"你还没确认过它"。 */
+.sg-ai-change-tag {
+  color: var(--warn);
+  font-size: 0.72rem;
+}
+.sg-ai-changed-none {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+/* N3-B: 改动影响评估面板(配色沿用引导卡, 但独立容器 —— 出现/消失的时机与引导卡无关)。 */
+.sg-ai-assess {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--raise-1);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-dim);
+  border-radius: 8px;
+}
+.sg-ai-assess[hidden] {
+  display: none;
+}
+.sg-ai-assess-result {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sg-ai-assess-block {
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.sg-ai-assess-block .sg-guide-body {
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* 回测作业区 */
 .sg-bt-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 10px;
-}
-.sg-bt-grid label {
+}.sg-bt-grid label {
   display: flex;
   flex-direction: column;
   gap: 4px;

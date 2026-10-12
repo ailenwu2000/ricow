@@ -685,8 +685,9 @@ fn test_build_manifest_validation() {
             "9bad key",
         ),
         (serde_json::json!([{"key": "script", "name": "n", "type": "f64", "desc": "d"}]), "保留键"),
-        (serde_json::json!([{"key": "a", "name": "", "type": "f64", "desc": "d"}]), "缺中文名"),
-        (serde_json::json!([{"key": "a", "name": "n", "type": "f64", "desc": "  "}]), "缺说明"),
+        // N2 (2026-10-11): "空 name / 空 desc 被拒" 这两条用例**已按新契约移除** —— 留空不再非法,
+        // 见本函数末尾的正向断言。之所以留这句注释: 谁把它们加回来, 谁就重新堵死了
+        // "从脚本识别参数 → 保存清单" 这条路(N3 的 AI 调参数也因此根本进不去)。
         (
             serde_json::json!([
                 {"key": "a", "name": "n", "type": "f64", "desc": "d"},
@@ -713,10 +714,27 @@ fn test_build_manifest_validation() {
         assert!(err.contains(needle), "应命中 '{needle}', 实际: {err}");
     }
 
-    // name 空 → 拒绝。
-    let mut bad = ok(serde_json::json!([]));
-    bad.name = "   ".into();
-    assert!(build_manifest("my-grid", "spot", bad).unwrap_err().contains("中文名"));
+    // N2 (2026-10-11): 中文名 / 说明 / 策略名**留空不再非法** —— 用户是脚本的使用者不是作者,
+    // 从脚本识别出来的参数本就没有名字与说明。这三条必须是**正向**断言: 一旦有人把校验加回去,
+    // "识别参数 → 一键保存" 会再次 400, 而 N3 的 AI 调参数功能会跟着一起进不去。
+    let blank = build_manifest(
+        "my-grid",
+        "spot",
+        ok(serde_json::json!([
+            {"key": "spacing_pct", "name": "", "type": "f64", "desc": ""},
+            {"key": "flag", "name": "   ", "type": "i64", "desc": "  "}
+        ])),
+    )
+    .expect("留空的中文名与说明必须能保存(N2)");
+    assert_eq!(blank.params.len(), 2);
+    assert!(blank.params[0].name.is_empty(), "空中文名应原样保留为空, 不得被填上假数据");
+    assert!(blank.params[0].desc.is_empty());
+
+    let mut blank_name = ok(serde_json::json!([]));
+    blank_name.name = "   ".into();
+    let m_blank =
+        build_manifest("my-grid", "spot", blank_name).expect("策略中文名留空必须能保存(N2)");
+    assert!(m_blank.name.is_empty());
 }
 
 /// 清单保存 (P2-8) 端到端: 落盘 strategies/{market}/{id}.toml → 详情 params 点亮;
@@ -847,4 +865,807 @@ fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+// ---- 052 方案 1: 复制带清单 ----
+
+/// `derive_manifest` 只改 id / market, 其余(含参数 schema 与展示元数据)逐字照搬。
+#[test]
+fn test_derive_manifest_rewrites_only_id_and_market() {
+    let src = catalog::find("paired_grid").expect("内置 paired_grid 应在目录里");
+    let d = derive_manifest(&src.manifest, "paired_grid-1", "spot");
+    assert_eq!(d.id, "paired_grid-1", "id 必须改成新策略名(落盘文件名按它)");
+    assert_eq!(d.market, "spot");
+    assert_eq!(d.name, src.manifest.name, "中文名照搬(副本与源是同一个策略)");
+    assert_eq!(d.summary, src.manifest.summary);
+    assert_eq!(d.params.len(), src.manifest.params.len(), "参数 schema 必须整份带过来");
+    let keys: Vec<&str> = d.params.iter().map(|p| p.key.as_str()).collect();
+    assert!(keys.contains(&"pair"), "保留键 pair 也照搬(表单侧自会跳过)");
+    assert!(keys.contains(&"spacing_pct"));
+    // 跨市场复制: market 必须改写, 否则 catalog 的 check_dir 会整条跳过。
+    let d2 = derive_manifest(&src.manifest, "paired_grid-f", "futures");
+    assert_eq!(d2.market, "futures");
+    assert!(d2.check_dir("futures").is_ok());
+}
+
+/// `copy_from` 端到端: 复制内置 → 清单随行落盘 → 详情页 `declared=true` 且参数非空。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_copy_from_writes_manifest_and_lights_up_params() {
+    // catalog 扫描读进程级 RICOW_ROOT, 与 manifest 用例同口径串行化。
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let root = tmp_root("copyfrom");
+    std::env::set_var("RICOW_ROOT", &root);
+    let port = boot(root.clone()).await;
+
+    let src = catalog::find("paired_grid").expect("内置源");
+    let n_params = src.manifest.params.len();
+    let code = src.code.clone();
+
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies?token=tok-ok",
+        Some(
+            &serde_json::json!({
+                "name": "paired_grid-1", "market": "spot", "pair": "BTCUSDT",
+                "code": code, "params": {}, "overwrite": false, "copy_from": "paired_grid"
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    let body = body_of(&res);
+    assert!(body.contains("manifest_path"), "响应应回报清单落盘路径: {body}");
+
+    // 清单落在 strategies/spot/paired_grid-1.toml(与内置清单同目录同构)。
+    let mf = root.join("strategies").join("spot").join("paired_grid-1.toml");
+    assert!(mf.is_file(), "清单须随复制落盘: {}", mf.display());
+    let text = std::fs::read_to_string(&mf).unwrap();
+    assert!(text.contains(r#"id = "paired_grid-1""#), "清单 id 必须改写: {text}");
+    assert!(text.contains("spacing_pct"), "{text}");
+
+    // 目录里这一条现在是"已声明"的, 参数表单据此渲染。
+    let entry = catalog::find("paired_grid-1").expect("复制后应能扫到");
+    assert!(entry.declared, "复制后必须是 declared=true(参数表单才有内容)");
+    assert_eq!(entry.manifest.params.len(), n_params, "参数 schema 应与源一致");
+
+    // 详情端点同样点亮(前端参数表单的数据源)。
+    let res = raw(port, "GET", "/api/strategies/paired_grid-1?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    let body = body_of(&res);
+    assert!(body.contains(r#""declared":true"#), "{body}");
+    assert!(body.contains(r#""key":"spacing_pct""#), "{body}");
+    assert!(body.contains("间距百分比"), "参数中文名应随清单带过来: {body}");
+
+    // 不带 copy_from 的普通新建: 清单不落盘, 仍是未声明(既有行为不变)。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies?token=tok-ok",
+        Some(
+            &serde_json::json!({
+                "name": "plain-new", "market": "spot", "pair": "BTCUSDT", "code": code
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    assert!(!body_of(&res).contains("manifest_path"), "非复制路径不应报清单路径: {res}");
+    assert!(!root.join("strategies").join("spot").join("plain-new.toml").exists());
+
+    std::env::remove_var("RICOW_ROOT");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `copy_from` 的两条拒绝: 未知源 / 与 overwrite 互斥 —— 都必须在**写盘之前** 400。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_copy_from_rejects_unknown_source_and_overwrite_combo() {
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let root = tmp_root("copyfrombad");
+    std::env::set_var("RICOW_ROOT", &root);
+    let port = boot(root.clone()).await;
+    let code = "function on_tick(ctx)\n    return {}\nend\n";
+    let post = |body: serde_json::Value| {
+        let body = body.to_string();
+        async move { raw(port, "POST", "/api/strategies?token=tok-ok", Some(&body)).await }
+    };
+
+    // 未知源 → 400 中文, 且**什么都没落盘**。
+    let res = post(serde_json::json!({
+        "name": "c1", "market": "spot", "pair": "BTCUSDT", "code": code, "copy_from": "no-such-src"
+    }))
+    .await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains("no-such-src"), "{res}");
+    assert!(!root.join("strategies").join("c1.toml").exists(), "失败不得落盘");
+    assert!(!root.join("strategies").join("spot").join("c1.lua").exists(), "失败不得落盘");
+
+    // copy_from + overwrite=true → 400(复制是新建语义)。
+    let res = post(serde_json::json!({
+        "name": "c2", "market": "spot", "pair": "BTCUSDT", "code": code,
+        "copy_from": "paired_grid", "overwrite": true
+    }))
+    .await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains("互斥"), "{res}");
+    assert!(!root.join("strategies").join("spot").join("c2.toml").exists(), "失败不得落盘");
+
+    std::env::remove_var("RICOW_ROOT");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 复制一个**自己没声明清单**的用户策略 → 400(复制带不来说明, 该走「从脚本识别参数」)。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_copy_from_rejects_undeclared_source() {
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let root = tmp_root("copyfrombare");
+    std::env::set_var("RICOW_ROOT", &root);
+    let port = boot(root.clone()).await;
+    let code =
+        "function on_tick(ctx)\n    local p = ctx:config_str(\"pair\")\n    return {}\nend\n";
+
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies?token=tok-ok",
+        Some(
+            &serde_json::json!({"name": "bare-src", "market": "spot", "pair": "ETHUSDT", "code": code})
+                .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "{res}");
+
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies?token=tok-ok",
+        Some(
+            &serde_json::json!({
+                "name": "bare-copy", "market": "spot", "pair": "ETHUSDT",
+                "code": code, "copy_from": "bare-src"
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains("没有声明参数清单"), "{res}");
+    assert!(body_of(&res).contains("从脚本识别参数"), "要给出下一步: {res}");
+
+    std::env::remove_var("RICOW_ROOT");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---- 052 方案 2: 无状态参数提取端点 ----
+
+#[test]
+fn test_parse_ai_mode() {
+    assert_eq!(parse_ai_mode(None).unwrap(), AiEditMode::Code, "缺省向后兼容旧前端");
+    assert_eq!(parse_ai_mode(Some("")).unwrap(), AiEditMode::Code);
+    assert_eq!(parse_ai_mode(Some("code")).unwrap(), AiEditMode::Code);
+    assert_eq!(parse_ai_mode(Some(" PARAMS ")).unwrap(), AiEditMode::Params);
+    let err = parse_ai_mode(Some("magic")).unwrap_err();
+    assert!(err.contains("code|params") && err.contains("magic"), "{err}");
+}
+
+/// 无状态端点: 喂一段内置 Lua, 抽出的键集合与清单声明一致; 空代码 400。
+#[tokio::test]
+async fn test_extract_params_endpoint() {
+    let root = tmp_root("extract");
+    let port = boot(root).await;
+
+    let lua = include_str!("../../../../../strategies/spot/paired_grid.lua");
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/extract-params?token=tok-ok",
+        Some(&serde_json::json!({"code": lua}).to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    let body = body_of(&res);
+    for key in ["spacing_pct", "accumulate_mode", "pair", "interval", "min_pair_profit"] {
+        assert!(body.contains(&format!(r#""key":"{key}""#)), "缺 {key}: {body}");
+    }
+    // 类型取 API 语义: `num` → f64, `cfg_str` → string。
+    assert!(body.contains(r#""key":"spacing_pct","type":"f64""#), "{body}");
+
+    // 空代码 → 400(没代码就无从识别); 无 token → 401(token 门禁之后)。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/extract-params?token=tok-ok",
+        Some(&serde_json::json!({"code": "   "}).to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/extract-params",
+        Some(&serde_json::json!({"code": lua}).to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 401, "{res}");
+    assert!(body_of(&res).is_empty(), "401 须空体: {res}");
+}
+
+// ---- N1: 删除用户策略 ----
+
+/// N1: 删除的**候选位置**要覆盖全部真实布局, 且**不能**误伤名字相近的别的策略。
+///
+/// 两条判据缺一不可:
+/// 1. **覆盖** —— 031 FR-006 起脚本落在 `strategies/{market}/`, 只认根目录就删不掉脚本
+///    (策略"删了"却仍在列表里)。这里连旧布局的根 `.lua` 与两个市场目录一起圈。
+/// 2. **精确** —— `.bak` 前缀判定必须是 `{id}.`(**带点**): 少了那个点, 删 `grid` 会顺手删掉
+///    `grid_futures.lua.<ts>.bak`, 而备份是用户唯一的回退手段。
+#[test]
+fn test_strategy_delete_candidates_cover_layout_and_scoped_to_id() {
+    let root = std::env::temp_dir().join(format!("ricow-del-targets-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("strategies");
+    let spot = dir.join("spot");
+    std::fs::create_dir_all(&spot).expect("建目录");
+    // 本策略: 实例 TOML + 市场目录脚本 + 清单 + 两处备份。
+    for f in [
+        "grid.toml",
+        "spot/grid.lua",
+        "spot/grid.toml",
+        "grid.toml.20261012T001122.bak",
+        "spot/grid.lua.20261012T001122.bak",
+    ] {
+        std::fs::write(dir.join(f), "x").expect("写文件");
+    }
+    // 同前缀的**另一个**策略: 一个文件都不能被选中。
+    for f in
+        ["grid_futures.toml", "spot/grid_futures.lua", "spot/grid_futures.lua.20261012T001122.bak"]
+    {
+        std::fs::write(dir.join(f), "x").expect("写文件");
+    }
+
+    let mut got: Vec<String> = crate::commands::strategy_file_candidates(&root, "grid")
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "strategies/grid.toml",
+            "strategies/grid.toml.20261012T001122.bak",
+            "strategies/spot/grid.lua",
+            "strategies/spot/grid.lua.20261012T001122.bak",
+            "strategies/spot/grid.toml",
+        ],
+        "应只圈定本策略的全部真实文件"
+    );
+
+    // 同一份判据喂给删除函数: **市场目录里的脚本必须被删掉** —— 这正是 031 之后的漏删点
+    // (旧实现只认 `strategies/{name}.lua`, 脚本删不掉, 策略仍会被 catalog 扫到)。
+    let removed = crate::commands::delete_strategy_files_in(&root, "grid").expect("应删成功");
+    assert!(removed.iter().any(|f| f == "grid.lua"), "市场目录脚本应被删: {removed:?}");
+    assert!(!spot.join("grid.lua").exists(), "市场目录脚本必须真的没了");
+    assert!(spot.join("grid_futures.lua").is_file(), "同前缀的别的策略不能被动到");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// N1 端点: 删自定义策略 → 三件套 + 备份都没了; 内置 409 reserved; 未知/非法名 404; 无 token 401。
+#[tokio::test]
+async fn test_delete_strategy_endpoint() {
+    let root = tmp_root("del");
+    let port = boot(root.clone()).await;
+
+    // 先落一个自定义策略(走真实保存端点)。
+    let body = serde_json::json!({
+        "name": "del_probe", "market": "spot", "pair": "ETHUSDT",
+        "params": {}, "code": "function on_tick(ctx) end",
+        "overwrite": false
+    })
+    .to_string();
+    let res = raw(port, "POST", "/api/strategies?token=tok-ok", Some(&body)).await;
+    assert_eq!(status_of(&res), 200, "前置: 保存应成功: {res}");
+
+    let dir = root.join("strategies");
+    assert!(dir.join("del_probe.toml").is_file(), "前置: 实例 TOML 应在");
+    assert!(dir.join("spot").join("del_probe.lua").is_file(), "前置: 脚本应在");
+    // 造一个同名备份(验证它也进删除清单), 与一个**同前缀**的邻居(验证它不受连累)。
+    std::fs::write(dir.join("del_probe.toml.20261012T001122.bak"), "old").expect("写备份");
+    std::fs::write(dir.join("spot").join("del_probe2.lua"), "x").expect("写邻居");
+
+    // 无 token → 401 空体(与其它策略端点同门禁)。
+    let res = raw(port, "DELETE", "/api/strategies/del_probe", None).await;
+    assert_eq!(status_of(&res), 401, "{res}");
+    assert!(body_of(&res).is_empty(), "401 须空体: {res}");
+
+    // 内置 → 409 reserved(与保存同口径, 单一来源 catalog::is_builtin_id)。
+    let res = raw(port, "DELETE", "/api/strategies/paired_grid?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 409, "{res}");
+    assert!(body_of(&res).contains("reserved"), "{res}");
+
+    // 未知 → 404。
+    let res = raw(port, "DELETE", "/api/strategies/no_such_thing?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 404, "{res}");
+
+    // 非法名(带路径分隔) → 404, 不穿越也不回显。
+    let res = raw(port, "DELETE", "/api/strategies/..%2Fetc?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 404, "{res}");
+
+    // 正常删除 → 200, 回包**如实列出**删了哪些。
+    let res = raw(port, "DELETE", "/api/strategies/del_probe?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    let body = body_of(&res);
+    assert!(body.contains("del_probe.toml"), "回包应列出删掉的文件: {res}");
+    assert!(body.contains(".bak"), "备份也应被删掉: {res}");
+    assert!(!dir.join("del_probe.toml").exists(), "实例 TOML 应已删");
+    assert!(!dir.join("spot").join("del_probe.lua").exists(), "脚本应已删");
+    assert!(!dir.join("del_probe.toml.20261012T001122.bak").exists(), "备份应已删");
+    assert!(dir.join("spot").join("del_probe2.lua").is_file(), "同前缀的别的策略不能被动到");
+
+    // 再删一次 → 404(已经不是策略了)。
+    let res = raw(port, "DELETE", "/api/strategies/del_probe?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 404, "{res}");
+}
+
+// ---- N2-C: AI 给参数起中文名(纯函数部分) ----
+
+/// N2-C: 命名结果**只保留静态提取到的键** —— 模型多给的键丢弃, 少给的就是没命名。
+///
+/// 与 `keep_manifest_params` 同一纪律(052 的键过滤), 但过滤依据不同: 这里的"合法键集合"
+/// 来自**代码扫描**而不是清单 —— 因为需要起名的场景恰恰是"清单还没建起来"的时候。
+#[test]
+fn test_parse_names_filters_to_extracted_keys() {
+    let hints = crate::strategies::params::extract_param_hints(
+        "local a = num(ctx, \"spacing_pct\", 0.01)\n\
+         local b = ctx:config_str(\"pair\")\n",
+    );
+    assert_eq!(hints.len(), 2, "前置: 应先扫出两个键");
+
+    // 模型: 多给了一个代码里没有的键; 两个真键里一个给了 name+desc, 一个只给字符串。
+    let raw = "{\"spacing_pct\": {\"name\": \"间距百分比\", \"desc\": \"上下挂单的间距\"},\n\
+               \"编造的键\": {\"name\": \"不该出现\"},\n\
+               \"pair\": \"交易对\"}";
+    // `WebError` 没派生 Debug, 所以用 unwrap_or_else 而不是 expect。
+    let got = parse_names(raw, &hints).unwrap_or_else(|_| panic!("应解析成功"));
+    let keys: Vec<&str> = got.iter().map(|n| n.key.as_str()).collect();
+    assert_eq!(keys, vec!["spacing_pct", "pair"], "顺序随静态提取; 编造的键必须被丢掉");
+    assert_eq!(got[0].name, "间距百分比");
+    assert_eq!(got[0].desc.as_deref(), Some("上下挂单的间距"));
+    assert_eq!(got[1].name, "交易对");
+    assert!(got[1].desc.is_none(), "只给了名字时说明留空(None), 不是空串");
+}
+
+/// N2-C: 一个都没命名成 → 报错, 而不是回一个空列表假装成功。
+#[test]
+fn test_parse_names_rejects_empty_and_bad_json() {
+    let hints = crate::strategies::params::extract_param_hints(
+        "local a = num(ctx, \"spacing_pct\", 0.01)\n",
+    );
+    // 模型回的键全都不在代码里。
+    assert!(parse_names("{\"other\": {\"name\": \"x\"}}", &hints).is_err());
+    // 名字是空串 → 不算命名。
+    assert!(parse_names("{\"spacing_pct\": {\"name\": \"  \"}}", &hints).is_err());
+    // 根本不是 JSON。
+    assert!(parse_names("我不会起名", &hints).is_err());
+}
+
+// ---- 052 方案 3: AI 调参数(纯函数部分) ----
+
+#[test]
+fn test_extract_json_object_strips_fences_and_noise() {
+    assert_eq!(extract_json_object(r#"{"a":1}"#).as_deref(), Some(r#"{"a":1}"#));
+    assert_eq!(
+        extract_json_object("```json\n{\"a\": 1}\n```").as_deref(),
+        Some(r#"{"a": 1}"#),
+        "围栏要剥掉"
+    );
+    assert_eq!(
+        extract_json_object("好的:\n{\"a\":1}\n以上").as_deref(),
+        Some(r#"{"a":1}"#),
+        "前后寒暄要切掉"
+    );
+    assert_eq!(extract_json_object("没有任何对象"), None);
+    assert_eq!(extract_json_object("[1,2]"), None, "数组不是对象");
+}
+
+#[test]
+fn test_current_values_text_is_sorted_and_readable() {
+    // 无实例 → 一句可读的说明(不是空串, 免得提示词里出现空段)。
+    assert!(current_values_text(None).contains("还没有保存过"));
+    let v = InstanceValues {
+        pair: Some("BTCUSDT".into()),
+        current: HashMap::from([
+            ("spacing_pct".to_string(), ConfigValue::Float(0.02)),
+            ("accumulate_mode".to_string(), ConfigValue::String("u".into())),
+            ("atr_period".to_string(), ConfigValue::Integer(14)),
+        ]),
+    };
+    let text = current_values_text(Some(&v));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "pair + 3 个参数: {text}");
+    assert_eq!(lines[0], "- accumulate_mode = \"u\"", "{text}");
+    assert!(text.contains("- atr_period = 14"), "{text}");
+    assert!(text.contains("- pair = \"BTCUSDT\""), "pair 也要给模型看到: {text}");
+}
+
+/// 键过滤: 清单外的键丢弃 + warning; 类型不符丢弃 + warning; 枚举取值必须合法。
+#[test]
+fn test_keep_manifest_params_filters_and_warns() {
+    let manifest = catalog::find("paired_grid").unwrap().manifest;
+    let suggested = HashMap::from([
+        ("spacing_pct".to_string(), ConfigValue::Float(0.02)),
+        ("atr_period".to_string(), ConfigValue::Integer(14)), // 清单里没有 → 丢
+        ("order_amount".to_string(), ConfigValue::Integer(20)), // f64 参数收整数 → 归一成浮点
+        ("accumulate_mode".to_string(), ConfigValue::String("coin".into())),
+        ("direction_offset".to_string(), ConfigValue::String("x".into())), // 类型不符 → 丢
+    ]);
+    let (kept, warns) = keep_manifest_params(suggested, &manifest);
+    assert_eq!(kept.len(), 3, "{kept:?}");
+    assert!(
+        matches!(kept.get("order_amount"), Some(ConfigValue::Float(f)) if (*f - 20.0).abs() < 1e-9)
+    );
+    assert!(matches!(kept.get("accumulate_mode"), Some(ConfigValue::String(s)) if s == "coin"));
+    assert!(!kept.contains_key("atr_period"), "清单外的键绝不能写进 TOML");
+    assert!(!kept.contains_key("direction_offset"), "类型不符必须丢");
+
+    let joined = warns.join("\n");
+    assert!(joined.contains("atr_period") && joined.contains("不在本策略清单里"), "{joined}");
+    assert!(joined.contains("改代码逻辑"), "要告诉用户正确路径: {joined}");
+    assert!(joined.contains("direction_offset") && joined.contains("需要数值"), "{joined}");
+
+    // 枚举取值不在可选集里 → 丢并点名可选值。
+    let (kept, warns) = keep_manifest_params(
+        HashMap::from([("accumulate_mode".to_string(), ConfigValue::String("wat".into()))]),
+        &manifest,
+    );
+    assert!(kept.is_empty());
+    assert!(warns[0].contains("wat") && warns[0].contains("u/coin"), "{warns:?}");
+}
+
+// ---- 052 方案 3: AI 调参数的离线端点行为 ----
+
+/// 未配密钥时两种模式都要 403 `need_keys`(params 模式也必须先在联网前拦住);
+/// `mode` 非法与清单为空是同步 400, 不该走到网络。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_ai_edit_params_offline_guards() {
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    // 与 test_ai_edit_validation_and_need_keys_offline 同款: 清掉 AI 覆盖变量,
+    // 确保走到"远程端点缺密钥"分支而不是真的去联网。
+    let saved =
+        ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].map(|k| std::env::var(k).ok());
+    for k in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"] {
+        std::env::remove_var(k);
+    }
+
+    let root = tmp_root("aiparams");
+    let port = boot(root).await;
+
+    // mode 非法 → 400(同步校验, 不联网, 不查策略)。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/paired_grid/ai-edit?token=tok-ok",
+        Some(&serde_json::json!({"instruction": "间距调大点", "mode": "magic"}).to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains("code|params"), "{res}");
+
+    // params 模式 + 内置(有清单)但没配密钥 → 403 need_keys(证明它真的走到了 provider 的密钥前置)。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/paired_grid/ai-edit?token=tok-ok",
+        Some(&serde_json::json!({"instruction": "把间距改成 0.02", "mode": "params"}).to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 403, "{res}");
+    assert!(body_of(&res).contains("need_keys"), "{res}");
+
+    // 未知 id → 404(与 source 同口径)。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/no-such-x/ai-edit?token=tok-ok",
+        Some(&serde_json::json!({"instruction": "x", "mode": "params"}).to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 404, "{res}");
+
+    for (k, v) in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].iter().zip(saved) {
+        if let Some(val) = v {
+            std::env::set_var(k, val);
+        } else {
+            std::env::remove_var(k);
+        }
+    }
+}
+
+// ---- N3-A: 多轮对话历史 + 改动对照(纯函数) ----
+
+/// 历史截断只保留**最近**的部分, 并如实标出"更早的已省略"。
+///
+/// 判据刻意不看总长度是否变小, 而看**尾部是否完整保留** —— 跟进话("再保守点")依赖的就是尾部。
+#[test]
+fn test_cap_history_keeps_tail_and_marks_truncation() {
+    assert_eq!(cap_history(None), "");
+    assert_eq!(cap_history(Some("   \n ")), "", "全空白等于没历史");
+    assert_eq!(cap_history(Some("  第一轮  ")), "第一轮", "两头空白要去掉");
+
+    // 刚过上限: 保留尾部, 并以标记开头(shorter than 原文)。
+    let long = format!("开头{}结尾", "x".repeat(MAX_HISTORY_CHARS + 100));
+    let capped = cap_history(Some(&long));
+    assert!(capped.starts_with("(更早的对话已省略)"), "{capped}");
+    assert!(capped.ends_with("结尾"), "尾部必须完整保留: {capped}");
+    assert_eq!(capped.chars().count(), MAX_HISTORY_CHARS + "(更早的对话已省略)\n".chars().count());
+
+    // 正好等于上限: 原样(不加标记)。
+    let exact = "y".repeat(MAX_HISTORY_CHARS);
+    assert_eq!(cap_history(Some(&exact)), exact);
+}
+
+/// 回包切段: 说明里的花括号**不能**把 JSON 段切歪; 没有 JSON 时说明也要留下。
+#[test]
+fn test_split_advice_and_json_separates_narrative_from_object() {
+    // 常规: 说明 + 末行 JSON。
+    let (advice, json) =
+        split_advice_and_json("整体调保守。\n\n- 间距放宽: 成交会变少\n\n{\"spacing_pct\": 0.02}");
+    assert!(advice.contains("间距放宽") && !advice.contains('{'), "说明段应不含 JSON: {advice}");
+    assert_eq!(json.as_deref(), Some("{\"spacing_pct\": 0.02}"));
+
+    // 说明里出现花括号(集合写法)时, 仍认末行那个真 JSON。
+    let (advice, json) =
+        split_advice_and_json("参数集合 {间距, 资金} 一起动。\n{\"spacing_pct\": 0.02}");
+    assert!(advice.contains("参数集合"), "{advice}");
+    assert_eq!(json.as_deref(), Some("{\"spacing_pct\": 0.02}"));
+
+    // 模型不遵守"不要围栏"也得认。
+    let (advice, json) = split_advice_and_json("改好了。\n```json\n{\"order_amount\": 5}\n```");
+    assert_eq!(advice, "改好了。");
+    assert_eq!(json.as_deref(), Some("{\"order_amount\": 5}"));
+
+    // 多行 JSON(缩进)同样要能切出来。
+    let (advice, json) = split_advice_and_json("说明。\n{\n  \"a\": 1,\n  \"b\": 2\n}");
+    assert_eq!(advice, "说明。");
+    assert!(json.as_deref().unwrap().contains("\"b\": 2"), "{json:?}");
+
+    // 一个花括号都没有 → 全算说明, JSON 为 None(调用方据此回中文 400, 但说明不丢)。
+    let (advice, json) = split_advice_and_json("这组参数不该动: 你已经很保守了。");
+    assert_eq!(advice, "这组参数不该动: 你已经很保守了。");
+    assert!(json.is_none());
+}
+
+/// 改动对照: 只列真变了的键; `before` 的两种来源必须**分开标注**(那是运行事实, 不能混)。
+#[test]
+fn test_diff_params_reports_only_real_changes_with_source() {
+    let manifest = catalog::find("paired_grid").unwrap().manifest;
+    let kept = HashMap::from([
+        ("spacing_pct".to_string(), ConfigValue::Float(0.02)), // 变了
+        ("order_amount".to_string(), ConfigValue::Float(10.0)), // 与默认值相同 → 不算改动
+    ]);
+
+    // ① 从没保存过实例值: before 取清单默认值, 并标明"只是默认值"。
+    let changed = diff_params(&kept, None, &manifest);
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert_eq!(changed[0].key, "spacing_pct");
+    assert_eq!(changed[0].name, "间距百分比", "给人看的行要用中文名");
+    assert_eq!(changed[0].before.as_deref(), Some("0.01"));
+    assert_eq!(changed[0].after, "0.02");
+    assert!(changed[0].before_is_default, "没保存过时必须标明改前值只是默认值");
+
+    // ② 实例里保存过 0.01: before 就是**用户在跑的值**, 不再标默认。
+    let values = InstanceValues {
+        pair: Some("BTCUSDT".to_string()),
+        current: HashMap::from([
+            ("spacing_pct".to_string(), ConfigValue::Float(0.01)),
+            ("order_amount".to_string(), ConfigValue::Float(10.0)),
+        ]),
+    };
+    let changed = diff_params(&kept, Some(&values), &manifest);
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert!(!changed[0].before_is_default, "保存过的值不是默认值");
+
+    // ③ 建议值与**当前值**相同 → 一个键都不进对照表(整组值仍会回给表单)。
+    let same = HashMap::from([("spacing_pct".to_string(), ConfigValue::Float(0.01))]);
+    assert!(diff_params(&same, Some(&values), &manifest).is_empty());
+
+    // ④ 清单里既没默认值、实例里也没存过的键(必填项) → before 为空(不编一个"0")。
+    let fresh = HashMap::from([("start_price".to_string(), ConfigValue::Float(123.0))]);
+    let changed = diff_params(&fresh, Some(&values), &manifest);
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].before, None, "没有依据就不要写改前值");
+    assert_eq!(changed[0].after, "123");
+}
+
+// ---- N3-B: 评估提示词的输入排布(纯函数) ----
+
+/// 指标清单: 只讲白名单里有值的; `null` 必须**跳过**(写成"无"会被模型当成 0)。
+#[test]
+fn test_metrics_brief_skips_missing_and_null() {
+    let m = serde_json::json!({
+        "pair": "BTCUSDT", "interval": "1h", "days": 90,
+        "equity_change_pct": 12.5, "max_drawdown_pct": 18.23456,
+        "sharpe": null, "annual_volatility_pct": 30.0,
+        "total_trades": 42, "unknown_field": 999,
+    });
+    let brief = metrics_brief(&m).unwrap();
+    assert!(brief.contains("窗口: BTCUSDT · 1h · 90 天"), "{brief}");
+    assert!(brief.contains("- 区间收益 %: 12.5"), "{brief}");
+    assert!(brief.contains("- 最大回撤 %: 18.2346"), "保留有效位, 只砍尾零: {brief}");
+    assert!(brief.contains("- 年化波动率 %: 30"), "{brief}");
+    assert!(brief.contains("- 成交笔数: 42"), "{brief}");
+    assert!(!brief.contains("夏普"), "null 指标不许出现在提示词里: {brief}");
+    assert!(
+        !brief.contains("unknown_field") && !brief.contains("999"),
+        "白名单外的字段不进: {brief}"
+    );
+
+    // 不是对象 / 一个白名单字段都没有 → 中文原因(由端点转 400)。
+    assert!(metrics_brief(&serde_json::json!([1, 2])).is_err());
+    assert!(metrics_brief(&serde_json::json!({"pair": "BTCUSDT"})).is_err());
+}
+
+/// 改动清单: 默认值要标出来; 超过 40 项要**如实计数**, 不静默截断。
+#[test]
+fn test_changed_lines_marks_default_and_counts_overflow() {
+    let one = ParamChange {
+        key: "spacing_pct".to_string(),
+        name: "间距百分比".to_string(),
+        before: Some("0.01".to_string()),
+        after: "0.02".to_string(),
+        before_is_default: true,
+    };
+    let text = changed_lines(&[one]);
+    assert!(text.contains("间距百分比 (spacing_pct): 0.01(清单默认, 未保存过) → 0.02"), "{text}");
+
+    let none_before = ParamChange {
+        key: "start_price".to_string(),
+        name: "开始价格".to_string(),
+        before: None,
+        after: "123".to_string(),
+        before_is_default: true,
+    };
+    assert!(changed_lines(&[none_before]).contains("未设置 → 123"));
+
+    let many: Vec<ParamChange> = (0..MAX_CHANGED_LINES + 3)
+        .map(|i| ParamChange {
+            key: format!("k{i}"),
+            name: format!("键{i}"),
+            before: Some("1".to_string()),
+            after: "2".to_string(),
+            before_is_default: false,
+        })
+        .collect();
+    let text = changed_lines(&many);
+    assert!(text.contains("(另有 3 项改动未列出)"), "截断必须报数: {text}");
+    assert!(!text.contains("k43"), "超限的行不该出现: {text}");
+}
+
+// ---- N3-B: 评估端点的离线守卫 ----
+
+/// 评估端点的同步校验: 没有改动 / 指标不是对象 / 未知 id 都在联网前拦掉;
+/// 正常的请求在没配密钥时 403 `need_keys`(证明它真的走到了 provider 的密钥前置)。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_ai_assess_offline_guards() {
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let saved =
+        ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].map(|k| std::env::var(k).ok());
+    for k in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"] {
+        std::env::remove_var(k);
+    }
+
+    let root = tmp_root("aiassess");
+    let port = boot(root).await;
+
+    let metric = serde_json::json!({"pair": "BTCUSDT", "interval": "1h", "days": 90,
+        "equity_change_pct": 1.0, "max_drawdown_pct": 2.0, "total_trades": 3});
+    let changed = serde_json::json!([{"key": "spacing_pct", "name": "间距百分比",
+        "before": "0.01", "after": "0.02", "before_is_default": false}]);
+
+    // 没有改动 → 400 nothing_changed(评估"什么都没改"没有意义)。
+    let body = serde_json::json!({"changed": [], "base_metrics": metric, "new_metrics": metric});
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/paired_grid/ai-assess?token=tok-ok",
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains("nothing_changed"), "{res}");
+
+    // 指标不是对象 → 400 bad_metrics。
+    let body = serde_json::json!({"changed": changed, "base_metrics": [1], "new_metrics": metric});
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/paired_grid/ai-assess?token=tok-ok",
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 400, "{res}");
+    assert!(body_of(&res).contains("bad_metrics"), "{res}");
+
+    // 未知 id → 404(与 ai-edit 同口径)。
+    let body =
+        serde_json::json!({"changed": changed, "base_metrics": metric, "new_metrics": metric});
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/no-such-x/ai-assess?token=tok-ok",
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 404, "{res}");
+
+    // 正常请求 + 没配密钥 → 403 need_keys(同步校验全过了才会走到这一步)。
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/paired_grid/ai-assess?token=tok-ok",
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 403, "{res}");
+    assert!(body_of(&res).contains("need_keys"), "{res}");
+
+    // 未带 token → 401(与其他策略端点一致)。
+    let res =
+        raw(port, "POST", "/api/strategies/paired_grid/ai-assess", Some(&body.to_string())).await;
+    assert_eq!(status_of(&res), 401, "{res}");
+
+    for (k, v) in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].iter().zip(saved) {
+        if let Some(val) = v {
+            std::env::set_var(k, val);
+        } else {
+            std::env::remove_var(k);
+        }
+    }
+}
+
+/// 多轮历史从请求进到 provider 提示词(用离线端点验证: 历史非法也只是 400/403, 不影响同步校验)。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_ai_edit_params_accepts_history_field() {
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let saved =
+        ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].map(|k| std::env::var(k).ok());
+    for k in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"] {
+        std::env::remove_var(k);
+    }
+
+    let root = tmp_root("aihist");
+    let port = boot(root).await;
+    // 带 history 的请求必须**解析得进去**(serde 不得因为多了一个字段就 400),
+    // 一路走到"没配密钥"的 403 —— 这正好证明它进了 params 分支而不是被字段校验挡住。
+    let body = serde_json::json!({
+        "instruction": "再保守一点",
+        "mode": "params",
+        "history": "用户: 保守点\nAI: 我把间距放宽到 0.02 了。"
+    });
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/paired_grid/ai-edit?token=tok-ok",
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 403, "{res}");
+    assert!(body_of(&res).contains("need_keys"), "{res}");
+
+    for (k, v) in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].iter().zip(saved) {
+        if let Some(val) = v {
+            std::env::set_var(k, val);
+        } else {
+            std::env::remove_var(k);
+        }
+    }
 }

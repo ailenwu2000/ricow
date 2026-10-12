@@ -24,6 +24,11 @@
   const updateDirty = (...a) => S.updateDirty(...a);
   const startPolling = (...a) => S.startPolling(...a);
   const renderJob = (...a) => S.renderJob(...a);
+  // 052: 引导卡的「问 AI 怎么配」要把 AI 卡切到调参模式 —— 走 editor 子文件的唯一入口。
+  const setAiMode = (...a) => S.setAiMode(...a);
+  // N3: 详情渲染后要重画对话线程与评估面板(它们依赖 detailCtx)。
+  const renderAiThread = (...a) => S.renderAiThread(...a);
+  const syncAssessPanel = (...a) => S.syncAssessPanel(...a);
 
   // ---------- 详情态 ----------
 
@@ -33,6 +38,9 @@
     st.savedCode = "";
     st.aiDraft = false;
     st.saveLocked = false;
+    // N3: 对话线程**按策略清空** —— 它是"这个策略这组参数的讨论", 换个策略接着聊会把上一个
+    // 策略的上下文带过去(历史会被原样拼进提示词)。两个模式各一条, 一并复位。
+    st.aiThreads = { params: [], code: [] };
     $("sg-params").innerHTML = "";
     $("sg-code").value = "";
     $("sg-code").readOnly = false;
@@ -151,6 +159,11 @@
       if (job.status === "running") startPolling(id, job.jobId, g);
       renderJob(job);
     }
+
+    // N3: 对话线程与评估面板**必须在详情渲染后重画** —— 空线程会自己收起来, 但不清就是
+    // 上一个策略的气泡留在原地(详情骨架只建一次); 评估面板则依赖 detailCtx(改后取参数要用)。
+    renderAiThread();
+    syncAssessPanel();
   }
 
   function renderBadges(detail, source) {
@@ -323,6 +336,9 @@
       .sort();
     if (extra.length) {
       box.appendChild(h("div", "sg-params-subhead", t("sgOtherParams")));
+      // 052: 这些键在实例 TOML 里有值、清单里没声明 —— 它们**没有中文名与说明**。
+      // 不解释清楚的话, 用户会以为这就是全部参数, 或者反过来以为界面坏了。
+      box.appendChild(h("div", "sg-hint", t("sgOtherParamsHint")));
       for (const key of extra) {
         const spec0 = { key: key, name: key, ty: extraInputFor(current[key]).kind, desc: "", required: false, options: null };
         const built = spec0.ty === "string" ? stringRow(spec0, current[key]) : paramRow(spec0, current[key]);
@@ -330,6 +346,59 @@
         st.paramInputs.push({ key: key, ty: spec0.ty, required: false, input: built.input });
       }
     }
+
+    // 052 方案 4: 一行都没画出来时(清单为空)给引导卡 —— 只丢一句红字用户不知道该干什么。
+    renderParamsGuide(detail);
+  }
+
+  /// 052 方案 4: 空参数表单的引导卡。
+  ///
+  /// 出现条件 = **清单里没有任何可渲染的参数**(全是保留键也算空): 这正是"复制完只剩一个交易对框"
+  /// 的那个状态。判据取自服务端返回的 `detail.params`, 不看 DOM, 也不猜。
+  /// 内置策略不显示 —— 它的参数说明随代码发布, 不存在"没整理出来", 且编辑入口整卡已隐藏。
+  /// 两个动作分别对应方案 2(静态识别)与方案 3(问 AI 调参); 后者需要清单先存在, 所以清单为空时
+  /// 它只把用户推去走第一步, **不假装能直接问**(后端 `mode=params` 清单为空时也是 400)。
+  function renderParamsGuide(detail) {
+    const box = $("sg-params-guide");
+    if (!box) return;
+    box.innerHTML = "";
+    const declared = (detail.params || []).filter(
+      (p) => !RESERVED_PARAM_KEYS.includes(p.key)
+    ).length;
+    if (declared > 0 || (st.detailCtx && st.detailCtx.builtin)) {
+      box.hidden = true;
+      return;
+    }
+    box.appendChild(h("div", "sg-guide-title", t("sgParamsGuideTitle")));
+    box.appendChild(h("div", "sg-guide-body", t("sgParamsGuideBody")));
+    const actions = h("div", "sg-guide-actions");
+    const btnExtract = h("button", "sg-btn sg-btn-mini", t("sgParamsGuideExtract"));
+    btnExtract.type = "button";
+    btnExtract.addEventListener("click", () => onExtractParams());
+    const btnAi = h("button", "sg-btn sg-btn-mini", t("sgParamsGuideAskAi"));
+    btnAi.type = "button";
+    btnAi.addEventListener("click", onGuideAskAi);
+    actions.append(btnExtract, btnAi);
+    box.appendChild(actions);
+    const msg = h("div", "sg-msg");
+    msg.id = "sg-params-guide-msg";
+    box.appendChild(msg);
+    box.hidden = false;
+  }
+
+  /// 引导卡的「问 AI 怎么配」: AI 的调参模式只认**清单里声明过的键** ——
+  /// 清单还空着就先去识别, 别让用户发一条注定 400 的请求(后端也会这么回, 但那是撞墙不是引导)。
+  function onGuideAskAi() {
+    const msg = $("sg-params-guide-msg");
+    if (!st.manifestRows || !st.manifestRows.length) {
+      setMsg(msg, t("sgParamsGuideAskAiFirst"), "err");
+      return;
+    }
+    setMsg(msg, "", "");
+    setAiMode("params");
+    const card = $("sg-ai-card");
+    if (card && card.scrollIntoView) card.scrollIntoView({ block: "center" });
+    $("sg-ai-instr").focus();
   }
 
   /// 读一个参数控件: 空 number/string → undefined(不覆盖); 非法数字抛错(带参数名)。
@@ -404,6 +473,140 @@
     st.manifestRows = [];
     for (const p of detail.params || []) addManifestRow(p);
     setMsg($("sg-mf-msg"), st.manifestRows.length ? "" : t("sgMfEmpty"), "");
+  }
+
+  /// 052 方案 2: 从 Lua 源码**静态识别**参数 → 预填进清单编辑器(不落盘)。
+  ///
+  /// 吃的是**编辑器里的当前代码**(可能是未保存的草稿): 端点是**无状态**的 ——
+  /// "这份脚本读了哪些参数"是代码本身的属性, 要求用户先保存再识别是多余的一步。
+  /// 全程不碰 AI: 识别结果只是**键 / 类型 / 代码里的字面量兜底默认**, 中文名留给用户或 AI 补。
+  async function onExtractParams() {
+    if (!st.detailCtx) return;
+    const code = $("sg-code").value;
+    const btn = $("sg-mf-extract");
+    if (!code.trim()) {
+      setMsg($("sg-mf-msg"), t("sgCodeEmpty"), "err");
+      return;
+    }
+    const g = st.gen;
+    btn.disabled = true;
+    btn.textContent = t("sgMfExtracting");
+    try {
+      const reply = await R.api("/api/strategies/extract-params", {
+        method: "POST",
+        body: { code: code },
+      });
+      if (g !== st.gen) return;
+      const added = applyExtractedParams(reply.params || []);
+      setMsg($("sg-mf-msg"), added ? t("sgMfExtractOk") : t("sgMfExtractNone"), added ? "ok" : "");
+      if (added) {
+        // 刚填好行却还收在折叠框里 —— 用户看不到发生了什么。替他展开。
+        const det = $("sg-manifest-card").querySelector("details");
+        if (det) det.open = true;
+      }
+    } catch (err) {
+      if (g !== st.gen) return;
+      setMsg($("sg-mf-msg"), (err && err.message) || String(err), "err");
+    } finally {
+      if (g === st.gen) {
+        btn.disabled = false;
+        btn.textContent = t("sgMfExtract");
+      }
+    }
+  }
+
+  /// 把识别结果并进清单编辑器, 返回**新增**行数(0 = 一个键都没新加)。
+  ///
+  /// 已存在的键**跳过不覆盖** —— 用户可能已经填过中文名/说明/默认值, 识别结果没有资格盖掉人工输入。
+  /// 类型与默认值**照抄**识别结果(`num`/`config_f64` → f64、字面量兜底值), 不美化也不猜。
+  function applyExtractedParams(list) {
+    const have = new Set(st.manifestRows.map((r) => r.key.value.trim()).filter((k) => k));
+    let added = 0;
+    for (const p of list) {
+      if (!p || !p.key || have.has(p.key)) continue;
+      addManifestRow({
+        key: p.key,
+        name: "",
+        ty: p.type || "f64",
+        default: p.default,
+        // N2 (2026-10-12): 说明优先用**脚本注释里原样搬来的那句**(静态提取带回来的 `desc`)。
+        // 中文名**仍然留空** —— 注释首段不一定是名字(`--  pair  必填, 交易对(现货)` 的首段是
+        // 「必填」), 切错比留空糟; 参数表在 name 为空时回退显示键名, 想要更好的名字可按「AI 起名」。
+        desc: p.desc || "",
+        required: false,
+        options: null,
+      });
+      have.add(p.key);
+      added += 1;
+    }
+    return added;
+  }
+
+  /// N2-C: 让 AI 按**脚本代码**给清单里的参数键起中文名与写说明(不落盘)。
+  ///
+  /// 与"识别参数"的分工: 识别回答"有哪些键", 起名回答"这些键叫什么、干什么"。
+  /// 键集合由**服务端静态提取**决定(不是让模型自己列 —— 那会多出编造的键), 所以这里只把 AI
+  /// 给的名字**填回已存在的行**; 代码里读不到、清单里却有的键, AI 根本不会收到它。
+  async function onAiNameParams() {
+    if (!st.detailCtx) return;
+    const code = $("sg-code").value;
+    const btn = $("sg-mf-autoname");
+    if (!code.trim()) {
+      setMsg($("sg-mf-msg"), t("sgCodeEmpty"), "err");
+      return;
+    }
+    const g = st.gen;
+    btn.disabled = true;
+    btn.textContent = t("sgMfAutoNaming");
+    try {
+      const reply = await R.api("/api/strategies/ai-name-params", {
+        method: "POST",
+        body: { code: code },
+      });
+      if (g !== st.gen) return;
+      const filled = applyAiNames(reply.names || []);
+      setMsg($("sg-mf-msg"), filled ? t("sgMfNameOk") : t("sgMfNameNone"), filled ? "ok" : "");
+      if (filled) {
+        const det = $("sg-manifest-card").querySelector("details");
+        if (det) det.open = true;
+      }
+    } catch (err) {
+      if (g !== st.gen) return;
+      setMsg($("sg-mf-msg"), (err && err.message) || String(err), "err");
+    } finally {
+      if (g === st.gen) {
+        btn.disabled = false;
+        btn.textContent = t("sgMfAutoName");
+      }
+    }
+  }
+
+  /// 把 AI 给的名字/说明填进清单行, 返回**真正填上**的行数。
+  ///
+  /// 只填**空着的**格子: 已有内容一个字都不动(与 `applyExtractedParams` 的"跳过不覆盖"同一
+  /// 纪律 —— AI 没资格覆盖人工输入)。说明也同样只填空位: 从注释里带出来的那句(识别参数时已填)
+  /// 优先于 AI 现编的。
+  function applyAiNames(list) {
+    const byKey = new Map();
+    for (const n of list) {
+      if (n && n.key) byKey.set(n.key, n);
+    }
+    let filled = 0;
+    for (const r of st.manifestRows) {
+      const n = byKey.get(r.key.value.trim());
+      if (!n) continue;
+      let touched = false;
+      if (!r.name.value.trim() && n.name) {
+        r.name.value = n.name;
+        touched = true;
+      }
+      if (!r.desc.value.trim() && n.desc) {
+        r.desc.value = n.desc;
+        touched = true;
+      }
+      if (touched) filled += 1;
+    }
+    return filled;
   }
 
   /// 追加一个参数行(p 为 null 时空行)。type 为 enum 时展开"可选值"输入。
@@ -675,6 +878,13 @@
   S.stringRow = stringRow;
   S.addManifestRow = addManifestRow;
   S.onSaveManifest = onSaveManifest;
+  // 052: 「从脚本识别参数」的按钮在**详情骨架**里(mount 建一次) —— 回调必须导出,
+  // 否则挂上去的是 undefined, 点了整片没反应(042 那批踩过同一个坑)。
+  S.onExtractParams = onExtractParams;
+  // N2-C: 同上 —— 「让 AI 起中文名」按钮也在骨架里, 漏导出就是点了没反应。
+  S.onAiNameParams = onAiNameParams;
+  // 052: 切语言时外壳要就地重建引导卡(它的文字是动态建的), 故一并导出。
+  S.renderParamsGuide = renderParamsGuide;
   S.gatherParams = gatherParams;
   // C8: 维度行的建 / 刷 / 读 —— 外壳 mount 用 addOptDim, 回测子文件用 readOptDims。
   S.addOptDim = addOptDim;

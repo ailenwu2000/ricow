@@ -998,10 +998,105 @@
     syncBtBtn(false);
   }
 
+  // ---------- N3-B: 改完自动评估影响(两次同窗口回测 + 实测指标解读) ----------
+  //
+  // 为什么由前端串三步而不是后端一个端点跑完: 回测是**作业**(同一策略只允许一个 running,
+  // 带 progress / 5 分钟结果保留), 已有 `/api/backtest` 那一整套。在 AI 端点里再开一条同步
+  // 回测路径 = 把并发规则抄第二遍, 而且"没配密钥"会让回测都跑不了 —— 那是两件独立的事。
+  //
+  // 窗口**固定**默认值(90 天 / 1h): 两次必须同窗口才可比。让用户两次各填一个窗口, 出来的差异
+  // 就分不清是参数造成的还是窗口造成的 —— 那正是这次要消灭的"看起来有结论其实没有"。
+
+  const ASSESS_DAYS = 90;
+  const ASSESS_INTERVAL = "1h";
+  /// 单次回测的等待上限(与后端 running 兜底 60 分钟同量级但更短: 到点**如实报超时**,
+  /// 而不是无限转圈 —— 作业可能仍在跑, 用户可回下面的回测卡继续看)。
+  const ASSESS_TIMEOUT_MS = 10 * 60 * 1000;
+
+  /// 轮询一个回测作业直到 done/error, 返回 metrics。代际变了就地终止(绝不往旧视图写)。
+  function waitForJob(jobId, g) {
+    return new Promise((resolve, reject) => {
+      const started = Date.now();
+      const tick = async () => {
+        if (g !== st.gen) {
+          reject(new Error(t("sgAiAssessStale")));
+          return;
+        }
+        let info;
+        try {
+          info = await R.api("/api/backtest/" + encodeURIComponent(jobId));
+        } catch (err) {
+          reject(err);
+          return;
+        }
+        if (info.status === "done") {
+          resolve(info.metrics || null);
+          return;
+        }
+        if (info.status === "error") {
+          reject(new Error(info.error || t("sgBtError")));
+          return;
+        }
+        if (Date.now() - started > ASSESS_TIMEOUT_MS) {
+          reject(new Error(t("sgAiAssessTimeout")));
+          return;
+        }
+        setTimeout(() => {
+          tick().catch(() => {});
+        }, POLL_MS);
+      };
+      setTimeout(() => {
+        tick().catch(() => {});
+      }, POLL_MS);
+    });
+  }
+
+  /// 跑一次回测并等结果(不登记台账、不画回测卡 —— 这是评估流程的私有作业, 与用户在回测卡
+  /// 里点的那次互不覆盖。busy 冲突由服务端 409 如实带回)。
+  async function assessRun(opts, params) {
+    const reply = await R.api("/api/backtest", {
+      method: "POST",
+      body: {
+        strategy: opts.id,
+        pair: opts.pair,
+        interval: ASSESS_INTERVAL,
+        days: ASSESS_DAYS,
+        params: params,
+      },
+    });
+    return waitForJob(reply.job_id, opts.g);
+  }
+
+  /// N3-B 编排: 改前 → 改后 → AI 读两份实测指标。返回 `{ advice, base, new }`。
+  /// 任一环节失败都**原样抛出**(带服务端中文原因), 由调用方贴在评估面板里。
+  async function runParamAssess(opts) {
+    if (!st.detailCtx) throw new Error(t("sgAiAssessStale"));
+    // 同一策略已有回测在跑 → 说清楚而不是等一个必然 409 的请求。
+    const running = st.jobs.get(opts.id);
+    if (running && running.status === "running") throw new Error(t("sgAiAssessBusy"));
+    opts.onStage && opts.onStage("base");
+    const base = await assessRun(opts, opts.baseParams);
+    if (opts.g !== st.gen) throw new Error(t("sgAiAssessStale"));
+    opts.onStage && opts.onStage("new");
+    const next = await assessRun(opts, opts.newParams);
+    if (opts.g !== st.gen) throw new Error(t("sgAiAssessStale"));
+    opts.onStage && opts.onStage("assess");
+    const reply = await R.api(
+      "/api/strategies/" + encodeURIComponent(opts.id) + "/ai-assess",
+      {
+        method: "POST",
+        body: { changed: opts.changed, base_metrics: base, new_metrics: next },
+      }
+    );
+    return { advice: reply.advice || "", base: base, new: next };
+  }
+
   // ---------- 对外(外壳与其它子文件调用) ----------
   S.renderHistory = renderHistory;
   S.destroyBtChart = destroyBtChart;
   S.renderJob = renderJob;
+  // N3-B: 评估编排 —— 在 strategy_editor.js 的评估面板里被调用(跨文件走延迟别名)。
+  S.runParamAssess = runParamAssess;
   S.onBacktest = onBacktest;
   S.onSweep = onSweep;
   S.onOptimize = onOptimize;

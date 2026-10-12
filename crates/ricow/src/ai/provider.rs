@@ -38,6 +38,30 @@ const AI_GEN_PREAMBLE: &str =
     严格只使用规范列出的 ctx/exec API(不发明接口); 最终只输出一份完整 Lua 代码, \
     不加任何解释或 Markdown 围栏。";
 
+/// 052 方案 3: Web「AI 调参数」的系统提示 —— 与上面两条**任务不同**: 不改代码, 只把用户的
+/// 自然语言翻译成**已声明参数**的取值, 且**只能**用给定的键。这与 `ai/tools.rs` 里
+/// `update_params` 工具的纪律同源("只有用户明确的键才写, 不要自行推断")。
+/// N3 (2026-10-12) 起这条的**任务变了**: 从前是"把用户的话翻译成键值", 现在是"当参数顾问" ——
+/// 用户只说**意图**(不说改哪个键、改成多少), 助手自己判断该动哪些参数、动到什么程度,
+/// 并讲清理由与风险。
+///
+/// 为什么改: "把 spacing_pct 改成 0.02"这件事用户自己点两下表单就能做, 根本不需要 AI;
+/// AI 该干的是**用户干不了的那部分** —— 把"保守点"这种意图翻译成一整套参数, 并说清代价。
+const AI_PARAMS_PREAMBLE: &str =
+    "你是 ricow 的策略参数顾问。用户只会说他想要的效果(如\"保守一点\"、\"更看好震荡行情\"), \
+    不会指定改哪个参数或改成多少 —— 你要自己判断该动哪些参数、动到什么程度, 并讲清理由与风险。 \
+    不写策略代码、不做行情分析、不调用任何工具; 参数键只能用用户消息里给出的清单里出现过的键, \
+    绝不发明新键; 讲完理由后再给一个 JSON 对象, 不加任何 Markdown 围栏。";
+
+/// N2-C (2026-10-12): Web「给参数起中文名」的系统提示 —— 任务是**补名字与说明**,
+/// 既不改代码也不改取值。名字只能从"这个键在脚本里怎么被用"推出来, 所以提示词必须带脚本全文;
+/// 代码里看不出用途时**如实说看不出**, 不许编(用户会当真)。
+const AI_NAMES_PREAMBLE: &str =
+    "你是 ricow 的策略参数命名助手。你只负责根据**脚本代码**为给定的参数键起中文名并写一句说明, \
+    不改代码、不改取值、不做行情分析、不调用任何工具; 键只能用用户消息里列出的那些, 绝不发明新键; \
+    代码里看不出用途的键要如实说看不出, 不得编一个听起来合理的解释; \
+    最终只输出一个 JSON 对象, 不加任何解释或 Markdown 围栏。";
+
 /// 构造 OpenAI 兼容客户端(自定义 base_url + 密钥)。
 pub fn build_client(resolved: &Resolved, api_key: &str) -> CoreResult<openai::CompletionsClient> {
     let client = openai::Client::builder()
@@ -517,6 +541,143 @@ pub(crate) async fn quick_generate(root: &Path, prompt: &str) -> CoreResult<Stri
     one_shot(root, AI_GEN_PREAMBLE, prompt).await
 }
 
+/// 052 方案 3: 构造「AI 调参数」的用户提示词(纯函数便于离线单测)。
+///
+/// 与 [`build_edit_prompt`] **任务不同**: 这里不产出代码, 只产出 `{键: 值}`。提示词给出
+/// 清单摘要(可用键的**唯一来源**)与实例当前值(让模型只动用户点到的那几个), 并硬性要求
+/// "键只能取清单里的" —— 回包那一侧还有一道键过滤做双保险(见 `strategy_io`)。
+pub(crate) fn build_params_prompt(
+    instruction: &str,
+    manifest_summary: &str,
+    current_values: &str,
+    history: &str,
+) -> String {
+    let history_block = if history.trim().is_empty() {
+        "(这是第一轮)\n".to_string()
+    } else {
+        format!("{history}\n")
+    };
+    format!(
+        "用户想要的效果在下面最末一行。他**不会**说改哪个参数、改成多少 —— 你自己判断。\n\
+         \n\
+         ## 可用的参数(键名 / 类型 / 说明 —— 只能用这里出现过的键)\n\
+         {manifest_summary}\n\
+         \n\
+         ## 当前取值\n\
+         {current_values}\n\
+         \n\
+         ## 之前的对话(帮你接住\"再保守点\"这类跟进的话)\n\
+         {history_block}\n\
+         ## 用户这次的话\n\
+         {instruction}\n\
+         \n\
+         ## 输出要求(必须严格遵守)\n\
+         1. 先用中文讲清三件事(**每件一行**, 不要寒暄、不要复述用户的话):\n\
+            - 打算怎么改: 一句话说清整体方向(如\"整体调保守: 放宽间距、压低单笔资金\");\n\
+            - 逐项理由: 每个被改的参数为什么这么改 —— **只能依据**上面的参数说明与参数含义;\n\
+            - 风险: 这么改要付出什么代价(如成交变少、单边行情更容易踏空、回撤未必真的变小);\n\
+         2. 上面清单里**没写说明**的参数, 如果你仍要动它, 必须如实标注\"该参数清单里没有说明, \
+         下面是按参数名与代码推断的\" —— 不许把推断说得像有出处;\n\
+         3. 讲完之后**另起一行**给出一个 JSON 对象, 形如 {{\"spacing_pct\": 0.02, ...}};\n\
+         4. JSON 里给的是**整组**参数(含你没改的, 保持当前值), 不是只给改动的几个;\n\
+         5. 键**只能**取上面清单里出现过的键名, 绝不发明新键; 值必须与类型一致\
+         (数值 / 字符串 / 布尔), 枚举只能取它列出的可选值;\n\
+         6. JSON 之后不要再写任何内容, 也不要 Markdown 围栏。"
+    )
+}
+
+/// 052 方案 3: Web「AI 调参数」的一次性非流式问答薄封装 —— 回包是 JSON, 全程不落盘。
+pub(crate) async fn quick_params(
+    root: &Path,
+    instruction: &str,
+    manifest_summary: &str,
+    current_values: &str,
+    history: &str,
+) -> CoreResult<String> {
+    one_shot(
+        root,
+        AI_PARAMS_PREAMBLE,
+        &build_params_prompt(instruction, manifest_summary, current_values, history),
+    )
+    .await
+}
+
+/// N3 (2026-10-12): Web「评估这组参数的影响」的系统提示 —— 输入是**实测回测指标**, 不是用户的话。
+/// 与 [`AI_PARAMS_PREAMBLE`] 的分工: 那条负责"打算怎么改", 这条负责"实际改成了什么样"。
+const AI_ASSESS_PREAMBLE: &str =
+    "你是 ricow 的策略参数评估助手。用户刚改了一组策略参数, 并且**真的跑了回测**; 你要基于给出的\
+     两份实测指标, 用大白话讲清这次改动的实际影响。不写代码、不做行情预测、不调用任何工具; \
+     **只能引用给出的指标数字**, 绝不编造没测过的数字; 拿不准的地方如实说拿不准。";
+
+/// N3 (2026-10-12): 构造「评估改动影响」的用户提示词(纯函数便于离线单测)。
+///
+/// 三样输入缺一不可: 改了什么(键与前后取值)、改前实测、改后实测。少了任何一样, 结论就只能靠猜 ——
+/// 而"猜出来的影响"正是这次要消灭的东西。
+pub(crate) fn build_assess_prompt(
+    changed_lines: &str,
+    base_metrics: &str,
+    new_metrics: &str,
+) -> String {
+    format!(
+        "同一个策略、同一个回测窗口下, 改参数前后的实测结果如下。请讲清这次改动的**实际**影响。\n\
+         \n\
+         ## 这次动了哪些参数\n\
+         {changed_lines}\n\
+         \n\
+         ## 改前的实测指标\n\
+         {base_metrics}\n\
+         \n\
+         ## 改后的实测指标\n\
+         {new_metrics}\n\
+         \n\
+         ## 输出要求(必须严格遵守)\n\
+         1. 先用一句话给结论: 这组改动**实际**让策略变得更保守了还是更激进了, 依据是哪个指标;\n\
+         2. 再逐项对比**关键**指标(如最大回撤、年化波动、夏普、成交笔数、净盈亏), 每一句都要带上\
+         改前→改后的数字, 形如\"最大回撤 −18% → −9%\";\n\
+         3. 如果有指标变差了(如收益下降、夏普下降), **必须直说** —— 不要只挑好看的说;\n\
+         4. 只讲上面两份指标里有的数字, **绝不**推算或编造没给出的数字;\n\
+         5. 最后提醒一句: 这只是**一段历史窗口**的回测结果, 不代表未来。"
+    )
+}
+
+/// N3 (2026-10-12): Web「评估改动影响」的一次性非流式问答薄封装 —— 回包是自然语言, 不落盘。
+pub(crate) async fn quick_assess(root: &Path, prompt: &str) -> CoreResult<String> {
+    one_shot(root, AI_ASSESS_PREAMBLE, prompt).await
+}
+
+/// N2-C (2026-10-12): 构造「给参数起中文名 + 写一句说明」的用户提示词(纯函数便于离线单测)。
+///
+/// 与 [`build_params_prompt`] **任务不同**: 那个是改**取值**, 这个是补**名字与说明**。
+/// 必须把脚本全文一并给它 —— 名字只能从"这个键在代码里怎么被读、被拿去算什么"推出来;
+/// 只给一串键名就让它起名, 等于让它按词形猜, 那样出来的名字是编的。
+pub(crate) fn build_names_prompt(key_lines: &str, code: &str) -> String {
+    format!(
+        "下面是一份 ricow Lua 策略脚本, 以及它读取的参数键。请为每个键给出**中文名**与**一句说明**。\n\
+         \n\
+         ## 待命名的参数键\n\
+         {key_lines}\n\
+         \n\
+         ## 脚本全文(命名与说明的**唯一依据**)\n\
+         ```lua\n\
+         {code}\n\
+         ```\n\
+         \n\
+         ## 输出要求(必须严格遵守)\n\
+         1. 只输出**一个 JSON 对象**, 形如 \
+         {{\"spacing_pct\": {{\"name\": \"间距百分比\", \"desc\": \"上下挂单的间距\"}}}}, \
+         不要输出任何解释、前后缀或 Markdown 围栏;\n\
+         2. 键**只能**用上面列出的那些, 一个不多一个不少, 绝不发明新键;\n\
+         3. 中文名要短(不超过 10 个字); 说明一句话(不超过 40 个字), 说清这个参数控制什么;\n\
+         4. **只能依据脚本代码**: 代码里看不出用途的键, 说明就写「代码中未见其用途」, \
+         不要编一个听起来合理的解释 —— 用户会当真。"
+    )
+}
+
+/// N2-C (2026-10-12): Web「给参数起中文名」的一次性非流式问答薄封装 —— 回包是 JSON, 不落盘。
+pub(crate) async fn quick_names(root: &Path, prompt: &str) -> CoreResult<String> {
+    one_shot(root, AI_NAMES_PREAMBLE, prompt).await
+}
+
 /// P0-3 构造「AI 生成新策略」的用户提示词(纯函数便于离线单测)。
 ///
 /// 结构: ① 规范全文(LUA_API_DOC, 唯一 API 依据); ② 结构化的策略意图(市场/标的/主时钟/
@@ -596,6 +757,50 @@ mod tests {
         // 密钥类字样绝不进入 prompt(quick_ask 只在构造客户端时用 key)
         assert!(!p.to_ascii_lowercase().contains("api_key"), "prompt 不得含密钥字样: {p}");
         assert!(!p.to_ascii_lowercase().contains("secret"), "prompt 不得含密钥字样: {p}");
+    }
+
+    // ---- N3: 参数顾问 / 影响评估的提示词 ----
+
+    /// 参数顾问提示词: 三块输入(清单 / 当前值 / 历史)都要在, 并且**必须**要求模型
+    /// 先讲理由与风险、说明为空的参数要标注 —— 这几条是 N3 的核心要求, 掉了就退回"只给数字"。
+    #[test]
+    fn test_build_params_prompt_requires_reasoning_and_risk() {
+        let manifest = "- 间距百分比 (键名 spacing_pct, 类型 f64): 网格间距(小数)";
+        let current = "- spacing_pct = 0.01\n";
+        let p = build_params_prompt("保守一点", manifest, current, "");
+        assert!(p.contains("保守一点"), "用户的话必须原样进入: {p}");
+        assert!(p.contains(manifest) && p.contains(current), "清单与当前值都要给模型: {p}");
+        assert!(p.contains("(这是第一轮)"), "没有历史时要明说这是第一轮: {p}");
+        assert!(p.contains("风险"), "必须要求讲风险: {p}");
+        assert!(p.contains("逐项理由"), "必须要求逐项理由: {p}");
+        assert!(p.contains("清单里没有说明"), "说明为空的参数必须要求如实标注: {p}");
+        assert!(p.contains("整组"), "JSON 要给整组, 不是只给改动的几个: {p}");
+        assert!(p.contains("绝不发明新键"), "禁止编键: {p}");
+
+        // 有历史时: 历史原样进提示词, 且不再出现"第一轮"。
+        let p = build_params_prompt(
+            "再保守点",
+            manifest,
+            current,
+            "用户: 保守点\nAI: 我把间距放宽了。",
+        );
+        assert!(p.contains("用户: 保守点") && p.contains("我把间距放宽了"), "{p}");
+        assert!(!p.contains("(这是第一轮)"), "{p}");
+    }
+
+    /// 影响评估提示词: 改动清单 + 两份实测指标; 必须要求带上数字对比、直说变差的项、
+    /// 不许编造没给出的数字。
+    #[test]
+    fn test_build_assess_prompt_demands_measured_numbers_only() {
+        let changed = "- 间距百分比 (spacing_pct): 0.01 → 0.02\n";
+        let base = "- 最大回撤 %: 18\n- 成交笔数: 40\n";
+        let new = "- 最大回撤 %: 9\n- 成交笔数: 12\n";
+        let p = build_assess_prompt(changed, base, new);
+        assert!(p.contains(changed) && p.contains(base) && p.contains(new), "{p}");
+        assert!(p.contains("改前→改后"), "必须要求带前后数字: {p}");
+        assert!(p.contains("必须直说"), "变差的地方必须直说: {p}");
+        assert!(p.contains("绝不") && p.contains("编造"), "不许编造没给出的数字: {p}");
+        assert!(p.contains("一段历史窗口"), "必须提醒窗口局限: {p}");
     }
 
     // ---- 3.4: LLM 重试判定 ----
