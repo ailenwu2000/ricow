@@ -25,24 +25,33 @@ struct StrategyRow {
     /// 与某内置策略脚本逐字相同时为其 id(冗余副本, 未声明者会被运行门禁拒)。
     #[serde(skip_serializing_if = "Option::is_none")]
     duplicate_of: Option<String>,
+    /// 054 D7: 是否 AI 生成(读 `strategies/<id>.toml` 顶部注释判定, **服务端事实**)。
+    ///
+    /// 只说来源, 不说验证 —— 验证状态由回测结果自己展示(D8), 徽章不越界下结论。
+    origin_ai: bool,
 }
 
 /// 策略列表(只读): 内置示例 + 用户自写, 按注册顺序。
-async fn list_strategies() -> Json<Vec<StrategyRow>> {
+async fn list_strategies(State(state): State<WebState>) -> Json<Vec<StrategyRow>> {
     let rows = crate::strategies::catalog::all()
         .into_iter()
-        .map(|e| StrategyRow {
-            id: e.manifest.id,
-            name: e.manifest.name,
-            market: e.manifest.market,
-            summary: e.manifest.summary,
-            source: match e.source {
-                crate::strategies::catalog::Source::Builtin => "builtin".to_string(),
-                crate::strategies::catalog::Source::User => "user".to_string(),
-            },
-            param_count: e.manifest.params.len(),
-            declared: e.declared,
-            duplicate_of: e.duplicate_of,
+        .map(|e| {
+            let is_user = e.source == crate::strategies::catalog::Source::User;
+            StrategyRow {
+                // 内置策略没有用户实例 TOML, 恒为 false(不读盘)。
+                origin_ai: is_user && strategy_io::strategy_origin_ai(&state.root, &e.manifest.id),
+                id: e.manifest.id,
+                name: e.manifest.name,
+                market: e.manifest.market,
+                summary: e.manifest.summary,
+                source: match e.source {
+                    crate::strategies::catalog::Source::Builtin => "builtin".to_string(),
+                    crate::strategies::catalog::Source::User => "user".to_string(),
+                },
+                param_count: e.manifest.params.len(),
+                declared: e.declared,
+                duplicate_of: e.duplicate_of,
+            }
         })
         .collect();
     Json(rows)
@@ -64,6 +73,8 @@ struct StrategyDetailReply {
     /// 脚本与某内置策略逐字相同时为其 id(详见 [`StrategyRow::duplicate_of`])。
     #[serde(skip_serializing_if = "Option::is_none")]
     duplicate_of: Option<String>,
+    /// 054 D7: 是否 AI 生成(详见 [`StrategyRow::origin_ai`])。
+    origin_ai: bool,
 }
 
 /// 单个策略详情(只读): 完整清单(含参数 schema) + 用户实例当前值, 供前端参数表单渲染。
@@ -80,9 +91,15 @@ async fn get_strategy(
     } else {
         strategy_io::load_instance_values(&state.root, &id)?
     };
+    let origin_ai = if entry.source == crate::strategies::catalog::Source::Builtin {
+        false
+    } else {
+        strategy_io::strategy_origin_ai(&state.root, &id)
+    };
     Ok(Json(StrategyDetailReply {
         declared: entry.declared,
         duplicate_of: entry.duplicate_of,
+        origin_ai,
         manifest: entry.manifest,
         pair: values.as_ref().and_then(|v| v.pair.clone()),
         current: values.map(|v| v.current),

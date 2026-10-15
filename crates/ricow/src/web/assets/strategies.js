@@ -64,6 +64,9 @@
   //   但表单里已由 `#sg-pair` 独立成字段, 再按清单画一行就是被顶层值盖掉的死控件(2026-10-05 修)。
   // - `script`/`script_path` 指脚本本身, 从来不是用户可填参数。
   const RESERVED_PARAM_KEYS = ["pair", "script", "script_path"];
+  // 054 P1: 验证回测窗口的可选档(默认 90 —— 与页面回测 / AI 评估同默认, 数字可直接互相比较)。
+  const VERIFY_DAY_CHOICES = [90, 180, 360];
+  const DEFAULT_VERIFY_DAYS = 90;
 
   /// 新建空白用的最小可编译骨架(编译门禁只校验语法; 真正运行所需参数由 Lua 内 fallback 决定)。
   const BLANK_LUA = [
@@ -179,9 +182,13 @@
   // C8: 多维寻优的维度行在表单子文件里建/读(键列表与单参数下拉同源), 发起与结果在回测子文件里。
   const addOptDim = (...a) => S.addOptDim(...a);
   const onOptimize = (...a) => S.onOptimize(...a);
+  // 054 P4: 样本外检验 —— 发起与结果渲染都在回测子文件(它管 `/api/backtest*` 的作业语义),
+  // 这里只有"形态下拉跟着方式显隐"这点纯界面逻辑。
+  const onValidate = (...a) => S.onValidate(...a);
   const renderJob = (...a) => S.renderJob(...a);
   const renderHistory = (...a) => S.renderHistory(...a);
   const destroyBtChart = (...a) => S.destroyBtChart(...a);
+  const destroyValChart = (...a) => S.destroyValChart(...a);
 
   // ---------- 双语文案(并入公共字典; 静态标签走 data-zh/data-en) ----------
   Object.assign(R.TEXT.zh, {
@@ -368,6 +375,77 @@
     sgConstraintsPh: "例如:单笔不超过总资金 10%; 亏损超 5% 止损; 每天最多交易 3 次",
     sgGen: "生成并保存",
     sgGenerating: "AI 生成中…(约 1–2 分钟)",
+    // 054 P1: 生成即验证 —— 生成完不是直接落盘, 而是先跑一次真实 K 线回测, 用户看过才决定存不存。
+    // 「跳过验证」是明码标价的选项: 关掉它意味着"我不知道它历史上表现如何"。
+    sgVerifyDays: "验证回测窗口",
+    sgVerifyCustom: "手填",
+    sgDaysUnit: "天",
+    sgVerifyDaysHint:
+      "生成后立刻用真实 K 线跑一次回测。天数越大看得越久, 也越慢(360 天 · 1m 可能要好几分钟)。默认 90 天, 与页面回测、AI 评估同一默认窗口, 数字可直接互相比较。",
+    sgVerifySlow: "窗口越大耗时越久",
+    sgVerifySkip: "跳过验证直接生成(不跑回测)",
+    sgVerifySkipHint: "跳过就不会有回测结果 —— 你拿到的是一段从未在任何历史数据上跑过的代码。",
+    sgGenVerifying: "已生成, 正在跑验证回测…(窗口越大越久)",
+    sgGenVerified: "验证回测已完成(未落盘)",
+    sgGenUnverified: "未验证",
+    sgGenUnverifiedHint:
+      "代码已生成并通过编译门禁, 但这次没能跑出回测结果 —— 下面的指标**一个都不显示**, 不能当成「已验证」。",
+    sgSaveDraft: "保存为我的策略",
+    sgDiscard: "放弃这份草稿",
+    sgGenSaving: "保存中…",
+    // 054 T37: 生成时顺带问出的一句话摘要与参数中文名 —— 先看一眼再决定存不存(审计 #10/#15)。
+    sgGenWhatItDoes: "这份策略在做什么",
+    sgGenMetaNote: "说明没能自动生成",
+    sgGenSavingMeta: "正在写入说明…",
+    sgGenMetaFail: "策略代码已保存, 但摘要与参数说明没能写进清单:",
+    sgGenMetaRetry: "重试写入说明",
+    // 054 P3-4: 成本假设(审计 #4)。滑点默认 0(乐观), 不写出来用户永远不知道这条曲线是零滑点下的。
+    sgCostTitle: "本回测的成本假设",
+    sgCostFee: "费率",
+    sgCostSlip: "滑点",
+    sgCostPen: "限价穿透",
+    sgCostCash: "本金",
+    sgCostLev: "杠杆",
+    sgCostZeroSlip:
+      "滑点假设为 0(乐观): 网格 / 高频这类靠小价差吃饭的策略, 收益会被系统性高估 —— 想看更接近现实的数, 把滑点按千分之几设进「高级(可选)」再跑一次。",
+    sgBtDisclaimer: "同一段历史窗口的回测结果, 不代表未来收益。",
+    // 055 B3: 档位目标的**事后核对** —— 档位此前只对模型有约束力, 用户侧没有反馈闭环:
+    // 选了「回撤 ≤10%」后界面只显示实测的 25%, 从不说"没达到你选的那档"。
+    sgTierCheckTitle: "你选的档位, 这份策略达到了吗",
+    sgTierCheckTarget: "目标",
+    sgTierCheckActual: "实测",
+    sgTierCheckMet: "达到目标",
+    sgTierCheckUnmet: "未达到目标",
+    sgTierCheckUnknown: "这次没测出来",
+    sgTierCheckUnmetNote:
+      "档位写的是**目标**不是保证: 没达到不代表这份策略不能用, 但它确实没做到你选的那档。可以调小单笔仓位 / 加大网格间距后重新生成, 或者直接改用更稳的一档。",
+    sgTierCheckNote:
+      "只对「回测真能算出数字」的项做核对(目前是最大回撤)。单笔仓位、网格间距、杠杆上限这些是代码里的约定, 回测指标里没有对应的数 —— 不凑假数字给你看。",
+    // 054 P2: 结构化投资输入(审计 #2)。「我想稳一点」这种话对模型没有约束力,
+    // 真正起作用的是档位换算出来的**具体数字** —— 所以这两个字段是必填, 不是可选项。
+    sgCapital: "准备投入的本金(USDT)",
+    sgCapitalHint:
+      "这个数会写进策略配置, 以后每次回测都按它算; 「单笔不超过 10%」这类约束也以它为基准 —— 不填就没法换算成具体金额。",
+    sgCapitalInvalid: "请填一个大于 0 的本金(USDT)",
+    sgRiskTier: "风险档位",
+    sgRiskTierHint:
+      "选一档: 传给 AI 的是这一档换算出的**具体数字**(回撤/单笔仓位/杠杆/间距), 不是「稳一点」这种形容词。",
+    sgRiskTierLoading: "载入档位说明…",
+    sgRiskTierFail: "档位说明没取到(不影响生成, 但档位含义显示不出来)",
+    sgRiskTierRequired: "请选一个风险档位",
+    sgRiskCustomHint: "自定义档: 下面几个数你自己填 —— 界面不代你解读, 也不给默认值。",
+    sgRiskMaxDd: "最大回撤目标(%)",
+    sgRiskMaxPos: "单笔最大仓位(%)",
+    sgRiskLevCap: "杠杆上限(x)",
+    sgRiskSpacing: "网格最小间距(%)",
+    sgRiskSpacingHint: "只对网格 / 分批挂单类策略有意义; 不是这类可以留空。",
+    sgCustomRequired: "自定义档需要填: 最大回撤目标、单笔最大仓位(合约还要杠杆上限)",
+    // 054 P3-1: 常驻风险提示条(不做勾选确认框 —— 会稀释 live 启动那个真正重要的门禁)。
+    sgRiskNoticeTitle: "生成之前请知道",
+    sgRiskNotice:
+      "① 它会真实下单 —— 取决于你之后怎么运行它(Dry Run 只本地撮合, 实盘是真钱); ② 它只在一段历史数据上跑过回测, 没有实盘验证; ③ 平台不代你做风控 —— 止损 / 仓位 / 杠杆这些约束靠策略代码自己实现, 生成时写进提示词的数字是**目标**, 不是事后拦截。",
+    // 054 D7: 来源徽章 —— 只说来源, 不说验证(验证状态由回测结果自己展示)。
+    sgOriginAi: "AI 生成",
     sgMetrics: "关键指标",
     sgBenchShort: "基准",
     sgEqVsBench: "策略 vs 买入持有",
@@ -454,6 +532,41 @@
     sgOptBestSuffix: ")",
     sgOptSortHint: "点表头排序; 失败的行始终排在最后。",
     sgOptErrRow: "该组失败",
+    // 054 P4: 样本外检验 / 分段验证 / 滚动验证。
+    // 术语纪律: 「分段验证」与「滚动验证(含重新调参)」是两件事, 界面上**不统称 walk-forward** ——
+    // 统称会让人以为两者可以互相比较(它们代价与含义都不同)。
+    sgVal: "样本外检验",
+    sgValHint:
+      "回测漂亮不等于能赚: 那组参数是在同一段历史上挑出来的。这里把它放到它没见过的数据上再跑一次。",
+    sgValMode: "方式",
+    sgValModeSplit: "样本内外切分(前 70% / 后 30%)",
+    sgValModeWalk: "分段验证(按时间切几段)",
+    sgValForm: "形态",
+    sgValFormA: "分段验证(参数全程不变)",
+    sgValFormB: "滚动验证(每段前重新调参)",
+    sgValFormBHint:
+      "候选网格沿用上面「多维寻优」里填的那几行 —— 重新调参必须知道在哪些参数上挑, 后端不会替你猜。",
+    sgValGo: "开始检验",
+    sgValRunning: "检验运行中…",
+    sgValDimsRequired: "形态「滚动验证」需要候选网格: 先在「多维寻优」里填至少一个维度(参数键 + 候选值)。",
+    sgValSegDays: "天",
+    sgValSpread: "各段净盈亏从",
+    sgValSpreadMid: "到",
+    sgValSpreadTail:
+      "(相差 ",
+    sgValSpreadEnd: ") —— 段与段差得越多, 说明它对行情越挑。这里只描述差异, 不断言原因。",
+    sgValNoSpread: "各段指标不足, 算不出离散度。",
+    sgValOos: "样本外",
+    sgValThresholdInsufficient: "样本不足, 不给结论 —— 请拉长窗口",
+    sgValThresholdMinimum: "已达最低可信线(仍偏短)",
+    sgValThresholdAmple: "样本充足",
+    sgValDegraded: "样本外退化",
+    sgValDegradedUnknown: "退化判定算不出来(缺指标), 所以没有给出「没退化」的结论",
+    sgValSegFail: "这一段没跑出来",
+    sgValCurveTitle: "曲线(两条线含义不同, 别直接比)",
+    sgValCurveOurs: "本次检验(拼接各段)",
+    sgValCurveFull: "同一组参数跑全窗口",
+    sgValCurveNoFull: "再跑一次普通回测, 这里就能把两条线并排放。",
     sgWarnings: "静态检查提示",
     sgApiRef: "ctx API 速查",
     sgSavedWithWarn: "已保存(附静态检查提示)",
@@ -619,6 +732,75 @@
     sgConstraintsPh: "e.g. max 10% of equity per order; stop loss at -5%; at most 3 trades per day",
     sgGen: "Generate & save",
     sgGenerating: "AI generating… (1–2 min)",
+    // 054 P1: generate-then-verify.
+    sgVerifyDays: "Verification window",
+    sgVerifyCustom: "Custom",
+    sgDaysUnit: "days",
+    sgVerifyDaysHint:
+      "Right after generation, the code is backtested on real klines. A longer window sees more history and takes longer (360 days · 1m can take minutes). The default 90 days matches the backtest card and the AI assessment, so the numbers are directly comparable.",
+    sgVerifySlow: "Longer window = longer wait",
+    sgVerifySkip: "Skip verification (no backtest)",
+    sgVerifySkipHint: "Skipping means no backtest at all — you get code that has never run on any historical data.",
+    sgGenVerifying: "Generated — running the verification backtest now… (longer window = longer wait)",
+    sgGenVerified: "Verification backtest finished (not saved yet)",
+    sgGenUnverified: "Not verified",
+    sgGenUnverifiedHint:
+      "The code was generated and passed the compile gate, but the backtest did not produce a result — no metric is shown below, and that is not the same as “verified”.",
+    sgSaveDraft: "Save as my strategy",
+    sgDiscard: "Discard this draft",
+    sgGenSaving: "Saving…",
+    // 054 T37: summary + parameter names produced alongside generation.
+    sgGenWhatItDoes: "What this strategy does",
+    sgGenMetaNote: "The description could not be generated",
+    sgGenSavingMeta: "Writing the description…",
+    sgGenMetaFail: "The code was saved, but the summary and parameter descriptions were not written into the manifest:",
+    sgGenMetaRetry: "Retry writing the description",
+    // 054 P3-4: cost assumptions.
+    sgCostTitle: "Cost assumptions for this backtest",
+    sgCostFee: "Fee",
+    sgCostSlip: "Slippage",
+    sgCostPen: "Limit penetration",
+    sgCostCash: "Cash",
+    sgCostLev: "Leverage",
+    sgCostZeroSlip:
+      "Slippage is assumed to be 0 (optimistic): grid and high-frequency strategies live on small price differences, so their returns are systematically overstated. To see a more realistic number, set slippage to a few per-mille under “Advanced (optional)” and run it again.",
+    sgBtDisclaimer: "A backtest over one historical window does not predict future returns.",
+    // 055 B3: post-hoc check of the targets of the tier that was picked.
+    // (字典块内的注释不要出现引号类字符: 静态检查按引号切字符串, 一个落单的引号会把后面整段吞掉。)
+    sgTierCheckTitle: "Did it hit the tier you picked?",
+    sgTierCheckTarget: "Target",
+    sgTierCheckActual: "Actual",
+    sgTierCheckMet: "Met",
+    sgTierCheckUnmet: "Not met",
+    sgTierCheckUnknown: "Not measured this run",
+    sgTierCheckUnmetNote:
+      "The tier states a **target**, not a guarantee: missing it does not make the strategy unusable, but it did not do what you asked for. Regenerate with a smaller position per trade / wider grid spacing, or simply pick a steadier tier.",
+    sgTierCheckNote:
+      "Only items the backtest can actually measure are checked (currently max drawdown). Position per trade, grid spacing and the leverage cap are conventions in the code — the metrics carry no number for them, so no fake number is shown.",
+    // 054 P2: structured investment input. "Make it safer" binds nothing — what binds is the number.
+    sgCapital: "Capital to invest (USDT)",
+    sgCapitalHint:
+      "This number is written into the strategy config, so every later backtest uses it; “no more than 10% per trade” is measured against it. Without it, nothing can be converted into an amount.",
+    sgCapitalInvalid: "Enter a capital greater than 0 (USDT)",
+    sgRiskTier: "Risk tier",
+    sgRiskTierHint:
+      "Pick one: the AI receives the tier's concrete numbers (drawdown / position per trade / leverage / spacing), not an adjective like “safer”.",
+    sgRiskTierLoading: "Loading tier descriptions…",
+    sgRiskTierFail: "Could not load tier descriptions (generation still works, but the tier meaning is not shown)",
+    sgRiskTierRequired: "Pick a risk tier",
+    sgRiskCustomHint: "Custom tier: you fill in the numbers below — the UI does not interpret them and provides no defaults.",
+    sgRiskMaxDd: "Max drawdown target (%)",
+    sgRiskMaxPos: "Max position per trade (%)",
+    sgRiskLevCap: "Leverage cap (x)",
+    sgRiskSpacing: "Grid min spacing (%)",
+    sgRiskSpacingHint: "Only meaningful for grid / laddered-order strategies; leave it empty otherwise.",
+    sgCustomRequired: "Custom tier needs: max drawdown target, max position per trade (and leverage cap for futures)",
+    // 054 P3-1: persistent risk notice (no checkbox — it would dilute the live-start gate).
+    sgRiskNoticeTitle: "Before you generate",
+    sgRiskNotice:
+      "① It places real orders — depending on how you run it later (Dry Run matches locally, live is real money). ② It has only been backtested on one historical window; it is not verified in live trading. ③ The platform does not do risk control for you — stop-loss / position / leverage are implemented by the strategy code itself, and the numbers written into the prompt are targets, not post-hoc enforcement.",
+    // 054 D7: origin badge — source only, never a verdict.
+    sgOriginAi: "AI generated",
     sgMetrics: "Key metrics",
     sgBenchShort: "B&H",
     sgEqVsBench: "Strategy vs buy & hold",
@@ -705,12 +887,72 @@
     sgOptBestSuffix: "",
     sgOptSortHint: "Click a header to sort; failed rows always sink to the bottom.",
     sgOptErrRow: "This combo failed",
+    // 054 P4: out-of-sample check / segmented / rolling validation.
+    sgVal: "Out-of-sample check",
+    sgValHint:
+      "A pretty backtest proves little: those params were picked on that very same slice of history. Here we run them again on data they have never seen.",
+    sgValMode: "Mode",
+    sgValModeSplit: "In/out-of-sample split (first 70% / last 30%)",
+    sgValModeWalk: "Segmented (split the window by time)",
+    sgValForm: "Form",
+    sgValFormA: "Segmented (params never change)",
+    sgValFormB: "Rolling (re-tune before each segment)",
+    sgValFormBHint:
+      "The candidate grid is the one filled in \"Multi-param search\" above — re-tuning must know which params to search; the backend will not guess for you.",
+    sgValGo: "Run check",
+    sgValRunning: "Check running…",
+    sgValDimsRequired:
+      "Form \"Rolling\" needs a candidate grid: fill in at least one dim (param key + candidates) under \"Multi-param search\" first.",
+    sgValSegDays: "d",
+    sgValSpread: "Net PnL per segment ranges from ",
+    sgValSpreadMid: " to ",
+    sgValSpreadTail: " (spread ",
+    sgValSpreadEnd:
+      ") — the wider the spread, the more picky it is about market conditions. This describes the spread only; it does not claim a cause.",
+    sgValNoSpread: "Not enough per-segment metrics to compute the spread.",
+    sgValOos: "Out-of-sample",
+    sgValThresholdInsufficient: "Sample too small — no conclusion; lengthen the window",
+    sgValThresholdMinimum: "At the minimum credibility line (still short)",
+    sgValThresholdAmple: "Sample sufficient",
+    sgValDegraded: "Degraded out of sample",
+    sgValDegradedUnknown:
+      "Degradation could not be computed (missing metrics), so no \"not degraded\" conclusion is given",
+    sgValSegFail: "This segment did not produce a result",
+    sgValCurveTitle: "Curves (two different meanings — do not compare them directly)",
+    sgValCurveOurs: "This check (segments stitched)",
+    sgValCurveFull: "Same params over the full window",
+    sgValCurveNoFull: "Run one normal backtest and the two lines will be shown side by side here.",
     sgWarnings: "Static check hints",
     sgApiRef: "ctx API reference",
     sgSavedWithWarn: "Saved (with static check hints)",
   });
 
   // ---------- 一次性挂载(骨架只建一次; 数据每次激活重取) ----------
+
+  /// 054 P4: 给检验下拉铺选项(值 + 双语标签)。
+  ///
+  /// 选项**必须**带 `data-zh` / `data-en`: 切语言时 `R.applyLang` 会就地改写所有带这两个
+  /// 属性的节点 —— 只写 `textContent` 的话, 切到英文再切回来标签会停在初始语言上。
+  function fillValSelect(id, pairs) {
+    const sel = $(id);
+    for (const [value, key] of pairs) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.dataset.zh = R.TEXT.zh[key];
+      opt.dataset.en = R.TEXT.en[key];
+      opt.textContent = R.TEXT.zh[key];
+      sel.appendChild(opt);
+    }
+  }
+
+  /// 形态下拉只在「分段」方式下有意义(样本内外切分不重新调参), 形态 B 还要额外提示
+  /// 候选网格从哪儿来 —— 靠 JS 显隐, 不给两个互斥的按钮让用户自己猜哪个生效。
+  function syncValForm() {
+    const walk = $("sg-val-mode").value === "walk";
+    const formB = walk && $("sg-val-form").value === "B";
+    $("sg-val-form-label").hidden = !walk;
+    $("sg-val-formb-hint").hidden = !formB;
+  }
 
   function mount() {
     if (st.mounted) return;
@@ -888,6 +1130,25 @@
       bi("sgOptGo") + ">" + R.TEXT.zh.sgOptGo + "</button></div>" +
       '<div id="sg-opt-msg" class="sg-msg" aria-live="polite"></div>' +
       '<div id="sg-opt-result"></div></details>' +
+      // 054 P4: 样本外检验(默认收起 —— 它是"回测之后才该问的问题", 摆在最显眼处
+      // 反而会让人在还没看懂回测数字时先被它吓到)。
+      '<details class="sg-advanced sg-sweep-box" id="sg-val-box"><summary' + bi("sgVal") + ">" +
+      R.TEXT.zh.sgVal + "</summary>" +
+      "<div class='sg-opt-hint'" + bi("sgValHint") + ">" + R.TEXT.zh.sgValHint + "</div>" +
+      '<div class="sg-bt-grid">' +
+      "<label><span" + bi("sgValMode") + ">" + R.TEXT.zh.sgValMode + "</span>" +
+      '<select id="sg-val-mode" class="sg-input"></select></label>' +
+      // 形态只在「分段」下有含义: 「样本内外切分」不重新调参, 它的参数就是当前这组。
+      '<label id="sg-val-form-label" hidden><span' + bi("sgValForm") + ">" +
+      R.TEXT.zh.sgValForm + "</span>" +
+      '<select id="sg-val-form" class="sg-input"></select></label>' +
+      "</div>" +
+      "<div id='sg-val-formb-hint' class='sg-opt-hint' hidden" + bi("sgValFormBHint") + ">" +
+      R.TEXT.zh.sgValFormBHint + "</div>" +
+      '<div class="sg-row-right"><button id="sg-val-go" class="sg-btn" type="button"' +
+      bi("sgValGo") + ">" + R.TEXT.zh.sgValGo + "</button></div>" +
+      '<div id="sg-val-msg" class="sg-msg" aria-live="polite"></div>' +
+      '<div id="sg-val-result"></div></details>' +
       '<div id="sg-bt-history"></div></div></section>' +
       "</div></div>" +
       // 弹窗层(新建/复制)
@@ -934,6 +1195,19 @@
     // 按真实参数铺(syncOptDims, 见 strategy_form.js 的 renderDetail / refreshSchema)。
     $("sg-opt-add").addEventListener("click", () => addOptDim());
     $("sg-opt-go").addEventListener("click", onOptimize);
+    // 054 P4: 样本外检验 —— 下拉选项带 data-zh/data-en(切语言时由 applyLang 就地改)。
+    fillValSelect("sg-val-mode", [
+      ["split", "sgValModeSplit"],
+      ["walk", "sgValModeWalk"],
+    ]);
+    fillValSelect("sg-val-form", [
+      ["A", "sgValFormA"],
+      ["B", "sgValFormB"],
+    ]);
+    $("sg-val-mode").addEventListener("change", syncValForm);
+    $("sg-val-form").addEventListener("change", syncValForm);
+    syncValForm();
+    $("sg-val-go").addEventListener("click", onValidate);
     $("sg-mf-add").addEventListener("click", () => {
       addManifestRow(null);
       setMsg($("sg-mf-msg"), "", "");
@@ -1058,6 +1332,11 @@
     const flags = h("span", "sg-badges");
     if (s.declared === false) {
       flags.appendChild(h("span", "sg-badge sg-badge-warn", t("sgUndeclaredShort")));
+    }
+    // 054 D7: 「AI 生成」徽章 —— **只说来源, 不说验证**(D8: 验证状态由回测结果自己展示,
+    // 徽章不越界下结论, 也不写「已验证/未验证」)。判据是服务端读 TOML 注释的结果。
+    if (s.origin_ai) {
+      flags.appendChild(h("span", "sg-badge sg-badge-ai", t("sgOriginAi")));
     }
     if (s.duplicate_of) {
       const dup = h("span", "sg-badge sg-badge-warn", t("sgDupOf"));
@@ -1341,6 +1620,163 @@
     constraints.setAttribute("data-en-placeholder", R.TEXT.en.sgConstraintsPh);
     form.appendChild(wrapField(t("sgConstraints"), constraints));
 
+    // ---- 054 P2: 结构化投资输入(本金 + 风险档位) ----
+    // 这两项是**必填**: 不知道投多少钱、不知道能承受多大波动, 档位表就没有锚点,
+    // 而给默认值等于替用户选档 —— 那正是 D3 禁止的那件事。
+    const riskRow = h("div", "sg-gen-row");
+    const cashInput = document.createElement("input");
+    cashInput.className = "sg-input";
+    cashInput.type = "number";
+    cashInput.min = "1";
+    cashInput.step = "any";
+    cashInput.autocomplete = "off";
+    cashInput.setAttribute("data-zh-placeholder", "例如 10000");
+    cashInput.setAttribute("data-en-placeholder", "e.g. 10000");
+    const tierSel = document.createElement("select");
+    tierSel.className = "sg-input";
+    // 有 id 才能被真机走查点到(静态门检查的是"字符串有没有被服务出去", 点不到 DOM)。
+    tierSel.id = "sg-gen-tier";
+    tierSel.disabled = true;
+    const loadingOpt = document.createElement("option");
+    loadingOpt.value = "";
+    loadingOpt.textContent = t("sgRiskTierLoading");
+    tierSel.appendChild(loadingOpt);
+    riskRow.appendChild(wrapField(t("sgCapital"), cashInput));
+    riskRow.appendChild(wrapField(t("sgRiskTier"), tierSel));
+    form.appendChild(riskRow);
+    form.appendChild(h("div", "sg-field-hint", t("sgCapitalHint")));
+    const tierHint = h("div", "sg-field-hint", t("sgRiskTierHint"));
+    form.appendChild(tierHint);
+
+    // 自定义档: 展开 4 个数值字段, **不给默认值**(D3)。
+    const customRow = h("div", "sg-gen-row");
+    // 有 id 才能被真机走查判定显隐(「选自定义才出现」是个行为, 静态门看不到)。
+    customRow.id = "sg-gen-custom-row";
+    customRow.hidden = true;
+    const mkNum = (min, max, step) => {
+      const el = document.createElement("input");
+      el.className = "sg-input";
+      el.type = "number";
+      el.min = String(min);
+      el.max = String(max);
+      el.step = String(step);
+      el.autocomplete = "off";
+      return el;
+    };
+    const ddInput = mkNum(0.01, 100, "any");
+    const posInput = mkNum(0.01, 100, "any");
+    const levInput = mkNum(1, 10, "any");
+    const spInput = mkNum(0.01, 100, "any");
+    customRow.appendChild(wrapField(t("sgRiskMaxDd"), ddInput));
+    customRow.appendChild(wrapField(t("sgRiskMaxPos"), posInput));
+    customRow.appendChild(wrapField(t("sgRiskLevCap"), levInput));
+    customRow.appendChild(wrapField(t("sgRiskSpacing"), spInput));
+    form.appendChild(customRow);
+    const customHint = h("div", "sg-field-hint", t("sgRiskCustomHint"));
+    customHint.hidden = true;
+    form.appendChild(customHint);
+    const spHint = h("div", "sg-field-hint", t("sgRiskSpacingHint"));
+    spHint.hidden = true;
+    form.appendChild(spHint);
+
+    // 档位表**从后端取**: 前端手抄一份必然在改表时静默分叉(spec §四-1)。
+    let tierDocs = [];
+    R.api("/api/strategies/risk-profiles")
+      .then((r) => {
+        tierDocs = (r && r.tiers) || [];
+        tierSel.innerHTML = "";
+        for (const d of tierDocs) {
+          const opt = document.createElement("option");
+          opt.value = d.key;
+          opt.textContent = R.lang === "en" ? d.label_en : d.label_zh;
+          tierSel.appendChild(opt);
+        }
+        tierSel.disabled = false;
+        syncTier();
+      })
+      .catch(() => {
+        // 取不到就如实说: 不让用户以为"没显示 = 没这回事"。生成仍可进行(后端会校验)。
+        tierHint.textContent = t("sgRiskTierFail");
+      });
+
+    /// 档位变化 → 更新含义文案 / 自定义字段显隐 / 杠杆字段(仅合约)。
+    function syncTier() {
+      const doc = tierDocs.find((d) => d.key === tierSel.value);
+      const isCustom = tierSel.value === "custom";
+      customRow.hidden = !isCustom;
+      customHint.hidden = !isCustom;
+      spHint.hidden = !isCustom;
+      // 杠杆只对合约有意义: 现货档位表里那一列本来就不适用。
+      levInput.disabled = marketSel.value !== "futures";
+      if (doc) tierHint.textContent = R.lang === "en" ? doc.meaning_en : doc.meaning_zh;
+    }
+    tierSel.addEventListener("change", syncTier);
+    marketSel.addEventListener("change", syncTier);
+
+    // 054 P1: 验证窗口 + 跳过开关。
+    // 「跳过验证」明码标价: 关掉它 = 你拿到的是一段从未在任何历史数据上跑过的代码。
+    // 「跳过验证」的勾选框**先建对象、后入 DOM**: 下面慢提示那行要读它的初值, 而显示顺序要求
+    // 它排在验证窗口之后 —— 于是建与插分两处。此前把它整段写在慢提示之后, 打开弹窗即
+    // `ReferenceError: Cannot access 'skipBox' before initialization`(const 的 TDZ),
+    // 整个生成弹窗直接白屏; 四道静态门都抓不到, 只有真机点击能抓到。
+    const skipBox = document.createElement("input");
+    skipBox.type = "checkbox"; // 只在 DOM 里读值, 不落浏览器存储
+    skipBox.id = "sg-gen-skip-verify";
+    const vRow = h("div", "sg-gen-row");
+    const vSel = document.createElement("select");
+    vSel.className = "sg-input";
+    vSel.id = "sg-gen-verify-days";
+    for (const d of VERIFY_DAY_CHOICES) {
+      const opt = document.createElement("option");
+      opt.value = String(d);
+      opt.textContent = d + " " + t("sgDaysUnit");
+      if (d === DEFAULT_VERIFY_DAYS) opt.selected = true;
+      vSel.appendChild(opt);
+    }
+    const vCustom = document.createElement("input");
+    vCustom.className = "sg-input";
+    vCustom.type = "number";
+    vCustom.min = "1";
+    vCustom.max = "3650";
+    vCustom.step = "1";
+    vCustom.placeholder = "1–3650";
+    vCustom.hidden = true; // 选「手填」才出现
+    vSel.addEventListener("change", () => {
+      vCustom.hidden = vSel.value !== "custom";
+      if (!vCustom.hidden) vCustom.focus();
+    });
+    const customOpt = document.createElement("option");
+    customOpt.value = "custom";
+    customOpt.textContent = t("sgVerifyCustom");
+    vSel.appendChild(customOpt);
+    vRow.appendChild(wrapField(t("sgVerifyDays"), vSel));
+    vRow.appendChild(wrapField("", vCustom));
+    form.appendChild(vRow);
+    // 天数越大越慢必须**写在旁边**(spec §五 纪律: 昂贵的选项留给用户, 但必须明码标价)。
+    form.appendChild(h("div", "sg-field-hint", t("sgVerifyDaysHint")));
+    const slowHint = h("div", "sg-field-hint", t("sgVerifySlow"));
+    slowHint.hidden = skipBox.checked;
+    form.appendChild(slowHint);
+
+    const skipRow = h("label", "sg-check");
+    skipRow.appendChild(skipBox);
+    skipRow.appendChild(h("span", null, t("sgVerifySkip")));
+    form.appendChild(skipRow);
+    const skipHint = h("div", "sg-field-hint", t("sgVerifySkipHint"));
+    skipHint.hidden = true;
+    skipBox.addEventListener("change", () => {
+      skipHint.hidden = !skipBox.checked;
+      slowHint.hidden = skipBox.checked;
+      vSel.disabled = skipBox.checked;
+      vCustom.disabled = skipBox.checked;
+    });
+    form.appendChild(skipHint);
+
+    // ---- 054 P3-1: 常驻风险提示条 ----
+    // 刻意**不做勾选确认框**: 那会稀释 live 启动那个真正重要的门禁语义(见 spec 「刻意不做」表)。
+    form.appendChild(h("div", "sg-risk-notice-title", t("sgRiskNoticeTitle")));
+    form.appendChild(h("div", "sg-risk-notice", t("sgRiskNotice")));
+
     const errLine = h("div", "sg-msg err");
     form.appendChild(errLine);
     card.appendChild(form);
@@ -1353,6 +1789,148 @@
       label.appendChild(h("span", null, labelText));
       label.appendChild(ctl);
       return label;
+    }
+
+    /// 054 P2: 读结构化投资输入。返回 null = 有字段不合法, 已就地报错。
+    ///
+    /// 校验只做"能不能发出去"这一层(非空 / 数值合法 / 自定义档必填), **不替用户挑数** ——
+    /// 真正的范围校验在后端(那里是唯一权威), 这里重复一遍只为省一次几十秒的等待。
+    function readRiskInput() {
+      const cash = Number(String(cashInput.value).trim());
+      if (!Number.isFinite(cash) || cash <= 0) {
+        setMsg(errLine, t("sgCapitalInvalid"), "err");
+        return null;
+      }
+      const tier = tierSel.value;
+      if (!tier) {
+        setMsg(errLine, t("sgRiskTierRequired"), "err");
+        return null;
+      }
+      const out = { initial_cash: cash, risk_tolerance: tier };
+      if (tier === "custom") {
+        const dd = Number(String(ddInput.value).trim());
+        const pos = Number(String(posInput.value).trim());
+        if (!Number.isFinite(dd) || dd <= 0 || !Number.isFinite(pos) || pos <= 0) {
+          setMsg(errLine, t("sgCustomRequired"), "err");
+          return null;
+        }
+        out.max_drawdown_pct = dd;
+        out.max_position_pct = pos;
+        if (marketSel.value === "futures") {
+          const lev = Number(String(levInput.value).trim());
+          if (!Number.isFinite(lev) || lev < 1 || lev > 10) {
+            setMsg(errLine, t("sgCustomRequired"), "err");
+            return null;
+          }
+          out.leverage_cap = lev;
+        }
+        // 网格最小间距**可选**: 只对网格/分批挂单类有意义, 逼趋势策略编一个没有信息量。
+        const sp = String(spInput.value).trim();
+        if (sp) out.min_spacing_pct = Number(sp);
+      }
+      return out;
+    }
+
+    /// 读验证窗口: 手填档读输入框, 否则读下拉; 非法(空/非整数/越界)→ null, 由调用方报错。
+    function readVerifyDays() {
+      const raw = (vSel.value === "custom" ? vCustom.value : vSel.value).trim();
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1 || n > 3650) return null;
+      return n;
+    }
+
+    /// 054 P1: 生成完**先展示验证结果**, 由用户决定存不存 —— 不再"生成即落盘"。
+    /// 这一步是整个 054 的落点: 此前用户点一次「生成并保存」, 拿到的是一段从未跑过的代码。
+    function showVerification(draft, risk) {
+      form.hidden = true;
+      const panel = h("div", "sg-gen-verify");
+      card.insertBefore(panel, card.firstChild);
+      // 渲染函数来自 strategy_backtest.js(跨文件走延迟别名, 见 042 D2)。
+      S.renderVerifyResult(panel, draft.verify);
+      // 054 T37: 「这份策略在做什么」要**在保存之前**就让人看到 —— 它是判断"这是不是我想要
+      // 的那个东西"最快的依据, 比看指标还快。服务端已按"只许依据代码"取过一轮。
+      if (draft.summary) {
+        const box = h("div", "sg-gen-summary");
+        box.appendChild(h("div", "sg-field-hint", t("sgGenWhatItDoes")));
+        box.appendChild(h("div", "sg-gen-summary-text", draft.summary));
+        panel.appendChild(box);
+      }
+      // 摘要/命名没生成出来也要说一声: 不说的话详情页空着一块, 用户分不清"没做"还是"坏了"。
+      if (draft.meta_note) {
+        panel.appendChild(h("div", "sg-val-note", t("sgGenMetaNote") + ": " + draft.meta_note));
+      }
+      if (draft.warnings && draft.warnings.length) {
+        const box = h("div", "sg-warnlist");
+        const ul = h("ul", "sg-warnlist-ul");
+        for (const w of draft.warnings) ul.appendChild(h("li", null, w));
+        box.appendChild(ul);
+        panel.appendChild(box);
+      }
+      // 按钮改口: 「生成并保存」→「保存为我的策略」, 「取消」→「放弃这份草稿」。
+      primary.textContent = t("sgSaveDraft");
+      primary.disabled = false;
+      cancel.textContent = t("sgDiscard");
+      // 覆盖掉「生成」那个 onclick —— 之后的点击只做保存。
+      primary.onclick = () => {
+        primary.disabled = true;
+        primary.textContent = t("sgGenSaving");
+        const name = nameInput.value.trim();
+        R.api("/api/strategies", {
+          method: "POST",
+          body: {
+            name: name,
+            market: marketSel.value,
+            pair: pairInput.value.trim(),
+            code: draft.code,
+            params: {},
+            overwrite: false,
+            // 054 D7: 来源标记(服务端读 TOML 注释判定, 前端只声明"这是 AI 产物")。
+            origin: "ai",
+            // 054 P2: 本金与杠杆上限随落盘写进 `[backtest]` —— 生成时的约束与以后每次回测的口径
+            // 必须是同一个数, 否则"单笔不超过 10%"在两处是两个意思。
+            initial_cash: risk.initial_cash,
+            // 055 B1: 档位给的是**上限** → 写 max_leverage, 不是 leverage。
+            // 写 leverage 会把"最多 2x"变成"就用 2x", 而实盘启动读的正是 [backtest].leverage ——
+            // 等于平台替用户在交易所开了 2~5 倍杠杆。实际开多少杠杆留给用户自己去设参数。
+            max_leverage: draft.leverage_cap === undefined ? null : draft.leverage_cap,
+          },
+        })
+          .then(async () => {
+            // 054 T37: 摘要与参数说明随保存写进清单(键/类型/默认值由服务端从代码提取, 这里
+            // 只转发)。写不进去**不装作成功** —— 弹窗留下来给一次重试, 否则用户拿到一个"能跑
+            // 但没人知道它在干嘛"的策略, 而平台一个字都没说。
+            if (!draft.summary && !(draft.manifest_params && draft.manifest_params.length)) {
+              close();
+              openDetail(name);
+              return;
+            }
+            primary.textContent = t("sgGenSavingMeta");
+            try {
+              await R.api("/api/strategies/" + encodeURIComponent(name) + "/manifest", {
+                method: "POST",
+                body: {
+                  // 中文名留空(N2 允许): 界面回退显示 id, 不去编一个名字。
+                  name: "",
+                  summary: draft.summary || "",
+                  params: draft.manifest_params || [],
+                },
+              });
+              close();
+              openDetail(name);
+            } catch (merr) {
+              setMsg(errLine, t("sgGenMetaFail") + " " + ((merr && merr.message) || String(merr)), "err");
+              primary.disabled = false;
+              primary.textContent = t("sgGenMetaRetry");
+            }
+          })
+          .catch((err) => {
+            primary.disabled = false;
+            primary.textContent = t("sgSaveDraft");
+            setMsg(errLine, (err && err.message) || String(err), "err");
+            panel.hidden = true;
+            form.hidden = false;
+          });
+      };
     }
 
     async function submit() {
@@ -1369,36 +1947,39 @@
         setMsg(errLine, t("sgIdeaPh"), "err");
         return;
       }
+      const skip = skipBox.checked;
+      const days = skip ? null : readVerifyDays();
+      if (!skip && days === null) {
+        setMsg(errLine, t("sgDaysInvalid"), "err");
+        return;
+      }
+      const risk = readRiskInput();
+      if (!risk) return; // 报错已就地给出
       primary.disabled = true;
-      primary.textContent = t("sgGenerating");
+      // 054 P1: 生成后还要跑回测 —— 按钮文案必须提前说清"还要等一会儿",
+      // 否则用户以为生成完就结束了。
+      primary.textContent = skip ? t("sgGenerating") : t("sgGenVerifying");
       setMsg(errLine, "", "");
       try {
-        // ① AI 生成(过编译门禁, 未落盘)。
+        // ① AI 生成 + 验证回测(都在服务端一次做完; 代码**未落盘**)。
         const draft = await R.api("/api/strategies/ai-generate", {
           method: "POST",
-          body: {
-            name: name,
-            market: marketSel.value,
-            pair: pairInput.value.trim(),
-            interval: ivSel.value,
-            idea: idea.value.trim(),
-            constraints: constraints.value.trim(),
-          },
+          body: Object.assign(
+            {
+              name: name,
+              market: marketSel.value,
+              pair: pairInput.value.trim(),
+              interval: ivSel.value,
+              idea: idea.value.trim(),
+              constraints: constraints.value.trim(),
+              verify: !skip,
+              verify_days: skip ? undefined : days,
+            },
+            risk
+          ),
         });
-        // ② 落盘(与手动保存同一端点; params 空 = 用 Lua 内 fallback)。
-        await R.api("/api/strategies", {
-          method: "POST",
-          body: {
-            name: name,
-            market: marketSel.value,
-            pair: pairInput.value.trim(),
-            code: draft.code,
-            params: {},
-            overwrite: false,
-          },
-        });
-        close();
-        openDetail(name);
+        // ② 让用户先看结果, 自己决定存不存(不再自动落盘)。
+        showVerification(draft, risk);
       } catch (err) {
         if (err && err.status === 403 && err.code === "need_keys") {
           showNeedKeysInline(errLine, err.message || t("sgNeedKeys"));
@@ -1409,7 +1990,9 @@
         primary.textContent = t("sgGen");
       }
     }
-    primary.addEventListener("click", () => submit().catch(strategyErr));
+    // 刻意用 `onclick` 而不是 addEventListener: showVerification 之后主按钮要**换一个动作**
+    // (生成 → 保存), 用 onclick 直接覆盖才不会两条监听器一起跑(那会再生成一次)。
+    primary.onclick = () => submit().catch(strategyErr);
     nameInput.focus();
   }
 
@@ -1634,6 +2217,8 @@
         st.pollTimer = 0;
       }
       destroyBtChart();
+      // 054 P4: 检验曲线的图表句柄是独立的(不与回测图共用一个), 离开视图一并销毁。
+      destroyValChart();
       $("sg-modal-root").innerHTML = "";
     },
   };

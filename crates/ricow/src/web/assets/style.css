@@ -29,6 +29,7 @@
   --ma-7: #e3b341;
   --ma-25: #58a6ff;
   --ma-99: #bc8cff;
+  --ai-badge: #bc8cff;
 }
 
 /* 034 白色浅色主题: 背景白、面板浅灰, 强调色加深保证对比度(WCAG AA)。 */
@@ -55,6 +56,7 @@
   --ma-7: #9a6a00;
   --ma-25: #0969da;
   --ma-99: #8250df;
+  --ai-badge: #8250df;
 }
 
 /* 034 红色主题: 深红褐面 + 珊瑚强调 —— 整体仍是暗色系, 红色为主色调。 */
@@ -81,6 +83,7 @@
   --ma-7: #f0c674;
   --ma-25: #7cc4ff;
   --ma-99: #d7b0ff;
+  --ai-badge: #d7b0ff;
 }
 * {
   box-sizing: border-box;
@@ -1606,6 +1609,11 @@ body {
   border-color: var(--warn);
   color: var(--warn);
 }
+/* 054 D7: 「AI 生成」徽章 —— 中性色(紫), 既不是告警也不是背书; 只说来源, 不说验证。 */
+.sg-badge-ai {
+  border-color: var(--ai-badge);
+  color: var(--ai-badge);
+}
 .sg-hint {
   margin-bottom: 10px;
   padding: 8px 10px;
@@ -2188,6 +2196,42 @@ body {
   flex-direction: column;
   gap: 12px;
 }
+/* 054 P1: 生成后表单让位给验证结果面板(两个都得能藏 —— 本文件没有全局 [hidden] 规则)。 */
+.sg-modal-form[hidden],
+.sg-gen-verify[hidden],
+.sg-check input[hidden] {
+  display: none;
+}
+.sg-gen-verify {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 60vh;
+  overflow: auto;
+}
+/* 054 P3-1: 常驻风险提示条 —— 用告警色, 但不做勾选确认框(会稀释 live 启动那个门禁)。 */
+.sg-risk-notice-title {
+  color: var(--warn);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.sg-risk-notice {
+  padding: 8px 10px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.6;
+}
+.sg-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--fg);
+}
 .sg-field {
   display: flex;
   flex-direction: column;
@@ -2365,6 +2409,119 @@ body {
 .sg-mcard-sub {
   color: var(--muted);
   font-size: 0.7rem;
+}
+
+/* 054 P3-4: 成本假设行 —— 与指标卡同层(不折叠)。滑点为 0 单独点名(审计 #4)。 */
+.sg-cost-box {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.sg-cost-title {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.sg-cost-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 0.74rem;
+}
+.sg-cost-item {
+  display: inline-flex;
+  gap: 4px;
+  white-space: nowrap;
+}
+.sg-cost-key {
+  color: var(--muted);
+}
+.sg-cost-val {
+  font-family: var(--mono);
+  color: var(--fg);
+}
+.sg-cost-warn {
+  margin-top: 6px;
+  color: var(--warn);
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+.sg-cost-note {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+/* 055 B3: 档位目标 vs 实测 —— 紧贴指标卡; 未达标时左边框转红, 一眼能看见。
+   这里的红/绿是"通过 / 没做到"的意思, 与涨跌配色无关。 */
+.sg-tiercheck {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+}
+.sg-tiercheck-unmet {
+  border-left-color: var(--error);
+}
+.sg-tiercheck-title {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.sg-tiercheck-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  font-size: 0.76rem;
+  padding: 2px 0;
+}
+.sg-tiercheck-name {
+  min-width: 5.5rem;
+  color: var(--fg);
+}
+.sg-tiercheck-target,
+.sg-tiercheck-actual {
+  color: var(--muted);
+  font-family: var(--mono);
+}
+.sg-tiercheck-verdict {
+  margin-left: auto;
+  font-size: 0.72rem;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.sg-tiercheck-met {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.sg-tiercheck-unmet {
+  color: var(--error);
+  border-color: var(--error);
+}
+.sg-tiercheck-note {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.55;
+}
+.sg-verify-reason {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* 权益曲线容器(P0-2, Lightweight Charts 自适应父容器高度) */
@@ -3648,6 +3805,95 @@ body.help-open {
   .sg-opt-prog-fill {
     transition: none;
   }
+}
+
+/* ── 054 P4: 样本外检验 / 分段验证 / 滚动验证 ──────────────────────────────────────
+   各段**并排**而不是竖排一列: 「同一组参数在不同行情段上的表现」只有横着摆才看得出
+   差异; 竖排时眼睛要做的是"记住上一段的数字再比下一段", 那基本比不出来。 */
+.sg-val-note {
+  margin: 6px 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: var(--raised);
+  color: var(--fg);
+  font-size: 0.8rem;
+  line-height: 1.6;
+}
+/* 054 T37: 生成弹窗里的「这份策略在做什么」—— 保存前给用户看的一行摘要。 */
+.sg-gen-summary {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--raised);
+}
+.sg-gen-summary-text {
+  color: var(--fg);
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+.sg-val-chip {
+  display: inline-block;
+  margin: 0 6px 6px 0;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+.sg-val-chip.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.sg-val-segs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+.sg-val-seg {
+  flex: 1 1 160px;
+  min-width: 150px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--raised);
+}
+/* 样本外那一段单独描边: 它是这次检验真正要看的那一段。 */
+.sg-val-seg.sg-val-oos {
+  border-color: var(--accent);
+}
+.sg-val-seg-label {
+  color: var(--fg);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.sg-val-seg-range {
+  margin: 2px 0 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.sg-val-mrow {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sg-val-mitem {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 0.75rem;
+}
+.sg-val-mkey {
+  color: var(--muted);
+}
+.sg-val-mval.up {
+  color: var(--error);
+}
+.sg-val-mval.down {
+  color: var(--accent);
 }
 
 /* ── B7: 命令面板(Ctrl/⌘+K) ──────────────────────────────────────────────────────

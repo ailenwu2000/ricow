@@ -231,6 +231,15 @@ pub(crate) struct BacktestRunSpec {
     pub(crate) params: HashMap<String, ConfigValue>,
     /// 直跑 lua 模式的脚本路径(仅 CLI `--script`; Web 首期不提供)。
     pub(crate) script_path: Option<PathBuf>,
+    /// 054 P1: **内存 Lua 代码**直跑 —— 给 AI 生成后**尚未落盘**的代码做验证回测。
+    ///
+    /// `Some` 时**不再**按 `strategy` 去磁盘找 `strategies/<name>.toml`, 而是用
+    /// [`ricow_engine::create_strategy`] 现场编译(与 Web 保存端点**同一道编译门禁**),
+    /// 于是"先验证、再落盘"与"落盘后回测"走的是**同一套** K 线拉取 / 预热 / 撮合 / 报告口径。
+    ///
+    /// 刻意不做成"先落盘再回测": 那样用户会先看到一个未经任何历史检验的策略文件,
+    /// 删不删都别扭(审计 #1)。
+    pub(crate) raw_code: Option<String>,
     // ---- 回测参数三层覆盖的最上层 (None=不覆盖, 见 specs/backtest.md §三) ----
     /// maker/taker 手续费同设 (bps)。
     pub(crate) fee: Option<f64>,
@@ -312,6 +321,7 @@ impl BacktestRunSpec {
             position_mode,
             params: overrides,
             script_path: script.map(PathBuf::from),
+            raw_code: None,
             fee,
             fee_maker,
             fee_taker,
@@ -888,13 +898,25 @@ pub(crate) async fn run_backtest_inner(spec: &BacktestRunSpec) -> CoreResult<Bac
     check_bar_budget(limit, days, &interval)?;
 
     let exchange = crate::commands::bn_exchange()?;
-    let mut config = load_run_config(
-        &spec.root,
-        &spec.strategy,
-        spec.pair.as_deref(),
-        spec.script_path.as_deref(),
-        spec.params.clone(),
-    )?;
+    // 054 P1: 内存代码直跑(AI 生成后未落盘的验证)。编译门禁就在这里 —— 与 Web 保存端点同一个
+    // `create_strategy`, 不通过即退出(不拉 K 线、不产生 run card)。
+    let mut config = match spec.raw_code.as_deref() {
+        Some(code) => {
+            let pair =
+                spec.pair.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+                    CoreError::InvalidArgument("内存代码回测需要显式给出 pair(交易对)".into())
+                })?;
+            ricow_engine::create_strategy(&spec.strategy, code, pair, spec.params.clone())
+                .map_err(CoreError::InvalidArgument)?
+        }
+        None => load_run_config(
+            &spec.root,
+            &spec.strategy,
+            spec.pair.as_deref(),
+            spec.script_path.as_deref(),
+            spec.params.clone(),
+        )?,
+    };
     // 覆盖 market/position_mode (三层最上层; market 同时决定数据源分支, 见下)。
     // CLI 文案保持 "--market/--position-mode" 原样(终端输出逐字不变); Web 层在发起前已先拦非法值。
     if let Some(m) = &spec.market {

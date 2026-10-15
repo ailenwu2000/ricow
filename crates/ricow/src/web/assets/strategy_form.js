@@ -59,6 +59,10 @@
     setMsg($("sg-opt-msg"), "", "");
     $("sg-opt-result").innerHTML = "";
     $("sg-opt-dims").innerHTML = ""; // 维度行随策略重建(键下拉取自该策略的参数清单)
+    // 054 P4: 样本外检验的结果同样**按策略**算出来 —— 不清就会挂在下一个策略名下。
+    setMsg($("sg-val-msg"), "", "");
+    $("sg-val-result").innerHTML = "";
+    $("sg-val-box").open = false;
     syncOptAddBtn(); // 行数清零后「添加维度」钮回到可用
     // 两个折叠框复位收起: 展开着的空框看着像"还在跑", 也让用户以为上一份结果还在。
     $("sg-sweep-box").open = false;
@@ -182,6 +186,10 @@
     // 诚实性徽章(2026-10-05)。
     if (detail.declared === false) {
       box.appendChild(h("span", "sg-badge sg-badge-warn", t("sgUndeclared")));
+    }
+    // 054 D7: 「AI 生成」—— 只说来源, 不说验证(D8)。判据来自服务端读 TOML 注释的结果。
+    if (detail.origin_ai) {
+      box.appendChild(h("span", "sg-badge sg-badge-ai", t("sgOriginAi")));
     }
     if (detail.duplicate_of) {
       const dup = h("span", "sg-badge sg-badge-warn", t("sgDupOf"));

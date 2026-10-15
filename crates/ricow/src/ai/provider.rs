@@ -63,6 +63,13 @@ const AI_NAMES_PREAMBLE: &str =
     最终只输出一个 JSON 对象, 不加任何解释或 Markdown 围栏。";
 
 /// 构造 OpenAI 兼容客户端(自定义 base_url + 密钥)。
+///
+/// 055 B5: 超时**不在这里**设, 见 [`Llm::ask_once`] 外层那道 `tokio::time::timeout`。
+/// 原因是依赖树里有两个 reqwest: 本仓用 0.12, 而 rig 0.42 用 **0.13** —— 想通过
+/// `ClientBuilder::http_client` 传一个自带 `.timeout()` 的客户端, 类型根本对不上
+/// (`reqwest::Client: HttpClientExt` 是为 0.13 实现的)。为它把本仓 reqwest 升到 0.13
+/// 会牵动交易所那条线, 不值得 —— 外层超时效果等价(取消 future 即中止请求),
+/// 而且对**所有** AI 调用(非流式/流式/连通校验)是同一道, 不会漏。
 pub fn build_client(resolved: &Resolved, api_key: &str) -> CoreResult<openai::CompletionsClient> {
     let client = openai::Client::builder()
         .api_key(api_key.to_string())
@@ -115,13 +122,14 @@ pub fn resolve_key(base_url: &str, from_config: CoreResult<String>) -> CoreResul
 pub async fn probe(resolved: &Resolved, api_key: &str) -> CoreResult<()> {
     let client = build_client(resolved, api_key)?;
     let model = client.completion_model(resolved.model.as_str());
-    model
-        .completion_request("ping")
-        .max_tokens(1)
-        .send()
-        .await
-        .map_err(|e| CoreError::Exchange(format!("LLM 连通校验失败: {e}")))?;
-    Ok(())
+    // 055 B5: 连通校验同样有上限 —— 端点不可达时它会是第一个被卡住的请求。
+    // 调用方(onboard)外面还有一道更短的 20s, 两道取小的那个生效, 不会互相打架。
+    let fut = model.completion_request("ping").max_tokens(1).send();
+    match tokio::time::timeout(std::time::Duration::from_secs(resolved.timeout_secs), fut).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(CoreError::Exchange(format!("LLM 连通校验失败: {e}"))),
+        Err(_) => Err(CoreError::Exchange(timeout_message(resolved.timeout_secs))),
+    }
 }
 
 /// 一轮问答的产出。
@@ -136,6 +144,8 @@ pub struct Llm {
     agent: rig::agent::Agent,
     /// 生效的每轮模型调用上限(非流式路径用)。
     max_turns: usize,
+    /// 055 B5: 生效的总超时(秒) —— 只为了把超时报错说清楚(报多少秒, 怎么调大)。
+    timeout_secs: u64,
 }
 
 /// 用最终参数 + 密钥 + 系统提示 + 工具集构造会话。
@@ -156,7 +166,7 @@ pub fn connect(
         .dynamic_tools(tools)
         .add_hook(super::tools::ToolGuard)
         .build();
-    Ok(Llm { agent, max_turns: resolved.max_turns })
+    Ok(Llm { agent, max_turns: resolved.max_turns, timeout_secs: resolved.timeout_secs })
 }
 
 /// LLM 调用最多尝试几次(1 次原始 + `LLM_MAX_ATTEMPTS - 1` 次重试)。
@@ -173,6 +183,30 @@ fn llm_backoff(attempt: u32) -> Duration {
 /// 判断错误里是否出现了某个 HTTP 状态码 token(按数字边界切分, 避免 "1500" 命中 "500")。
 fn has_status_token(lowered_msg: &str, code: &str) -> bool {
     lowered_msg.split(|c: char| !c.is_ascii_digit()).any(|tok| tok == code)
+}
+
+/// 055 B5: 是否命中**我们自己设的总超时**(纯函数, 便于单测)。
+///
+/// 判据只能落在错误文本上(rig 收敛掉了结构化状态码)。因为传输层只设了 `timeout`、
+/// 没设更细的 connect timeout, 所以文本里出现 timeout/timed out 就意味着
+/// "整整等了 N 秒, 上游一个字节都没回"。
+///
+/// 这与"网络抖一下"不是一回事 —— 见 [`is_retryable_llm_error`] 里那条前置否决。
+fn is_ai_timeout(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("timed out") || m.contains("timeout")
+}
+
+/// 超时时给用户的说法(把"等了多久"和"怎么调大"一并说清)。
+fn timeout_message(secs: u64) -> String {
+    format!(
+        "模型服务商 {secs} 秒内没有返回任何内容(上游繁忙或网络中断)。\n\
+         这不是本机故障, 也不代表策略有问题 —— 稍后重试即可; \
+         若你的模型确实需要更久(例如本机小模型), 在 ricow.toml 的 [ai] 段加一行 \
+         timeout_secs = 900(取值 {MIN}..={MAX})。",
+        MIN = config::MIN_TIMEOUT_SECS,
+        MAX = config::MAX_TIMEOUT_SECS,
+    )
 }
 
 /// LLM 故障是否**值得重试**(纯函数, 便于单测)。
@@ -192,12 +226,16 @@ fn is_retryable_llm_error(msg: &str) -> bool {
     if RETRYABLE_STATUS.iter().any(|c| has_status_token(&m, c)) {
         return true;
     }
+    // 055 B5: **先否决总超时** —— 一次就等满 N 秒, 再退避重试两次就是十几分钟,
+    // 用户对着转圈的页面根本等不起, 而且上游多半仍无响应。宁可早点如实报错,
+    // 让他自己决定要不要再来一次(必须判在下面 SOFT 之前: 那里把 timeout 当瞬时抖动)。
+    if is_ai_timeout(&m) {
+        return false;
+    }
     // 没有状态码的传输层抖动。
-    const SOFT: [&str; 11] = [
+    const SOFT: &[&str] = &[
         "too many requests",
         "rate limit",
-        "timed out",
-        "timeout",
         "connection reset",
         "connection refused",
         "broken pipe",
@@ -234,14 +272,31 @@ impl Llm {
     }
 
     /// 单次非流式尝试(被 [`Llm::ask`] 的重试循环包裹)。
+    ///
+    /// 055 B5: 外面套一道 `tokio::time::timeout` —— 上游挂起时(真跑实测 900s / 1500s 无响应,
+    /// 而同一端点 `/models` 秒回)这里就是唯一的兜底。取消了 future, 底层请求随之中止,
+    /// 不会留一条没人管的连接在后台跑。
+    ///
+    /// 超时**只算单次**: 它已被 [`is_retryable_llm_error`] 判为不可重试, 所以最坏情况就是
+    /// 等 `timeout_secs` 一次, 不会变成"每次都等满、连等三遍"。
     async fn ask_once(&self, prompt: &str) -> CoreResult<Answer> {
-        let resp = self
-            .agent
-            .prompt(prompt)
-            .max_turns(self.max_turns)
-            .extended_details()
-            .await
-            .map_err(|e| CoreError::Exchange(format!("LLM 调用失败: {e}")))?;
+        let fut = self.agent.prompt(prompt).max_turns(self.max_turns).extended_details();
+        let resp = match tokio::time::timeout(
+            std::time::Duration::from_secs(self.timeout_secs),
+            fut,
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                if is_ai_timeout(&msg) {
+                    return Err(CoreError::Exchange(timeout_message(self.timeout_secs)));
+                }
+                return Err(CoreError::Exchange(format!("LLM 调用失败: {msg}")));
+            }
+            Err(_) => return Err(CoreError::Exchange(timeout_message(self.timeout_secs))),
+        };
         let usage = format!(
             "输入 {} / 输出 {} / 合计 {} tokens",
             resp.usage.input_tokens, resp.usage.output_tokens, resp.usage.total_tokens
@@ -281,7 +336,26 @@ impl Llm {
     }
 
     /// 单次流式尝试; `emitted` 在**首次向 sink 吐出文本**时置位(供重试判定)。
+    ///
+    /// 055 B5: 与非流式同一道超时(理由见 [`Llm::ask_once`])。这里套的是**整段流**
+    /// 而不只是首包 —— 上游卡在半截时, 用户已经看到前面几个字却永远等不到结尾,
+    /// 比一开始就失败还难判断。
     async fn ask_stream_once(
+        &self,
+        prompt: &str,
+        history: &[Message],
+        sink: &mut dyn SessionSink,
+        emitted: &mut bool,
+    ) -> CoreResult<Answer> {
+        let fut = self.stream_once(prompt, history, sink, emitted);
+        match tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), fut).await {
+            Ok(r) => r,
+            Err(_) => Err(CoreError::Exchange(timeout_message(self.timeout_secs))),
+        }
+    }
+
+    /// 被 [`Llm::ask_stream_once`] 的超时外壳包裹的实际读流过程。
+    async fn stream_once(
         &self,
         prompt: &str,
         history: &[Message],
@@ -311,7 +385,12 @@ impl Llm {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    return Err(CoreError::Exchange(format!("LLM 流式调用中断: {e}")));
+                    let msg = e.to_string();
+                    // 055 B5: 同 ask_once —— 超时讲人话(等了多久 / 怎么调大)。
+                    if is_ai_timeout(&msg) {
+                        return Err(CoreError::Exchange(timeout_message(self.timeout_secs)));
+                    }
+                    return Err(CoreError::Exchange(format!("LLM 流式调用中断: {msg}")));
                 }
             }
         }
@@ -511,6 +590,8 @@ async fn one_shot(root: &Path, preamble: &str, prompt: &str) -> CoreResult<Strin
             .transpose()?
             .unwrap_or(config::DEFAULT_MAX_TURNS),
         allow_custom_base_url: file.ai.allow_custom_base_url.unwrap_or(false),
+        // 055 B5: 超时 —— 配了就校验(非法报错误解法), 没配回填默认 300 秒。
+        timeout_secs: file.ai.timeout_secs.map(config::check_timeout_secs).transpose()?,
     };
     // 覆盖优先级与对话会话一致: 环境变量 > ricow.toml > 预设(Web 无命令行覆盖层)。
     let env_base_url = std::env::var(config::ENV_BASE_URL).ok();
@@ -690,17 +771,98 @@ pub(crate) async fn quick_names(root: &Path, prompt: &str) -> CoreResult<String>
     one_shot(root, AI_NAMES_PREAMBLE, prompt).await
 }
 
+// ---- 054 T37: 生成后补「一句话摘要 + 参数中文名」(2026-10-13) ----
+
+/// 054 T37: 这条任务**单开一个**系统提示, 不用 [`AI_NAMES_PREAMBLE`]。
+///
+/// 差别只有一条: 那条契约是「只能输出参数键」—— 前端直接拿回包去覆盖清单行, 多一个键都不许有;
+/// 这里除了参数键还要一个 `_summary`。混用会破坏前者的契约(前端会以为冒出一个参数), 所以另起一条。
+/// 其余纪律与那条完全一致: 只依据代码、不许编、只输出一个 JSON 对象。
+const AI_META_PREAMBLE: &str =
+    "你是 ricow 的策略说明助手。你只负责根据**脚本代码**做两件事: 写一句「这份策略在做什么」的\
+     摘要, 以及为给定的参数键起中文名并写一句说明。不改代码、不改取值、不做行情分析、不调用任何\
+     工具; 参数键只能用用户消息里列出的那些(外加固定字段 _summary), 绝不发明新键; \
+     代码里没有实现的东西不许写进摘要; 代码里看不出用途的键要如实说看不出, 不得编一个听起来\
+     合理的解释; 最终只输出一个 JSON 对象, 不加任何解释或 Markdown 围栏。";
+
+/// 054 T37: 构造「生成后补摘要 + 参数中文名」的用户提示词(纯函数便于离线单测)。
+///
+/// 与 [`build_names_prompt`] 的关键差别是**摘要的措辞纪律**: 摘要会被当作"这份策略在做什么"
+/// 展示给用户, 而模型刚写完代码、最容易照着用户的原始想法复述一遍 —— 想法里有、代码里没落
+/// 地的部分一旦写进摘要, 详情页就在骗人。所以提示词把"想法"降级成背景, 把"代码"立成唯一依据。
+pub(crate) fn build_generate_meta_prompt(
+    market: &str,
+    pair: &str,
+    interval: &str,
+    idea: &str,
+    key_lines: &str,
+    code: &str,
+) -> String {
+    format!(
+        "下面是一份刚生成的 ricow Lua 策略脚本, 以及它读取的参数键。请做两件事: \
+         写一句摘要, 并为每个参数键起中文名、写一句说明。\n\
+         \n\
+         ## 背景: 用户原本想要什么(**只作背景, 不代表代码一定做到了**)\n\
+         市场 {market} · 标的 {pair} · 主时钟 {interval}\n\
+         {idea}\n\
+         \n\
+         ## 待命名的参数键\n\
+         {key_lines}\n\
+         \n\
+         ## 脚本全文(摘要与命名的**唯一依据**)\n\
+         ```lua\n\
+         {code}\n\
+         ```\n\
+         \n\
+         ## 输出要求(必须严格遵守)\n\
+         1. 只输出**一个 JSON 对象**, 不要输出任何解释、前后缀或 Markdown 围栏;\n\
+         2. 固定带一个 \"_summary\" 字段: 一句话(不超过 40 个字)说清**这份代码实际在做什么** —— \
+         什么条件下进、什么条件下出、靠什么赚钱;\n\
+         3. 其余字段是上面列出的参数键, 形如 \
+         {{\"spacing_pct\": {{\"name\": \"间距百分比\", \"desc\": \"上下挂单的间距\"}}}};\n\
+         4. 参数键**只能**用列出的那些, 一个不多一个不少; 中文名不超过 10 个字, 说明不超过 40 个字;\n\
+         5. **代码没写的东西不许写进摘要**: 上面「用户原本想要什么」里有、代码里没落地的, 就当它\
+         不存在 —— 这句摘要会被直接展示给用户当成「这份策略在做什么」, 写多了就是骗人;\n\
+         6. **只能依据脚本代码**: 代码里看不出用途的键, 说明就写「代码中未见其用途」, \
+         不要编一个听起来合理的解释 —— 用户会当真。"
+    )
+}
+
+/// 054 T37: 同上, 一次性非流式问答薄封装 —— 回包是 JSON, 不落盘。
+pub(crate) async fn quick_meta(root: &Path, prompt: &str) -> CoreResult<String> {
+    one_shot(root, AI_META_PREAMBLE, prompt).await
+}
+
 /// P0-3 构造「AI 生成新策略」的用户提示词(纯函数便于离线单测)。
 ///
 /// 结构: ① 规范全文(LUA_API_DOC, 唯一 API 依据); ② 结构化的策略意图(市场/标的/主时钟/
 /// 思路/风控约束); ③ 输出要求(回调结构、need_klines 声明、参数读取辅助、订单字段)。
+/// `risk_text`: 054 P2 —— 由风险档位映射出的**具体数字**约束(见
+/// `web::strategy_io::risk_profile::constraints_text`)。
+///
+/// 必须放在"策略意图"里、且排在自由文本 `constraints` **之前**: 用户随口写的一句"稳一点"
+/// 不该盖掉换算出来的数字; 反过来, 数字也不删掉用户原话(两者可能互补)。
+/// 传空串表示调用方没有结构化输入(对话链路), 此时该小节不出现。
 pub(crate) fn build_generate_prompt(
     market: &str,
     pair: &str,
     interval: &str,
     idea: &str,
     constraints: &str,
+    risk_text: &str,
 ) -> String {
+    let risk_section = if risk_text.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n         ## 投资约束(上面的自然语言已换算成具体数字; 两者冲突时**以本节为准**)\n\
+             {risk_text}\n\
+         ## 本节数字必须落到代码里\n\
+         - 单笔仓位 / 回撤 / 间距这类「目标」要写成**可执行的代码**(下单前先算额度、超了就不下), \
+         不能只写在注释里;\n\
+         - 杠杆上限由配置保证(平台会真的校验), 你只需**不写出依赖更高杠杆的逻辑**。\n"
+        )
+    };
     format!(
         "请根据下面的策略意图, 从零编写一份 ricow Lua 交易策略。\n\
          \n\
@@ -713,7 +875,7 @@ pub(crate) fn build_generate_prompt(
          - 主时钟周期: {interval}\n\
          - 策略思路: {idea}\n\
          - 风控与约束: {constraints}\n\
-         \n\
+         {risk_section}\
          ## 输出要求(必须严格遵守)\n\
          1. 只输出**一份**完整 Lua 代码(包含 on_tick; 需要 on_init/on_fill/on_stop 就一并给出);\n\
          2. 不要输出 ```lua 之类的代码围栏, 不要输出任何解释、前后缀、寒暄或 Markdown;\n\
@@ -731,6 +893,24 @@ pub(crate) fn build_generate_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 054 P2/T19: 结构化约束段必须**原样**进提示词, 且空串时**整段不出现**
+    /// (对话链路没有结构化输入, 不该冒出一节空标题让模型去猜)。
+    #[test]
+    fn test_generate_prompt_carries_risk_section_only_when_present() {
+        let with =
+            build_generate_prompt("futures", "ETHUSDT", "1h", "网格", "无", "【风险档位】激进");
+        assert!(with.contains("投资约束"), "结构化约束段必须出现: {with}");
+        assert!(with.contains("【风险档位】激进"), "约束原文必须逐字进提示词: {with}");
+        // 冲突时以本节为准 —— 否则模型会挑一句好听的照做。
+        assert!(with.contains("以本节为准"), "必须写明优先级: {with}");
+        // 光给数字不够: 还得要求它落到代码里(否则只是提示词装饰)。
+        assert!(with.contains("必须落到代码里"), "必须要求约束可执行: {with}");
+
+        let without = build_generate_prompt("spot", "ETHUSDT", "1h", "网格", "无", "");
+        assert!(!without.contains("投资约束"), "空约束不该留空节: {without}");
+        assert!(without.contains("风控与约束"), "自然语言约束段仍在: {without}");
+    }
 
     #[test]
     fn test_local_endpoint_detection() {
@@ -815,6 +995,26 @@ mod tests {
         assert!(p.contains("一段历史窗口"), "必须提醒窗口局限: {p}");
     }
 
+    /// 054 T37: 「补摘要 + 命名」的提示词必须把**代码**立成唯一依据、把用户想法降级成背景 ——
+    /// 否则模型会照着用户原话复述一遍, 把"想要但没做到"的部分写成摘要, 详情页就在骗人。
+    #[test]
+    fn test_build_generate_meta_prompt_binds_summary_to_code_not_to_idea() {
+        let p = build_generate_meta_prompt(
+            "spot",
+            "ETHUSDT",
+            "1h",
+            "跌了分批买, 涨了分批卖, 还要能自动止损",
+            "- spacing_pct",
+            "local a = num(ctx, \"spacing_pct\", 0.01)\n",
+        );
+        assert!(p.contains("_summary"), "必须点名要 _summary 字段: {p}");
+        assert!(p.contains("ETHUSDT") && p.contains("自动止损"), "原始想法要作为背景带进去: {p}");
+        assert!(p.contains("只作背景"), "想法必须被降级成背景: {p}");
+        assert!(p.contains("唯一依据"), "代码必须是唯一依据: {p}");
+        assert!(p.contains("不许写进摘要"), "没落地的不能写进摘要: {p}");
+        assert!(p.contains("spacing_pct") && p.contains("num(ctx"), "参数键与全文都要给: {p}");
+    }
+
     /// 053: 评估的系统提示必须自带两条口径 —— 实测中模型正是缺了它们才把**设计**误判成
     /// **数据错误**(两次基准收益不同 → 怀疑口径不一致; 成交 3 笔 → 夏普 −737 当成重大恶化)。
     /// 这两条锁在提示词里, 不是模型该自己推的东西。
@@ -846,7 +1046,6 @@ mod tests {
         for m in [
             "LLM 调用失败: 429 Too Many Requests",
             "LLM 流式调用中断: 503 Service Unavailable",
-            "error: request timed out",
             "connection reset by peer",
         ] {
             assert!(is_retryable_llm_error(m), "应判可重试: {m}");
@@ -863,6 +1062,28 @@ mod tests {
         }
         // 无状态码的普通报错不重试(宁可漏判, 不要把无关错误卷进来)
         assert!(!is_retryable_llm_error("模型未按 Chat Completions 返回"));
+    }
+
+    /// 055 B5: **总超时不重试** —— 一次就等满 N 秒, 退避重试两次是十几分钟没人等得起。
+    #[test]
+    fn test_ai_timeout_is_never_retried_but_is_explained() {
+        for m in [
+            "LLM 调用失败: error sending request for url: operation timed out",
+            "request timeout",
+            "TIMED OUT",
+        ] {
+            assert!(is_ai_timeout(m), "应识别为超时: {m}");
+            assert!(!is_retryable_llm_error(m), "超时不该重试: {m}");
+        }
+        // 非超时的传输层抖动照旧可重试(别把整类软错误一起否掉)。
+        assert!(is_retryable_llm_error("connection reset by peer"));
+        assert!(!is_ai_timeout("connection reset by peer"));
+
+        // 报错要说清三件事: 等了多久 / 不是本机的错 / 怎么调大。
+        let msg = timeout_message(300);
+        assert!(msg.contains("300"), "{msg}");
+        assert!(msg.contains("timeout_secs"), "应给出怎么调: {msg}");
+        assert!(msg.contains("900"), "应给出可填的样例值: {msg}");
     }
 
     /// 状态码必须按数字边界匹配: "1500 tokens" 里的 500 不算 HTTP 500。

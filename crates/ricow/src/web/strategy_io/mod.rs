@@ -26,6 +26,9 @@ use crate::strategies::catalog::{self, ManifestParam, ParamType, Source, Strateg
 
 use super::{WebError, WebState};
 
+// 054 P2: 风险档位 → 数字的**单点定义**(提示词 / 前端文案 / TOML 都从它派生)。
+pub(super) mod risk_profile;
+
 // ---- 响应/请求体 (data-model §4/§5, http-api §3) ----
 
 /// `GET .../source` 响应: Lua 文件原文 + 用户实例 TOML 原文(内置为 null)。
@@ -64,6 +67,50 @@ pub(super) struct SaveRequest {
     /// 与 `overwrite: true` 互斥: 复制是"新建"语义, 覆盖是"保存"语义。
     #[serde(default)]
     copy_from: Option<String>,
+    /// 054 D7: 来源标记(`"ai"` = 这份策略由 AI 生成)。
+    ///
+    /// **只影响 TOML 顶部一行注释**(`# ricow:origin = ai`), 不新增 schema 字段 ——
+    /// 与 `declared`/`duplicate_of` 同一哲学: 来源能**推导**就不额外存一列, 多一列就会
+    /// 出现"字段说 AI、文件其实是人写的"这类对不上的状态。
+    #[serde(default)]
+    origin: Option<String>,
+    /// 054 P2: 随落盘写进 `[backtest].initial_cash`(准备投入的本金)。
+    ///
+    /// 它是结构化输入里**唯一真下场**的数字: 写进 TOML 后, 以后每次回测都按这个本金算,
+    /// 与用户在生成时填的那个数是同一个 —— 否则"单笔不超过 10%"在生成时和回测时会是两个口径。
+    #[serde(default)]
+    initial_cash: Option<f64>,
+    /// 随落盘写进 `[backtest].max_leverage`(合约**杠杆上限**, 现货不应传)。
+    ///
+    /// 提示词里对模型说"杠杆必须 ≤ Nx"却在配置里不设上限, 那句话就是空的 ——
+    /// 这一项是唯一可静态验证的约束, 必须**说与做一致**。
+    ///
+    /// 055 B1 修: 此前写的是 `[backtest].leverage`(**实际杠杆**), 于是"选保守档"被落盘成
+    /// **实打实 2 倍杠杆** —— 而 `commands/run.rs` 启动实盘时读的正是 `[backtest].leverage`,
+    /// 会真的在交易所把杠杆设成 2x / 3x / 5x。平台替用户开杠杆, 而且是在他以为自己选了
+    /// "更稳"的时候。上限就该写 `max_leverage`; 实际用多少杠杆留给**用户自己**去设参数
+    /// (`leverage` 保持引擎默认 1x = 不加杠杆)。
+    #[serde(default)]
+    max_leverage: Option<f64>,
+    /// 随落盘写进 `[backtest].leverage`(合约**实际**杠杆; 现货不应传)。
+    ///
+    /// 055 B1 起 AI 生成流程**不再传这个字段**: 风险档位表达的是"最多允许多少",
+    /// 不是"就用多少"。保留字段是因为手动新建/编辑策略仍需要能指定实际杠杆。
+    #[serde(default)]
+    leverage: Option<f64>,
+}
+
+/// 054 D7: 实例 TOML 里的来源标记(整行, 写在文件最顶部)。
+///
+/// 解析端的安全默认(见 [`origin_is_ai`]): **找不到这行注释 = 用户策略**。
+/// 绝不反过来默认成 AI —— 那会把每个老策略都标成"AI 生成", 是明目张胆的编造。
+pub(super) const ORIGIN_AI_MARKER: &str = "# ricow:origin = ai";
+
+/// 054 D7: 一段实例 TOML 原文是否带 AI 来源标记(**纯函数**)。
+///
+/// 只认**独立一行**的注释(前缀匹配后必须到行尾), 免得正文里出现同形字符串被误判。
+pub(super) fn origin_is_ai(toml_text: &str) -> bool {
+    toml_text.lines().any(|l| l.trim() == ORIGIN_AI_MARKER)
 }
 
 /// `POST /api/strategies` 成功响应(http-api §3: name/toml_path/lua_path/backup?; 另带 market)。
@@ -262,6 +309,15 @@ fn read_instance_toml(root: &Path, id: &str) -> CoreResult<Option<String>> {
     }
 }
 
+/// 054 D7/T24: 这份用户策略是否由 AI 生成(**读盘判定**, 不另存一列)。
+///
+/// 判据是实例 TOML 顶部那行 `# ricow:origin = ai` 注释; 读不到文件/没有标记一律 `false`
+/// —— 安全默认永远指向"用户自己写的", 绝不反过来把老策略标成 AI 产物。
+pub(super) fn strategy_origin_ai(root: &Path, id: &str) -> bool {
+    let path = root.join("strategies").join(format!("{id}.toml"));
+    std::fs::read_to_string(&path).map(|s| origin_is_ai(&s)).unwrap_or(false)
+}
+
 /// 详情表单回填用的实例当前值(032 T027): 交易对 + 已保存的策略参数。
 ///
 /// 前端不引 TOML 解析库, 由本端点把 `strategies/<id>.toml` 反序列化后以 JSON 给出;
@@ -367,13 +423,44 @@ fn has_word(s: &str, pat: &str) -> bool {
     false
 }
 
+/// 逐行类警告的条数上限(防刷屏)。
+///
+/// 055 B4: 这个上限**只管逐行类**, 管不到整份级结论(第 ⑥ 类) —— 否则一段 10 行的
+/// `config_f64(...) or ...` 就能把"这份脚本会下单但没有任何止损线索"挤掉, 而那恰恰是
+/// 最该让用户看见的一条。
+const LINE_WARN_CAP: usize = 8;
+
 /// 静态检查(纯函数, P1-5): 编译门禁只保证**语法**可编译, 这里把已知的高频踩坑
 /// (specs/lua-api.md 实测记录)在保存/生成时提示给作者 —— **只提示不拦截**:
-/// 每条都可能是误报, 拦截权在用户手里。最多回 8 条, 防止刷屏。
+/// 每条都可能是误报, 拦截权在用户手里。
+///
+/// 两类警告的配额**分开算**(055 B4):
+/// - 逐行类(①~⑤): 最多 [`LINE_WARN_CAP`] 条, 防止一份长脚本刷屏;
+/// - 整份级(⑥): **独立且恒出现**, 排在最前 —— 它是"没人会替你止损"这句最要紧的话,
+///   被逐行噪音挤掉等于没说。
 pub(super) fn lint_lua(code: &str) -> Vec<String> {
     let mut warns: Vec<String> = Vec::new();
+    // ⑥ 055 T35 + B4: **整份代码级** —— 会下单, 却既没有止损线索、也没有仓位上限/爆仓监控线索。
+    //
+    // 存在理由: 平台**不代做盈亏风控**(宪法级), 亏损熔断与峰值回撤都要策略自己实现
+    // (见 RULES 第 9 条)。一份一路买下去、什么都不管的脚本在回测里可能很好看,
+    // 但用户未必意识到"没人会替我止损"。
+    //
+    // **只警告不拦截**: 命中关键字不代表风控逻辑真的对, 没命中也不代表一定没有
+    // (可能用了别的名字或别的实现方式) —— 硬拦会误杀合法策略。
+    //
+    // **先算先放**: 它排在第一位, 且不占逐行配额(那里很容易被 8 条行号细节填满)。
+    if lint_trades(code) && !has_any(code, STOP_CLUES) && !has_any(code, SIZE_CLUES) {
+        warns.push(
+            "这份脚本会下单, 但没看到止损、仓位上限或爆仓监控的任何线索 —— \
+             平台不代做盈亏风控(亏损熔断与回撤止损要策略自己实现, 否则会一直亏下去)。\
+             只提示不拦截: 静态判断看不出风控逻辑是否真的对。"
+                .to_string(),
+        );
+    }
     for (idx, raw) in code.lines().enumerate() {
-        if warns.len() >= 8 {
+        // 逐行部分自己守住上限: 整份级那条已占 1 个位置, 总长 = 1 + LINE_WARN_CAP。
+        if warns.len() > LINE_WARN_CAP {
             break;
         }
         let line = raw.trim();
@@ -413,6 +500,47 @@ pub(super) fn lint_lua(code: &str) -> Vec<String> {
         }
     }
     warns
+}
+
+/// ⑥ 的止损线索(小写比对): 命中任一个即认为"作者可能做了止损"。
+const STOP_CLUES: &[&str] = &[
+    "stop_loss",
+    "stoploss",
+    "stop_pct",
+    "止损",
+    "max_drawdown",
+    "drawdown_pct",
+    "dd_limit",
+    "stop_out",
+];
+
+/// ⑥ 的仓位上限 / 爆仓监控线索。
+const SIZE_CLUES: &[&str] = &[
+    "max_position",
+    "max_pos",
+    "position_limit",
+    "max_size",
+    "max_notional",
+    "仓位",
+    "爆仓",
+    "liquidation",
+    "mmr",
+    "margin_ratio",
+];
+
+/// ⑥ 的前置: 确实会下单才提示。纯观察型脚本(只 log 不下单)没有风控可言,
+/// 对它提示"没有止损"是噪音。
+fn lint_trades(code: &str) -> bool {
+    code.contains("place_order")
+        || code.contains("side_order")
+        || code.contains("submit_order")
+        || code.contains("exec.")
+}
+
+/// ⑥ 的线索命中(纯函数): 整份代码小写化后子串匹配。
+fn has_any(code: &str, clues: &[&str]) -> bool {
+    let lower = code.to_lowercase();
+    clues.iter().any(|c| lower.contains(c))
 }
 
 // ---- 用户策略清单 (manifest) 编辑 (P2-8) ----
@@ -822,6 +950,22 @@ pub(super) fn parse_names(
     raw: &str,
     hints: &[crate::strategies::params::ParamHint],
 ) -> Result<Vec<NamedParam>, WebError> {
+    let map = parse_names_json(raw)?;
+    let out = parse_names_map(&map, hints);
+    if out.is_empty() {
+        return Err(WebError::bad_request_code(
+            "AI 没有给出任何可用命名: 换一种方式重试, 或自己填中文名(留空也能保存)",
+            "names_empty",
+        ));
+    }
+    Ok(out)
+}
+
+/// 把回包里的 JSON 对象抠出来并解析成 map(纯解析, 不含"哪些键算数"的业务判断)。
+///
+/// 054 T37: 从 `parse_names` 里分出来, 让"生成后补摘要"复用同一套解析 —— 它要在**同一个**
+/// JSON 里同时读 `_summary` 与参数命名, 重新抠一遍 JSON 就会有两套围栏处理, 迟早对不上。
+fn parse_names_json(raw: &str) -> Result<HashMap<String, Value>, WebError> {
     let json = extract_json_object(raw).ok_or_else(|| {
         WebError::bad_request_code(
             "AI 未返回可识别的 JSON 对象: 应只输出一个 {键: {name, desc}} 对象(无解释、无围栏)。\
@@ -829,10 +973,16 @@ pub(super) fn parse_names(
             "names_parse",
         )
     })?;
-    let map: HashMap<String, Value> = serde_json::from_str(&json).map_err(|e| {
+    serde_json::from_str(&json).map_err(|e| {
         WebError::bad_request_code(format!("AI 返回的 JSON 无法解析({e}): 请重试"), "names_parse")
-    })?;
+    })
+}
 
+/// 按**静态提取到的键**过滤命名结果(纯函数)。键集合来自代码事实, 模型多给的键到此为止。
+fn parse_names_map(
+    map: &HashMap<String, Value>,
+    hints: &[crate::strategies::params::ParamHint],
+) -> Vec<NamedParam> {
     let mut out: Vec<NamedParam> = Vec::new();
     for h in hints {
         let Some(v) = map.get(&h.key) else { continue };
@@ -853,13 +1003,151 @@ pub(super) fn parse_names(
             desc: if desc.is_empty() { None } else { Some(desc) },
         });
     }
-    if out.is_empty() {
-        return Err(WebError::bad_request_code(
-            "AI 没有给出任何可用命名: 换一种方式重试, 或自己填中文名(留空也能保存)",
-            "names_empty",
-        ));
+    out
+}
+
+// ---- 054 T37: 生成后补「一句话摘要 + 参数中文名/说明」(2026-10-13) ----
+
+/// 摘要在 JSON 里的固定字段名。
+///
+/// 下划线开头: 与 Lua 参数键的命名规范(字母/下划线开头, 但参数键不会这么写)天然不撞,
+/// 且 `valid_param_key` 也认它 —— 靠"约定 + 解析端先 remove"两道保证它不会变成一行参数。
+pub(super) const SUMMARY_KEY: &str = "_summary";
+
+/// 摘要在界面上是标题下的**一行**副标题(详情页适用性卡、列表行), 不是长文。
+/// 提示词已要求 ≤ 40 字, 这里是兜底: 模型超了也不能把整张卡片撑破。
+const SUMMARY_MAX_CHARS: usize = 80;
+
+/// 把 AI 给的一句话摘要收拾成能进清单的样子(纯函数): 取第一行、去空白、超长截断。
+///
+/// 空串 → `None`(没摘要就是没摘要, **不**拿别的东西顶上 —— 拿思路原文顶上等于在详情页
+/// 复述用户自己刚写的话, 还让它看起来像系统的结论)。
+pub(super) fn clamp_summary(s: &str) -> Option<String> {
+    let first = s.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return None;
     }
-    Ok(out)
+    let chars: Vec<char> = first.chars().collect();
+    if chars.len() <= SUMMARY_MAX_CHARS {
+        return Some(first.to_string());
+    }
+    Some(format!("{}…", chars[..SUMMARY_MAX_CHARS].iter().collect::<String>()))
+}
+
+/// 054 T37: 把**静态提取**到的参数(键/类型/默认值 = 代码事实)与 AI 起的中文名/说明合成为
+/// 一份可直接 `POST /manifest` 的参数 schema(纯函数, 便于单测)。
+///
+/// 三条归属纪律(谁的事实谁说话):
+/// - 键 / 类型 / 默认值**只认静态提取**: 模型说这个键是 f64 不算数, 代码怎么读才是事实;
+/// - 中文名**只认 AI**: 代码里没有"名字"这回事;
+/// - 说明**注释优先于 AI**: 脚本注释里作者自己写的那句, 比模型照着代码现编的更可信。
+///   两者都没有就留空 —— 留空是常态, 界面回退显示键名(见 N2 的"不逼用户起名")。
+pub(super) fn merge_manifest_params(
+    hints: Vec<crate::strategies::params::ParamHint>,
+    named: &[NamedParam],
+) -> Vec<ManifestParam> {
+    let by_key: HashMap<&str, &NamedParam> = named.iter().map(|n| (n.key.as_str(), n)).collect();
+    let mut out: Vec<ManifestParam> = Vec::with_capacity(hints.len());
+    for h in hints {
+        // 引擎内部键由 loader 装载使用, 清单不得声明(与 `build_manifest` 同一条)。
+        if RESERVED_PARAM_KEYS.contains(&h.key.as_str()) {
+            continue;
+        }
+        let n = by_key.get(h.key.as_str()).copied();
+        let name = n.map(|x| x.name.trim()).unwrap_or("").to_string();
+        let from_comment = h.desc.as_deref().map(str::trim).filter(|d| !d.is_empty());
+        let from_ai = n.and_then(|x| x.desc.as_deref()).map(str::trim).filter(|d| !d.is_empty());
+        let desc = from_comment.or(from_ai).unwrap_or("").to_string();
+        out.push(ManifestParam {
+            key: h.key,
+            name,
+            ty: h.ty,
+            desc,
+            default: h.default,
+            required: false,
+            options: None,
+        });
+    }
+    out
+}
+
+/// 从回包里同时读出摘要与参数命名(纯函数)。`_summary` **先摘出来再从 map 里删掉** ——
+/// 否则它会作为"模型多给的键"被静默丢弃, 摘要就没了。
+pub(super) fn parse_generated_meta(
+    raw: &str,
+    hints: &[crate::strategies::params::ParamHint],
+) -> Result<(Option<String>, Vec<NamedParam>), WebError> {
+    let mut map = parse_names_json(raw)?;
+    let summary = map
+        .remove(SUMMARY_KEY)
+        .and_then(|v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        })
+        .and_then(|s| clamp_summary(&s));
+    let names = parse_names_map(&map, hints);
+    Ok((summary, names))
+}
+
+/// 一次"补摘要 + 补命名"的结果。
+#[derive(Debug, Default)]
+struct GeneratedMeta {
+    summary: Option<String>,
+    params: Vec<ManifestParam>,
+    /// 没生成出来时的**如实说明**(绝不静默降级)。
+    note: Option<String>,
+}
+
+/// 054 T37: 代码过编译门禁之后, 再问一轮 AI 要"这份策略在做什么"与参数中文名。
+///
+/// **复用 N2-C 的命名能力**(同一套 `extract_param_hints` → 提示词 → JSON 解析), 不另起一套:
+/// 两处对"键从哪来、模型多给的键怎么办"的判断必须一致, 否则同一个键在详情页与生成弹窗里
+/// 会是两个名字。
+///
+/// 刻意**不让失败影响生成**: 代码已经能落盘, 少了摘要只是"详情页少一行说明", 不该让整轮
+/// 生成报错 —— 但也不静默: 原因进 `note`, 由界面如实说出, 用户知道该自己补。
+async fn generate_meta(
+    root: &Path,
+    market: &str,
+    pair: &str,
+    interval: &str,
+    idea: &str,
+    code: &str,
+) -> GeneratedMeta {
+    let hints = crate::strategies::params::extract_param_hints(code);
+    let key_lines = if hints.is_empty() {
+        "(这份脚本没有读到任何参数, 只要给 _summary)".to_string()
+    } else {
+        hints.iter().map(|h| format!("- {}", h.key)).collect::<Vec<_>>().join("\n")
+    };
+    let prompt = crate::ai::provider::build_generate_meta_prompt(
+        market, pair, interval, idea, &key_lines, code,
+    );
+    match crate::ai::provider::quick_meta(root, &prompt).await {
+        Err(e) => GeneratedMeta {
+            summary: None,
+            params: Vec::new(),
+            note: Some(format!(
+                "摘要与参数说明没能自动生成(AI 调用失败: {e}); 策略本身已生成, 这两项可以在详情页的清单里自己填"
+            )),
+        },
+        Ok(raw) => match parse_generated_meta(&raw, &hints) {
+            Ok((summary, named)) => GeneratedMeta {
+                summary,
+                params: merge_manifest_params(hints, &named),
+                note: None,
+            },
+            Err(e) => GeneratedMeta {
+                summary: None,
+                params: Vec::new(),
+                // 取错误体里那句中文(`WebError` 本身不实现 Display, 免得把状态码一起拼进去)。
+                note: Some(format!(
+                    "摘要与参数说明没能自动生成({}); 策略本身已生成, 这两项可以在详情页的清单里自己填",
+                    e.body.error
+                )),
+            },
+        },
+    }
 }
 
 // ---- N1: 删除用户策略(2026-10-12) ----
@@ -1058,6 +1346,85 @@ pub(super) struct AiGenerateRequest {
     /// 风控与约束(可选)。
     #[serde(default)]
     constraints: Option<String>,
+    /// 054 P1: 生成后**立刻**跑一次真实 K 线沙箱回测(默认 **true**)。
+    ///
+    /// 刻意默认开: 审计 #1 —— 此前 Web 生成的策略只有编译门禁, 用户拿到的是一段**从未在任何
+    /// 历史数据上跑过**的代码, 却和"跑过回测的策略"在同一个列表里。
+    /// 关掉它意味着"我不知道它历史上表现如何", 所以明码标价(UI 上写清楚)。
+    #[serde(default)]
+    verify: Option<bool>,
+    /// 054 P2: 准备投入的本金(USDT, **必填且必须 > 0**)。
+    ///
+    /// 这是整个结构化输入里**唯一真下场**的数字 —— 它会写进策略 TOML 的 `[backtest].initial_cash`,
+    /// 让回测口径与用户真实资金一致(spec §四-5)。其余字段都是"生成时的约束语义"。
+    ///
+    /// 必填是刻意的: 不知道投多少钱就谈不上"单笔不超过 10%", 整个档位表会失去锚点。
+    initial_cash: Option<f64>,
+    /// 054 P2: 风险档位(四档): conservative / balanced / aggressive / custom。
+    ///
+    /// **必填** —— 不填就等于让平台替用户选档, 而"替用户选"正是 D3 禁止的那件事
+    /// (自定义档连默认值都不给, 默认档位更是替他选了)。
+    risk_tolerance: Option<String>,
+    /// 054 P2: 自定义档的**最大回撤目标**(%)。仅 custom 档必填。
+    max_drawdown_pct: Option<f64>,
+    /// 054 P2: 自定义档的**单笔最大仓位**(%)。仅 custom 档必填。
+    max_position_pct: Option<f64>,
+    /// 054 P2: 自定义档的**杠杆上限**(仅合约; 现货给了 → 400)。仅 custom 档必填。
+    leverage_cap: Option<f64>,
+    /// 054 P2: 自定义档的**网格最小间距**(%, 按当前市场解释)。可选 —— 非网格策略不需要。
+    min_spacing_pct: Option<f64>,
+    /// 054 P1: 验证回测的窗口天数(默认 **90**, 合法 1–3650)。
+    ///
+    /// 默认 90 不是挑出来的"更好的数": 对话 `preview_strategy`、`ricow backtest`、
+    /// 影响评估、Web 回测**四处的默认都是 90**, 取同一个值才能让几处数字互相可比。
+    #[serde(default)]
+    verify_days: Option<u32>,
+}
+
+/// 054 P1: 验证回测窗口天数的合法上界(10 年)。
+pub(super) const MAX_VERIFY_DAYS: u32 = 3_650;
+
+/// 054 P2: `GET /api/strategies/risk-profiles` —— 风险档位表(**纯常量派生**, 无状态)。
+///
+/// 前端「这档意味着什么」的文案与数字一律从这里取, **不得**在 JS 里手抄一份 ——
+/// 两处手抄必然在改表时静默分叉, 用户看到的档位说明就不是真正生效的那个数(spec §四-1)。
+pub(super) async fn list_risk_profiles() -> Json<Value> {
+    Json(serde_json::json!({ "tiers": risk_profile::docs() }))
+}
+
+/// 054 P1: 生成后那次验证回测的结果。
+///
+/// **失败不阻断生成** —— 网络不可达 / 交易对无数据时, 代码照常回给用户,
+/// 只是 `ok=false` 且带中文原因。宁可回一份"未验证但能用"的代码, 也不让一次网络抖动
+/// 吃掉用户已经等了几十秒的 AI 产物(生成本身与验证是两件事, 不该互相绑架)。
+#[derive(Debug, Serialize)]
+pub(super) struct VerifyOutcome {
+    /// 回测是否真的跑出来了(指标/图表都有值)。
+    ok: bool,
+    /// 实际回测天数(回给前端, 免得界面另猜一份)。
+    days: u32,
+    /// K 线周期。
+    interval: String,
+    /// 文本报告(与 CLI `ricow backtest` 逐字同源; 失败为 None)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report_text: Option<String>,
+    /// 结构化指标(前端指标卡直接吃; 失败为 None)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<Value>,
+    /// 结构化图表(权益曲线/基准/成交点; 失败为 None)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chart: Option<Value>,
+    /// 055 B3: 档位目标的**事后核对**("你选的回撤目标 ≤10%, 实测 25%, 未达到")。
+    /// 只核回测真能测出来的项(目前只有最大回撤), 测不出/不适用则不下发。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier_check: Option<risk_profile::TierCheck>,
+    /// 054 P3-4: 本次回测**实际生效**的成本假设 —— 必须与指标并排展示(审计 #4)。
+    /// 与回测作业同一类型、同一取值函数, 免得两处各写一份口径。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<super::backtest_jobs::CostAssumption>,
+    /// 失败原因(ok=false 时**必填**; ok=true 时为 None)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 /// `POST /api/strategies/ai-generate` 成功响应: 生成的完整 Lua(已过编译门禁, **未落盘**)。
@@ -1067,6 +1434,38 @@ pub(super) struct AiGenerateReply {
     /// 静态检查提示(P1-5): 只提示不拦截。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+    /// 054 P1: 生成后那次验证回测的结果。`verify=false` 时字段不出现(用户明确跳过了)。
+    ///
+    /// 刻意**不**把 ok 与否并进 `warnings`: 那是个静态检查清单, 混进"网络不通"会让人
+    /// 以为是代码有问题。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verify: Option<VerifyOutcome>,
+    /// 054 P2: 解析后的本金(回给前端, 让它在落盘时写进 `[backtest].initial_cash`)。
+    initial_cash: f64,
+    /// 054 T37: AI 写的一句话摘要("这份策略在做什么")。**依据只有代码** —— 提示词里明令
+    /// 不许把用户想法里没落地的部分写进来。前端保存时一并写进清单 `summary`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    /// 054 T37: 可直接交给 `POST /api/strategies/{id}/manifest` 的参数 schema ——
+    /// 键/类型/默认值来自**静态提取**(代码事实), 中文名/说明来自 AI。
+    ///
+    /// 刻意**在服务端合并**而不是让前端自己拼: 拼错一次就会写出"类型是模型说的"这种清单,
+    /// 而清单是参数表单的唯一来源。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    manifest_params: Vec<ManifestParam>,
+    /// 054 T37: 上面两样没生成出来时的**如实说明**(失败原因)。
+    ///
+    /// 不并进 `warnings`(那是静态代码检查清单), 也不静默: 用户有权知道"这份策略缺一行说明,
+    /// 得自己补" —— 否则详情页空着一块, 他不知道是没做还是坏了。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta_note: Option<String>,
+    /// 054 P2: 生效的合约**杠杆上限**(现货为 null)。**前端必须带着它落盘** ——
+    /// 提示词里对模型说"必须 ≤ Nx"却在配置里不设上限, 那句话就是空的。
+    ///
+    /// 055 B1: 落盘位置是 `[backtest].max_leverage`(**上限**), 不是 `[backtest].leverage`
+    /// (**实际**)。后者会被实盘启动读走并在交易所真的设上 —— 那是替用户开杠杆。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leverage_cap: Option<f64>,
 }
 
 // ---- 052 方案 3: AI 改配置(只改参数, 不动代码) ----
@@ -1404,6 +1803,24 @@ pub(super) async fn save_strategy(
     let mut config = ricow_engine::create_strategy(name, &req.code, pair, params)
         .map_err(|e| WebError::compile_failed(e.clone(), parse_lua_line(&e)))?;
     config.market = market.to_string();
+    // 054 P2: 本金与杠杆上限落进 `[backtest]` —— 让"生成时的约束"与"以后每次回测的口径"是同一个数。
+    // 校验已在 ai-generate 那一步做过(> 0 / ∈[1,10]), 这里只做搬运; 后端不替用户拍一个数。
+    //
+    // 055 B1: 档位给的是**上限** → 只写 `max_leverage`; `leverage`(实际杠杆)保持引擎默认 1x。
+    // 写实际杠杆等于替用户开杠杆 —— 而实盘启动读的就是 `[backtest].leverage`(run.rs)。
+    if req.initial_cash.is_some() || req.max_leverage.is_some() || req.leverage.is_some() {
+        let mut bt = config.backtest.clone().unwrap_or_default();
+        if let Some(v) = req.initial_cash {
+            bt.initial_cash = Some(v);
+        }
+        if let Some(v) = req.max_leverage {
+            bt.max_leverage = Some(v);
+        }
+        if let Some(v) = req.leverage {
+            bt.leverage = Some(v);
+        }
+        config.backtest = Some(bt);
+    }
 
     // 052 方案 1: 复制/模板新建 → 先把源清单派生好。任何失败都在**写盘之前**返回(400)。
     let manifest_target: Option<(std::path::PathBuf, String)> =
@@ -1443,6 +1860,13 @@ pub(super) async fn save_strategy(
         None => None,
     };
 
+    // 054 D7: 来源标记 —— 落盘**前**先读旧文件, 判断它是否已是 AI 产物。
+    // 顺序上必须在 write_strategy_files 之前: 一旦写下去, 旧内容就只剩 .bak 了。
+    let instance_toml = dir.join(format!("{name}.toml"));
+    let prev_origin_ai =
+        std::fs::read_to_string(&instance_toml).map(|s| origin_is_ai(&s)).unwrap_or(false);
+    let origin_ai = req.origin.as_deref().map(str::trim) == Some("ai") || prev_origin_ai;
+
     // 落盘内核(与 execute_strategy 同一份): 备份 .bak → 先写 lua 再写 toml → 失败回滚。
     let deployed = match ricow_engine::write_strategy_files(config, &dir, allow_replace) {
         Ok(d) => d,
@@ -1461,6 +1885,20 @@ pub(super) async fn save_strategy(
         }
     };
 
+    // 054 D7: 标记写在**落盘之后**(引擎不认识这个注释, 由本层补)。
+    // 失败不回滚: 脚本与配置都已正确落盘, 为一行注释推翻整次保存得不偿失 ——
+    // 但也不静默吞掉, 进服务端日志 + 回包 warnings, 让用户看得见。
+    let mut warnings = lint_lua(&req.code);
+    if origin_ai {
+        if let Err(e) = mark_origin_ai(&deployed.toml_path) {
+            tracing::warn!(target: "web", strategy = %name, "来源标记写入失败: {e}");
+            warnings.push(format!(
+                "这份策略的来源标记没能写入({e}) —— 它会被当作普通策略显示。\
+                 代码与配置都已保存成功, 不影响使用"
+            ));
+        }
+    }
+
     Ok(Json(SaveReply {
         name: name.to_string(),
         market: market.to_string(),
@@ -1468,8 +1906,19 @@ pub(super) async fn save_strategy(
         lua_path: deployed.lua_path.display().to_string(),
         backup: deployed.backup.map(|p| p.display().to_string()),
         manifest_path: manifest_written.map(|(p, _)| p.display().to_string()),
-        warnings: lint_lua(&req.code),
+        warnings,
     }))
+}
+
+/// 054 D7: 给已落盘的实例 TOML 顶部补一行来源注释(**幂等** —— 已有则不重复写)。
+fn mark_origin_ai(toml_path: &std::path::Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(toml_path)
+        .map_err(|e| format!("读 {} 失败: {e}", toml_path.display()))?;
+    if origin_is_ai(&text) {
+        return Ok(());
+    }
+    let out = format!("{ORIGIN_AI_MARKER}\n{text}");
+    std::fs::write(toml_path, out).map_err(|e| format!("写 {} 失败: {e}", toml_path.display()))
 }
 
 /// `POST /api/strategies/{id}/ai-edit`(FR-018 + 052 方案 3 + N3): 一句自然语言指令 → AI 改写。
@@ -1829,6 +2278,259 @@ pub(super) async fn ai_assess_params(
     Ok(Json(AiAssessReply { advice }))
 }
 
+/// 054 P2: 结构化投资输入 → (档位约束, 本金)(**纯函数**, 便于单测)。
+///
+/// 校验口径见 spec §四-2。三条值得单独说明的取舍:
+/// 1. `initial_cash` 与 `risk_tolerance` **必填**: 不知道投多少钱、不知道能承受多大波动,
+///    档位表就没有锚点; 而给默认值等于替用户选档(D3 明确禁止)。
+/// 2. 非自定义档**拒绝**携带自定义数值字段: 静默忽略会造成"我填了 5% 却没生效" ——
+///    这是最坏的一种结果, 用户会以为自己被保护着。宁可 400 让他二选一。
+/// 3. `min_spacing_pct` 在自定义档下**可选**: 它只对网格/分批挂单类有意义, 逼一个趋势策略
+///    的用户编一个网格间距是没有任何信息量的输入(spec §二原写"全部必填", 本处有意收窄)。
+#[allow(clippy::too_many_arguments)]
+fn resolve_risk_input(
+    market: &str,
+    initial_cash: Option<f64>,
+    risk_tolerance: Option<&str>,
+    max_drawdown_pct: Option<f64>,
+    max_position_pct: Option<f64>,
+    leverage_cap: Option<f64>,
+    min_spacing_pct: Option<f64>,
+) -> Result<(risk_profile::RiskProfile, f64), String> {
+    use risk_profile::{RiskProfile, RiskTier};
+
+    let cash = initial_cash.ok_or_else(|| {
+        "缺少 initial_cash(准备投入的本金): 不知道投多少钱, 就无法换算「单笔不超过百分之几」\
+         —— 请填一个大于 0 的数字"
+            .to_string()
+    })?;
+    if !cash.is_finite() || cash <= 0.0 {
+        return Err(format!("initial_cash(投入本金)必须是大于 0 的有限数, 收到: {cash}"));
+    }
+    let raw_tier = risk_tolerance.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+        format!("缺少 risk_tolerance(风险档位): 可选 {}", RiskTier::accepted().join(" / "))
+    })?;
+    let tier = RiskTier::parse(raw_tier).ok_or_else(|| {
+        format!(
+            "risk_tolerance(风险档位)只能是 {}, 收到 '{raw_tier}'",
+            RiskTier::accepted().join(" / ")
+        )
+    })?;
+
+    let has_custom_field = max_drawdown_pct.is_some()
+        || max_position_pct.is_some()
+        || leverage_cap.is_some()
+        || min_spacing_pct.is_some();
+    if tier != RiskTier::Custom && has_custom_field {
+        return Err(format!(
+            "max_drawdown_pct / max_position_pct / leverage_cap / min_spacing_pct 只在 \
+             risk_tolerance=custom 下有意义: 当前档位 '{raw_tier}' 的数字由档位表给出, \
+             同时传会让人以为填的值生效了(实际不会) —— 请去掉这些字段, 或改用 custom 档"
+        ));
+    }
+
+    let pct = |name: &str, v: f64| -> Result<f64, String> {
+        if !v.is_finite() || v <= 0.0 || v > 100.0 {
+            return Err(format!("{name} 需在 (0, 100] 之间, 收到: {v}"));
+        }
+        Ok(v)
+    };
+
+    if tier != RiskTier::Custom {
+        // 现货档位表里的 leverage_cap 不适用 —— 渲染时会改成"现货不使用杠杆"。
+        return Ok((RiskProfile::of(tier), cash));
+    }
+
+    let dd = max_drawdown_pct
+        .ok_or_else(|| "custom(自定义)档必须填 max_drawdown_pct(最大回撤目标 %)".to_string())?;
+    let dd = pct("max_drawdown_pct", dd)?;
+    let pos = max_position_pct
+        .ok_or_else(|| "custom(自定义)档必须填 max_position_pct(单笔最大仓位 %)".to_string())?;
+    let pos = pct("max_position_pct", pos)?;
+    // 现货无杠杆: 给了就是无效输入, 400(spec §四-2 结构性互斥)。
+    let lev = if market == "futures" {
+        let lv = leverage_cap
+            .ok_or_else(|| "custom(自定义)档在合约市场必须填 leverage_cap(杠杆上限)".to_string())?;
+        if !lv.is_finite() || !(1.0..=10.0).contains(&lv) {
+            return Err(format!(
+                "leverage_cap(杠杆上限)需在 [1, 10] 之间(与引擎 max_leverage 同上限), 收到: {lv}"
+            ));
+        }
+        Some(lv)
+    } else if leverage_cap.is_some() {
+        return Err("现货不使用杠杆: 请不要传 leverage_cap(它只对合约有意义)".to_string());
+    } else {
+        None
+    };
+    // 网格间距只在这一个数上做下界校验; 它是可选的(趋势类策略没有"间距"这回事)。
+    let spacing = match min_spacing_pct {
+        None => None,
+        Some(v) => {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(format!("min_spacing_pct(网格最小间距 %)必须大于 0, 收到: {v}"));
+            }
+            Some((v, v))
+        }
+    };
+    Ok((
+        RiskProfile {
+            tier,
+            max_drawdown_pct: Some(dd),
+            max_position_pct: Some(pos),
+            leverage_cap: lev,
+            min_spacing_pct: spacing,
+            // 用户没表态就不替他放开加仓(与 custom_template 同一安全默认)。
+            forbid_one_side_add: true,
+            turnover: "由你按下面的数字自行判断",
+        },
+        cash,
+    ))
+}
+
+/// 验证回测的入参组装(**纯函数**, 便于离线单测)。
+///
+/// 抽出来的唯一目的: "本金真的带进回测了"这条必须能被单测钉住 —— 跑回测本身要联网,
+/// 只能靠真跑发现(054 T41 就是这样发现的), 而真跑不会天天跑。
+///
+/// 055 B2 修: `max_leverage` 此前不传(None → 引擎默认 10x), 而保存时档位写的是 2/3/5x ——
+/// 于是**合约策略生成时看到的成绩(默认上限)与保存后看到的(档位上限)不是一回事**。
+/// 与本金同一条纪律: 用户在生成弹窗里做的每一个结构化选择, 验证回测都必须照同一个口径跑。
+#[allow(clippy::too_many_arguments)] // 9 个入参就是 BacktestRunSpec 的字段, 拆成结构体反而多一层无意义的间接
+fn verify_spec(
+    root: &Path,
+    name: &str,
+    code: &str,
+    pair: &str,
+    market: &str,
+    days: u32,
+    interval: &str,
+    initial_cash: f64,
+    max_leverage: Option<f64>,
+) -> crate::commands::backtest::BacktestRunSpec {
+    crate::commands::backtest::BacktestRunSpec {
+        root: root.to_path_buf(),
+        strategy: name.to_string(),
+        pair: Some(pair.to_string()),
+        days,
+        interval: interval.to_string(),
+        start: None,
+        end: None,
+        market: Some(market.to_string()),
+        position_mode: None,
+        params: HashMap::new(),
+        script_path: None,
+        raw_code: Some(code.to_string()),
+        fee: None,
+        fee_maker: None,
+        fee_taker: None,
+        slippage_bps: None,
+        limit_fill_penetration_bps: None,
+        // 054 T41: 用**用户填的本金**跑, 不是默认 10 万 —— 见 [`verify_generated`] 的说明。
+        cash: Some(initial_cash),
+        // 055 B2: 档位上限照实带进验证回测(现货恒为 None —— 现货没有杠杆这件事要说清楚)。
+        // 实际杠杆仍是默认 1x: 与保存后的 TOML 口径完全一致(那边也只写 max_leverage)。
+        max_leverage,
+        leverage: None,
+        mmr_pct: None,
+        funding_rate: None,
+        klines_market: None,
+        // 生成弹窗里选的周期必须压过 Lua 自己的 fallback, 否则验证的粒度不是用户以为的粒度。
+        interval_explicit: true,
+        close_at_end: false,
+        export_dir: None,
+    }
+}
+
+/// 054 P1: 给**尚未落盘**的 AI 产物跑一次真实 K 线沙箱回测。
+///
+/// 走的是与 `POST /api/backtest` **同一个** [`crate::commands::backtest::run_backtest_full`]
+/// (`BacktestRunSpec.raw_code` 分支), 于是 K 线拉取 / 预热 / 撮合 / 指标 / 图表口径零分叉。
+/// 刻意不去落盘再回测 —— 那样用户会先看到一个从未在任何历史数据上跑过的策略文件。
+///
+/// **任何失败都返回 `ok:false` 而不 `Err`**: 生成本身已经成功, 网络抖动不该吃掉用户等了
+/// 几十秒的产物。调用方把 `verify` 原样塞进回包即可。
+///
+/// 054 T41 真跑发现(并修): 此前 `cash` 传 `None`, 验证回测一律按**默认 10 万**跑; 而给模型的
+/// 提示词说的是"用户准备投入 {initial_cash} USDT"。于是用户填 1 万、看到的是 10 万的成交与盈亏
+/// —— 仓位是否拒单、手续费占比、网格能不能铺满, 在小资金下完全是另一回事。这与 spec §四-2
+/// 「`initial_cash` 是唯一真下场的数字…让回测口径与用户真实资金一致」直接冲突。现在按用户本金跑:
+/// 小资金铺不开网格会**如实**出现拒单, 这正是用户该在生成阶段就知道的事。
+///
+/// 参数组装抽成 [`verify_spec`] 纯函数, 让"本金真的带进去了"可以被离线单测锁住
+/// (跑回测本身要联网, 测不了)。
+///
+/// 055 B2: 同一条纪律延伸到杠杆上限 —— `max_leverage` 现在也带进来了, 否则合约策略
+/// 生成时看到的是"默认 10x 上限下的成绩", 保存后跑的却是"档位 2/3/5x 上限下的成绩"。
+#[allow(clippy::too_many_arguments)] // 同上: 与它所组装的 spec 一一对应
+async fn verify_generated(
+    root: &Path,
+    name: &str,
+    code: &str,
+    pair: &str,
+    market: &str,
+    days: u32,
+    interval: &str,
+    initial_cash: f64,
+    max_leverage: Option<f64>,
+) -> VerifyOutcome {
+    let spec =
+        verify_spec(root, name, code, pair, market, days, interval, initial_cash, max_leverage);
+    // 与三个回测端点同一道保险丝: 内核或后处理 panic 一律变中文错误文本, 不逃逸出请求。
+    let result =
+        super::backtest_jobs::guarded(crate::commands::backtest::run_backtest_full(spec)).await;
+    let out = match result {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return VerifyOutcome {
+                ok: false,
+                days,
+                interval: interval.to_string(),
+                report_text: None,
+                metrics: None,
+                chart: None,
+                cost: None,
+                tier_check: None,
+                reason: Some(super::backtest_jobs::redact_root(&e.to_string(), root)),
+            };
+        }
+        Err(panic_text) => {
+            return VerifyOutcome {
+                ok: false,
+                days,
+                interval: interval.to_string(),
+                report_text: None,
+                metrics: None,
+                chart: None,
+                cost: None,
+                tier_check: None,
+                // panic 文本里可能有路径与内部细节, 只回一句可行动的中文 + 简要原因。
+                reason: Some(format!("回测内核异常, 本次未能验证: {panic_text}")),
+            };
+        }
+    };
+    let text = crate::commands::format_backtest_report(
+        &out.report,
+        &out.header(name),
+        out.initial_cash,
+        out.is_futures,
+        &out.test_params(),
+    );
+    let metrics = serde_json::to_value(out.metrics()).ok();
+    let chart = serde_json::to_value(out.chart()).ok();
+    let cost = super::backtest_jobs::cost_assumption(&out);
+    VerifyOutcome {
+        ok: true,
+        days,
+        interval: interval.to_string(),
+        report_text: Some(text),
+        metrics,
+        chart,
+        cost: Some(cost),
+        tier_check: None,
+        reason: None,
+    }
+}
+
 /// `POST /api/strategies/ai-generate`(P0-3): 结构化策略意图 → AI 参照 specs/lua-api.md 全文
 /// 从零生成一份完整 Lua, 剥围栏后过**与保存同一道编译门禁**, 返回 `{code}` —— **不写任何文件**,
 /// 由前端随后调 `POST /api/strategies`(overwrite=false)落盘。
@@ -1871,8 +2573,37 @@ pub(super) async fn ai_generate_strategy(
     if idea.is_empty() {
         return Err(WebError::bad_request("idea(策略思路)不能为空: 描述你想要策略做什么"));
     }
+    // 054 P1: 验证开关 —— 默认开; 天数默认 90(与其余四处回测入口同默认, 换取数字可比)。
+    let want_verify = req.verify.unwrap_or(true);
+    let verify_days = req.verify_days.unwrap_or(90);
+    // 只要**显式给了** verify_days 就校验, 哪怕 verify=false: 传了垃圾说明前端状态不对,
+    // 放过去只会让"这个数到底有没有生效"变成悬案。
+    if req.verify_days.is_some() && !(1..=MAX_VERIFY_DAYS).contains(&verify_days) {
+        return Err(WebError::bad_request(format!(
+            "verify_days(验证回测天数)需在 1–{MAX_VERIFY_DAYS} 之间, 收到 {verify_days}"
+        )));
+    }
+    // 054 P2: 结构化投资输入 —— 校验全部在 AI 调用之前(缺一个数字都不该浪费一轮生成)。
+    // 解析出的档位约束稍后渲染进提示词; 本金还要带回给前端, 让它落盘时写进 TOML。
+    let (risk, initial_cash) = resolve_risk_input(
+        market,
+        req.initial_cash,
+        req.risk_tolerance.as_deref(),
+        req.max_drawdown_pct,
+        req.max_position_pct,
+        req.leverage_cap,
+        req.min_spacing_pct,
+    )
+    .map_err(WebError::bad_request)?;
     let constraints =
         req.constraints.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("无特别约束");
+    // 杠杆上限是**唯一可静态验证**的约束 → 回给前端, 由它落盘写进 `[backtest].max_leverage`,
+    // 之后真跑回测时由 `validate_leverage` 执行(spec §四-4: 措辞与执行必须一致)。
+    //
+    // 055 B1: 是 `max_leverage`(上限)不是 `leverage`(实际)。写实际杠杆 = 替用户开杠杆,
+    // 而 `commands/run.rs` 启动实盘时读的正是 `[backtest].leverage`, 会真的在交易所设上。
+    // 055 B2: 同一个数也要进验证回测, 否则"生成时看到的"与"保存后看到的"是两个口径。
+    let leverage_cap = if market == "futures" { risk.leverage_cap } else { None };
     // 同名已存在: 生成结果无法用现名落盘, 当场 409(前端提示换名), 不让用户白等一轮 AI。
     let dir = crate::commands::ensure_strategies_dir_in(&state.root)?;
     if strategy_files_exist(&dir, market, name) {
@@ -1883,8 +2614,15 @@ pub(super) async fn ai_generate_strategy(
     }
 
     // ---- AI 生成(密钥只在 one_shot 内部构造客户端, 不进 prompt) ----
-    let prompt =
-        crate::ai::provider::build_generate_prompt(market, pair, interval, idea, constraints);
+    let risk_text = risk_profile::constraints_text(&risk, market, initial_cash);
+    let prompt = crate::ai::provider::build_generate_prompt(
+        market,
+        pair,
+        interval,
+        idea,
+        constraints,
+        &risk_text,
+    );
     let replied =
         crate::ai::provider::quick_generate(&state.root, &prompt).await.map_err(|e| match e {
             CoreError::Auth(msg) => WebError::forbidden(
@@ -1905,7 +2643,53 @@ pub(super) async fn ai_generate_strategy(
         .map_err(|e| WebError::compile_failed(e.clone(), parse_lua_line(&e)))?;
 
     let warnings = lint_lua(&code);
-    Ok(Json(AiGenerateReply { code, warnings }))
+
+    // 054 P1: 生成即验证 —— 同一份**未落盘**的代码跑一次真实 K 线回测。
+    // 放在编译门禁之后: 编译都不过的代码没必要浪费一轮网络与撮合。
+    //
+    // 054 T37: 补摘要/命名那一轮 AI 与验证回测**并行**(`join!`): 两者互不依赖(一个问模型,
+    // 一个拉行情), 串行会让用户多等一轮模型推理的时间。
+    let (meta, verify) =
+        tokio::join!(generate_meta(&state.root, market, pair, interval, idea, &code), async {
+            if want_verify {
+                Some(
+                    verify_generated(
+                        &state.root,
+                        name,
+                        &code,
+                        pair,
+                        market,
+                        verify_days,
+                        interval,
+                        initial_cash,
+                        // 055 B2: 验证回测按**档位上限**跑, 与保存后 TOML 的口径一致。
+                        leverage_cap,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
+        });
+
+    // 055 B3: 档位目标 vs 实测 —— 拿到回测数字之后才核得出来, 所以放在 join 之后。
+    // 没有回测(用户跳过验证 / 跑失败)就没有实测值, 此时**不下发**核对框 ——
+    // 摆一个"目标 10%、实测 —"的空框等于用界面暗示已经核过。
+    let verify = verify.map(|mut v| {
+        v.tier_check = risk_profile::tier_check(&risk, v.metrics.as_ref());
+        v
+    });
+
+    Ok(Json(AiGenerateReply {
+        code,
+        warnings,
+        verify,
+        initial_cash,
+        leverage_cap,
+        summary: meta.summary,
+        manifest_params: meta.params,
+        meta_note: meta.note,
+    }))
 }
 
 #[cfg(test)]

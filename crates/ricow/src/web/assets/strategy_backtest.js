@@ -115,7 +115,9 @@
       !!st.detailCtx &&
       (strategy === st.detailCtx.id ||
         strategy === st.detailCtx.id + "#sweep" ||
-        strategy === st.detailCtx.id + "#opt");
+        strategy === st.detailCtx.id + "#opt" ||
+        // 054 P4: 样本外检验作业(同一策略, 另一个作业槽 —— 它也可能跑很久)。
+        strategy === st.detailCtx.id + "#val");
     const tick = async () => {
       let info;
       try {
@@ -148,6 +150,8 @@
       job.error = info.error || null;
       // C8: 多维寻优才有 progress(`{done,total}`); 其余作业该字段不出现 → 保持 null。
       job.progress = info.progress || null;
+      // 054 P4: 验证作业的结果在 `validate` 字段(不在 metrics —— 一次验证有 N 段)。
+      job.validate = info.validate || null;
       renderJob(job);
       if (info.status !== "running" && st.pollTimer) clearInterval(st.pollTimer);
     };
@@ -159,9 +163,8 @@
   /// 三态渲染: running 转圈 / done 指标卡+权益曲线+可折叠文本报告 / error 原因+重试。
   /// 寻优作业另走对比表渲染 (`kind==="sweep"` 单参数 / `"optimize"` 多维)。
   function renderJob(job) {
-    const box = $("sg-bt-result");
-    destroyBtChart();
-    box.innerHTML = "";
+    // 054 P4: 三类"另开一个作业槽"的结果各有自己的容器 —— **必须先分发再碰 `sg-bt-result`**。
+    // 之前这里先清 `sg-bt-result` 再分发, 于是寻优/检验一跑完就把用户刚看的回测卡擦掉了。
     if (job.kind === "sweep") {
       renderSweepResult(job);
       return;
@@ -170,6 +173,13 @@
       renderOptimizeResult(job);
       return;
     }
+    if (job.kind === "validate") {
+      renderValidateResult(job);
+      return;
+    }
+    const box = $("sg-bt-result");
+    destroyBtChart();
+    box.innerHTML = "";
     if (job.status === "running") {
       const row = h("div", "sg-job running");
       row.appendChild(h("span", "sg-spinner"));
@@ -183,6 +193,8 @@
       if (m) {
         const label = job.strategyLabel || (st.detailCtx && st.detailCtx.id) || "";
         renderMetricCards(box, m);
+        // 054 P3-4: 生效成本假设(含"滑点为 0"的点名) —— 紧挨指标, 不折叠。
+        renderCostLine(box, job.cost);
         // C9: 与"同策略同窗口"的上一次结果并排(会话内); 首次跑时不出现。
         renderCompare(box, m, label);
         pushHistory(m, label);
@@ -291,6 +303,118 @@
       grid.appendChild(card);
     }
     box.appendChild(grid);
+  }
+
+  /// 054 P3-4: 成本假设行 —— 就摆在指标卡**下面**(不是折叠里)。
+  ///
+  /// 为什么必须贴着指标: 滑点与限价穿透默认是 0(乐观), 网格/高频类策略的收益会被系统性高估。
+  /// 用户看着一条漂亮的权益曲线时, 如果不知道这是零滑点下的数字, 后面所有判断都是错的 ——
+  /// 这一行比任何免责声明都有效, 折叠起来等于没写。
+  function renderCostLine(box, cost) {
+    if (!cost) return;
+    const n = (v, d) => (v == null ? "—" : R.fmt.num(Number(v), d == null ? 2 : d));
+    const wrap = h("div", "sg-cost-box");
+    wrap.appendChild(h("div", "sg-cost-title", t("sgCostTitle")));
+    const line = h("div", "sg-cost-line");
+    const parts = [
+      [t("sgCostFee"), n(cost.fee_maker_bps, 1) + " / " + n(cost.fee_taker_bps, 1) + " bps"],
+      [t("sgCostSlip"), n(cost.slippage_bps, 1) + " bps"],
+      [t("sgCostPen"), n(cost.limit_fill_penetration_bps, 1) + " bps"],
+      [t("sgCostCash"), n(cost.initial_cash, 0)],
+      [t("sgCostLev"), n(cost.leverage, 1) + "x"],
+    ];
+    for (const [k, v] of parts) {
+      const item = h("span", "sg-cost-item");
+      item.appendChild(h("span", "sg-cost-key", k));
+      item.appendChild(h("span", "sg-cost-val", v));
+      line.appendChild(item);
+    }
+    wrap.appendChild(line);
+    // 滑点为 0 必须**单独点名**: 混在一行里等于没说。
+    if (cost.zero_slippage) {
+      wrap.appendChild(h("div", "sg-cost-warn", t("sgCostZeroSlip")));
+    }
+    // 免责: 与 AI 评估提示词第 5 条同源(两处说法必须一致, 否则用户会挑一个好听的信)。
+    wrap.appendChild(h("div", "sg-cost-note", t("sgBtDisclaimer")));
+    box.appendChild(wrap);
+  }
+
+  /// 055 B3: 档位目标 vs 实测。
+  ///
+  /// 为什么必须摆出来: 用户选「保守」时, 平台替他把这句话翻译成了"回撤目标 ≤10%"并写进提示词,
+  /// 但**说过了就该回头核对** —— 只把实测的 25% 显示成一个红数字, 等于让用户自己记住选了什么
+  /// 再去比对。档位对用户的作用就断在这里。
+  ///
+  /// 措辞纪律: 判语是"未达到目标"而不是"不合规/失败" —— 档位写的是目标不是断言;
+  /// 测不出来就说测不出来, 不摆一个 0 或 — 冒充实测值。
+  function renderTierCheck(box, tc) {
+    if (!tc || !tc.items || !tc.items.length) return;
+    const wrap = h("div", "sg-tiercheck" + (tc.unmet > 0 ? " sg-tiercheck-unmet" : ""));
+    wrap.appendChild(h("div", "sg-tiercheck-title", t("sgTierCheckTitle")));
+    for (const it of tc.items) {
+      const row = h("div", "sg-tiercheck-row");
+      row.appendChild(h("span", "sg-tiercheck-name", R.lang === "en" ? it.label_en : it.label_zh));
+      row.appendChild(
+        h("span", "sg-tiercheck-target", t("sgTierCheckTarget") + " ≤ " + fmtNum2(it.target) + it.unit)
+      );
+      const actual =
+        it.actual == null
+          ? "—"
+          : fmtNum2(it.actual) + it.unit;
+      row.appendChild(h("span", "sg-tiercheck-actual", t("sgTierCheckActual") + " " + actual));
+      const verdict =
+        it.verdict === "unmet"
+          ? t("sgTierCheckUnmet")
+          : it.verdict === "met"
+            ? t("sgTierCheckMet")
+            : t("sgTierCheckUnknown");
+      row.appendChild(h("span", "sg-tiercheck-verdict sg-tiercheck-" + it.verdict, verdict));
+      wrap.appendChild(row);
+    }
+    // 未达标时给一条可行动的下一步; 达标时把"只核了哪些项"说清(免得用户以为全都核过)。
+    wrap.appendChild(
+      h("div", "sg-tiercheck-note", tc.unmet > 0 ? t("sgTierCheckUnmetNote") : t("sgTierCheckNote"))
+    );
+    box.appendChild(wrap);
+  }
+
+  function fmtNum2(v) {
+    return R.fmt.num(Number(v), 2);
+  }
+
+  /// 054 P1/T6/T7: 把一次「验证回测」的结果渲染进任意容器(生成弹窗用)。
+  ///
+  /// **失败时绝不显示任何指标卡** —— 宁可空着, 也不能让用户以为已验证(与实时行情三态 chip
+  /// 同一纪律: 不静默降级)。
+  function renderVerifyResult(box, verify) {
+    box.innerHTML = "";
+    if (!verify) {
+      box.appendChild(h("div", "sg-hint", t("sgVerifySkipHint")));
+      return;
+    }
+    if (!verify.ok) {
+      const head = h("div", "sg-job-head sg-err", t("sgGenUnverified"));
+      box.appendChild(head);
+      box.appendChild(h("div", "sg-hint", t("sgGenUnverifiedHint")));
+      if (verify.reason) {
+        const pre = h("div", "sg-verify-reason", verify.reason); // 服务端文本走 textContent
+        box.appendChild(pre);
+      }
+      return;
+    }
+    box.appendChild(h("div", "sg-job-head sg-ok", t("sgGenVerified")));
+    if (verify.metrics) {
+      renderMetricCards(box, verify.metrics);
+    }
+    // 055 B3: 紧贴指标卡 —— 先看到数字, 立刻看到"达到你选的那档了吗"。
+    renderTierCheck(box, verify.tier_check);
+    renderCostLine(box, verify.cost);
+    if (verify.chart && verify.chart.times && verify.chart.times.length) {
+      renderBtChart(box, verify.chart);
+    }
+    if (verify.metrics && (verify.metrics.total_trades ?? 0) === 0) {
+      box.appendChild(h("div", "sg-hint", t("sgZeroTradeHint")));
+    }
   }
 
   /// 权益曲线 vs 标的价格(P0-2): 两者同 quote 计价共轴; 买卖点标记在价格线上。
@@ -462,6 +586,13 @@
     const sub = h("div", "sg-closed-sub", note);
     R.glossary.decorate(sub); // A2: 这行说明里的指标名(如"已实现盈亏")同样可点
     box.appendChild(sub);
+  }
+
+  function destroyValChart() {
+    if (st.valChart) {
+      st.valChart.remove();
+      st.valChart = null;
+    }
   }
 
   function destroyBtChart() {
@@ -974,6 +1105,252 @@
     setMsg($("sg-opt-msg"), t("sgBtDone"), "ok");
   }
 
+  // ---------- 054 P4: 样本外检验 / 分段验证 / 滚动验证 ----------
+  //
+  // 为什么要有这一块(审计 #3 / #5): 用户跑完一次回测看到的数字, 全部来自**同一段**历史;
+  // 参数寻优又是在这同一段上挑出来的最好一组 —— 于是"回测很漂亮"这件事几乎不携带关于未来
+  // 的信息。这里把它做成"点一下就能看", 而不是要求用户先理解方法论。
+  //
+  // 三条纪律:
+  //   1. 只按时间顺序切(随机/交错切会把未来信息漏进训练段, 自己制造前视偏差)—— 切法在后端;
+  //   2. 术语分开: 「分段验证」(参数不变) 与「滚动验证(含重新调参)」是两件事, 不统称;
+  //   3. 退化只描述不定性: 界面照抄服务端的 note, 不自己拼"过拟合"这类定性词。
+
+  /// 发起验证作业(202 + job_id, 与回测共用队列与 409 busy)。
+  async function onValidate() {
+    if (!st.detailCtx) return;
+    const mode = $("sg-val-mode").value;
+    const form = mode === "walk" ? $("sg-val-form").value : "A";
+    const body = {
+      strategy: st.detailCtx.id,
+      pair: $("sg-bt-pair").value.trim() || $("sg-pair").value.trim(),
+      interval: $("sg-bt-interval").value,
+      days: Number($("sg-bt-days").value.trim()) || 90,
+      mode: mode,
+      form: form,
+    };
+    // 形态 B 的候选网格**沿用多维寻优那几行**: 不让用户在第二处再填一遍(两处迟早不一致),
+    // 也不让后端去猜 —— 猜出来的"最优参数"是平台的产物, 用户根本不知道它被调过什么。
+    if (form === "B") {
+      const dims = S.readOptDims();
+      if (!dims || !dims.length) {
+        setMsg($("sg-val-msg"), t("sgValDimsRequired"), "err");
+        return;
+      }
+      body.dims = dims;
+    }
+    const g = st.gen;
+    const btn = $("sg-val-go");
+    btn.disabled = true;
+    setMsg($("sg-val-msg"), "", "");
+    try {
+      const reply = await R.api("/api/backtest/validate", { method: "POST", body: body });
+      if (g !== st.gen) return;
+      const key = st.detailCtx.id + "#val";
+      const job = {
+        jobId: reply.job_id,
+        status: "running",
+        kind: "validate",
+        body: body,
+        strategyLabel: st.detailCtx.id,
+      };
+      st.jobs.set(key, job);
+      renderJob(job);
+      startPolling(key, reply.job_id, g);
+    } catch (err) {
+      if (g !== st.gen) return;
+      setMsg($("sg-val-msg"), (err && err.message) || String(err), "err");
+    } finally {
+      if (g === st.gen) btn.disabled = false;
+    }
+  }
+
+  /// 一段的指标行(与普通回测的指标卡同源口径, 但只挑最能说明"这段怎么样"的四项)。
+  function segMetricRow(m) {
+    const wrap = h("div", "sg-val-mrow");
+    if (!m) return wrap;
+    const items = [
+      [t("sgNetPnl"), fmtNum(m.net_pnl), signCls(m.net_pnl)],
+      [t("sgMaxDd"), fmtPct(-Math.abs(m.max_drawdown_pct || 0)), (m.max_drawdown_pct || 0) > 0 ? "down" : "flat"],
+      [t("sgTrades"), String(m.total_trades ?? 0), "flat"],
+      [t("sgWinRate"), fmtPct(m.win_rate), "flat"],
+    ];
+    for (const [k, vv, cls] of items) {
+      const item = h("span", "sg-val-mitem");
+      item.appendChild(h("span", "sg-val-mkey", k));
+      item.appendChild(h("span", "sg-val-mval" + (cls ? " " + cls : ""), vv));
+      wrap.appendChild(item);
+    }
+    return wrap;
+  }
+
+  /// 离散度提示(T32): 只**描述**段与段的差异, 不断言原因 —— 差异大 ≠ 过拟合,
+  /// 可能只是行情换了风格。定性词一律不出现在这里。
+  function renderSpread(box, segs) {
+    const vals = segs
+      .map((s) => (s.metrics ? Number(s.metrics.net_pnl) : NaN))
+      .filter((v) => Number.isFinite(v));
+    if (vals.length < 2) {
+      box.appendChild(h("div", "sg-hint", t("sgValNoSpread")));
+      return;
+    }
+    const min = Math.min.apply(null, vals);
+    const max = Math.max.apply(null, vals);
+    const line =
+      t("sgValSpread") +
+      fmtNum(min) +
+      t("sgValSpreadMid") +
+      fmtNum(max) +
+      t("sgValSpreadTail") +
+      fmtNum(max - min) +
+      t("sgValSpreadEnd");
+    box.appendChild(h("div", "sg-hint", line));
+  }
+
+  /// 拼接各段曲线 → 一条线。段间有空档(形态 B 跳过第一段训练区)时插**空白点**断开,
+  /// 否则直连会画出一段"策略其实没在里面"的斜线 —— 那等于编造。
+  function stitchCurve(segs) {
+    const pts = [];
+    for (const s of segs) {
+      const c = s.curve;
+      if (!c || !c.t || !c.eq) continue;
+      const startMs = Date.parse(s.start + "T00:00:00Z");
+      if (pts.length && Number.isFinite(startMs)) {
+        const last = pts[pts.length - 1];
+        // 上一段的终点早于这一段的起点 → 中间是空档。
+        if (last.time < Math.floor(startMs / 1000) - 1) {
+          pts.push({ time: Math.floor(startMs / 1000) - 1 });
+        }
+      }
+      for (let i = 0; i < c.t.length; i += 1) {
+        const v = Number(c.eq[i]);
+        if (Number.isFinite(v)) pts.push({ time: Math.floor(c.t[i] / 1000), value: v });
+      }
+    }
+    return pts.sort((a, b) => a.time - b.time);
+  }
+
+  /// 两条线并排(T32): 本次检验拼接线 + 同一组参数跑全窗口的线(取自会话内最近一次
+  /// **同窗口同周期**的普通回测)。窗口/周期对不上就不画 —— 那两条线没有可比性,
+  /// 画上去只会让人做出错误的比较。
+  function renderValChart(box, v, strategyId) {
+    const ours = stitchCurve(v.segments || []);
+    if (!ours.length) return;
+    const full0 = st.jobs.get(strategyId);
+    const fm = full0 && full0.metrics;
+    const ok =
+      full0 &&
+      full0.status === "done" &&
+      full0.chart &&
+      fm &&
+      fm.interval === v.interval &&
+      fm.days === v.days;
+    const wrap = h("div", "sg-bt-chart-wrap");
+    wrap.appendChild(h("div", "sg-mcards-title", t("sgValCurveTitle")));
+    const legend = h("div", "sg-bt-legend");
+    legend.appendChild(h("span", "lg lg-equity", t("sgValCurveOurs")));
+    if (ok) legend.appendChild(h("span", "lg lg-bench", t("sgValCurveFull")));
+    wrap.appendChild(legend);
+    const div = h("div", "sg-bt-chart");
+    wrap.appendChild(div);
+    box.appendChild(wrap);
+    const border = themeColor("--border", "#2b333d");
+    const LWC = window.LightweightCharts;
+    destroyValChart();
+    st.valChart = LWC.createChart(div, {
+      autoSize: true,
+      layout: { background: { color: "transparent" }, textColor: themeColor("--muted", "#9aa7b4") },
+      grid: { vertLines: { color: border }, horzLines: { color: border } },
+      timeScale: { timeVisible: true, secondsVisible: false, borderColor: border },
+    });
+    const a = st.valChart.addLineSeries({
+      color: themeColor("--accent", "#4dd4ac"),
+      lineWidth: 2,
+      priceLineVisible: false,
+    });
+    a.setData(ours);
+    if (ok) {
+      const b = st.valChart.addLineSeries({
+        color: themeColor("--warn", "#e3b341"),
+        lineWidth: 1,
+        lineStyle: 2,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+      b.setData(
+        full0.chart.times
+          .map((ti, i) => ({ time: Math.floor(ti / 1000), value: full0.chart.equity[i] }))
+          .filter((d) => Number.isFinite(d.value) && Number.isFinite(d.time))
+          .sort((x, y) => x.time - y.time)
+      );
+    } else {
+      box.appendChild(h("div", "sg-hint", t("sgValCurveNoFull")));
+    }
+    st.valChart.timeScale().fitContent();
+  }
+
+  /// 三态渲染: 跑 → 转圈 / 完 → 结论文案 + 各段并排 + 离散度 + 曲线 / 错 → 原因。
+  function renderValidateResult(job) {
+    const box = $("sg-val-result");
+    if (!box) return;
+    destroyValChart();
+    box.textContent = "";
+    if (job.status === "running") {
+      const row = h("div", "sg-job running");
+      row.appendChild(h("span", "sg-spinner"));
+      row.appendChild(h("span", null, t("sgValRunning")));
+      box.appendChild(row);
+      return;
+    }
+    if (job.status === "error") {
+      box.appendChild(h("div", "sg-msg err", job.error || ""));
+      return;
+    }
+    const v = job.validate;
+    if (!v) return;
+    // 结论: **服务端写好, 前端原样展示** —— 门槛分层与退化判定只有一处口径, 不两边各拼一份。
+    box.appendChild(h("div", "sg-job-head sg-ok", t("sgVal") + " · " + v.window[0] + " → " + v.window[1]));
+    box.appendChild(h("div", "sg-val-note", v.note || ""));
+    if (v.threshold) {
+      const key =
+        v.threshold === "insufficient"
+          ? "sgValThresholdInsufficient"
+          : v.threshold === "ample"
+            ? "sgValThresholdAmple"
+            : "sgValThresholdMinimum";
+      const line = h("div", "sg-val-chip" + (v.threshold === "insufficient" ? " warn" : ""), t(key));
+      if (v.oos_days != null) {
+        line.textContent += " · " + t("sgValOos") + " " + v.oos_days + t("sgValSegDays");
+      }
+      box.appendChild(line);
+    }
+    // 退化: true / false / null 三种都要如实 —— null 是"算不出来", 不能画成"没退化"。
+    if (v.degraded === true) {
+      box.appendChild(h("div", "sg-val-chip warn", t("sgValDegraded")));
+    } else if (v.degraded === null || v.degraded === undefined) {
+      box.appendChild(h("div", "sg-hint", t("sgValDegradedUnknown")));
+    }
+    // 各段并排。
+    const grid = h("div", "sg-val-segs");
+    for (const s of v.segments || []) {
+      const card = h("div", "sg-val-seg");
+      if (v.mode === "split" && s.index === v.oos_index) card.classList.add("sg-val-oos");
+      card.appendChild(h("div", "sg-val-seg-label", s.label));
+      card.appendChild(
+        h("div", "sg-val-seg-range", s.start + " → " + s.end + " (" + s.days + t("sgValSegDays") + ")")
+      );
+      if (s.metrics) {
+        card.appendChild(segMetricRow(s.metrics));
+      } else {
+        card.appendChild(h("div", "sg-msg err", s.reason || t("sgValSegFail")));
+      }
+      grid.appendChild(card);
+    }
+    box.appendChild(grid);
+    renderSpread(box, v.segments || []);
+    renderValChart(box, v, job.strategyLabel || (st.detailCtx && st.detailCtx.id) || "");
+  }
+
   /// 用发起时的同一份参数重新发起(错误态一键重试)。
   async function rerunJob(job) {
     if (!st.detailCtx) return;
@@ -1095,11 +1472,18 @@
   S.renderHistory = renderHistory;
   S.destroyBtChart = destroyBtChart;
   S.renderJob = renderJob;
+  // 054: 生成弹窗要复用「指标卡 / 权益曲线 / 成本假设行」—— 不新写第二套渲染。
+  S.renderMetricCards = renderMetricCards;
+  S.renderBtChart = renderBtChart;
+  S.renderCostLine = renderCostLine;
+  S.renderVerifyResult = renderVerifyResult;
   // N3-B: 评估编排 —— 在 strategy_editor.js 的评估面板里被调用(跨文件走延迟别名)。
   S.runParamAssess = runParamAssess;
   S.onBacktest = onBacktest;
   S.onSweep = onSweep;
   S.onOptimize = onOptimize;
+  S.onValidate = onValidate;
+  S.destroyValChart = destroyValChart;
   S.syncBtBtn = syncBtBtn;
   S.startPolling = startPolling;
 })();

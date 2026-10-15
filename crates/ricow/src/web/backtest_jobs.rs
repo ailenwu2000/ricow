@@ -69,8 +69,15 @@ pub(super) struct BacktestJob {
     metrics: Option<Value>,
     /// 结构化图表数据(P0-2 权益曲线/成交点; done 才有)。
     chart: Option<Value>,
+    /// 054 P3-4: 本次回测**实际生效**的成本假设(费率/滑点/限价穿透); done 才有。
+    cost: Option<Value>,
     /// 策略运行期日志(`ctx:log`, 已按上限裁剪; done 才有, 空则 None)。
     logs: Option<Vec<String>>,
+    /// 054 P4: 样本外 / 分段验证的结构化结果(done 才有; 只有验证类作业会设)。
+    ///
+    /// 与 `metrics` 分开而不是塞进去: 一次「分段验证」内有 N 段, 每段都有自己的指标 ——
+    /// 硬塞进 `metrics` 会让前端那套"六张指标卡"的渲染无从下手。
+    validate: Option<Value>,
     /// C8: 运行中作业的进度(`{done, total}`, 仅多维寻优会设)。
     ///
     /// 单次回测的"进度"只有 0/1 两态, 报它没有信息量; 而一次 100 组的多维寻优可能跑十几分钟,
@@ -100,9 +107,15 @@ pub(super) struct JobReply {
     metrics: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chart: Option<Value>,
+    /// 054 P3-4: 生效成本假设(与指标卡并排展示; 缺省字段直接不出现)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<Value>,
     /// 策略日志(`ctx:log`; 空/无则字段不出现)。供前端在回测详情展示策略自检与停机原因。
     #[serde(skip_serializing_if = "Option::is_none")]
     logs: Option<Vec<String>>,
+    /// 054 P4: 样本外 / 分段验证结果(只有验证类作业会带; 缺省字段直接不出现)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validate: Option<Value>,
     /// C8: 运行中进度(`{done, total}`; 只有多维寻优会带)。已完成的作业不需要它。
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<Value>,
@@ -117,6 +130,8 @@ impl From<&BacktestJob> for JobReply {
             report: j.report.clone(),
             metrics: j.metrics.clone(),
             chart: j.chart.clone(),
+            cost: j.cost.clone(),
+            validate: j.validate.clone(),
             logs: j.logs.clone(),
             progress: j.progress.clone(),
             error: j.error.clone(),
@@ -200,7 +215,7 @@ fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
 ///
 /// 抽出成独立函数的目的就是**可单测**: 一个 `panic!` 掉进去, 必须变成 `Err(文本)`
 /// 而不是把 panic 交给 tokio(见 `test_guarded_turns_panic_into_error`)。
-async fn guarded<F, T>(f: F) -> Result<T, String>
+pub(super) async fn guarded<F, T>(f: F) -> Result<T, String>
 where
     F: std::future::Future<Output = T>,
 {
@@ -264,6 +279,8 @@ impl JobStore {
                 report: None,
                 metrics: None,
                 chart: None,
+                cost: None,
+                validate: None,
                 logs: None,
                 progress: None,
                 error: None,
@@ -276,25 +293,57 @@ impl JobStore {
 
     /// 作业成功: running → done, 记报告与完成时刻(单向; 非 running 记录一律不改)。
     pub(super) fn finish_done(&self, job_id: &str, report: String, now: DateTime<Utc>) {
-        self.finish_done_full(job_id, report, None, None, None, now);
+        self.finish_done_full(job_id, report, None, None, None, None, now);
     }
 
     /// 作业成功(带结构化指标/图表/日志, P0-2 + 日志透出): 同 [`Self::finish_done`]。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn finish_done_full(
         &self,
         job_id: &str,
         report: String,
         metrics: Option<Value>,
         chart: Option<Value>,
+        cost: Option<Value>,
         logs: Option<Vec<String>>,
         now: DateTime<Utc>,
     ) {
-        self.finish(job_id, JobStatus::Done, Some(report), metrics, chart, logs, None, now);
+        self.finish(
+            job_id,
+            JobStatus::Done,
+            Some(report),
+            metrics,
+            chart,
+            cost,
+            logs,
+            None,
+            None,
+            now,
+        );
     }
 
     /// 作业失败: running → error, 记中文原因与完成时刻(单向; 非 running 记录一律不改)。
     pub(super) fn finish_error(&self, job_id: &str, error: String, now: DateTime<Utc>) {
-        self.finish(job_id, JobStatus::Error, None, None, None, None, Some(error), now);
+        self.finish(job_id, JobStatus::Error, None, None, None, None, None, None, Some(error), now);
+    }
+
+    /// 054 P4: 验证类作业成功 —— 只带 `validate` 结果(不生成文本报告)。
+    ///
+    /// 刻意**不复用** `finish_done_full`: 后者要求一份 `report`, 而一次三段验证没有
+    /// "一份报告"这回事(每段都有自己的指标), 编一份拼盘报告等于造一个前端用不上的东西。
+    pub(super) fn finish_validate(&self, job_id: &str, validate: Value, now: DateTime<Utc>) {
+        self.finish(
+            job_id,
+            JobStatus::Done,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(validate),
+            None,
+            now,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -305,7 +354,9 @@ impl JobStore {
         report: Option<String>,
         metrics: Option<Value>,
         chart: Option<Value>,
+        cost: Option<Value>,
         logs: Option<Vec<String>>,
+        validate: Option<Value>,
         error: Option<String>,
         now: DateTime<Utc>,
     ) {
@@ -316,6 +367,8 @@ impl JobStore {
                 job.report = report;
                 job.metrics = metrics;
                 job.chart = chart;
+                job.cost = cost;
+                job.validate = validate;
                 job.logs = logs;
                 job.error = error;
                 job.finished_at = Some(now);
@@ -386,7 +439,8 @@ pub(super) struct BacktestRequest {
 
 #[derive(Debug, Serialize)]
 pub(super) struct StartedReply {
-    job_id: String,
+    /// 054: `pub(super)` —— `web::validate` 复用同一份 202 回包形状, 不另造一个。
+    pub(super) job_id: String,
 }
 
 /// K 线间隔白名单(与 CLI 内核、markets 端点同口径)。
@@ -440,12 +494,54 @@ fn reject_internal_param_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Re
 /// 但不在 HTTP 响应里暴露本机目录布局; **原文仍进服务端日志**(见各 `tracing::error!`/`warn!`),
 /// 本机排查不受影响。留一处残余: 用户在 TOML 里自填的 `script_path` 若为绝对路径, 不在根目录下,
 /// 那道口的路径是**用户自己的声明**, 不属内部信息。
-fn redact_root(msg: &str, root: &std::path::Path) -> String {
+pub(super) fn redact_root(msg: &str, root: &std::path::Path) -> String {
     let r = root.to_string_lossy();
     if r.is_empty() {
         msg.to_string()
     } else {
         msg.replace(r.as_ref(), "<root>")
+    }
+}
+
+/// 054 P3-4: 一次回测**实际生效**的成本假设(费率 / 滑点 / 限价穿透 / 本金 / 杠杆)。
+///
+/// 存在理由(审计 #4): 滑点与限价穿透的默认值都是 **0**(乐观), 用户看着一条漂亮的权益曲线时
+/// **没有任何线索**知道这是零滑点下的数字 —— 网格/高频类策略的收益会被系统性高估。
+/// 把假设摆在指标卡旁边, 比任何免责声明都有效。
+///
+/// 数值取自回测**跑完后**三层合并的结果, 不是默认值常量 —— 否则策略 TOML 里写了
+/// `[backtest].slippage_bps` 时会显示错的假设。
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct CostAssumption {
+    /// maker 费率(bps)。
+    pub(super) fee_maker_bps: f64,
+    /// taker 费率(bps)。
+    pub(super) fee_taker_bps: f64,
+    /// 市价滑点(bps)。
+    pub(super) slippage_bps: f64,
+    /// 限价成交所需穿透深度(bps)。
+    pub(super) limit_fill_penetration_bps: f64,
+    /// 初始本金(quote)。
+    pub(super) initial_cash: f64,
+    /// 合约杠杆(现货恒为 1.0 —— 现货没有杠杆这件事要说清楚, 不能显示策略里残留的值)。
+    pub(super) leverage: f64,
+    /// 滑点是否为 0 —— 前端据此提示"收益被系统性高估"。
+    ///
+    /// 判据在服务端算好而不让前端自己比 `0.0`: 浮点相等的口径放在两端会各写一遍。
+    pub(super) zero_slippage: bool,
+}
+
+/// 从回测结果里取生效成本假设(纯函数, 便于单测)。
+pub(super) fn cost_assumption(out: &crate::commands::backtest::BacktestOutcome) -> CostAssumption {
+    let p = &out.params;
+    CostAssumption {
+        fee_maker_bps: p.fee_maker_bps,
+        fee_taker_bps: p.fee_taker_bps,
+        slippage_bps: p.slippage_bps,
+        limit_fill_penetration_bps: p.limit_fill_penetration_bps,
+        initial_cash: p.initial_cash,
+        leverage: if out.is_futures { p.leverage } else { 1.0 },
+        zero_slippage: p.slippage_bps <= 0.0,
     }
 }
 
@@ -459,7 +555,8 @@ fn clean(v: Option<String>) -> Option<String> {
 ///
 /// 实例 TOML 的存在性判定绕过 catalog, 所以 `strategies/<id>.toml` 是不是文件**不足以**
 /// 说明这个策略可用: 未声明的内置副本、清单解析失败/缺同名 .lua 的 id 都能凑出这个文件。
-fn reject_unavailable(strategy: &str) -> Result<(), WebError> {
+/// 054: `pub(super)` —— `web::validate` 走同一道门禁(验证问的也是"这个策略能不能跑")。
+pub(super) fn reject_unavailable(strategy: &str) -> Result<(), WebError> {
     match crate::strategies::catalog::run_block(strategy) {
         Some(why) => Err(WebError::bad_request_code(why, "strategy_unavailable")),
         None => Ok(()),
@@ -540,6 +637,7 @@ pub(super) async fn start_backtest(
         position_mode: None,
         params,
         script_path: None,
+        raw_code: None,
         fee,
         fee_maker: None,
         fee_taker: None,
@@ -589,9 +687,11 @@ pub(super) async fn start_backtest(
                     );
                     let metrics = serde_json::to_value(out.metrics()).ok();
                     let chart = serde_json::to_value(out.chart()).ok();
+                    // 054 P3-4: 生效成本假设(滑点为 0 必须在界面上说出来)。
+                    let cost = serde_json::to_value(cost_assumption(&out)).ok();
                     // 策略运行期日志 (ctx:log): 裁剪后回传, 让"0 成交/停机"有可解释原因。
                     let logs = cap_strategy_logs(out.report.strategy_logs.clone());
-                    Ok((text, metrics, chart, logs))
+                    Ok((text, metrics, chart, cost, logs))
                 }
                 // CoreError 的中文 Display 直接作为 error 文本(含"预热段不足/窗口日期非法"等)。
                 Err(e) => Err(redact_root(&e.to_string(), &job_root)),
@@ -599,8 +699,8 @@ pub(super) async fn start_backtest(
         })
         .await;
         match result {
-            Ok(Ok((text, metrics, chart, logs))) => {
-                jobs.finish_done_full(&id, text, metrics, chart, logs, Utc::now());
+            Ok(Ok((text, metrics, chart, cost, logs))) => {
+                jobs.finish_done_full(&id, text, metrics, chart, cost, logs, Utc::now());
             }
             Ok(Err(msg)) => jobs.finish_error(&id, msg, Utc::now()),
             Err(msg) => {
@@ -767,6 +867,7 @@ pub(super) async fn start_sweep(
                     position_mode: None,
                     params,
                     script_path: None,
+                    raw_code: None,
                     fee,
                     fee_maker: None,
                     fee_taker: None,
@@ -1068,6 +1169,7 @@ pub(super) async fn start_optimize(
                     position_mode: None,
                     params,
                     script_path: None,
+                    raw_code: None,
                     fee,
                     fee_maker: None,
                     fee_taker: None,

@@ -29,6 +29,32 @@ pub const DEFAULT_MAX_TURNS: usize = 8;
 /// `max_turns` 上限 (防误配成天文数字烧钱)。
 pub const MAX_MAX_TURNS: usize = 32;
 
+/// AI 请求**总超时**默认值(秒)。
+///
+/// 055 B5: reqwest 默认**不设**超时 —— 上游一挂起, Web 请求就永远悬着, 用户看到的
+/// 只是一个一直转圈的页面, 连"是网络问题还是模型问题"都无从判断(真跑时实测踩到:
+/// 上游挂起 900s / 1500s 都拿不到响应体, 而同一个端点的 `/models` 秒回)。
+///
+/// 定值依据: 一次完整的策略生成(带全文 Lua API 规范的长提示词 + 30 天验证回测)
+/// 实测约 150 秒。取 300 秒 = 正常值的一倍余量, 既不会误杀长回答, 也不会让人等到
+/// 以为程序死了。想放宽就配 `[ai].timeout_secs`。
+pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// `timeout_secs` 下限(秒): 再短就不是"慢", 而是必然超时。
+pub const MIN_TIMEOUT_SECS: u64 = 10;
+/// `timeout_secs` 上限(秒): 一小时还没回, 那不是配置问题是服务已不可用。
+pub const MAX_TIMEOUT_SECS: u64 = 3600;
+
+/// `timeout_secs` 校验(报错不静默兜底, 与 `max_turns` 同一纪律)。
+pub fn check_timeout_secs(n: i64) -> CoreResult<u64> {
+    if n < MIN_TIMEOUT_SECS as i64 || n > MAX_TIMEOUT_SECS as i64 {
+        return Err(CoreError::InvalidArgument(format!(
+            "timeout_secs={n} 非法: 取值范围 {MIN_TIMEOUT_SECS}..={MAX_TIMEOUT_SECS} \
+             (删掉该行则用默认 {DEFAULT_TIMEOUT_SECS} 秒)"
+        )));
+    }
+    Ok(n as u64)
+}
+
 /// 供应商预设。`model` 为推荐模型(取自各官方文档/rig 常量); 所选模型必须支持 function calling。
 pub struct Preset {
     pub id: &'static str,
@@ -95,6 +121,9 @@ pub struct AiConfig {
     /// 显式确认白名单外的自建/中转主机 (审计 H-7)。默认 false: 非白名单主机直接拒绝,
     /// 防止"从网上抄的配置"或被改写的配置把 api_key 与完整对话上下文静默发给第三方。
     pub allow_custom_base_url: bool,
+    /// 055 B5: 单次 AI 请求总超时(秒)。`None` = 用 [`DEFAULT_TIMEOUT_SECS`]。
+    /// 本机小模型(ollama)往往比云端慢得多, 所以留了这一个覆盖口子。
+    pub timeout_secs: Option<u64>,
 }
 
 /// 解析后的最终参数(base_url/model 已合成, env 覆盖已应用)。
@@ -104,6 +133,8 @@ pub struct Resolved {
     pub base_url: String,
     pub model: String,
     pub max_turns: usize,
+    /// 055 B5: 生效的总超时(秒) —— 已回填默认值, 客户端构造处直接用。
+    pub timeout_secs: u64,
 }
 
 /// 默认预设 = 预设表**首项**(引导页里排第一的那个, 即"官方推荐")。
@@ -227,7 +258,21 @@ pub fn resolve(
             ))
         })?;
 
-    Ok(Resolved { provider: cfg.provider.clone(), base_url, model, max_turns: cfg.max_turns })
+    // 055 B5: 超时不配就用默认值; 配了就校验(报错误解法, 不静默取整)。
+    let timeout_secs = cfg.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+    if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&timeout_secs) {
+        return Err(CoreError::InvalidArgument(format!(
+            "timeout_secs={timeout_secs} 非法: 取值范围 {MIN_TIMEOUT_SECS}..={MAX_TIMEOUT_SECS}"
+        )));
+    }
+
+    Ok(Resolved {
+        provider: cfg.provider.clone(),
+        base_url,
+        model,
+        max_turns: cfg.max_turns,
+        timeout_secs,
+    })
 }
 
 /// 取 AI 密钥: 环境变量(显式覆盖, 适合 CI/临时) → 配置文件 `[ai].api_key`。
@@ -259,6 +304,7 @@ mod tests {
             base_url: None,
             max_turns: DEFAULT_MAX_TURNS,
             allow_custom_base_url: false,
+            timeout_secs: None,
         }
     }
 
@@ -277,6 +323,31 @@ mod tests {
             assert!(err.contains("0..=32") || err.contains("1..=32"), "{err}");
         }
         assert_eq!(check_max_turns(DEFAULT_MAX_TURNS as i64).unwrap(), DEFAULT_MAX_TURNS);
+    }
+
+    /// 055 B5: 超时值 — 缺省回填、非法报错给解法、配置优先于默认。
+    #[test]
+    fn test_timeout_secs_defaults_and_bounds() {
+        // 不配 → 默认 300 秒(不是"永不超时")。
+        let r = resolve(&cfg("deepseek", ""), None, None).unwrap();
+        assert_eq!(r.timeout_secs, DEFAULT_TIMEOUT_SECS);
+
+        // 配了就用配的(本机 ollama 慢, 这是它的口子)。
+        let mut c = cfg("deepseek", "deepseek-flash");
+        c.timeout_secs = Some(900);
+        assert_eq!(resolve(&c, None, None).unwrap().timeout_secs, 900);
+
+        // 越界 → 报错且给出取值范围与"删掉就用默认"的解法。
+        for bad in [0i64, 9, 3601, -1] {
+            let err = check_timeout_secs(bad).unwrap_err().to_string();
+            assert!(err.contains("timeout_secs"), "{err}");
+            assert!(err.contains(&format!("{MIN_TIMEOUT_SECS}..={MAX_TIMEOUT_SECS}")), "{err}");
+        }
+        assert_eq!(check_timeout_secs(600).unwrap(), 600);
+        // 直接塞进 AiConfig 的越界值也不静默兜底。
+        let mut c2 = cfg("deepseek", "deepseek-flash");
+        c2.timeout_secs = Some(1);
+        assert!(resolve(&c2, None, None).unwrap_err().to_string().contains("timeout_secs"));
     }
 
     #[test]

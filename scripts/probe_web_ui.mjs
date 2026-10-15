@@ -664,6 +664,154 @@ async function main() {
   await ev("window.Ricow.applyLang('zh')");
   await sleep(300);
 
+  // ---- ⑩ 054: AI 生成弹窗的结构化输入 / 验证窗口 / P4 验证卡 / T37 摘要落点 ----
+  //
+  // 这一轮新增的能力有一半是**行为**(档位下拉的选项来自后端、形态 B 的联动、摘要真的显示在
+  // 详情页)。静态门只能证明那段字符串被服务出去了, 证明不了 DOM 真的长出来了 —— 所以走真机。
+  await ev('location.hash = "#strategies"');
+  await sleep(700);
+  const genOpened = await ev(
+    "(() => { const b = document.getElementById('sg-ai-new');" +
+      " if (!b) return 'no-btn'; b.click(); return 'ok'; })()"
+  );
+  check("054 列表页「AI 生成」入口可点", genOpened === "ok", String(genOpened));
+  await sleep(900);
+  // 常驻风险提示条(P3-1): 不做勾选确认框, 但那几句话必须在场。
+  const riskNotice = await ev(
+    "(() => { const n = document.querySelector('.sg-modal-card .sg-risk-notice');" +
+      " return n ? n.textContent : null; })()"
+  );
+  check(
+    "054 生成弹窗有常驻风险提示条(不是空壳)",
+    typeof riskNotice === "string" && riskNotice.length > 20,
+    String(riskNotice).slice(0, 120)
+  );
+  // 档位下拉: 选项必须与后端 `/api/strategies/risk-profiles` **逐项一致**(前端不许手抄)。
+  const tierOpts = await ev(
+    "(() => { const s = document.getElementById('sg-gen-tier');" +
+      " return s ? Array.from(s.options).map(function (o) { return o.value; }) : null; })()"
+  );
+  const tierApi = await ev(
+    "window.Ricow.api('/api/strategies/risk-profiles').then(function (r) {" +
+      " return (r.tiers || []).map(function (t) { return t.key; }); })"
+  );
+  check(
+    "054 档位下拉的选项**就是**后端那几档(前端未手抄)",
+    JSON.stringify(tierOpts) === JSON.stringify(tierApi),
+    "dom=" + JSON.stringify(tierOpts) + " api=" + JSON.stringify(tierApi)
+  );
+  // 选中某档后, 含义文案要带上后端下发的**数字**(否则"稳一点"还是一句空话)。
+  const tierMeaning = await ev(
+    "(() => { const s = document.getElementById('sg-gen-tier');" +
+      " s.value = 'conservative'; s.dispatchEvent(new Event('change', { bubbles: true }));" +
+      " const h = document.querySelector('.sg-modal-card .sg-field-hint');" +
+      " const rows = Array.from(document.querySelectorAll('.sg-modal-card .sg-field-hint'));" +
+      " return rows.map(function (n) { return n.textContent; }).join(' | '); })()"
+  );
+  const consDoc = await ev(
+    "window.Ricow.api('/api/strategies/risk-profiles').then(function (r) {" +
+      " var t = (r.tiers || []).filter(function (x) { return x.key === 'conservative'; })[0];" +
+      " return t ? t.meaning_zh : null; })"
+  );
+  check(
+    "054 选档后显示后端给的「这档意味着什么」(含具体数字)",
+    typeof consDoc === "string" && typeof tierMeaning === "string" &&
+      tierMeaning.indexOf(consDoc) >= 0 && /[0-9]/.test(consDoc),
+    "meaning=" + String(consDoc).slice(0, 120)
+  );
+  const customShown = await ev(
+    "(() => { const s = document.getElementById('sg-gen-tier');" +
+      " s.value = 'custom'; s.dispatchEvent(new Event('change', { bubbles: true }));" +
+      " const r = document.getElementById('sg-gen-custom-row');" +
+      " return r ? !r.hidden : null; })()"
+  );
+  check("054 选「自定义」档后手填字段出现", customShown === true, String(customShown));
+  // P1: 验证窗口默认 90 天 —— 与回测卡/AI 评估同一默认, 数字才可比。
+  const vDays = await ev(
+    "(() => { const s = document.getElementById('sg-gen-verify-days'); return s ? s.value : null; })()"
+  );
+  check("054 验证窗口默认 90 天(与其余回测入口同默认)", vDays === "90", String(vDays));
+  await ev(
+    "(() => { const b = document.querySelector('.sg-modal-card .sg-modal-actions button');" +
+      " if (b) b.click(); return 'ok'; })()"
+  );
+  await sleep(400);
+
+  // P4 验证卡: 形态选择只在 walk 下出现, 形态 B 的提示只在 B 下出现(模式相关文案不能漏改)。
+  await ev("location.hash = '#strategies/' + " + JSON.stringify(copyName));
+  await sleep(1500);
+  const valBoxExists = await ev("!!document.getElementById('sg-val-box')");
+  check("054 P4 详情页有验证卡(sg-val-box)", valBoxExists === true, String(valBoxExists));
+  const formHiddenAtSplit = await ev(
+    "(() => { const m = document.getElementById('sg-val-mode');" +
+      " m.value = 'split'; m.dispatchEvent(new Event('change', { bubbles: true }));" +
+      " const l = document.getElementById('sg-val-form-label'); return l ? l.hidden : null; })()"
+  );
+  check("054 P4 mode=split 时不显示形态选择", formHiddenAtSplit === true, String(formHiddenAtSplit));
+  const formShownAtWalk = await ev(
+    "(() => { const m = document.getElementById('sg-val-mode');" +
+      " m.value = 'walk'; m.dispatchEvent(new Event('change', { bubbles: true }));" +
+      " const l = document.getElementById('sg-val-form-label'); return l ? l.hidden : null; })()"
+  );
+  check("054 P4 mode=walk 时形态选择出现", formShownAtWalk === false, String(formShownAtWalk));
+  const bHint = await ev(
+    "(() => { const f = document.getElementById('sg-val-form');" +
+      " f.value = 'B'; f.dispatchEvent(new Event('change', { bubbles: true }));" +
+      " const h = document.getElementById('sg-val-formb-hint');" +
+      " return h ? (h.hidden ? 'hidden' : h.textContent) : null; })()"
+  );
+  check(
+    "054 P4 选形态 B 时给出「每段前重新寻优」的说明(不让人以为参数是固定的)",
+    typeof bHint === "string" && bHint !== "hidden" && bHint.length > 10,
+    String(bHint).slice(0, 120)
+  );
+  // 回测卡的「不代表未来」免责(T25)只在**跑过回测**后随成本块渲染, 此处不重复断言
+  // (真机走查不该为一条静态文案去跑一次几十秒的回测); 由 e2e L5 盯住它真的被引用。
+
+  // T37 落点: 给一个 origin=ai 的策略写进摘要, 详情页要显示「这份策略在做什么」+ AI 徽章。
+  const aiName = await ev("'zzaigen' + String(Date.now() % 100000000)");
+  const aiSaved = await ev(
+    "window.Ricow.api('/api/strategies', { method: 'POST', body: {" +
+      " name: '" + aiName + "'," +
+      " market: 'spot', pair: 'ETHUSDT'," +
+      " code: 'function on_init(ctx) end\\nfunction on_tick(ctx) end\\n'," +
+      " params: {}, overwrite: false, origin: 'ai', initial_cash: 10000 } })" +
+      ".then(function () { return 'ok'; }).catch(function (e) { return 'ERR ' + e.message; })"
+  );
+  check("054 建一个 origin=ai 的探针策略", aiSaved === "ok", JSON.stringify(aiSaved).slice(0, 240));
+  // 写入清单摘要 —— 这一步在真实链路里由服务端(AI 生成时)给出、前端随保存转发; 这里手工喂
+  // 同一个端点, 验的是**详情页真的把它显示出来了**(T37 的落点: "这份策略在做什么")。
+  const aiMf = await ev(
+    "window.Ricow.api('/api/strategies/' + " + JSON.stringify(aiName) + " + '/manifest', { method: 'POST', body: {" +
+      " name: '', summary: '按固定间距高抛低吸的网格', params: [] } })" +
+      ".then(function () { return 'ok'; }).catch(function (e) { return 'ERR ' + e.message; })"
+  );
+  check("054 T37 摘要写进清单", aiMf === "ok", JSON.stringify(aiMf).slice(0, 240));
+  await ev("location.hash = '#strategies/' + " + JSON.stringify(aiName));
+  await sleep(1600);
+  const fitText = await ev(
+    "(() => { const b = document.getElementById('sg-fit-body'); return b ? b.textContent : null; })()"
+  );
+  check(
+    "054 T37 详情页显示「这份策略在做什么」(摘要真的渲染出来)",
+    typeof fitText === "string" && fitText.indexOf("按固定间距高抛低吸的网格") >= 0,
+    String(fitText).slice(0, 160)
+  );
+  const aiBadge = await ev(
+    "(() => { const b = document.querySelector('.sg-badge-ai');" +
+      " return b ? b.textContent : null; })()"
+  );
+  check(
+    "054 D8 详情页给 AI 生成的策略打「AI 生成」徽章",
+    typeof aiBadge === "string" && aiBadge.length > 0,
+    String(aiBadge)
+  );
+  // 收尾: 删掉探针策略(不把测试残留留给下一轮)。
+  await ev(
+    "window.Ricow.api('/api/strategies/' + " + JSON.stringify(aiName) + ", { method: 'DELETE' })" +
+      ".then(function () { return 'ok'; }).catch(function () { return 'err'; })"
+  );
+
   checkNoErrors("052 模式 chip / 引导卡 / 识别参数 / 复制带清单");
 
   // ---- ⑩ 全局收口: 全程零未捕获异常 ----

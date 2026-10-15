@@ -28,6 +28,8 @@ mod terms;
 #[cfg(test)]
 mod test_support;
 mod trades;
+/// 054 P4: 样本外检验 / 分段验证 / 滚动验证(**异步作业**, 复用回测队列)。
+mod validate;
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -302,6 +304,9 @@ pub fn router(state: WebState) -> Router {
             "/api/strategies/ai-generate",
             axum::routing::post(strategy_io::ai_generate_strategy),
         )
+        // 风险档位表(054 P2): 纯常量派生, 前端「这档意味着什么」的数字与文案都从这里取,
+        // 禁止在 JS 里手抄一份(两处会分叉)。
+        .route("/api/strategies/risk-profiles", get(strategy_io::list_risk_profiles))
         // 从 Lua 源码静态提取参数骨架(052 方案 2): **无状态**(只吃请求里的代码), 不读盘、
         // 不落盘、不碰 AI —— 供未声明清单的策略一键列出"它读了哪些参数"。
         // 静态段必须先于 `/api/strategies/{id}` 之外的同层动态段声明; matchit 会给静态段更高优先级。
@@ -314,6 +319,9 @@ pub fn router(state: WebState) -> Router {
         .route("/api/backtest/sweep", axum::routing::post(backtest_jobs::start_sweep))
         // 多维参数寻优 (C8): 多参数笛卡尔积, 复用 CLI `ricow optimize` 的展开与护栏, 运行中报进度。
         .route("/api/backtest/optimize", axum::routing::post(backtest_jobs::start_optimize))
+        // 054 P4: 样本外检验(mode=split) / 分段·滚动验证(mode=walk, form=A|B)。
+        // 同样走 202 + job_id: 一次验证 = N 段回测(形态 B 每段还要先寻优), 不能挂在 HTTP 上。
+        .route("/api/backtest/validate", axum::routing::post(validate::start_validate))
         .route("/api/backtest", axum::routing::post(backtest_jobs::start_backtest))
         .route("/api/backtest/{job_id}", get(backtest_jobs::get_backtest))
         // 交易面板数据(026 FR-010 / FR-012): 全部**只读**, 数据来自与引擎同一份本地库(D1)。

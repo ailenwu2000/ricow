@@ -112,6 +112,9 @@ pub struct AiSection {
     pub api_key: Option<String>,
     /// 显式确认白名单外的自建/中转 AI 端点 (审计 H-7); 缺省 = 拒绝非白名单主机。
     pub allow_custom_base_url: Option<bool>,
+    /// 055 B5: 单次 AI 请求总超时(秒); 缺省 = [`crate::ai::config::DEFAULT_TIMEOUT_SECS`]。
+    /// 本机小模型(ollama)常比云端慢, 这是它的口子。
+    pub timeout_secs: Option<i64>,
 }
 
 impl Default for AiSection {
@@ -123,6 +126,7 @@ impl Default for AiSection {
             max_turns: None,
             api_key: None,
             allow_custom_base_url: None,
+            timeout_secs: None,
         }
     }
 }
@@ -275,6 +279,7 @@ pub fn template_text() -> String {
          max_turns = {ai_max_turns}\n\
          # base_url = \"https://api.deepseek.com/v1\"   # 仅自定义/自建端点才需要\n\
          # allow_custom_base_url = true               # 白名单外厂商主机才需要: 显式确认后放行\n\
+         # timeout_secs = 300                         # 单次请求最多等多久(默认 300 秒); 本机小模型可放宽\n\
          \n\
          # ── ② 交易所凭据(用哪个环境就填哪个) ────────────────────────────\n\
          #   演示(测试网): demo.binance.com 登录 → API 管理 → 创建 Key(建议只开交易, 不开提现)\n\

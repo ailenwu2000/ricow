@@ -358,7 +358,23 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-10-12, 053 改参数未保存提示 + 改动前后对比后实跑)**: `cargo test --workspace --no-fail-fast` = **1001 passed / 0 failed / 22 ignored**(全目标零失败)。
+- **基线(2026-10-15, 054 AI 策略生成流程审计整改后实跑)**: `cargo test --workspace --no-fail-fast` = **1040 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+39**, 与本轮同源: `ricow` bin **500 → 538**(P1 生成即验证 / P2 结构化输入与风险档位表 / P3 样本外与 walk-forward / P4 `optimize` 接通 / P5 lint 第六类 + 手动改参可评估 + T37 摘要与参数中文名 + `read_doc` 分片 + 帮助层「平台不代做风控」); 其余 target 一字未变
+  (`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 282 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。
+  同口径真机: 官方冒烟 `e2e_web.py`(干净 root + `show_all_pairs=true`) **458 PASS / 0 FAIL**(较 053 的 388 **+70**, 054 新增 L 段 50 条: 风险档位表 / 生成端点校验 / `mode=random` 被拒 / `origin=ai` 落盘与徽章 / 前端接线); CDP 真机走查 `scripts/probe_web_ui.mjs` **100 PASS / 0 FAIL**(较 86 **+14**; 054 段为**行为级**断言: 真点开 AI 生成弹窗、断言档位下拉选项**等于**后端 `/api/strategies/risk-profiles` 的键、档位含义文案含数字、自定义档行真的出现, 再建一个 `origin=ai` 探针策略并写摘要, 断言详情页真的渲染出「这份策略在做什么」与「AI 生成」徽章)。
+  本轮是**审计整改**: 对「AI 生成的策略能不能给一个普通投资者拿去配量化」做多角度审核, 落下 15 条缺陷、分四轮 42 项任务。
+  四条主干: ① **P1 生成即验证** —— Web 单发生成此前**完全不回测**(与对话路径割裂, 审计 #1), 现在用同一份**未落盘**的代码
+  跑一次真实 K 线回测, 结果随产物回前端。② **P2 结构化投资输入** —— 「我想稳一点」此前原样进提示词、对模型无约束力(审计 #2);
+  现在本金 + 风险档位**必填**, 档位表(`web/strategy_io/risk_profile.rs` 单点定义)把档位落成数字, 本金写进 `[backtest].initial_cash`。**真跑对照**(同一句话 + 同一笔 10000 U, 只换档位): 间距下限 **0.8%(保守) vs 0.4%(激进)** / 单笔 **8% vs 45%** / 回撤目标 **10% vs 35%** / 加仓层数 **4 vs 8**, 且两份代码不逐字相同 —— 档位不只进了提示词, 真落进了代码。
+  ③ **P3 样本外与 walk-forward** —— 按**时间顺序**前 70% / 后 30% 切分(`mode=random` 在校验层直接拒: 会制造前视偏差,
+  违反 `backtest.md §一`), 并给逐段推进的 walk-forward。④ **P5 收尾** —— lint 第六类(**只警告不拦截**)、影响评估改用
+  `paramDiffs()` 判据(手动改参也能评估)、生成时一并产出 `summary` 与参数中文名、`read_doc` 分片、帮助层「平台不代做风控」。
+  **真跑发现并修掉的两处**: ① 验证回测此前 `cash: None`, 一律按默认 10 万跑, 而提示词说的是用户填的本金
+  (填 1 万却看到 10 万的成交与盈亏) —— 已改成按用户本金跑, 并抽 `verify_spec` 纯函数加单测钉住。② `strategies.js` 的
+  `skipBox` TDZ: `const` 初始化前被引用, AI 生成弹窗一打开就 `ReferenceError` —— 四道静态门全绿, 只有 CDP 抓得到。
+**055 复审的另外四条(B3–B6)也已全部落地**: ① **B3 档位目标事后核对** —— 档位此前只对模型有约束力, 生成完界面只把实测回撤显示成一个红数字, 从不说「你选的是 10%, 实测 25%, 未达到」; 现在紧贴指标卡给出目标/实测/判语(只核最大回撤 —— 其余档位项在回测指标里没有对应数字, 凑就是编造; 拿不到实测值就不摆核对框)。② **B4 lint 整份级警告独立配额** —— 8 条上限原本同时管逐行与整份级, 十行 config_f64(...) or ... 就能把「这份脚本会下单但没有任何止损线索」挤掉; 现在上限只管逐行, 整份级先算先放、排第一。③ **B5 AI 请求总超时** —— reqwest 默认不设超时, 上游一挂起页面就一直转圈(真跑实测 900s/1500s 无响应); 现在每次调用外套 300 秒总超时(可配 [ai].timeout_secs), 且超时**不重试**(一次就 300 秒, 重试三遍没人等得起)。④ **B6 两条生成路径口径对齐** —— 对话路径的 preview_strategy 此前**没有本金入参**, 助手问到了也没处传, 回测一律按默认 10 万跑; 现在新增 initial_cash(落到 params.cash, 与 CLI --param cash= 同一条链路), 没传时回包如实写明「这是默认本金, 不是你的资金规模」。
+  见 `specs/changes/054-ai-strategy-flow/`。
+- **前基线(2026-10-12, 053 改参数未保存提示 + 改动前后对比后实跑)**: `cargo test --workspace --no-fail-fast` = **1001 passed / 0 failed / 22 ignored**(全目标零失败)。
   增量 = **+1**, 与本轮同源: `ricow` bin **499 → 500**(`ai::provider::tests::test_assess_preamble_states_benchmark_and_ratio_caveats` ——
   锁住评估提示词里「基准从首次成交起算」「成交极少时比率指标失真」两条口径); 其余 target 一字未变
   (`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 282 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。

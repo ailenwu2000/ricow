@@ -113,6 +113,9 @@
     }
     // 行内「原 X → 改为 Y」与顶部改动清单同源, 一次算完一起刷。
     renderParamDiff();
+    // 054 T36: 手动改参也要能评估影响 —— 改动集合一变就重刷评估面板(面板自己带签名,
+    // 集合没变不会重建, 所以打字不会把上一次的结论清掉)。
+    syncAssessPanel();
   }
 
   function onCodeKeydown(ev) {
@@ -449,19 +452,29 @@
   // 前两步复用 `/api/backtest` 的既有作业(带 busy / 进度 / 结果保留那一整套), 这里只负责
   // 串起来 + 如实展示进度与失败原因。真正跑回测的代码在 strategy_backtest.js。
 
-  /// 当前模式是否该显示评估面板: 参数模式 + 本页已经有改动。
+  /// 当前模式是否该显示评估面板: 参数模式 + **当前表单里真的有改动**。
+  ///
+  /// 054 T36: 判据从"AI 回包的 `changed`" 换成 `paramDiffs()` —— 只看 AI 回包时, 用户**自己**
+  /// 手动改的参数永远没有入口可评估(而手动改恰恰是最需要看影响的那一类: AI 至少还给了一段
+  /// 说明, 手改的人是凭感觉调的)。`paramDiffs()` 与基线比字符串, AI 改的同样算在内。
+  ///
   /// **没有改动就不显示** —— 摆一个点了只会 400 的按钮, 比不摆还糟。
+  ///
+  /// 改动集合**没变就不重建**: 面板每重建一次就清空一次结果, 而 `updateDirty` 是每次按键
+  /// 都会跑的 —— 不判签名的话, 打字打到一半结论就被自己清掉了。
   function syncAssessPanel() {
     const box = $("sg-ai-assess");
     if (!box) return;
-    const turns = st.aiThreads.params;
-    const last = turns.length ? turns[turns.length - 1] : null;
-    const changed = last && last.changed ? last.changed : [];
-    if (st.aiMode !== "params" || !changed.length || !st.detailCtx) {
+    const diffs = paramDiffs();
+    const sig = diffs.map((d) => d.key + "=" + d.after).join("|");
+    if (st.aiMode !== "params" || !diffs.length || !st.detailCtx) {
       box.hidden = true;
       box.innerHTML = "";
+      delete box.dataset.sig;
       return;
     }
+    if (box.dataset.sig === sig && !box.hidden) return;
+    box.dataset.sig = sig;
     box.hidden = false;
     box.innerHTML = "";
     box.appendChild(h("div", "sg-guide-title", t("sgAiAssessTitle")));
@@ -506,9 +519,9 @@
     // 改前 = **上次保存的参数**(进详情页时读到的实例值): AI 改动是草稿, 还没落盘,
     // 所以这一份就是"当前在跑的那组"。改后 = 表单里现在这些(用户可能还手动调过)。
     const baseParams = Object.assign({}, (st.detailCtx.detail && st.detailCtx.detail.current) || {});
-    const turns = st.aiThreads.params;
-    const last = turns.length ? turns[turns.length - 1] : null;
-    const changed = last && last.changed ? last.changed : [];
+    // 054 T36: 改动清单直接取 `paramDiffs()`(AI 改的 + 手动改的都在里头), 不再只认 AI 回包。
+    // 两者形状一致 `[{key,name,before,after}]`, 后端 ai-assess 只用它做"改了哪几项"的说明。
+    const changed = paramDiffs();
     const btn = $("sg-ai-assess-go");
     if (btn) btn.disabled = true;
     setMsg(msg, t("sgAiAssessRunningBase"), "");

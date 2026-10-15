@@ -125,6 +125,13 @@
   // 常见问题: 只写"该往哪看/为什么这样设计", 不写会过期的数字与清单。
   const FAQ = {
     zh: [
+      // 054 T39: 「平台不代做风控」的**用户可读版本**。
+      // 给模型看的是 `ai::prompt::TRAPS_GUIDE`(那条是命令式核对清单, 语气是"逐条核对"),
+      // 这里要说人话: 用户真正想知道的是"那谁来止损"以及"我该怎么确认"。
+      {
+        q: "平台会替我止损、替我控风险吗?",
+        a: "不会。ricow 不代做盈亏风控: 亏损熔断、峰值回撤止损都要策略自己实现(在策略里读 ctx:net_pnl() / ctx:equity() 自己判断)。平台只留工程护栏 —— 比如下单频率上限, 那是防程序失控, 不是防亏钱。保存策略时如果脚本里看不到任何止损或仓位上限的线索, 会提示一句; 只提示, 拦不拦由你决定。",
+      },
       {
         q: "回测一笔都没成交, 为什么?",
         a: "最常见是必填参数没填(例如香农的「开始价格」)、预热 K 线根数不够, 或开仓条件始终没触发。打开详情页展开「策略日志」, 能看到策略自己报出的原因。",
@@ -147,6 +154,10 @@
       },
     ],
     en: [
+      {
+        q: "Does the platform stop my losses or manage risk for me?",
+        a: "No. ricow does not do profit-and-loss risk control for you: loss circuit-breakers and peak-drawdown stops have to be implemented inside the strategy itself (read ctx:net_pnl() / ctx:equity() and decide there). What the platform keeps are engineering guardrails — e.g. an order-rate cap — which protect against a runaway program, not against losing money. When you save a strategy, if the script shows no trace of a stop-loss or a position cap, you get one hint. It is a hint only; blocking is your call.",
+      },
       {
         q: "My backtest made no trades at all — why?",
         a: "Usually a required parameter is missing (e.g. Shannon's start price), there aren't enough warm-up candles, or the entry condition never triggered. Open the detail page and expand Strategy logs to see the strategy's own reason.",

@@ -571,6 +571,63 @@ fn test_lint_lua_flags_known_pitfalls() {
     assert!(super::lint_lua("o = { order_type = \"limit\" }\n").is_empty());
 }
 
+/// 054 T35: 第 6 类 —— 会下单却毫无风控线索 → 提示; 但**只提示**, 且**不得误伤**。
+#[test]
+fn test_lint_lua_sixth_class_is_a_hint_never_a_block() {
+    // 会下单 + 完全没有止损/仓位上限线索 → 提示(且必须点明"平台不代做风控")。
+    let bare = "ctx:place_order({ pair = p, side = \"buy\", size = 1 })\n";
+    let w = super::lint_lua(bare);
+    assert!(w.iter().any(|m| m.contains("不代做盈亏风控")), "实际: {w:?}");
+
+    // 有止损线索 → 不提示。
+    let with_sl = "local stop_loss = 0.95\nctx:place_order({ pair = p })\n";
+    assert!(
+        super::lint_lua(with_sl).iter().all(|m| !m.contains("不代做盈亏风控")),
+        "有止损线索就不该再提示: {:?}",
+        super::lint_lua(with_sl)
+    );
+    // 只有仓位上限线索也算(不是必须有止损才算有风控)。
+    let with_cap = "if pos > max_position then return end\nctx:place_order({ pair = p })\n";
+    assert!(
+        super::lint_lua(with_cap).iter().all(|m| !m.contains("不代做盈亏风控")),
+        "有仓位上限就不该再提示: {:?}",
+        super::lint_lua(with_cap)
+    );
+    // 纯观察型脚本(不下单)不该被提示 —— 对它谈"止损"是噪音。
+    let watch = "ctx:log(\"price=\" .. ctx:price())\n";
+    assert!(super::lint_lua(watch).is_empty(), "纯观察脚本不该有提示: {watch:?}");
+}
+
+/// 055 B4: 整份级第 6 类**不得被逐行警告挤掉**。
+///
+/// 之前 `lint_lua` 用一个 8 条的总上限同时管逐行与整份级, 而逐行类**每行都能触发**:
+/// 十行 `config_f64(...) or ...` 就把配额吃满, 于是"这份脚本会下单但没有任何止损线索"
+/// —— 对普通投资者最要紧的那句 —— 恰好就是看不见的那句。
+#[test]
+fn test_lint_lua_whole_file_warning_survives_a_flood_of_line_warnings() {
+    // 12 行会触发 ② 类(`config_f64(...) or ...`), 足以把 8 条逐行配额吃满并溢出。
+    let mut src = String::new();
+    for i in 0..12 {
+        src.push_str(&format!("  local v{i} = ctx:config_f64(\"k{i}\") or {i}\n"));
+    }
+    // 再加一行下单、且**没有任何**止损/仓位上限线索。
+    src.push_str("ctx:place_order({ pair = p, side = \"buy\", size = 1 })\n");
+
+    let w = super::lint_lua(&src);
+    assert!(
+        w.iter().any(|m| m.contains("不代做盈亏风控")),
+        "逐行警告刷屏时, 整份级第 6 类必须还在: {w:?}"
+    );
+    // 而且要排在**第一条** —— 它是最该先看到的一句, 塞在末尾等于没说。
+    assert!(
+        w.first().is_some_and(|m| m.contains("不代做盈亏风控")),
+        "整份级结论应排在最前(最要紧的一句): {w:?}"
+    );
+    // 逐行类仍受 8 条上限约束(防刷屏这条纪律本身没变)。
+    let line_warns = w.iter().filter(|m| m.contains("行:")).count();
+    assert!(line_warns <= super::LINE_WARN_CAP, "逐行类仍须 ≤ 8 条, 实际 {line_warns}: {w:?}");
+}
+
 /// AI 从零生成(P0-3)的同步校验: 校验全部发生在任何 AI 调用之前(全程离线)。
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
@@ -627,9 +684,10 @@ async fn test_ai_generate_validation_offline() {
 
     // ⑦ 合法意图 + 空配置(临时 root, 无 api_key, 默认远程端点)→ 403 need_keys,
     //    发生在网络请求之前; 且不回显 idea 原文。
+    //    054 P2 起「合法意图」必须带上本金与风险档位(两者缺一即 400)—— 这是审计 #2 的落点。
     let idea = "UNIQUE-IDEA-双均线金叉做多";
     let body = format!(
-        r#"{{"name":"gen-x","market":"spot","pair":"ETHUSDT","interval":"1h","idea":"{idea}"}}"#
+        r#"{{"name":"gen-x","market":"spot","pair":"ETHUSDT","interval":"1h","idea":"{idea}","initial_cash":10000,"risk_tolerance":"balanced"}}"#
     );
     let res = post(body).await;
     assert_eq!(status_of(&res), 403, "缺密钥应 403: {res}");
@@ -646,6 +704,218 @@ async fn test_ai_generate_validation_offline() {
         }
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 054 P1: `verify_days` 越界必须在 **AI 调用之前**就 400 —— 否则用户白白等一轮生成,
+/// 才被告知窗口不合法(而且没配密钥时会先撞 403, 掩盖真正的问题)。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_ai_generate_verify_days_bounds_offline() {
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let saved = ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"]
+        .map(std::env::var)
+        .map(|r| r.ok());
+    for k in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"] {
+        std::env::remove_var(k);
+    }
+
+    let root = tmp_root("aigen-vdays");
+    let port = boot(root.clone()).await;
+    let post = |json: String| async move {
+        raw(port, "POST", "/api/strategies/ai-generate?token=tok-ok", Some(&json)).await
+    };
+    // 054 P2 起本金与风险档位是必填 → 窗口用例也得带上, 否则卡在结构化输入那一步。
+    let base = |days: &str| {
+        format!(
+            r#"{{"name":"gen-v","market":"spot","pair":"ETHUSDT","idea":"双均线","initial_cash":10000,"risk_tolerance":"balanced","verify_days":{days}}}"#
+        )
+    };
+
+    // ① 0 天 / 超上界 → 400, 且原因是 verify_days(不是 403 need_keys)。
+    for bad in ["0", "3651", "100000"] {
+        let res = post(base(bad)).await;
+        assert_eq!(status_of(&res), 400, "verify_days={bad} 应 400: {res}");
+        let b = body_of(&res);
+        assert!(b.contains("verify_days"), "400 要点名 verify_days: {b}");
+        assert!(!b.contains("need_keys"), "窗口校验必须先于 AI 调用: {b}");
+    }
+
+    // ② 边界内(含 1 与 3650)不该因窗口被拒 —— 这里没配密钥, 应当走到 403(说明校验放行了)。
+    for ok_days in ["1", "90", "3650"] {
+        let res = post(base(ok_days)).await;
+        assert_eq!(status_of(&res), 403, "verify_days={ok_days} 应通过校验: {res}");
+    }
+
+    // ③ 显式 verify=false 时窗口仍要合法(跳过验证 ≠ 可以传垃圾 ——
+    //    否则"这个数到底有没有生效"会变成悬案)。
+    let res = post(
+        r#"{"name":"gen-v","market":"spot","pair":"ETHUSDT","idea":"双均线","initial_cash":10000,"risk_tolerance":"balanced","verify":false,"verify_days":99999}"#
+            .to_string(),
+    )
+    .await;
+    assert_eq!(status_of(&res), 400, "verify=false 也要校验显式给出的窗口: {res}");
+    assert!(body_of(&res).contains("verify_days"), "{res}");
+
+    for (k, v) in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].iter().zip(saved) {
+        if let Some(val) = v {
+            std::env::set_var(k, val);
+        } else {
+            std::env::remove_var(k);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 054 P2: 结构化投资输入的**纯函数**校验(T17)。
+///
+/// 这里断言的是"哪些输入必须被拒": 缺本金 / 档位不合法 / 非自定义档夹带自定义数字 /
+/// 自定义档缺字段 / 现货带杠杆 / 百分数越界 / 杠杆越界。
+/// 一句话概括取舍: **凡是会让人以为"我填的数生效了"的组合, 一律 400 而不是静默忽略**。
+#[test]
+fn test_resolve_risk_input_rejects_ambiguous_combinations() {
+    let r =
+        |market: &str,
+         cash: Option<f64>,
+         tier: Option<&str>,
+         dd: Option<f64>,
+         pos: Option<f64>,
+         lev: Option<f64>,
+         sp: Option<f64>| { resolve_risk_input(market, cash, tier, dd, pos, lev, sp) };
+    // ① 本金必填且必须 > 0。
+    for bad in [None, Some(0.0), Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+        let e = r("spot", bad, Some("balanced"), None, None, None, None).unwrap_err();
+        assert!(e.contains("initial_cash"), "本金非法({bad:?})应点名 initial_cash: {e}");
+    }
+    // ② 档位必填且必须认得。
+    let e = r("spot", Some(1000.0), None, None, None, None, None).unwrap_err();
+    assert!(e.contains("risk_tolerance"), "{e}");
+    let e = r("spot", Some(1000.0), Some("随便"), None, None, None, None).unwrap_err();
+    assert!(e.contains("risk_tolerance") && e.contains("随便"), "{e}");
+    // ③ 非自定义档夹带自定义数字 → 拒(否则"我填了 5% 却没生效")。
+    let e = r("spot", Some(1000.0), Some("balanced"), Some(5.0), None, None, None).unwrap_err();
+    assert!(e.contains("custom"), "非自定义档带自定义字段应被拒: {e}");
+    // ④ 自定义档缺字段 → 拒; 现货不该要杠杆, 合约才要。
+    let e = r("spot", Some(1000.0), Some("custom"), None, None, None, None).unwrap_err();
+    assert!(e.contains("max_drawdown_pct"), "{e}");
+    let e = r("spot", Some(1000.0), Some("custom"), Some(10.0), None, None, None).unwrap_err();
+    assert!(e.contains("max_position_pct"), "{e}");
+    let e =
+        r("futures", Some(1000.0), Some("custom"), Some(10.0), Some(10.0), None, None).unwrap_err();
+    assert!(e.contains("leverage_cap"), "合约自定义档必须给杠杆上限: {e}");
+    // ⑤ 现货 + 杠杆 → 400(现货没有杠杆这回事, 收下就是虚假承诺)。
+    let e = r("spot", Some(1000.0), Some("custom"), Some(10.0), Some(10.0), Some(3.0), None)
+        .unwrap_err();
+    assert!(e.contains("杠杆") || e.contains("leverage"), "现货带杠杆应被拒: {e}");
+    // ⑥ 百分数与杠杆的范围。
+    for bad in [0.0, -1.0, 100.5] {
+        let e =
+            r("spot", Some(1000.0), Some("custom"), Some(bad), Some(10.0), None, None).unwrap_err();
+        assert!(e.contains("max_drawdown_pct"), "{bad} 应越界: {e}");
+    }
+    for bad in [0.5, 10.5] {
+        let e = r("futures", Some(1000.0), Some("custom"), Some(10.0), Some(10.0), Some(bad), None)
+            .unwrap_err();
+        assert!(e.contains("leverage_cap"), "杠杆 {bad} 应越界: {e}");
+    }
+    // ⑦ 合法组合能过: 现货自定义档不给间距也行(间距只对网格类有意义)。
+    let (p, cash) =
+        r("spot", Some(1000.0), Some("custom"), Some(10.0), Some(10.0), None, None).unwrap();
+    assert_eq!(cash, 1000.0);
+    assert_eq!(p.tier.label_zh(), "自定义");
+    // 预设档不该被用户的额外字段影响 —— 它本来就会被拒, 这里是正向确认档位数字来自表。
+    let (p, _) = r("futures", Some(1000.0), Some("aggressive"), None, None, None, None).unwrap();
+    assert_eq!(p.leverage_cap, Some(5.0));
+    assert_eq!(p.max_position_pct, Some(50.0));
+    // 现货下预设档的杠杆不生效(渲染时会改成"现货不使用杠杆")。
+    let (p, _) = r("spot", Some(1000.0), Some("aggressive"), None, None, None, None).unwrap();
+    assert_eq!(p.leverage_cap, Some(5.0), "档位表本身带值, 由渲染层按市场决定用不用");
+}
+
+/// 054 P2/T19: 结构化输入的校验必须发生在 **AI 调用之前**(没配密钥时应看到 400, 不是 403)。
+///
+/// 判据: 没配密钥时任何请求都会走到 403 need_keys —— 所以"应 400"的用例若回了 403,
+/// 就说明校验被放到 AI 调用之后了, 用户会白等几十秒才被告知输入不合法。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_ai_generate_risk_input_validation_offline() {
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let saved = ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"]
+        .map(std::env::var)
+        .map(|r| r.ok());
+    for k in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"] {
+        std::env::remove_var(k);
+    }
+
+    let root = tmp_root("aigen-risk");
+    let port = boot(root.clone()).await;
+    let post = |json: String| async move {
+        raw(port, "POST", "/api/strategies/ai-generate?token=tok-ok", Some(&json)).await
+    };
+    let base = r#"{"name":"gen-r","market":"spot","pair":"ETHUSDT","idea":"双均线"}"#;
+
+    // 缺本金 / 缺档位 → 400(而不是 403)。
+    for (label, body) in [
+        ("缺本金", base.to_string()),
+        (
+            "缺档位",
+            r#"{"name":"gen-r","market":"spot","pair":"ETHUSDT","idea":"x","initial_cash":1000}"#
+                .to_string(),
+        ),
+        (
+            "档位非法",
+            r#"{"name":"gen-r","market":"spot","pair":"ETHUSDT","idea":"x","initial_cash":1000,"risk_tolerance":"随便"}"#
+                .to_string(),
+        ),
+        (
+            "非自定义档夹带数字",
+            r#"{"name":"gen-r","market":"spot","pair":"ETHUSDT","idea":"x","initial_cash":1000,"risk_tolerance":"balanced","max_drawdown_pct":5}"#
+                .to_string(),
+        ),
+    ] {
+        let res = post(body).await;
+        assert_eq!(status_of(&res), 400, "{label} 应 400: {res}");
+    }
+
+    // 合法输入 → 通过校验(没配密钥, 于是撞在 403 need_keys 上)。
+    let res = post(
+        r#"{"name":"gen-r","market":"spot","pair":"ETHUSDT","idea":"x","initial_cash":1000,"risk_tolerance":"conservative"}"#
+            .to_string(),
+    )
+    .await;
+    assert_eq!(status_of(&res), 403, "合法输入应通过校验(403 是没配密钥): {res}");
+    assert!(body_of(&res).contains("need_keys"), "{res}");
+
+    for (k, v) in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].iter().zip(saved) {
+        if let Some(val) = v {
+            std::env::set_var(k, val);
+        } else {
+            std::env::remove_var(k);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 054 D7: 来源标记的写入与判定(**幂等**, 且安全默认 = 用户策略)。
+#[test]
+fn test_origin_marker_is_idempotent_and_defaults_to_user() {
+    assert!(!origin_is_ai("# nothing here\n[params]\n"), "没有标记 = 用户策略(安全默认)");
+    assert!(!origin_is_ai(""), "空文件 = 用户策略");
+    // 必须整行匹配: 正文里出现同形字符串不该被误判。
+    assert!(!origin_is_ai("# see # ricow:origin = ai ?\nnote = \"# ricow:origin = ai\""));
+    assert!(origin_is_ai(&format!("{ORIGIN_AI_MARKER}\n[params]\n")));
+
+    let dir = std::env::temp_dir().join(format!("ricow-origin-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("probe.toml");
+    std::fs::write(&path, "[params]\n").unwrap();
+    mark_origin_ai(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with(ORIGIN_AI_MARKER), "标记应在文件顶部: {text}");
+    // 幂等: 再写一次不该出现两行。
+    mark_origin_ai(&path).unwrap();
+    let again = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text, again, "重复标记不应叠加: {again}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 清单构造/校验 (P2-8, 纯函数): id/market 由调用方注入, 参数 schema 逐项校验。
@@ -1255,6 +1525,94 @@ fn test_parse_names_rejects_empty_and_bad_json() {
     assert!(parse_names("我不会起名", &hints).is_err());
 }
 
+// ---- 054 T37: 生成后补摘要 + 参数中文名(纯函数部分) ----
+
+/// T37: 摘要是**一行**: 模型给了两段就只取第一段, 空的就是没有(不拿别的东西顶上)。
+#[test]
+fn test_clamp_summary_takes_one_line_and_caps_length() {
+    assert_eq!(clamp_summary("  "), None, "空摘要就是没有摘要");
+    assert_eq!(clamp_summary("高抛低吸的网格").as_deref(), Some("高抛低吸的网格"));
+    // 换行后面那句是模型的多余解释, 不该进清单。
+    assert_eq!(clamp_summary("网格策略\n\n- 涨了卖\n- 跌了买").as_deref(), Some("网格策略"));
+
+    let long: String = "涨".repeat(200);
+    let got = clamp_summary(&long).unwrap_or_else(|| panic!("超长也该有值"));
+    assert!(got.ends_with('…'), "超长必须截断并留省略号: {got}");
+    assert_eq!(got.chars().count(), SUMMARY_MAX_CHARS + 1, "80 字 + 省略号: {got}");
+}
+
+/// T37: `_summary` 要被读成摘要, 且**不能**顺带变成一行参数。
+///
+/// 这是这次最容易出的错: 命名解析的纪律是"模型多给的键一律丢弃", 而 `_summary` 在 JSON 里
+/// 恰恰长得像一个多给的键 —— 不先摘出来就会静默变成一个假参数。
+#[test]
+fn test_parse_generated_meta_reads_summary_without_leaking_it_as_a_param() {
+    let hints = crate::strategies::params::extract_param_hints(
+        "local a = num(ctx, \"spacing_pct\", 0.01)\n",
+    );
+    let raw = "{\"_summary\": \"按固定间距高抛低吸\", \
+               \"spacing_pct\": {\"name\": \"间距百分比\", \"desc\": \"上下挂单的间距\"}}";
+    let (summary, names) =
+        parse_generated_meta(raw, &hints).unwrap_or_else(|_| panic!("应解析成功"));
+    assert_eq!(summary.as_deref(), Some("按固定间距高抛低吸"));
+    assert_eq!(names.len(), 1, "_summary 不是参数: {names:?}");
+    assert_eq!(names[0].key, "spacing_pct");
+
+    // 模型压根没给 _summary → 摘要 None, 但参数命名照旧生效(两个能力互不牵连)。
+    let (no_summary, names2) =
+        parse_generated_meta("{\"spacing_pct\": {\"name\": \"间距百分比\"}}", &hints)
+            .unwrap_or_else(|_| panic!("应解析成功"));
+    assert!(no_summary.is_none());
+    assert_eq!(names2.len(), 1);
+}
+
+/// T37: 合并成清单参数时, **类型与默认值只认静态提取**(模型说的不算),
+/// 说明则**注释优先于 AI** —— 作者自己写的那句比模型照着代码现编的更可信。
+#[test]
+fn test_merge_manifest_params_keeps_code_facts_and_prefers_comment_desc() {
+    let hints = crate::strategies::params::extract_param_hints(
+        // 注释说明的认读形态是「-- 键 空格 说明」(与内置清单块同形), 键后不能带冒号。
+        "--   spacing_pct     作者自己写的间距说明\n\
+         local a = num(ctx, \"spacing_pct\", 0.01)\n\
+         local b = ctx:config_i64(\"levels\", 5)\n",
+    );
+    assert_eq!(hints.len(), 2, "前置: 两个键, 类型分别是 f64 / i64");
+    let named = vec![
+        NamedParam {
+            key: "spacing_pct".to_string(),
+            name: "间距百分比".to_string(),
+            desc: Some("模型现编的说明".to_string()),
+        },
+        NamedParam { key: "levels".to_string(), name: "档位数".to_string(), desc: None },
+        NamedParam {
+            key: "代码里没有的键".to_string(), name: "不该出现".to_string(), desc: None
+        },
+    ];
+    let got = merge_manifest_params(hints, &named);
+    assert_eq!(got.len(), 2, "只按静态提取出参: {got:?}");
+    // 类型/默认值来自代码: 模型没插手的余地。
+    assert!(matches!(got[0].ty, ParamType::Float));
+    assert!(matches!(got[0].default, Some(ConfigValue::Float(f)) if (f - 0.01).abs() < 1e-9));
+    assert!(matches!(got[1].ty, ParamType::Int));
+    assert!(matches!(got[1].default, Some(ConfigValue::Integer(5))));
+    // 名字来自 AI。
+    assert_eq!(got[0].name, "间距百分比");
+    assert_eq!(got[1].name, "档位数");
+    // 说明: 注释那句赢了 AI 那句; 没有注释也没有 AI 说明时留空(不是编一句)。
+    assert_eq!(got[0].desc, "作者自己写的间距说明");
+    assert_eq!(got[1].desc, "");
+    // 合并结果必须能直接过 `build_manifest` 的校验(键合法、不重复)。
+    let req = ManifestRequest {
+        name: String::new(),
+        summary: "s".to_string(),
+        description: String::new(),
+        suitable: String::new(),
+        unsuitable: String::new(),
+        params: got,
+    };
+    assert!(build_manifest("x", "spot", req).is_ok(), "合并结果应可直接落清单");
+}
+
 // ---- 052 方案 3: AI 调参数(纯函数部分) ----
 
 #[test]
@@ -1668,4 +2026,127 @@ async fn test_ai_edit_params_accepts_history_field() {
             std::env::remove_var(k);
         }
     }
+}
+
+// ── 054 T41: 验证回测必须跑在**用户填的本金**上 ──────────────────────────────────
+//
+// 真跑发现的缺陷: `verify_generated` 此前 `cash: None`, 一律按默认 10 万跑;
+// 而给模型的提示词说的是"用户准备投入 {initial_cash} USDT"(spec §四-2)。
+// 用户填 1 万却看到 10 万的成交与盈亏 —— 仓位拒单、手续费占比、网格能否铺满,
+// 在小资金下完全是另一回事。跑回测要联网(测不了), 所以把"本金真带进去了"
+// 用纯函数 [`super::verify_spec`] 钉住。
+#[test]
+fn test_verify_spec_runs_on_users_own_cash_not_the_default() {
+    use std::path::Path;
+
+    let spec = super::verify_spec(
+        Path::new("/tmp/root"),
+        "zz_v",
+        "-- lua",
+        "ETHUSDT",
+        "spot",
+        30,
+        "1h",
+        10000.0,
+        None, // 现货没有杠杆上限
+    );
+    assert_eq!(spec.cash, Some(10000.0), "验证回测必须用用户填的本金, 不能用默认 10 万: {spec:?}");
+    // 同一份**未落盘**的代码走 raw_code 分支(刻意不落盘再回测)。
+    assert!(spec.raw_code.is_some(), "验证必须跑 raw_code 分支: {spec:?}");
+    assert_eq!(spec.days, 30);
+    assert_eq!(spec.interval, "1h");
+    // 生成弹窗选的周期要压过 Lua 自己的 fallback。
+    assert!(spec.interval_explicit);
+
+    // 小资金也要照实传(500 U 铺不开 12 档网格会如实拒单 —— 这正是用户该知道的)。
+    let small = super::verify_spec(
+        Path::new("/tmp/root"),
+        "zz_v",
+        "-- lua",
+        "ETHUSDT",
+        "spot",
+        30,
+        "1h",
+        500.0,
+        None,
+    );
+    assert_eq!(small.cash, Some(500.0), "小资金同样要用用户填的数: {small:?}");
+}
+
+// ── 055 B2: 验证回测必须跑在**档位的杠杆上限**下 ──────────────────────────────────
+//
+// 与上面本金那条**同一个 bug 的另一半**: `verify_spec` 此前 `max_leverage: None`
+// (→ 引擎默认 10x), 而保存时档位写的是 2/3/5x。于是合约策略**生成时看到的成绩**
+// 与**保存后点回测看到的成绩**不是一回事 —— P1「生成即验证」在合约场景等于白跑。
+#[test]
+fn test_verify_spec_carries_the_tier_leverage_cap() {
+    use std::path::Path;
+
+    let fut = super::verify_spec(
+        Path::new("/tmp/root"),
+        "zz_v",
+        "-- lua",
+        "ETHUSDT",
+        "futures",
+        90,
+        "1h",
+        10000.0,
+        Some(2.0), // 保守档上限
+    );
+    assert_eq!(fut.max_leverage, Some(2.0), "验证回测必须按档位上限跑: {fut:?}");
+    // **实际**杠杆仍是默认 1x —— 与保存后的 TOML 口径一致(那边也只写 max_leverage)。
+    // 若这里也写 2.0, 就等于替用户开了 2 倍杠杆(055 B1)。
+    assert_eq!(fut.leverage, None, "验证回测不该替用户指定实际杠杆: {fut:?}");
+
+    // 激进档 5x 同样照实传 —— 上限是 5x, 不是"就用 5x"。
+    let agg = super::verify_spec(
+        Path::new("/tmp/root"),
+        "zz_v",
+        "-- lua",
+        "ETHUSDT",
+        "futures",
+        90,
+        "1h",
+        10000.0,
+        Some(5.0),
+    );
+    assert_eq!(agg.max_leverage, Some(5.0), "激进档上限要照实带进去: {agg:?}");
+    assert_eq!(agg.leverage, None, "同上: 实际杠杆不代用户决定: {agg:?}");
+
+    // 现货恒为 None —— 现货没有杠杆这件事要说清楚, 不能残留一个数字。
+    let spot = super::verify_spec(
+        Path::new("/tmp/root"),
+        "zz_v",
+        "-- lua",
+        "ETHUSDT",
+        "spot",
+        90,
+        "1h",
+        10000.0,
+        None,
+    );
+    assert_eq!(spot.max_leverage, None, "现货不该带杠杆上限: {spot:?}");
+}
+
+// ── 055 B1: 档位的杠杆**上限**必须落进 `max_leverage`, 不是 `leverage` ──────────────
+//
+// 这是本轮审核发现的最严重一条。`leverage` 是**实际杠杆**, 而 `commands/run.rs` 启动
+// 实盘/demo 时读的正是 `[backtest].leverage`, 会把它**真的设到交易所**上去
+// (`ex.prepare(pair, leverage, ...)`)。写它 = 用户点了个「保守」, 平台替他开 2 倍杠杆。
+#[test]
+fn test_save_request_writes_tier_cap_as_max_leverage_not_as_actual_leverage() {
+    // 前端现在的落盘体(见 strategies.js 保存段): 带 max_leverage, 不带 leverage。
+    let body = serde_json::json!({
+        "name": "zz_lev",
+        "market": "futures",
+        "pair": "ETHUSDT",
+        "code": "function on_tick(ctx) end",
+        "max_leverage": 2.0,
+    });
+    let req: super::SaveRequest = serde_json::from_value(body).expect("请求体应能解析");
+    assert_eq!(req.max_leverage, Some(2.0), "档位上限应落在 max_leverage: {req:?}");
+    assert_eq!(
+        req.leverage, None,
+        "生成路径**不得**传 leverage(实际杠杆): 它会一路走到交易所, 等于替用户开杠杆"
+    );
 }
