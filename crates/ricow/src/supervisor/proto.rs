@@ -32,6 +32,21 @@ pub enum Request {
         #[serde(default)]
         close_all: bool,
     },
+    /// **kill switch**: 停止**当前全部**运行中实例 (057-G4)。
+    ///
+    /// 与 [`Request::Shutdown`] 的区别是**刻意的**: `Shutdown` 停完就退出 daemon 自身
+    /// (收摊路径, 面向"我要关机"); 本请求**只停策略, daemon 继续活着** —— 面向
+    /// "行情/参数出了问题, 我要立刻按住所有正在跑的东西, 但还要继续看状态"。
+    ///
+    /// 实现上逐个走 [`Request::Stop`] 同一内核, 而不是复用 daemon 退出时的 `stop_all`:
+    /// 前者保证每个实例都拿到完整的停机语义(逐字确认已在 CLI 侧做完、清理提示、
+    /// 台账写入、超时如实报告), 后者是内部收摊路径、不对外承诺这些。
+    StopAll {
+        /// 是否同时平掉持仓。**默认 false** —— kill switch 的第一诉求是"停止开新仓",
+        /// 平仓是另一个不可逆动作, 必须由用户显式要。
+        #[serde(default)]
+        close_all: bool,
+    },
     /// 单实例详情 (live 视图 + 台账)
     Info { name: String },
     /// 停止 daemon (先优雅停全部策略)
@@ -195,6 +210,45 @@ mod tests {
         let env3 =
             decode_envelope(r#"{"token":"t","cmd":"stop","name":"g","close_all":true}"#).unwrap();
         assert_eq!(env3.request, Request::Stop { name: "g".into(), close_all: true });
+    }
+
+    /// 057-G4: kill switch 的线上形态 —— `cmd=stop_all`, `close_all` 缺省 false。
+    ///
+    /// **缺省必须是 false**: kill switch 的第一诉求是"停止开新仓", 平仓是独立的不可逆动作。
+    /// 反序列化侧省略该字段时应回false, 而不是 true。
+    #[test]
+    fn stop_all_envelope_roundtrip_and_defaults() {
+        let e1 = decode_envelope(r#"{"token":"t","cmd":"stop_all"}"#).unwrap();
+        assert_eq!(e1.request, Request::StopAll { close_all: false }, "缺省不平仓");
+        let e2 = decode_envelope(r#"{"token":"t","cmd":"stop_all","close_all":true}"#).unwrap();
+        assert_eq!(e2.request, Request::StopAll { close_all: true });
+        // 线上标签是 snake_case
+        let v: serde_json::Value =
+            serde_json::from_str(&encode(&Envelope {
+                token: "t".into(),
+                request: Request::StopAll { close_all: true },
+            }))
+            .unwrap();
+        assert_eq!(v["cmd"], "stop_all");
+        assert_eq!(v["close_all"], true);
+    }
+
+    /// 057-G4: `stop_all` 不得与 `stop` / `shutdown` 混淆 —— 三个 cmd 必须各自独立可解析。
+    /// 分派错一条 = 紧急动作要么没反应, 要么把 daemon 一起关掉(后者极糟)。
+    #[test]
+    fn stop_all_is_distinct_from_stop_and_shutdown() {
+        assert_eq!(
+            decode_envelope(r#"{"token":"t","cmd":"stop","name":"g"}"#).unwrap().request,
+            Request::Stop { name: "g".into(), close_all: false }
+        );
+        assert_eq!(
+            decode_envelope(r#"{"token":"t","cmd":"shutdown"}"#).unwrap().request,
+            Request::Shutdown
+        );
+        assert_eq!(
+            decode_envelope(r#"{"token":"t","cmd":"stop_all"}"#).unwrap().request,
+            Request::StopAll { close_all: false }
+        );
     }
 
     #[test]

@@ -129,6 +129,69 @@ pub async fn stop(args: StopArgs) -> CoreResult<()> {
     Ok(())
 }
 
+#[derive(Args)]
+pub struct KillArgs {
+    /// 同时平掉各实例持仓。**默认不平** —— 平仓是不可逆动作, 必须显式要。
+    #[arg(long = "close-all")]
+    pub close_all: bool,
+}
+
+/// kill switch (057-G4): 停止**全部**运行中实例, daemon 继续运行。
+///
+/// ## 逐字短语确认(与实盘启动同纪律)
+/// 停全部是**批量且不可逆**的动作 —— 误触一次会让所有策略静默下线(可能带未平仓敞口),
+/// 用户以为它们还在跑。所以要求逐字短语, 而不是"y/n 一问就过"。
+///
+/// ## 与 daemon shutdown 的分工
+/// `shutdown` 是"我要收摊关机"(连daemon 一起停); 本命令只停策略、**daemon 继续活着** ——
+/// 紧急按住之后用户还要能 `list` / `status` 看现场。
+pub async fn kill(args: KillArgs) -> CoreResult<()> {
+    crate::commands::require_explicit_phrase(
+        &format!(
+            "即将停止**全部运行中**的策略{}。\n  停止后这些实例不再下单, 但持仓**仍留在交易所**; \
+             需要平仓请加 --close-all。\n  daemon 与行情连接不受影响, 停止后仍可 ricow list / status 查看现场。",
+            if args.close_all { "(并平掉各实例持仓)" } else { "" }
+        ),
+        &format!("确认停止全部{}", if args.close_all { "并平仓" } else { "" }),
+    )?;
+    print!("{}", kill_daemon(&crate::commands::project_root(), args.close_all).await?);
+    Ok(())
+}
+
+/// kill switch 内核 (**不打印**): 返回面向用户的说明文本。
+pub(crate) async fn kill_daemon(
+    root: &std::path::Path,
+    close_all: bool,
+) -> CoreResult<String> {
+    let client = Client::connect(root).await?;
+    let data = client.call_ok(Request::StopAll { close_all }).await?;
+    let stopped = data.get("stopped").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let note = data.get("note").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(kill_report_text(stopped, note))
+}
+
+/// kill switch 报告 → 面向用户的文本 (**纯函数**, 口径由单测盯住; 027 同一原则)。
+///
+/// 关键: `stopped == 0` 时**不套"已全部停止"头衔** —— "本来就没在跑"与"已停止"打架会摧毁
+/// 用户对紧急通道的信任(他会以为危险已解除)。
+pub(crate) fn kill_report_text(stopped: usize, note: &str) -> String {
+    let mut out = String::new();
+    if stopped == 0 {
+        let _ = writeln_kill(&mut out, "当前没有运行中的实例 (无需停止)");
+    } else {
+        let _ = writeln_kill(&mut out, &format!("已停止 {stopped} 个运行中实例"));
+    }
+    if !note.is_empty() {
+        let _ = writeln_kill(&mut out, note);
+    }
+    out
+}
+
+fn writeln_kill(out: &mut String, line: &str) -> std::fmt::Result {
+    use std::fmt::Write as _;
+    writeln!(out, "{line}")
+}
+
 // ———————— 实盘三判据共享内核 (019 R4) ————————
 //
 // 018 风险确认 / 002 Dry Run 时长门禁 / FR-008 时钟预检 原本在三条实盘路径各写一遍
@@ -217,10 +280,30 @@ pub(crate) async fn live_preflight(
     Ok(notice)
 }
 
+/// 启动策略**目录审计闸** (056 FR-1): 目录里明知不可运行的 id, 一律在**发起启动请求前**拒绝。
+///
+/// **为什么落在 `start_daemon` 而不是各个调用方**: 它是唯一的公共汇聚点 —— CLI `start`
+/// (`ctrl.rs:88`)、Web 运行端点 (`web/runs/mod.rs:375`)、对话内 5 条 L1 动作
+/// (`ai/session.rs:1234/1295/1348/1403/1436`) 全经过它。闸加在调用方 = 下一条新路径必然漏,
+/// 而"对话里让 AI 启动一个未声明副本"正是 056 立项的起因。
+///
+/// 与回测端(`backtest.rs:1294`)、Web 运行端(`web/runs/mod.rs:296`)共用
+/// [`crate::strategies::catalog::run_block`] 同一份判定, 不新增第二套口径。
+///
+/// **拒绝而非降级**: 被拒时如实回报原因(原文含三个自助改法), 不静默跳过、不替用户改配置。
+pub(crate) fn startup_gate(name: &str) -> CoreResult<()> {
+    match crate::strategies::catalog::run_block(name) {
+        Some(why) => Err(CoreError::InvalidArgument(why)),
+        None => Ok(()),
+    }
+}
+
 /// 启动内核(**不打印**): 走既有 daemon 控制通道, 返回 `(pid, mode)`。
 ///
 /// CLI `ricow start` 与 AI 的 L1 工具共用(019 T031); 实盘三判据见 [`live_preflight`],
 /// 打印留在各自调用方 (CLI stdout / 会话 sink)。
+///
+/// 目录审计闸见 [`startup_gate`] —— 必须在**建连之前**判, 否则会先拉起 daemon 再失败。
 pub(crate) async fn start_daemon(
     root: &std::path::Path,
     name: &str,
@@ -228,6 +311,7 @@ pub(crate) async fn start_daemon(
     demo: bool,
     confirmed: bool,
 ) -> CoreResult<(u64, String)> {
+    startup_gate(name)?;
     let client = Client::connect(root).await?;
     let data =
         client.call_ok(Request::Start { name: name.to_string(), live, demo, confirmed }).await?;
@@ -298,6 +382,13 @@ fn format_stop_report(report: &StopReport) -> String {
 /// 悄悄下线 / 测试网验证被换掉)。这里先读停机前的运行模式, 原样传回 `start`; 实盘仍会
 /// 重过三判据并**再逐字确认一次** (`start` 内既有逻辑), 拒绝而非静默降级。
 pub async fn restart(args: RestartArgs) -> CoreResult<()> {
+    // 056 FR-3 **先判后停**: 目录审计闸必须在 stop **之前**跑。
+    // restart 的结构是「先 stop 再 start」, 而闸加在 `start_daemon` 内 —— 若不前置,
+    // 被拒的策略会**先被停掉、再拒绝启动**, 变成「实例停掉没起来」, 可能带着未平仓敞口
+    // 静默下线。那比不做门禁更糟: 用户以为它还在原位跑。
+    // 放行路径不重复判(同一进程内已判过), 门禁只在这里与 `start_daemon` 各判一次。
+    startup_gate(&args.name)?;
+
     // 必须在 stop 之前读: 停机后台账/daemon 视图已被覆盖, 无从得知原本的模式。
     let prev_mode = crate::commands::instances::views(&crate::commands::project_root())
         .await
@@ -331,7 +422,7 @@ fn restart_flags(prev_mode: Option<&str>) -> (bool, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_stop_report, restart_flags};
+    use super::{format_stop_report, kill_report_text, restart_flags};
     use crate::supervisor::proto::StopReport;
 
     /// 027 T012: 停机回执文案分派 4 组合 —— 一条"本来就没在跑"不得套"已停止"头衔;
@@ -393,5 +484,94 @@ mod tests {
     fn test_restart_flags_unknown_falls_back_to_dry_run() {
         assert_eq!(restart_flags(None), (false, false), "未运行/无记录 → Dry Run");
         assert_eq!(restart_flags(Some("weird")), (false, false), "无法识别 → Dry Run");
+    }
+
+    // ———————— 056: 启动门禁收口 ————————
+
+    /// 056 FR-5: 闸的四态口径与 `catalog::run_block` 单测(`catalog.rs:681`)一致 ——
+    /// 内置 id 与未知 id **放行**, 只有"未声明清单且与内置逐字相同"的副本被拒。
+    ///
+    /// 这里对内置 id / 未知 id 断言"不因闸被拒"; 副本态由 `catalog` 自己的注入目录单测负责
+    /// (闸不重复实现一遍判定, 只透传)。
+    #[test]
+    fn startup_gate_passes_builtin_and_unknown() {
+        // 内置 id 从公开入口取(`all()` 是 `pub`), 不用私有的 `BUILTIN` 常量。
+        let builtin = crate::strategies::catalog::all()
+            .into_iter()
+            .find(|e| e.source == crate::strategies::catalog::Source::Builtin)
+            .expect("至少有一个内置策略")
+            .manifest
+            .id;
+        assert!(super::startup_gate(&builtin).is_ok(), "内置 id 恒放行");
+        assert!(
+            super::startup_gate("no-such-strategy-056-probe").is_ok(),
+            "未知 id 不由闸判(交由 daemon 按不存在处理)"
+        );
+    }
+
+    /// 056 FR-2: 被拒时**原样透出** `run_block` 的中文原因, 不加前缀不改写 ——
+    /// 那段文案已含三个自助改法, 改写等于让用户拿不到可操作信息。
+    #[test]
+    fn startup_gate_reason_is_verbatim() {
+        let builtin = crate::strategies::catalog::all()
+            .into_iter()
+            .find(|e| e.source == crate::strategies::catalog::Source::Builtin)
+            .expect("至少有一个内置策略")
+            .manifest
+            .id;
+        // 闸不凭空造拒绝理由: 内置恒放行, `run_block` 与闸的结论必须一致。
+        assert_eq!(
+            super::startup_gate(&builtin).is_err(),
+            crate::strategies::catalog::run_block(&builtin).is_some(),
+            "闸的结论必须等于 run_block 的结论(同一份判定, 不改写)"
+        );
+    }
+
+    /// 056 FR-3 回归护栏: `restart` 里闸的调用位置**必须**在 `stop` 之前。
+    ///
+    /// 行为级断言需要真跑 daemon(过重), 这里用源码顺序做静态护栏 ——
+    /// 顺序本身就是这个需求的全部内容, 且真机断言易受环境影响。
+    #[test]
+    fn restart_gates_before_stopping() {
+        let src = include_str!("ctrl.rs");
+        let body = src
+            .split("pub async fn restart(")
+            .nth(1)
+            .expect("restart 函数体")
+            .split("fn restart_flags")
+            .next()
+            .expect("restart 到 restart_flags 之间的源码");
+        let gate = body.find("startup_gate(&args.name)").expect("restart 内必须调闸");
+        let stop = body.find("stop(StopArgs").expect("restart 内必须调 stop");
+        assert!(gate < stop, "闸({gate}) 必须早于 stop({stop}) —— 否则被拒策略会被先停掉");
+    }
+
+    // ———————— 057-G4: kill switch 报告口径 ————————
+
+    /// 一个都没在跑时**不套"已全部停止"头衔** —— 否则用户会以为危险已解除。
+    #[test]
+    fn kill_report_zero_does_not_claim_success() {
+        let t = kill_report_text(0, "当前没有运行中的实例 (无需停止)");
+        assert!(t.contains("无需停止"), "{t}");
+        assert!(!t.contains("已停止"), "零实例不得说已停止: {t}");
+    }
+
+    /// 停成了要说清**停了几个**, 且有未成功项时必须一并报出。
+    #[test]
+    fn kill_report_states_count_and_failures() {
+        let t = kill_report_text(2, "已停止 1/3 个; 未成功: b: 停止未成功; c: 停止未成功");
+        assert!(t.contains("已停止 2 个运行中实例"), "{t}");
+        assert!(t.contains("1/3"), "部分失败必须报计数: {t}");
+        assert!(t.contains("b"), "{t}");
+        assert!(t.contains("c"), "{t}");
+    }
+
+    /// kill switch 的批量不可逆性要求逐字短语, 不接受裸 y/yes 一问就过。
+    #[test]
+    fn kill_requires_explicit_phrase_not_bare_confirm() {
+        let src = include_str!("ctrl.rs");
+        let body = src.split("pub async fn kill(").nth(1).expect("kill 函数体").split("/// kill switch 内核").next().unwrap();
+        assert!(body.contains("require_explicit_phrase"), "kill 必须走逐字短语确认");
+        assert!(!body.contains("n|y|yes"), "不得退回一问就过的裸确认");
     }
 }

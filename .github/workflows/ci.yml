@@ -29,6 +29,27 @@ jobs:
       - name: 安全 / 架构红线
         run: bash scripts/ci_grep_gates.sh
 
+  # 前端静态门 (057-G6): 语法 / 中英键一一对应 / 文案引用完整性 / data-zh↔data-en 配对 /
+  # router.parseHash 边界 / 同名碰撞。
+  #
+  # **为什么进 CI 了**(它此前"故意不进", 见 ci_grep_gates.sh 头部原注释):
+  #  ① 当初顾虑是"会给 CI 多绑一个 node 运行时" —— 但 test job 的 matrix 已是
+  #     ubuntu/windows/macos 三平台, node 预装, 额外成本只是 ubuntu 上的几分钟;
+  #  ② 更硬的理由: 054 复审抓到过 `skipBox` TDZ **真实缺陷**, 而当时四道静态门
+  #     (node --check / grep 扫描 / Rust 单测 / Python 冒烟)**全绿**。
+  #     这类缺陷"语法合法、双语齐、引用有定义", 靠人肉发现一次要几小时。
+  #  ③ 它零依赖(纯 node 内建模块), 不会引入供应链与版本漂移风险。
+  frontend:
+    name: frontend (静态门)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: 前端静态检查
+        run: node scripts/web_frontend_check.mjs
+
   lint:
     name: lint (clippy + fmt)
     runs-on: ubuntu-latest

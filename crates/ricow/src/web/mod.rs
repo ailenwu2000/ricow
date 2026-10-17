@@ -331,6 +331,7 @@ pub fn router(state: WebState) -> Router {
         // 运行控制(032 US4 / FR-022 ~ FR-026): 运行态一览 / 单实例状态 / 拉起 / 停机 / 风险确认。
         // 启停复用 CLI 同一 ctrl 内核, daemon 自举走幂等的 ensure_daemon —— 本层零控制逻辑复制。
         .route("/api/runs", get(runs::list_runs))
+        .route("/api/runs/kill", axum::routing::post(runs::post_kill_all))
         .route("/api/strategies/{id}/status", get(runs::get_status))
         .route("/api/strategies/{id}/start", axum::routing::post(runs::start_strategy))
         .route("/api/strategies/{id}/stop", axum::routing::post(runs::stop_strategy))

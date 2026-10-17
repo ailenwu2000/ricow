@@ -9,10 +9,14 @@
 # 用法:
 #   bash scripts/ci_grep_gates.sh          # 退出码 0 = 全绿
 #
-# 姊妹脚本(不在这里调用, 需要 node):
-#   node scripts/web_frontend_check.mjs    # 前端静态检查: 双语键一一对应 / 文案引用完整性 /
-#                                          # 首页 data-zh↔data-en 配对 / router.parseHash 边界
-#   它**故意不进 `cargo test`** —— 那会给 CI 多绑一个 node 运行时。前端改动时手动跑一次即可。
+# 姊妹脚本(**不进本脚本**, 各有各的触发方式):
+#   node scripts/web_frontend_check.mjs    # 前端静态检查: 语法 / 双语键一一对应 / 文案引用完整性 /
+#                                          # 首页 data-zh↔data-en 配对 / router.parseHash 边界 / 同名碰撞
+#     → **057-G6 起进 ci.yml 的 frontend job**(此前"故意不进": 顾虑是多绑一个 node 运行时。
+#       但 test job 的 matrix 本就三平台且 node 预装, 额外成本很小; 更硬的理由是 054 抓到过
+#       `skipBox` TDZ 真实缺陷而当时**四道静态门全绿**)。本脚本仍是**零依赖**, 所以不调它。
+#   node scripts/probe_web_ui.mjs          # CDP 真机走查: 需真浏览器 + headless, 进 nightly.yml。
+#                                          # 保留这一层的理由同上 —— 静态门结构上抓不到运行期缺陷。
 #
 # 新增红线时: 先想清楚"违反它的代价"与"误报概率"。宁可少一条, 不要留一条天天误报的。
 set -uo pipefail
