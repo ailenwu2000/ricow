@@ -138,7 +138,9 @@ async function main() {
         faviconNoise += 1;
         return;
       }
-      pageErrors.push("[console.error] " + text);
+      // 带上 URL: 浏览器对「Failed to load resource」的 text 只有一句通用话(不含路径),
+      // 只看 text 没法定位是哪个资源 404 —— 058 排查时就被这条挡过一次。
+      pageErrors.push("[console.error] " + text + (m.params.entry.url ? " <" + m.params.entry.url + ">" : ""));
     }
   });
 
@@ -813,6 +815,87 @@ async function main() {
   );
 
   checkNoErrors("052 模式 chip / 引导卡 / 识别参数 / 复制带清单");
+
+  // ---- ⑨' 058 kill switch: 运行视图入口 + 逐字短语联动 ----
+  //
+  // 为什么单列一段而不是并进 052: 这个按钮**带写动作**(POST /api/runs/kill), 与本页其余
+  // 只读断言性质不同; 而且它的核心不变量是「短语没写对时按钮不放行」—— 这条只能真点一次
+  // 才验得到, grep JS 文本永远验不出 `primary.disabled` 有没有真的被 syncHint 联动。
+  await ev("window.Ricow.router && (location.hash = '#runs'), 'ok'");
+  await sleep(1200);
+  const killBtn = await ev(
+    "(() => { const b = document.getElementById('rn-kill-all');" +
+      " return b ? b.textContent.trim() : null; })()"
+  );
+  check("058 运行视图有「停止全部」入口", killBtn === "停止全部", String(killBtn));
+
+  // 点开弹窗: 必须能点开且给出短语输入框与不可逆提示。
+  const opened = await ev(
+    "(() => { const b = document.getElementById('rn-kill-all'); if (!b) return 'no-btn'; b.click();" +
+      " const root = document.getElementById('rn-modal-root');" +
+      " return root && root.querySelector('input.sg-input') ? 'ok' : 'no-input'; })()"
+  );
+  check("058 点开「停止全部」弹窗且有逐字短语输入框", opened === "ok", String(opened));
+
+  const warn = await ev(
+    "(() => { const w = document.querySelector('.rn-kill-warn');" +
+      " return w ? w.textContent : null; })()"
+  );
+  check(
+    "058 弹窗写明后果(不是无声按下)",
+    typeof warn === "string" && warn.length > 0,
+    String(warn)
+  );
+  const keepDaemon = await ev(
+    "(() => { const k = document.querySelector('.rn-kill-keep-daemon');" +
+      " return k ? k.textContent : null; })()"
+  );
+  check(
+    "058 弹窗说清 daemon 仍然活着(kill ≠ shutdown)",
+    typeof keepDaemon === "string" && keepDaemon.indexOf("daemon") >= 0,
+    String(keepDaemon)
+  );
+
+  // 核心不变量: 短语写错 → 按钮禁用; 写对 → 放行。后端是逐字比对(含平仓变体), 这里对齐前端。
+  // 主按钮按**文案**定位而不是 `.sg-btn`: 弹窗里取消按钮也是 `sg-btn` 且默认未禁用,
+  // 用类名挑会挑错对象, 断言就成了永远为 true 的假绿(058 第一版就栽在这)。
+  const gate = await ev(
+    "(() => { const root = document.getElementById('rn-modal-root');" +
+      " const input = root.querySelector('input.sg-input');" +
+      " const btns = Array.from(root.querySelectorAll('button'));" +
+      " const btn = btns.find(b => b.textContent.indexOf('停止全部') >= 0);" +
+      " if (!input || !btn) return { err: 'missing', n: btns.length };" +
+      " const set = (v) => { input.value = v; input.dispatchEvent(new Event('input', { bubbles: true })); };" +
+      " set('y'); const afterY = btn.disabled;" +
+      " set('确认停止全部 '); const afterSpace = btn.disabled;" +
+      " set('确认停止全部'); const afterOk = btn.disabled;" +
+      " const cb = root.querySelector('input[type=checkbox]');" +
+      " cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true }));" +
+      " const cleared = input.value;" +
+      " set('确认停止全部'); const afterPlainWhenCloseAll = btn.disabled;" +
+      " set('确认停止全部并平仓'); const afterFull = btn.disabled;" +
+      " return { afterY, afterSpace, afterOk, cleared, afterPlainWhenCloseAll, afterFull }; })()"
+  );
+  check("058 裸 y 不放行", gate && gate.afterY === true, JSON.stringify(gate));
+  check("058 尾部多一个空格不放行(与后端逐字比对一致)", gate && gate.afterSpace === true, JSON.stringify(gate));
+  check("058 短语逐字正确才放行", gate && gate.afterOk === false, JSON.stringify(gate));
+  check("058 勾上平仓后输入框被清空(短语变了要重新打)", gate && gate.cleared === "", JSON.stringify(gate));
+  check(
+    "058 勾上平仓后旧短语不再放行",
+    gate && gate.afterPlainWhenCloseAll === true,
+    JSON.stringify(gate)
+  );
+  check("058 勾上平仓后要用更长的那个短语", gate && gate.afterFull === false, JSON.stringify(gate));
+
+  // 关掉弹窗, 别把遮罩留给后续断言。按文案找取消钮(键 sgCancel → 「取消」),
+  // 不要用 `!sg-btn-danger` 这类启发式: 主按钮本来就不带 danger 类, 挑不到。
+  await ev(
+    "(() => { const root = document.getElementById('rn-modal-root');" +
+      " const c = Array.from(root.querySelectorAll('button')).find(b => b.textContent.trim() === '取消');" +
+      " if (c) c.click(); return 'ok'; })()"
+  );
+  await sleep(300);
+  checkNoErrors("058 kill switch 入口与逐字短语联动");
 
   // ---- ⑩ 全局收口: 全程零未捕获异常 ----
   check("全程零未捕获异常/控制台错误", pageErrors.length === 0, pageErrors.slice(0, 5).join(" | "));

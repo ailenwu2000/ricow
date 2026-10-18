@@ -64,6 +64,17 @@
     rnStopGo: "停止",
     rnStopping: "停止中…",
     rnStopOk: "已停止: ",
+    // 058: kill switch。短语本身**不进字典** —— 它必须与后端逐字比对, 写成可替换文案
+    // 就等于给了它一个被翻译掉的入口(后端只认中文字面量)。这里只放"提示"不含短语值。
+    rnKillAll: "停止全部",
+    rnKillTitle: "停止全部运行中的策略",
+    rnKillWarn: "将停止当前所有运行中的实例。",
+    rnKillKeep: "后台守护进程",
+    rnKillKeepDaemon: "daemon 保持运行(停完策略后还要看现场)。",
+    rnKillCloseAll: "同时撤销全部挂单并平仓(不可逆)",
+    rnKillGo: "停止全部",
+    rnKillOk: "已停止 ",
+    rnKillNone: "当前没有运行中的实例(无需停止)。",
     rnLogOf: "日志: ",
     rnLogClose: "收起",
     rnLogToggle: "点击展开/收起日志",
@@ -118,6 +129,15 @@
     rnStopGo: "Stop",
     rnStopping: "Stopping…",
     rnStopOk: "Stopped: ",
+    rnKillAll: "Stop all",
+    rnKillTitle: "Stop all running strategies",
+    rnKillWarn: "This stops every instance that is currently running.",
+    rnKillKeep: "The daemon keeps running",
+    rnKillKeepDaemon: "daemon keeps running (you still need to look at the scene afterwards).",
+    rnKillCloseAll: "Also cancel all open orders and close positions (irreversible)",
+    rnKillGo: "Stop all",
+    rnKillOk: "Stopped ",
+    rnKillNone: "No running instances (nothing to stop).",
     rnLogOf: "Log: ",
     rnLogClose: "Collapse",
     rnLogToggle: "Click to expand/collapse log",
@@ -184,7 +204,10 @@
       '<div class="rn-listview">' +
       '<div class="sg-head"><h2 class="sg-title"' + bi("rnTitle") + ">" + R.TEXT.zh.rnTitle + "</h2>" +
       '<span id="rn-poll-hint" class="rn-poll-hint"' + bi("rnPollHint") + ">" +
-      R.TEXT.zh.rnPollHint + "</span></div>" +
+      R.TEXT.zh.rnPollHint + "</span>" +
+      // 058: 「停止全部」挂在运行视图表头, 不进顶栏 —— 它是运行域的动作, 不是全局导航。
+      '<button id="rn-kill-all" class="sg-btn sg-btn-danger rn-kill-all"' + bi("rnKillAll") + ">" +
+      R.TEXT.zh.rnKillAll + "</button></div>" +
       '<div id="rn-list-msg" class="sg-msg" aria-live="polite"></div>' +
       '<div class="rn-table-scroll"><table class="rn-table"><thead><tr>' +
       "<th" + bi("rnThName") + ">" + R.TEXT.zh.rnThName + "</th>" +
@@ -203,6 +226,11 @@
 
     // 回前台立即补一次刷新(轮询在不可见期间是暂停的)。
     document.addEventListener("visibilitychange", onVisibility);
+    // 058: 停止全部入口。绑一次即可 —— 按钮是 mount() 里静态建的, 不参与列表重绘。
+    // openKillModal 本身是同步的(只开弹窗, 提交在弹窗内), 错误由弹窗自己的 errLine 承载,
+    // 所以这里**不能** .catch() —— 那会把同步函数的 undefined 当 Promise 而在运行期抛
+    // TypeError(真机走查 058 抓到过; 静态门看不见这一类)。
+    $("rn-kill-all").addEventListener("click", () => openKillModal());
     mounted = true;
   }
 
@@ -797,6 +825,118 @@
     sel.addEventListener("change", () => {
       if (currentMode() === "live") syncLiveHint();
     });
+  }
+
+  // ---------- 停止全部(kill switch, 058) ----------
+
+  /// 期望短语**与后端同串**(web/runs/mod.rs `post_kill_all`): 勾了平仓就多「并平仓」三字。
+  /// 这里是逐字比对, 不 trim、不接受包含 —— 少一个字都会被后端 400 打回, 与其那时才发现,
+  /// 不如按钮直接 disabled 并把期望短语原文明示。
+  function killPhrase(closeAll) {
+    return "确认停止全部" + (closeAll ? "并平仓" : "");
+  }
+
+  /// 紧急按住全部运行中的策略(057 后端就绪, 058 补 Web 入口)。
+  ///
+  /// 为什么在弹窗里逐字输入而不是一个「确定」按钮: 这个动作**没有撤销**, 而且默认**只**停
+  /// 策略、daemon 继续活着(紧急按住之后还要看现场), 与「停止单个」不是一回事。后端已用
+  /// 逐字短语把这道门做实, 前端照做而不是绕过它。
+  function openKillModal() {
+    let alive = true;
+    const g = gen;
+    const { card, close } = openModal(t("rnKillTitle"));
+    const doClose = () => {
+      alive = false;
+      close();
+    };
+
+    const form = h("div", "sg-modal-form");
+
+    // 后果说明写在按钮之前(与策略删除确认同纪律): 用户按下之前必须先读到"会发生什么"。
+    const body = h("div", "rn-kill-body");
+    body.appendChild(h("div", "rn-kill-warn", t("rnKillWarn")));
+    const keepLine = h("div", "rn-kill-keep");
+    keepLine.appendChild(h("span", null, t("rnKillKeep")));
+    keepLine.appendChild(h("span", "rn-kill-keep-daemon", t("rnKillKeepDaemon")));
+    body.appendChild(keepLine);
+    form.appendChild(body);
+
+    // 勾选 = 连交易所挂单与持仓一起撤/平(不可逆动作, 默认不勾)。
+    const checkLabel = h("label", "rn-stop-check");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    checkLabel.appendChild(cb);
+    checkLabel.appendChild(h("span", null, t("rnKillCloseAll")));
+    form.appendChild(checkLabel);
+
+    // 逐字短语输入区(与实盘启动同一套写法: 期望短语原文明示, 不写对按钮不放行)。
+    const phraseWrap = h("div", "sg-field");
+    const phraseHint = h("div", "sg-field-hint");
+    phraseWrap.appendChild(phraseHint);
+    const phraseEl = document.createElement("input");
+    phraseEl.className = "sg-input";
+    phraseEl.type = "text";
+    phraseEl.autocomplete = "off";
+    phraseEl.spellcheck = false;
+    phraseWrap.appendChild(phraseEl);
+    form.appendChild(phraseWrap);
+
+    const errLine = h("div", "sg-msg err");
+    form.appendChild(errLine);
+    card.appendChild(form);
+
+    const { cancel, primary } = modalActions(card, "rnKillGo");
+    cancel.addEventListener("click", doClose);
+
+    function syncHint() {
+      const want = killPhrase(cb.checked);
+      phraseHint.textContent = t("rnPhraseHint") + want;
+      // 前端只做「一致才放行」这一件事, 不代填 —— 确认必须由用户亲手逐字输入。
+      primary.disabled = phraseEl.value !== want;
+      if (phraseEl.value && !primary.disabled) errLine.textContent = "";
+    }
+
+    cb.addEventListener("change", () => {
+      phraseEl.value = "";
+      syncHint();
+    });
+    phraseEl.addEventListener("input", syncHint);
+    phraseEl.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter") return;
+      ev.preventDefault();
+      if (primary.disabled) return;
+      submit().catch((e) => setMsg(errLine, (e && e.message) || String(e), "err"));
+    });
+
+    async function submit() {
+      primary.disabled = true;
+      const label = primary.textContent;
+      primary.textContent = t("rnStopping");
+      let reply;
+      try {
+        reply = await R.api("/api/runs/kill", {
+          method: "POST",
+          body: { close_all: cb.checked, confirm: phraseEl.value },
+        });
+      } catch (err) {
+        if (!alive || g !== gen) return;
+        primary.textContent = label;
+        syncHint();
+        setMsg(errLine, (err && err.message) || String(err), "err");
+        return;
+      }
+      if (!alive || g !== gen) return;
+      doClose();
+      // 报告口径照服务端原文透传(027 原则): stopped=0 时服务端只说"无需停止",
+      // 前端不另加"已全部停止"这类头衔。
+      const stopped = reply && typeof reply.stopped === "number" ? reply.stopped : null;
+      const head = stopped === 0 ? t("rnKillNone") : t("rnKillOk") + stopped;
+      const report = reply && reply.report ? " · " + reply.report : "";
+      setListMsg(head + report, "ok");
+      refreshQuiet(gen);
+    }
+
+    syncHint();
   }
 
   // ---------- 停止确认(可选同时撤单平仓) ----------

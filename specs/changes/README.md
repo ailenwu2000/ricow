@@ -63,6 +63,7 @@
 | 055 | **无档案目录** · 全仓已引用（编号被占，见下「055」一节） |
 | 056 | `056-startup-gate-convergence`（启动门禁收口：`start_daemon` 唯一闸 + `restart` 先判后停 + 运行态 `declared`/`duplicate_of` 可见性） |
 | 057 | `057-p0d-notional-guard`（P0-D 单笔名义护栏 `NOTIONAL_LIMIT_MULTIPLE = 10` + 跨实例 kill switch `ricow kill`/`POST /api/runs/kill` + 前端检查进 CI；含一份「刻意不为回测装名义上限」的设计说明） |
+| 058 | `058-web-kill-switch-and-cash-aware-ai`（**推翻 057「不做 kill switch 前端按钮」** —— 用户要求全程只走 Web UI：按钮挂运行视图表头 + 逐字短语输入 + 13 条 CDP 真机断言；AI 按资金量给建议：`[backtest].initial_cash` 进 `ai-edit?mode=params` / `ai-assess` 提示词，四档判据来自 demo 真跑实测（10 万成交 21 笔 / 300 USDT 成交 1 笔）） |
 
 > **057 的档案齐备性例外（2026-10-18 如实记录）**：057 目录只有 `spec.md` + `converge.md`，**缺 `plan.md` 与 `tasks.md`**，不满足下方「051 起一律齐备」。原因是当轮把「拍板 → 落码 → 实跑 → 收敛」压在一个提交内完成，跳过了计划/任务拆分这一步。**不回填**（补写的计划会与当时事实不符，违反「定稿不回改」）—— 但例外如实记在这里，别让下一个人以为「051 起齐备」是 100% 达成。053 同样是 051 后的例外（只有 `spec.md`，验收表塞在 spec 的「七、验收」节里，用 spec 兼当 converge）。
 

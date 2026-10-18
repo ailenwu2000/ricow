@@ -632,13 +632,14 @@ pub(crate) fn build_params_prompt(
     manifest_summary: &str,
     current_values: &str,
     history: &str,
+    initial_cash: Option<f64>,
 ) -> String {
     let history_block = if history.trim().is_empty() {
         "(这是第一轮)\n".to_string()
     } else {
         format!("{history}\n")
     };
-    format!(
+    let body = format!(
         "用户想要的效果在下面最末一行。他**不会**说改哪个参数、改成多少 —— 你自己判断。\n\
          \n\
          ## 可用的参数(键名 / 类型 / 说明 —— 只能用这里出现过的键)\n\
@@ -664,7 +665,9 @@ pub(crate) fn build_params_prompt(
          5. 键**只能**取上面清单里出现过的键名, 绝不发明新键; 值必须与类型一致\
          (数值 / 字符串 / 布尔), 枚举只能取它列出的可选值;\n\
          6. JSON 之后不要再写任何内容, 也不要 Markdown 围栏。"
-    )
+    );
+    // 058: 资金量段插在输出要求之前 —— 参数顾问必须先判「这个钱数跑不跑得动」再谈调参。
+    append_cash_section(&body, initial_cash)
 }
 
 /// 052 方案 3: Web「AI 调参数」的一次性非流式问答薄封装 —— 回包是 JSON, 全程不落盘。
@@ -674,13 +677,84 @@ pub(crate) async fn quick_params(
     manifest_summary: &str,
     current_values: &str,
     history: &str,
+    initial_cash: Option<f64>,
 ) -> CoreResult<String> {
     one_shot(
         root,
         AI_PARAMS_PREAMBLE,
-        &build_params_prompt(instruction, manifest_summary, current_values, history),
+        &build_params_prompt(
+            instruction,
+            manifest_summary,
+            current_values,
+            history,
+            initial_cash,
+        ),
     )
     .await
+}
+
+/// 058: 资金量级提醒的**知识段**(编译期常量, 供 `build_cash_advice` 拼进提示词)。
+///
+/// 为什么要有这一段(真跑出来的, 不是推演): 2026-10-18 在 demo 测试网真跑阶段 0,
+/// 同一个内置策略 `shannon_grid` 换资金量级跑出两种结果:
+/// - `--cash 100000`(默认) → **21 笔成交**, 网格完整铺开, 净 +6.07;
+/// - `--cash 300`(手册建议的小资金下限) → **只成交 1 笔**(建仓那一笔), 之后一单挂不出 ——
+///   建仓吃掉一半资金后只剩 149.85, 达不到下一档的最小名义。
+/// 结论: **同样一套参数, 资金量不够时策略是"跑不起来"的, 不是"收益差一点"**。不把这件事
+/// 写进提示词, AI 就会照着默认 10 万的直觉给建议, 用户小额跟单时才发现只成交 1 笔。
+///
+/// 边界(D15/D17: 平台不做投资判断): 这里判的是**可行性**(这个资金量能不能让策略正常运转),
+/// **不是**"该投多少钱"、也不是该不该用这个策略。绝不改成收益承诺或仓位推荐。
+const CASH_TIER_GUIDE: &str = "\
+1. 本金低于 1000 USDT: 网格/分批挂单类策略很可能**跑不起来** —— 建仓就吃掉大半资金, 剩下的钱挂不出下一档, \
+表现为\"只有 1 笔成交\"。此时应把单笔金额压到本金的 1%~2%, 或直接建议改用小资金友好的策略形态 \
+(如 paired_grid 这类按固定间距挂单、单笔金额小的), 并如实说明原形态在这个资金量下为什么不行。\
+2. 本金在 1000~10000 USDT: 多数网格策略可运行, 但单笔金额必须控制在**本金的一两个百分点**以内, \
+否则一档就把可用资金吃掉大半; 手续费占比也会明显高于大本金, 要提醒用户这一点。\
+3. 本金在 10000~100000 USDT: 常规网格参数基本可用, 重点看单笔金额是否与本金匹配。\
+4. 本金高于 100000 USDT: 单笔金额不构成约束, 可以谈间距与档位密度。";
+
+/// 058: 按资金量拼一段给模型看的**可行性提醒**(纯函数, 便于离线单测)。
+///
+/// 只回答「这个资金量能不能让策略正常跑起来」, 不回答「该投多少」——后者是投资判断,
+/// 平台刻意不做(宪法 D15/D17)。`initial_cash` 为 None(策略 TOML 没写过本金)时返回固定文案,
+/// **明确告诉模型钱数未知**, 而不是替用户编一个 —— 编一个等于替他做投资决定
+/// (与 `tools.rs` 里 `initial_cash`「必问项, 绝不替他填」同一条纪律)。
+pub(crate) fn build_cash_advice(initial_cash: Option<f64>) -> String {
+    let known = match initial_cash {
+        Some(c) if c.is_finite() && c > 0.0 => {
+            format!("这个策略准备的本金是 **{c:.2} USDT**。")
+        }
+        // 拿不到就是拿不到: 如实说不知道, 不猜一个数填进去。
+        _ => "**不知道这个策略准备投入多少资金**(策略配置里没写)。\
+如果接下来的建议依赖资金量(网格类、仓位类策略尤其依赖), 你必须先在说明里请用户填一下本金, \
+不要按任何假设值给参数 —— 按猜的数给的参数会让他在小额跟单时才发现根本跑不起来。"
+            .to_string(),
+    };
+    format!(
+        "{known}\n\n\
+         **必须先判可行性, 再谈调参**: 本金不够让策略正常运转时(典型症状: 回测只成交一两笔), \
+         如实直说\"这个资金量跑不动这种形态\", 并给出可行的替代(压小单笔金额 / 换小资金友好的形态), \
+         不要只微调参数就交差。\n\n\
+         资金量级怎么影响可行性:\n{CASH_TIER_GUIDE}"
+    )
+}
+
+/// 058: 把资金量段插进已有提示词(纯函数)。
+///
+/// 插在**输出要求之前**、上下文之后: 让模型先读到钱数与档位知识, 再按输出要求作答;
+/// 放末尾会被当成"补充说明"而权重降低。
+pub(crate) fn append_cash_section(prompt: &str, initial_cash: Option<f64>) -> String {
+    let marker = "## 输出要求";
+    let advice = build_cash_advice(initial_cash);
+    match prompt.find(marker) {
+        Some(idx) => {
+            let (head, tail) = prompt.split_at(idx);
+            format!("{head}## 资金量与可行性\n{advice}\n\n{tail}")
+        }
+        // 没有输出要求段(理论上不会发生): 追加在末尾, 不丢原文。
+        None => format!("{prompt}\n\n## 资金量与可行性\n{advice}\n"),
+    }
 }
 
 /// N3 (2026-10-12): Web「评估这组参数的影响」的系统提示 —— 输入是**实测回测指标**, 不是用户的话。
@@ -710,8 +784,9 @@ pub(crate) fn build_assess_prompt(
     changed_lines: &str,
     base_metrics: &str,
     new_metrics: &str,
+    initial_cash: Option<f64>,
 ) -> String {
-    format!(
+    let body = format!(
         "同一个策略、同一个回测窗口下, 改参数前后的实测结果如下。请讲清这次改动的**实际**影响。\n\
          \n\
          ## 这次动了哪些参数\n\
@@ -730,7 +805,10 @@ pub(crate) fn build_assess_prompt(
          3. 如果有指标变差了(如收益下降、夏普下降), **必须直说** —— 不要只挑好看的说;\n\
          4. 只讲上面两份指标里有的数字, **绝不**推算或编造没给出的数字;\n\
          5. 最后提醒一句: 这只是**一段历史窗口**的回测结果, 不代表未来。"
-    )
+    );
+    // 058: 资金量段插在输出要求之前 —— 评估里最容易漏判的正是「成交笔数极少」背后的资金原因
+    // (实测: 同一策略 10 万跑出 21 笔, 300 USDT 只成交 1 笔, 只看指标会误判成"参数改坏了")。
+    append_cash_section(&body, initial_cash)
 }
 
 /// N3 (2026-10-12): Web「评估改动影响」的一次性非流式问答薄封装 —— 回包是自然语言, 不落盘。
@@ -959,7 +1037,7 @@ mod tests {
     fn test_build_params_prompt_requires_reasoning_and_risk() {
         let manifest = "- 间距百分比 (键名 spacing_pct, 类型 f64): 网格间距(小数)";
         let current = "- spacing_pct = 0.01\n";
-        let p = build_params_prompt("保守一点", manifest, current, "");
+        let p = build_params_prompt("保守一点", manifest, current, "", Some(10000.0));
         assert!(p.contains("保守一点"), "用户的话必须原样进入: {p}");
         assert!(p.contains(manifest) && p.contains(current), "清单与当前值都要给模型: {p}");
         assert!(p.contains("(这是第一轮)"), "没有历史时要明说这是第一轮: {p}");
@@ -975,6 +1053,7 @@ mod tests {
             manifest,
             current,
             "用户: 保守点\nAI: 我把间距放宽了。",
+            Some(10000.0),
         );
         assert!(p.contains("用户: 保守点") && p.contains("我把间距放宽了"), "{p}");
         assert!(!p.contains("(这是第一轮)"), "{p}");
@@ -987,7 +1066,7 @@ mod tests {
         let changed = "- 间距百分比 (spacing_pct): 0.01 → 0.02\n";
         let base = "- 最大回撤 %: 18\n- 成交笔数: 40\n";
         let new = "- 最大回撤 %: 9\n- 成交笔数: 12\n";
-        let p = build_assess_prompt(changed, base, new);
+        let p = build_assess_prompt(changed, base, new, Some(300.0));
         assert!(p.contains(changed) && p.contains(base) && p.contains(new), "{p}");
         assert!(p.contains("改前→改后"), "必须要求带前后数字: {p}");
         assert!(p.contains("必须直说"), "变差的地方必须直说: {p}");
@@ -1036,6 +1115,48 @@ mod tests {
             AI_ASSESS_PREAMBLE.contains("不要编一个原因"),
             "解释不了时只准如实说, 不许编原因: {AI_ASSESS_PREAMBLE}"
         );
+    }
+
+    // ---- 058: 资金量级提醒 ----
+
+    /// 058 的核心: 提示词里**必须出现用户真实的本金数字**。
+    /// 不带的话 AI 会按内置默认 10 万的直觉给建议, 用户小额跟单才发现只成交 1 笔
+    /// (实测: 同一策略 10 万成交 21 笔 / 300 USDT 成交 1 笔)。
+    #[test]
+    fn test_cash_advice_carries_the_real_initial_cash() {
+        let p = build_cash_advice(Some(300.0));
+        assert!(p.contains("300.00"), "本金数字必须原样进入提示词: {p}");
+        assert!(p.contains("USDT"), "必须带计价单位: {p}");
+        // 必须落在"输出要求"之前: 放末尾会被模型当成补充说明而降低权重。
+        let full = build_assess_prompt("改了什么", "- 成交笔数: 1\n", "- 成交笔数: 20\n", Some(300.0));
+        let cash_at = full.find("## 资金量与可行性").expect("必须插入资金量段");
+        let req_at = full.find("## 输出要求").expect("必须有输出要求段");
+        assert!(cash_at < req_at, "资金量段必须在输出要求之前: {full}");
+    }
+
+    /// 拿不到本金时**如实说不知道**, 不许编一个数 —— 编一个等于替用户做投资决定
+    /// (与 `tools.rs` 的 `initial_cash` 必问项同纪律)。也不能回退成内置默认 10 万。
+    #[test]
+    fn test_cash_advice_never_invents_a_number_when_unknown() {
+        for unknown in [None, Some(0.0), Some(-100.0), Some(f64::NAN)] {
+            let p = build_cash_advice(unknown);
+            assert!(p.contains("不知道"), "必须明说不知道本金: {unknown:?} → {p}");
+            assert!(p.contains("先"), "必须要求先问用户: {unknown:?} → {p}");
+            assert!(!p.contains("100000.00"), "绝不能拿内置默认 10 万当用户的本金: {unknown:?} → {p}");
+        }
+    }
+
+    /// 档位知识必须真的写进去, 且守住 D15/D17 边界: 只判**可行性**, 不做投资建议。
+    /// 这段一旦被"优化"成收益承诺或仓位推荐, 就是把平台拉回做投资判断。
+    #[test]
+    fn test_cash_tier_guide_judges_feasibility_not_investment() {
+        assert!(CASH_TIER_GUIDE.contains("1000"), "必须有金额门槛: {CASH_TIER_GUIDE}");
+        assert!(CASH_TIER_GUIDE.contains("paired_grid"), "小资金应指向小资金友好的形态: {CASH_TIER_GUIDE}");
+        // 禁止的话术: 承诺收益 / 劝用户加钱 / 替用户选策略
+        for banned in ["建议投入", "推荐买入", "预期收益", "稳赚", "加仓到"] {
+            assert!(!CASH_TIER_GUIDE.contains(banned), "不得出现投资建议话术「{banned}」: {CASH_TIER_GUIDE}");
+        }
+        assert!(CASH_TIER_GUIDE.contains("跑不起来"), "必须点明本金不足是跑不动而非收益差: {CASH_TIER_GUIDE}");
     }
 
     // ---- 3.4: LLM 重试判定 ----

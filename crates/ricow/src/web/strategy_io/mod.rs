@@ -1470,6 +1470,23 @@ pub(super) struct AiGenerateReply {
 
 // ---- 052 方案 3: AI 改配置(只改参数, 不动代码) ----
 
+/// 058: 读实例 TOML `[backtest].initial_cash`(= 用户为这个策略投入的本金)。
+///
+/// 用途是给 AI 的参数建议带**资金量级**上下文(见 `ai::provider::build_cash_advice`): 同一套
+/// 参数在 10 万下成交 21 笔、在 300 USDT 下只成交 1 笔, 不带这个数字 AI 会按默认体量给建议。
+///
+/// 取不到(文件不存在 / 没写这一段 / 键不是正数)一律 `None`, **不回退到内置默认 10 万** ——
+/// 回退等于替用户编一个资金量, 与「绝不替他填 `initial_cash`」同一条纪律。调用侧拿到 `None`
+/// 就如实告诉模型「不知道本金, 要先问」。
+fn load_instance_initial_cash(root: &Path, id: &str) -> CoreResult<Option<f64>> {
+    let Some(text) = read_instance_toml(root, id)? else {
+        return Ok(None);
+    };
+    let config = ricow_strategy::StrategyConfig::from_toml(&text)
+        .map_err(|e| CoreError::Parse(format!("实例 TOML 解析失败: {e}")))?;
+    Ok(config.backtest.and_then(|b| b.initial_cash).filter(|c| c.is_finite() && *c > 0.0))
+}
+
 /// 把实例当前值排成给模型的「键 = 值」清单(纯函数, 便于单测)。
 ///
 /// 顺序刻意固定(键排序 + `pair` 归在同一条序列里): 同样的输入必须给模型同样的提示词,
@@ -2026,11 +2043,19 @@ async fn ai_edit_params(
     let values = load_instance_values(&state.root, id)?;
     let current = current_values_text(values.as_ref());
     let hist = cap_history(history);
+    // 058: 带上资金量级 —— 参数建议必须先判「这个钱数跑不跑得动这个形态」。
+    let initial_cash = load_instance_initial_cash(&state.root, id)?;
 
-    let replied =
-        crate::ai::provider::quick_params(&state.root, instruction, summary, &current, &hist)
-            .await
-            .map_err(map_ai_error)?;
+    let replied = crate::ai::provider::quick_params(
+        &state.root,
+        instruction,
+        summary,
+        &current,
+        &hist,
+        initial_cash,
+    )
+    .await
+    .map_err(map_ai_error)?;
 
     // 回包 = 人话 + JSON 两段。先切段: "说不出 JSON"与"说不出人话"是两种毛病, 提示语要分开。
     let (advice, json) = split_advice_and_json(&replied);
@@ -2267,8 +2292,14 @@ pub(super) async fn ai_assess_params(
     let new = metrics_brief(&req.new_metrics)
         .map_err(|m| WebError::bad_request_code(format!("改后指标不可用: {m}"), "bad_metrics"))?;
 
-    let prompt =
-        crate::ai::provider::build_assess_prompt(&changed_lines(&req.changed), &base, &new);
+    // 058: 带上资金量级 —— 「改后成交笔数暴跌」的第一嫌疑不是参数改坏了, 而是本金不够跑动了。
+    let initial_cash = load_instance_initial_cash(&state.root, &id)?;
+    let prompt = crate::ai::provider::build_assess_prompt(
+        &changed_lines(&req.changed),
+        &base,
+        &new,
+        initial_cash,
+    );
     let advice =
         crate::ai::provider::quick_assess(&state.root, &prompt).await.map_err(map_ai_error)?;
     let advice = strip_fence(&advice).trim().to_string();

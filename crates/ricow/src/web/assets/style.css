@@ -1394,6 +1394,12 @@ body {
   font-size: 1.15rem;
   font-weight: 600;
 }
+/* 058 kill switch: 表头变三段(标题/轮询提示/按钮)后靠自动左边距把按钮推到右侧,
+   不改 .sg-head 本身的 space-between —— 策略页也在用它, 两处共用同一骨架。 */
+.rn-kill-all {
+  margin-left: auto;
+  flex: none;
+}
 .sg-btn {
   display: inline-flex;
   align-items: center;
@@ -2811,6 +2817,24 @@ body {
   gap: 6px;
   cursor: pointer;
   font-size: 0.8rem;
+}
+/* 058 kill switch: 后果说明与"daemon 仍在跑"两行。危险色只用在结论行, 保持克制。 */
+.rn-kill-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.84rem;
+}
+.rn-kill-warn {
+  color: var(--error);
+}
+.rn-kill-keep {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.rn-kill-keep-daemon {
+  color: var(--accent);
+  font-family: var(--mono);
 }
 .rn-log-tr > td {
   padding: 0 10px 10px;
