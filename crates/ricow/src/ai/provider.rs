@@ -682,13 +682,7 @@ pub(crate) async fn quick_params(
     one_shot(
         root,
         AI_PARAMS_PREAMBLE,
-        &build_params_prompt(
-            instruction,
-            manifest_summary,
-            current_values,
-            history,
-            initial_cash,
-        ),
+        &build_params_prompt(instruction, manifest_summary, current_values, history, initial_cash),
     )
     .await
 }
@@ -700,8 +694,8 @@ pub(crate) async fn quick_params(
 /// - `--cash 100000`(默认) → **21 笔成交**, 网格完整铺开, 净 +6.07;
 /// - `--cash 300`(手册建议的小资金下限) → **只成交 1 笔**(建仓那一笔), 之后一单挂不出 ——
 ///   建仓吃掉一半资金后只剩 149.85, 达不到下一档的最小名义。
-/// 结论: **同样一套参数, 资金量不够时策略是"跑不起来"的, 不是"收益差一点"**。不把这件事
-/// 写进提示词, AI 就会照着默认 10 万的直觉给建议, 用户小额跟单时才发现只成交 1 笔。
+///   结论: **同样一套参数, 资金量不够时策略是"跑不起来"的, 不是"收益差一点"**。不把这件事
+///   写进提示词, AI 就会照着默认 10 万的直觉给建议, 用户小额跟单时才发现只成交 1 笔。
 ///
 /// 边界(D15/D17: 平台不做投资判断): 这里判的是**可行性**(这个资金量能不能让策略正常运转),
 /// **不是**"该投多少钱"、也不是该不该用这个策略。绝不改成收益承诺或仓位推荐。
@@ -1128,7 +1122,8 @@ mod tests {
         assert!(p.contains("300.00"), "本金数字必须原样进入提示词: {p}");
         assert!(p.contains("USDT"), "必须带计价单位: {p}");
         // 必须落在"输出要求"之前: 放末尾会被模型当成补充说明而降低权重。
-        let full = build_assess_prompt("改了什么", "- 成交笔数: 1\n", "- 成交笔数: 20\n", Some(300.0));
+        let full =
+            build_assess_prompt("改了什么", "- 成交笔数: 1\n", "- 成交笔数: 20\n", Some(300.0));
         let cash_at = full.find("## 资金量与可行性").expect("必须插入资金量段");
         let req_at = full.find("## 输出要求").expect("必须有输出要求段");
         assert!(cash_at < req_at, "资金量段必须在输出要求之前: {full}");
@@ -1142,7 +1137,10 @@ mod tests {
             let p = build_cash_advice(unknown);
             assert!(p.contains("不知道"), "必须明说不知道本金: {unknown:?} → {p}");
             assert!(p.contains("先"), "必须要求先问用户: {unknown:?} → {p}");
-            assert!(!p.contains("100000.00"), "绝不能拿内置默认 10 万当用户的本金: {unknown:?} → {p}");
+            assert!(
+                !p.contains("100000.00"),
+                "绝不能拿内置默认 10 万当用户的本金: {unknown:?} → {p}"
+            );
         }
     }
 
@@ -1151,12 +1149,21 @@ mod tests {
     #[test]
     fn test_cash_tier_guide_judges_feasibility_not_investment() {
         assert!(CASH_TIER_GUIDE.contains("1000"), "必须有金额门槛: {CASH_TIER_GUIDE}");
-        assert!(CASH_TIER_GUIDE.contains("paired_grid"), "小资金应指向小资金友好的形态: {CASH_TIER_GUIDE}");
+        assert!(
+            CASH_TIER_GUIDE.contains("paired_grid"),
+            "小资金应指向小资金友好的形态: {CASH_TIER_GUIDE}"
+        );
         // 禁止的话术: 承诺收益 / 劝用户加钱 / 替用户选策略
         for banned in ["建议投入", "推荐买入", "预期收益", "稳赚", "加仓到"] {
-            assert!(!CASH_TIER_GUIDE.contains(banned), "不得出现投资建议话术「{banned}」: {CASH_TIER_GUIDE}");
+            assert!(
+                !CASH_TIER_GUIDE.contains(banned),
+                "不得出现投资建议话术「{banned}」: {CASH_TIER_GUIDE}"
+            );
         }
-        assert!(CASH_TIER_GUIDE.contains("跑不起来"), "必须点明本金不足是跑不动而非收益差: {CASH_TIER_GUIDE}");
+        assert!(
+            CASH_TIER_GUIDE.contains("跑不起来"),
+            "必须点明本金不足是跑不动而非收益差: {CASH_TIER_GUIDE}"
+        );
     }
 
     // ---- 3.4: LLM 重试判定 ----

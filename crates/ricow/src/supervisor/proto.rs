@@ -223,12 +223,11 @@ mod tests {
         let e2 = decode_envelope(r#"{"token":"t","cmd":"stop_all","close_all":true}"#).unwrap();
         assert_eq!(e2.request, Request::StopAll { close_all: true });
         // 线上标签是 snake_case
-        let v: serde_json::Value =
-            serde_json::from_str(&encode(&Envelope {
-                token: "t".into(),
-                request: Request::StopAll { close_all: true },
-            }))
-            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&encode(&Envelope {
+            token: "t".into(),
+            request: Request::StopAll { close_all: true },
+        }))
+        .unwrap();
         assert_eq!(v["cmd"], "stop_all");
         assert_eq!(v["close_all"], true);
     }

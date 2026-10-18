@@ -159,10 +159,7 @@ pub async fn kill(args: KillArgs) -> CoreResult<()> {
 }
 
 /// kill switch 内核 (**不打印**): 返回面向用户的说明文本。
-pub(crate) async fn kill_daemon(
-    root: &std::path::Path,
-    close_all: bool,
-) -> CoreResult<String> {
+pub(crate) async fn kill_daemon(root: &std::path::Path, close_all: bool) -> CoreResult<String> {
     let client = Client::connect(root).await?;
     let data = client.call_ok(Request::StopAll { close_all }).await?;
     let stopped = data.get("stopped").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
@@ -570,7 +567,13 @@ mod tests {
     #[test]
     fn kill_requires_explicit_phrase_not_bare_confirm() {
         let src = include_str!("ctrl.rs");
-        let body = src.split("pub async fn kill(").nth(1).expect("kill 函数体").split("/// kill switch 内核").next().unwrap();
+        let body = src
+            .split("pub async fn kill(")
+            .nth(1)
+            .expect("kill 函数体")
+            .split("/// kill switch 内核")
+            .next()
+            .unwrap();
         assert!(body.contains("require_explicit_phrase"), "kill 必须走逐字短语确认");
         assert!(!body.contains("n|y|yes"), "不得退回一问就过的裸确认");
     }

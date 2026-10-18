@@ -10,7 +10,7 @@
 //! - **两条规则的边界(别混)**:
 //!   ① 频率(100 单/秒): 防 bug 风暴;
 //!   ② 单笔名义(权益 × 10, 057-P0-D): **只拦数量级笔误**(把 1000 当 0.1、漏小数点这类)。
-//!      它**不拦**"策略本身就要重仓"—— 那是仓位政策, 属投资判断, 由策略自管。
+//!   它**不拦**"策略本身就要重仓"—— 那是仓位政策, 属投资判断, 由策略自管。
 //! - 接入点仍是回测 / Dry Run / 实盘三条 `place_order` 顶部: 超限返回 Rejected ack
 //!   (策略循环不中断), 并记 warn 日志(target = "order_guard"), 计入 rejected_count。
 
@@ -40,7 +40,7 @@ pub const NOTIONAL_LIMIT_MULTIPLE: u32 = 10;
 ///
 /// - `equity` 取不到 → **放行**(见函数文档的诚实性说明);
 /// - `price` 缺失(市价单无价格) → **放行**;
-/// 两者都不是"猜一个值", 而是"拿不到就不拦" —— 护栏拒绝必须是**有依据**的拒绝。
+///   两者都不是"猜一个值", 而是"拿不到就不拦" —— 护栏拒绝必须是**有依据**的拒绝。
 ///
 /// ## 为什么取不到权益就放行
 /// 护栏的作用是拦"明显失控", 不是"必须拦住一切"。在没有权益基准时按某个假定的权益
@@ -72,11 +72,7 @@ pub enum OrderGuardError {
     ///
     /// **只拦这一类明显失控的下单**(如把 1000 当 0.1), 不是仓位政策 ——
     /// 最大持仓 / 单日亏损 / 回撤熔断仍属投资判断, 由策略自管(宪法 D15/D17)。
-    NotionalLimitExceeded {
-        notional: Decimal,
-        equity: Decimal,
-        multiple: u32,
-    },
+    NotionalLimitExceeded { notional: Decimal, equity: Decimal, multiple: u32 },
 }
 
 impl fmt::Display for OrderGuardError {
@@ -329,16 +325,15 @@ mod tests {
         assert!(guard_check(&mut g, t, Some(eq("100")), Some(eq("1000"))).is_ok());
         // 第 2 单: 频率(第2>1)与名义(100000>10000)同时超限 → 必须报频率
         let err = guard_check(&mut g, t, Some(eq("100000")), Some(eq("1000"))).unwrap_err();
-        assert!(
-            matches!(err, OrderGuardError::OrderRateLimited { .. }),
-            "先报频率, 实际: {err}"
-        );
+        assert!(matches!(err, OrderGuardError::OrderRateLimited { .. }), "先报频率, 实际: {err}");
     }
 
     #[test]
     fn guard_check_passes_when_notional_unknown() {
         // 市价单无价格 → notional 取不到 → 放行(频率判定仍照常)
         let mut g = OrderGuard::with_limit(100);
-        assert!(guard_check(&mut g, DateTime::from_timestamp(1_000, 0), None, Some(eq("1000"))).is_ok());
+        assert!(
+            guard_check(&mut g, DateTime::from_timestamp(1_000, 0), None, Some(eq("1000"))).is_ok()
+        );
     }
 }

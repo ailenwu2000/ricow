@@ -95,13 +95,24 @@
 - 双向闭合已当场验：分项 `550+3+67+18+128+290+3 = 1059`；`1056 + 3 = 1059`
   > ⚠️ **1059 撞号提醒**：这个数字上一轮曾是「按分项加算算出的错值」被订正掉。本轮**真跑读出**恰是 1059，且双向闭合 —— **是巧合撞号，不是回到那个错值**。
 - `node scripts/web_frontend_check.mjs` 七段全绿（双语 **567·567**，新加 9+9 键）
-- CDP 走查 **99 PASS / 0 FAIL**（干净 root；另一条 NOTE = `/favicon.ico` 404，历史遗留）
+- CDP 走查 **全绿**(干净 root; 058 kill switch 段 11 条; 另一条 NOTE = `/favicon.ico` 404, 历史遗留)
+  > **2026-10-18 订正**: 此处原记 `99 PASS`。同代码同脚本复跑读出 **111** —— 两个都不是错:
+  > 探针含循环复用与 `checkNoErrors` 聚合, **静态 `check(` 调用仅 93 个, 运行期 PASS 数随页面元素
+  > 数量浮动**。故与 `architecture.md` 第九节、roadmap 056/057 条统一口径 —— **只声明"全绿", 不钉数字**。
+- 官方冒烟 `e2e_web.py`: 058 当轮**未跑**(纯前端 + 提示词, 未动接口形状); **2026-10-18 补跑 = 458 PASS / 0 FAIL**(与 056/057 同基线, 零回归)。
 
 ---
 
 ## 六、踩坑（留给下一个）
 
 - **`show_all_pairs` 第 4 次踩**：干净 root 默认 `false` → `ETHUSDT` 不在视野报错；且它是**启动期**读取，改完必须重启服务，重启后 token 也会变。
+- **058 当轮漏跑了 `cargo fmt` 与 `clippy`**（2026-10-18 盘点时补跑才发现两道都红）：fmt 差 4 个文件；
+  clippy 2 条 `doc_lazy_continuation` / `doc_overindented_list_items`，**全在文档注释缩进**
+  （`order_guard.rs:13/43`、`provider.rs:697/698`）。**CI 的 `lint` job 第一件事就是这两条 → 会挂**。
+  两个教训：① 提交前**六件门禁要跑全**，别只跑 `cargo test` + 真机两路；
+  ② clippy **编译到第一个 error 就停**，必须**迭代到 exit 0** 才算完（058 修完一处才暴露下一处）；
+  ③ 文档注释列表续行缩进**别自己数格**（`②` 是 CJK 宽字符，2 格判 lazy、5/6 格判 overindented），
+  **照 clippy help 给的那一格改**。
 - **token 三路没有 `X-Ricow-Token`**：是 `Authorization: Bearer` / `?token=` / cookie（我一开始猜错头名导致全 401）。
 - **探针同 root 不可跑第二轮**：临时探针策略已删 → `/api/strategies/<它>` 404，必须换干净 root（与 `e2e_web.py` 同纪律）。
 - **`daemon start` 是前台阻塞的**：同一串命令后面的 `ricow start` 永远不会执行，要另开 shell。
