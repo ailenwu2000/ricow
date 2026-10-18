@@ -222,7 +222,7 @@
       "</tr></thead>" +
       '<tbody id="rn-tbody"></tbody></table></div>' +
       "</div>" +
-      '<div id="rn-modal-root"></div></div>';
+      '</div>';
 
     // 回前台立即补一次刷新(轮询在不可见期间是暂停的)。
     document.addEventListener("visibilitychange", onVisibility);
@@ -314,6 +314,11 @@
   function renderRows() {
     const tbody = $("rn-tbody");
     tbody.innerHTML = "";
+    // 059 UX-06/13: 「停止全部」是**不可逆的危险动作**, 没有任何实例时它无事可停 ——
+    // 此前它一直亮在空表格上方(旁边就是"暂无策略实例"), 视觉上把最危险的东西摆在
+    // 一个什么都没有的页面上。有实例才出现。
+    const killAll = $("rn-kill-all");
+    if (killAll) killAll.hidden = !listData || listData.length === 0;
     if (!listData || !listData.length) {
       const tr = document.createElement("tr");
       tr.className = "rn-empty";
@@ -526,40 +531,13 @@
     anchor.after(logTr);
   }
 
-  // ---------- 通用弹窗(与策略页同款骨架) ----------
-
-  function openModal(titleText) {
-    const overlay = h("div", "sg-modal-overlay");
-    const card = h("div", "sg-modal-card");
-    card.appendChild(h("div", "sg-modal-title", titleText));
-    overlay.appendChild(card);
-    $("rn-modal-root").appendChild(overlay);
-    const close = () => overlay.remove();
-    overlay.addEventListener("mousedown", (ev) => {
-      if (ev.target === overlay) close();
-    });
-    const onKey = (ev) => {
-      if (ev.key === "Escape") {
-        close();
-        document.removeEventListener("keydown", onKey);
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return { card, close };
-  }
-
-  /// 弹窗底部一行: 取消 + 主钮; 返回 { cancel, primary }。
-  function modalActions(card, primaryKey) {
-    const row = h("div", "sg-modal-actions");
-    const cancel = h("button", "sg-btn", t("sgCancel"));
-    cancel.type = "button";
-    const primary = h("button", "sg-btn sg-btn-primary", t(primaryKey));
-    primary.type = "button";
-    row.appendChild(cancel);
-    row.appendChild(primary);
-    card.appendChild(row);
-    return { cancel, primary };
-  }
+  // ---------- 弹窗 ----------
+  //
+  // 059 UX-09: 本地这份 `openModal` / `modalActions` 已删 —— 实现统一收进 `common.js` 的
+  // `R.modal`(挂载点 `#modal-root`), 与策略视图共用同一份。原先那份缺 `role="dialog"` /
+  // 焦点管理, 且**点取消关闭时 Esc 监听不摘**。这里只留薄封装。
+  const openModal = (...a) => R.modal.open(...a);
+  const modalActions = (...a) => R.modal.actions(...a);
 
   // ---------- 启动对话框(dry_run / demo / live 三模式; live 两步门禁) ----------
 
@@ -1037,7 +1015,8 @@
       active = true;
       const g = (gen += 1);
       R.applyLang(R.lang);
-      $("rn-modal-root").innerHTML = "";
+      // 059 UX-09: 弹窗挂载点统一为 `#modal-root`。
+      R.modal.closeAll();
       enter(g);
       startPolling();
     },
@@ -1049,7 +1028,8 @@
         pollTimer = 0;
       }
       collapseLog(); // 关日志流
-      $("rn-modal-root").innerHTML = "";
+      // 059 UX-09: 弹窗挂载点统一为 `#modal-root`(原 `rn-modal-root` 已从骨架移除)。
+      R.modal.closeAll();
     },
   };
 })();

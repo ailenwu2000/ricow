@@ -121,14 +121,18 @@ const sources = new Map(jsFiles.map((f) => [f, fs.readFileSync(path.join(ASSETS,
 console.log("=".repeat(78));
 console.log("A. 语法 (每个 .js 交给 V8 编译一次, 等价于 `node --check`)");
 console.log("=".repeat(78));
+let syntaxBad = 0;
 for (const [name, src] of sources) {
   try {
     new vm.Script(src, { filename: name });
   } catch (err) {
+    syntaxBad += 1;
     fail(`${name} 语法错误`, String(err && err.message));
   }
 }
-pass(`${jsFiles.length} 份 .js 语法可编译`);
+// 有红线的文件不参与这句 ok —— 否则日志里"红线 + ok"并排, 读的人以为语法都过了
+// (退出码是对的, 但这种"旁边打个勾"的失真一样会误导)。
+if (syntaxBad === 0) pass(`${jsFiles.length} 份 .js 语法可编译`);
 
 // ---------------------------------------------------------------------------
 // B. 双语字典: zh / en 键集合必须一致。

@@ -241,6 +241,13 @@
     // 是三件事 —— 合成一句用户就不知道该点哪张卡上的保存(其实保存是同一个按钮, 但得说清改了什么)。
     sgParamDirty: "参数有未保存的修改",
     sgDirtyBoth: "代码与参数都有未保存修改",
+    // 059 UX-16: 带着未保存改动离开详情页时的确认。053 解决了"看不出没保存",
+    // 但用户仍可点左侧导航 / 浏览器后退直接走掉 —— 提示看见了一次, 改动还是丢了。
+    // 两个按钮都**说清后果**, 不用「确定/取消」这种要用户猜的词。
+    sgLeaveTitle: "有未保存的改动",
+    sgLeaveBody: "这个策略的代码或参数改过但还没保存。现在离开的话, 这些改动会丢失。",
+    sgLeaveStay: "留在这里(去保存)",
+    sgLeaveGo: "放弃改动, 离开",
     sgParamChangesTitle: "改动对比(未保存)",
     sgParamFrom: "原",
     sgParamTo: "改为",
@@ -354,6 +361,16 @@
     sgAiCompilePrefix: "AI 草稿未通过编译,编辑器内容没有替换:",
     sgCompilePrefix: "编译未通过:",
     sgNoSummary: "—",
+    // 059 UX-12: 列表卡片描述是**单行截断**(style.css .sg-row-summary 的 nowrap+ellipsis),
+    // 而策略名对新手往往不够自解释 —— 此前要看到完整说明只能点进详情。
+    // 这里在卡片内直接展开完整描述(不跳转), 按钮只在**真被截断**时才出现(见 renderRow)。
+    sgExpand: "展开",
+    sgCollapse: "收起",
+    // 059 UX-06: 空分组此前是一个孤零零的「—」 —— 用户看完不知道这一组为什么空、
+    // 也不知道该做什么(四条分组线各挂一个「—」, 像表格缺数据而不是"还没有")。
+    // 换成统一空状态组件的一句话说明; 「我的」两组额外点明"内置要先复制才能改"。
+    sgGroupEmpty: "这一组暂时没有策略。",
+    sgGroupEmptyUser: "还没有自己的策略 —— 内置策略要先「复制」才能改, 也可以直接新建。",
     // 适用性卡片(帮助计划第 7 条): 清单里早就写好 适用/不适用 场景, 此前只在「清单编辑器」
     // (新建/复制时)可见, 只读详情页一个字都不显示 —— 8 个内置策略只能靠名字猜。
     // 这里把同一份数据在**只读**详情页展示出来, 数据源 = GET /api/strategies/{id} 的 manifest,
@@ -618,6 +635,11 @@
     sgAiDirty: "AI draft not saved — review then save",
     sgParamDirty: "Unsaved parameter changes",
     sgDirtyBoth: "Unsaved changes in code and parameters",
+    sgLeaveTitle: "You have unsaved changes",
+    sgLeaveBody:
+      "This strategy's code or parameters were changed but not saved. Leaving now discards them.",
+    sgLeaveStay: "Stay here (so I can save)",
+    sgLeaveGo: "Discard and leave",
     sgParamChangesTitle: "Changed values (not saved yet)",
     sgParamFrom: "was",
     sgParamTo: "now",
@@ -715,6 +737,11 @@
     sgAiCompilePrefix: "AI draft failed the compile gate; the editor was not changed:",
     sgCompilePrefix: "Compile failed:",
     sgNoSummary: "—",
+    sgExpand: "Expand",
+    sgCollapse: "Collapse",
+    sgGroupEmpty: "No strategies in this group yet.",
+    sgGroupEmptyUser:
+      "No strategies of your own yet — copy a built-in one to edit it, or create a blank one.",
     sgDetail: "Details",
     sgFit: "Suitability",
     sgFitSummary: "Summary",
@@ -1151,8 +1178,7 @@
       '<div id="sg-val-result"></div></details>' +
       '<div id="sg-bt-history"></div></div></section>' +
       "</div></div>" +
-      // 弹窗层(新建/复制)
-      '<div id="sg-modal-root"></div></div>';
+      "</div></div>";
 
     // 周期下拉选项(静态常量, 直接建 option)。
     const ivSel = $("sg-bt-interval");
@@ -1220,40 +1246,14 @@
     st.mounted = true;
   }
 
-  // ---------- 通用弹窗(内容由调用方用 DOM 追加; 文案随当前语言) ----------
-
-  function openModal(titleText) {
-    const overlay = h("div", "sg-modal-overlay");
-    const card = h("div", "sg-modal-card");
-    card.appendChild(h("div", "sg-modal-title", titleText));
-    overlay.appendChild(card);
-    $("sg-modal-root").appendChild(overlay);
-    const close = () => overlay.remove();
-    overlay.addEventListener("mousedown", (ev) => {
-      if (ev.target === overlay) close();
-    });
-    const onKey = (ev) => {
-      if (ev.key === "Escape") {
-        close();
-        document.removeEventListener("keydown", onKey);
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return { card, close };
-  }
-
-  /// 弹窗底部一行: 取消 + 主钮; 返回 { cancel, primary }。
-  function modalActions(card, primaryKey) {
-    const row = h("div", "sg-modal-actions");
-    const cancel = h("button", "sg-btn", t("sgCancel"));
-    cancel.type = "button";
-    const primary = h("button", "sg-btn sg-btn-primary", t(primaryKey));
-    primary.type = "button";
-    row.appendChild(cancel);
-    row.appendChild(primary);
-    card.appendChild(row);
-    return { cancel, primary };
-  }
+  // ---------- 弹窗 ----------
+  //
+  // 059 UX-09: 本地这份 `openModal` / `modalActions` 已删 —— 实现统一收进 `common.js` 的
+  // `R.modal`(挂载点 `#modal-root`), 与运行视图共用同一份。原先那份缺 `role="dialog"` /
+  // 焦点管理, 且**点取消关闭时 Esc 监听不摘**(每个弹窗漏一个)。这里只留薄封装, 免得
+  // 各调用点都去写 `R.modal.`。
+  const openModal = (...a) => R.modal.open(...a);
+  const modalActions = (...a) => R.modal.actions(...a);
 
   // ---------- 列表态 ----------
 
@@ -1302,7 +1302,11 @@
       sec.appendChild(head);
       const box = h("div", "sg-rows");
       if (!rows.length) {
-        box.appendChild(h("div", "sg-empty", "—"));
+        // 059 UX-06: 统一空状态(原先是一个光秃秃的「—」)。「我的」两组多说一句
+        // "内置要先复制" —— 这正是新用户最常卡住的地方(见下方 sg-firststep 同因)。
+        box.appendChild(
+          R.emptyState(t(def.source === "user" ? "sgGroupEmptyUser" : "sgGroupEmpty"))
+        );
       } else {
         for (const row of rows) box.appendChild(renderRow(row));
       }
@@ -1344,9 +1348,24 @@
       flags.appendChild(dup);
     }
     if (flags.childNodes.length) main.appendChild(flags);
-    main.appendChild(
-      h("span", "sg-row-summary", s.summary ? s.summary : t("sgNoSummary"))
-    );
+    // 059 UX-12: 描述节点留引用 —— 展开按钮要实测它是否真被截断, 并切换它的换行样式。
+    const sum = h("span", "sg-row-summary", s.summary ? s.summary : t("sgNoSummary"));
+    main.appendChild(sum);
+    // 展开/收起只在**有描述**时才存在(没描述就是「—」, 没什么可展开的)。
+    // 按钮放在 .sg-row-actions 里而不是 .sg-row-main 里 —— main 本身是个 <button>,
+    // HTML 不允许按钮套按钮, 套了点「展开」会连带触发进详情。
+    let more = null;
+    if (s.summary) {
+      more = h("button", "sg-btn sg-btn-mini sg-row-more", t("sgExpand"));
+      more.type = "button";
+      more.hidden = true; // 默认藏: 下一帧实测真截断才露出来
+      more.setAttribute("aria-expanded", "false");
+      more.addEventListener("click", () => {
+        const open = sum.classList.toggle("sg-row-summary-open");
+        more.textContent = t(open ? "sgCollapse" : "sgExpand");
+        more.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+    }
     const act = h("div", "sg-row-actions");
     if (s.source === "builtin") {
       // 内置: 可看详情(适用性 + 参数 + 直接回测), 但**不能直接改** —— 改要先「复制」。
@@ -1375,6 +1394,15 @@
       del.addEventListener("click", () => onDelete(s));
       act.appendChild(del);
       main.addEventListener("click", () => openDetail(s.id));
+    }
+    if (more) {
+      // 实测截断要等元素进了文档才准(renderRow 返回时还没 append)。单行 ellipsis 下
+      // scrollWidth 被 clientWidth 卡住, 两者基本相等就说明这一行本来就放得下。
+      // 视图未激活时 clientWidth 是 0 —— 那种情况保持隐藏, 不做判断。
+      requestAnimationFrame(() => {
+        more.hidden = sum.scrollWidth <= sum.clientWidth + 1;
+      });
+      act.insertBefore(more, act.firstChild);
     }
     row.appendChild(main);
     row.appendChild(act);
@@ -2186,6 +2214,95 @@
     }
   }
 
+  // ---------- 059 UX-16: 带着未保存改动离开详情页时拦一下 ----------
+  //
+  // 053 解决了"改了参数界面不吭声", 但用户仍可以点左侧导航 / 按浏览器后退直接走掉 ——
+  // 「未保存」的提示就挂在详情页上, 一走就整屏没了, 改动跟着丢。
+  //
+  // 为什么不用 `beforeunload`: 本产品是**单页 + hash 路由**, 切视图不改地址栏的路径、
+  // 不触发 `beforeunload` —— 挂它只会拦住"关标签页/刷新"这一种, 而真正会丢改动的是
+  // "切到别的视图"这一种, 它完全不管。
+  //
+  // 为什么由 **router 回调** 而不是自己监听 `hashchange`: 同一个 window 上的多个监听按
+  // **注册顺序**跑, 而 router.js 排在本文件之前加载(assets.rs 的加载顺序契约), 它的监听
+  // 必然先跑 —— 轮到本文件时, router 已经把策略视图 deactivate(顺手还 `closeAll()` 了弹窗),
+  // 守卫就成了永远不触发的死代码(059 第一版就栽在这: 静态门四道全绿, 只有 CDP 真点一次才现形)。
+  // 于是改成 router 在**切走之前**先问一句, 顺序由它保证(见 router.js 的 `R.setLeaveGuard`)。
+  let viewActive = false;
+  let leaveAllowed = false; // 「放弃改动, 离开」放行一次
+
+  /// 当前详情页自己的 hash(列表态没有)。
+  function currentDetailHash() {
+    if (!st.detailCtx || !st.detailCtx.id) return null;
+    return "strategies/" + st.detailCtx.id;
+  }
+
+  /// router 给的目标路由还原成 hash 主体(与 `currentDetailHash()` 同口径才好比)。
+  function routeTarget(route) {
+    if (route.name === "strategies" && route.param) return "strategies/" + route.param;
+    return route.name;
+  }
+
+  /// 返回 false = "先别切"(router 停在原视图); 返回 true = 放行。
+  function guardUnsaved(route) {
+    if (leaveAllowed) {
+      leaveAllowed = false;
+      return true;
+    }
+    if (!viewActive || !st.detailCtx || !S.isDirty) return true;
+    let dirty = false;
+    try {
+      dirty = S.isDirty();
+    } catch (_) {
+      return true; // 判据算不出来(骨架未就绪)时不拦 —— 误拦比不拦更糟
+    }
+    if (!dirty) return true;
+    const here = currentDetailHash();
+    const target = routeTarget(route);
+    if (!here || target === here) return true; // 还在同一个策略详情里, 不算离开
+
+    // 地址栏已经变了(`hashchange` 无法取消), 先把它拨回详情页 —— 这样按 Esc 或直接关窗
+    // 也不会留下"地址写着市场、画面停在策略"的错位。replaceState 不往历史栈里塞新条目。
+    try {
+      history.replaceState(null, "", "#" + here);
+    } catch (_) {}
+
+    const { card, close } = R.modal.open(t("sgLeaveTitle"));
+    const body = document.createElement("div");
+    body.className = "sg-modal-form";
+    const p = document.createElement("div");
+    p.className = "sg-leave-body";
+    p.textContent = t("sgLeaveBody");
+    body.appendChild(p);
+    card.appendChild(body);
+
+    const row = document.createElement("div");
+    row.className = "sg-modal-actions";
+    // 主位放"留下去保存" —— 它是**更不容易出错**的那个选择, 不该藏在次要位置。
+    const stay = document.createElement("button");
+    stay.className = "sg-btn sg-btn-primary";
+    stay.type = "button";
+    stay.textContent = t("sgLeaveStay");
+    const go = document.createElement("button");
+    go.className = "sg-btn sg-btn-danger";
+    go.type = "button";
+    go.textContent = t("sgLeaveGo");
+    row.appendChild(stay);
+    row.appendChild(go);
+    card.appendChild(row);
+
+    // 留下 = 什么都不用做: 地址栏已经拨回详情页了(见上)。
+    stay.addEventListener("click", () => close());
+    go.addEventListener("click", () => {
+      close();
+      leaveAllowed = true; // 下一轮 applyRoute 放行(守卫这次不再问)
+      R.navigate("#" + target);
+    });
+    return false;
+  }
+
+  R.setLeaveGuard(guardUnsaved);
+
   const baseApplyLang = R.applyLang;
   R.applyLang = function (lang) {
     const ret = baseApplyLang.call(this, lang);
@@ -2201,16 +2318,20 @@
     /// param = 二级 hash 解码后的策略 id; 缺省 = 列表态。
     activate: (param) => {
       mount();
+      viewActive = true; // 059 UX-16: 只有本视图激活时才拦离开
       const g = (st.gen += 1);
       R.applyLang(R.lang);
       $("sg-listview").hidden = !!param;
       $("sg-detail").hidden = !param;
-      $("sg-modal-root").innerHTML = "";
+      // 059 UX-09: 弹窗挂载点统一为 `#modal-root`(原 `sg-modal-root` 已从骨架移除)。
+      R.modal.closeAll();
       renderHistory(); // 会话级历史表(P1-6): 列表态与详情态都可见
       if (param) enterDetail(param, g);
       else enterList(g);
     },
     deactivate: () => {
+      // 059 UX-16: 已经离开本视图就别再拦了(否则从别处切回来还会弹一次)。
+      viewActive = false;
       st.gen += 1; // 在途响应/轮询全部作废
       if (st.pollTimer) {
         clearInterval(st.pollTimer);
@@ -2219,7 +2340,8 @@
       destroyBtChart();
       // 054 P4: 检验曲线的图表句柄是独立的(不与回测图共用一个), 离开视图一并销毁。
       destroyValChart();
-      $("sg-modal-root").innerHTML = "";
+      // 059 UX-09: 弹窗已统一挂到 `#modal-root`(见 common.js 的 `R.modal`)。
+      R.modal.closeAll();
     },
   };
 })();

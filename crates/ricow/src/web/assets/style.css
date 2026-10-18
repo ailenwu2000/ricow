@@ -214,12 +214,29 @@ body {
   padding: 10px 16px;
   border-bottom: 1px solid var(--border);
 }
+/* 059 UX-01: 顶栏「当前视图名」。比会话名更醒目 —— 它是"我在哪一屏"的唯一答案,
+   会话名(#session-title)是它的补充, 且只在对话视图出现(见下面 [data-view] 规则)。 */
+#view-title {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--text);
+}
 #session-title {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+/* 059 UX-01/03: 会话名与会话列表都是**对话视图**的概念。
+   此前两者在六个视图下都常驻 —— 看密钥/设置时顶栏写着「新会话」、左栏挂着聊天列表,
+   既占空间又与当前任务无关。现在按 `#app` 上的 `data-view`(由 router.js 写)显隐:
+   JS 只写一个数据属性, 具体表现交给 CSS, 省掉两处各自改 style 的分叉。 */
+#app:not([data-view="chat"]) #session-title {
+  display: none;
+}
+#app:not([data-view="chat"]) #session-list {
+  display: none;
 }
 .status {
   color: var(--accent);
@@ -1552,6 +1569,13 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* 059 UX-12: 展开态 —— 放行换行、不再截断(默认态见上方 nowrap+ellipsis)。 */
+.sg-row-summary-open {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: break-word;
 }
 .sg-row-actions {
   flex: none;

@@ -364,7 +364,9 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-10-18, 058 kill switch 的 Web 端入口 + AI 按资金量给建议 落地后实跑)**: `cargo test --workspace --no-fail-fast` = **1059 passed / 0 failed / 22 ignored**(全目标零失败)。
+- **基线(2026-10-18, 059 假绿排查: 安全红线门 / 架构守卫的花括号配平漏扫、前端门 A 段无条件 pass 修掉后实跑)**: `cargo test --workspace --no-fail-fast` = **1060 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+1**(整仓实跑 1060 − 上一基线 1059), 来自 `architecture_guard` **3 → 4**: `production_lines_survives_braces_inside_string_literals` —— 它锁的是本轮查出的**假绿**: `brace_delta` 朴素地数 `{`/`}`，`#[cfg(test)]` 块里只要有一句 `format!("{")`，`skip_depth` 就永不归零，**该块之后的生产代码被整段静默吞掉**，架构守卫从此对那个文件失明(而且"测试写得越多越容易失明")。同一种错法在 `scripts/ci_grep_gates.sh` 的 `non_test_lines` 里也有一份，已一并修。其余 target **实测** 一字未变(`ricow` bin 550 / `ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 290 / `ai_live_smoke` 3 通过 + 9 ignored)。当前分解 550+3+67+18+128+290+4 = **1060**, ignored 分解 1+9+0+3+3+1+2+0+0+2+1+0 = **22**, 与总数自洽。
+- ~~基线(2026-10-18, 058 kill switch 的 Web 端入口 + AI 按资金量给建议 落地后实跑)~~: `cargo test --workspace --no-fail-fast` = **1059 passed / 0 failed / 22 ignored**(全目标零失败)。
   增量 = **+3**(整仓实跑 1059 − 上一基线 1056), 全部来自 058 的 `ai::provider::tests`(`ricow` bin **547 → 550**): 本金必须进提示词 / 拿不到本金不许编数 / 档位知识只判可行性不做投资判断; 其余 target **实测** 一字未变(`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 290 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。当前分解 550+3+67+18+128+290+3+3 = **1059**, 与总数自洽。
   > **1059 撞号提醒**: `specs/roadmap.md` 上一轮曾把 1059 订正掉(那是按分项加算算出的错值, 真实值 1056)。058 这次**真跑读出**恰是 1059 且双向闭合 —— **巧合撞号, 不是回到那个错值**。
 - ~~基线(2026-10-18, 056 + 057)~~: = **1056 passed / 0 failed / 22 ignored**。

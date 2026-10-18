@@ -665,6 +665,14 @@ async function main() {
   );
   await ev("window.Ricow.applyLang('zh')");
   await sleep(300);
+  // 上面为了看英文文案又把值改成了 0.07, 页面**停在脏状态** —— 而 054 / 058 两段都假定能
+  // 自由切视图。059 加了"带着未保存改动离开要拦一下"之后, 这个残留的脏会让它们全被拦住
+  // (表象是 054 的详情页断言读到副本的摘要)。这里补一次还原: 让后续段回到"没改动"的前提,
+  // 而"脏了会被拦"由 059 段**自己造脏**去验。
+  await ev("(() => { const b = document.getElementById('sg-param-revert'); if (b) b.click(); return 'ok'; })()");
+  await sleep(300);
+  const cleanAgain = await ev("document.getElementById('sg-params-dirty').hidden");
+  check("053 收尾: 探针把改动还原干净(后续段的前提)", cleanAgain === true, String(cleanAgain));
 
   // ---- ⑩ 054: AI 生成弹窗的结构化输入 / 验证窗口 / P4 验证卡 / T37 摘要落点 ----
   //
@@ -821,7 +829,11 @@ async function main() {
   // 为什么单列一段而不是并进 052: 这个按钮**带写动作**(POST /api/runs/kill), 与本页其余
   // 只读断言性质不同; 而且它的核心不变量是「短语没写对时按钮不放行」—— 这条只能真点一次
   // 才验得到, grep JS 文本永远验不出 `primary.disabled` 有没有真的被 syncHint 联动。
-  await ev("window.Ricow.router && (location.hash = '#runs'), 'ok'");
+  // `R.router` **从未导出**(router.js 只导出 navigate/parseHash/refreshTitle), 所以此前
+  // `window.Ricow.router && (location.hash = ...)` 这条恒短路 —— hash 根本没被赋值, 而本段
+  // 的断言又只读 DOM 常驻元素(视图切换只是显隐), 于是"切到运行视图"是**假绿**: 一直停在
+  // 上一段的策略详情页。改走真导出 `R.navigate`, 让视图真的切过去。
+  await ev("window.Ricow.navigate('#runs'), 'ok'");
   await sleep(1200);
   const killBtn = await ev(
     "(() => { const b = document.getElementById('rn-kill-all');" +
@@ -830,9 +842,11 @@ async function main() {
   check("058 运行视图有「停止全部」入口", killBtn === "停止全部", String(killBtn));
 
   // 点开弹窗: 必须能点开且给出短语输入框与不可逆提示。
+  // 059 UX-09: 弹窗挂载点统一到首页的 `#modal-root`(原先 runs 视图自带的 `rn-modal-root`
+  // 已从骨架移除)。这里跟着改成新挂载点 —— 对照组是"点开后弹窗内容真的在", 挂载点只是寻址。
   const opened = await ev(
     "(() => { const b = document.getElementById('rn-kill-all'); if (!b) return 'no-btn'; b.click();" +
-      " const root = document.getElementById('rn-modal-root');" +
+      " const root = document.getElementById('modal-root');" +
       " return root && root.querySelector('input.sg-input') ? 'ok' : 'no-input'; })()"
   );
   check("058 点开「停止全部」弹窗且有逐字短语输入框", opened === "ok", String(opened));
@@ -860,7 +874,7 @@ async function main() {
   // 主按钮按**文案**定位而不是 `.sg-btn`: 弹窗里取消按钮也是 `sg-btn` 且默认未禁用,
   // 用类名挑会挑错对象, 断言就成了永远为 true 的假绿(058 第一版就栽在这)。
   const gate = await ev(
-    "(() => { const root = document.getElementById('rn-modal-root');" +
+    "(() => { const root = document.getElementById('modal-root');" +
       " const input = root.querySelector('input.sg-input');" +
       " const btns = Array.from(root.querySelectorAll('button'));" +
       " const btn = btns.find(b => b.textContent.indexOf('停止全部') >= 0);" +
@@ -890,12 +904,363 @@ async function main() {
   // 关掉弹窗, 别把遮罩留给后续断言。按文案找取消钮(键 sgCancel → 「取消」),
   // 不要用 `!sg-btn-danger` 这类启发式: 主按钮本来就不带 danger 类, 挑不到。
   await ev(
-    "(() => { const root = document.getElementById('rn-modal-root');" +
+    "(() => { const root = document.getElementById('modal-root');" +
       " const c = Array.from(root.querySelectorAll('button')).find(b => b.textContent.trim() === '取消');" +
       " if (c) c.click(); return 'ok'; })()"
   );
   await sleep(300);
   checkNoErrors("058 kill switch 入口与逐字短语联动");
+
+  // ---- ⑪ 059 Web UI 体验改进 ----
+  //
+  // 这一批全是**纯前端**改动: HTTP 层冒烟(e2e_web.py)取回的只是一段字符串, 它证明不了
+  // "焦点真的进了弹窗" / "卡片真的变高了"。所以每条都在真浏览器里点一次。
+  const nav = async (v) => {
+    await ev("window.Ricow.navigate('#" + v + "'), 'ok'");
+    await sleep(900);
+  };
+
+  // UX-01 / UX-02: 顶栏标出当前视图 + 浏览器标签标题跟着走(此前 document.title 恒为 "Ricow",
+  // 六个页签的标签页长得一模一样, 切了视图看不出自己在哪儿)。
+  await nav("markets");
+  const vt = await ev(
+    "(() => ({ view: document.getElementById('app').dataset.view," +
+      " label: (document.getElementById('view-title') || {}).textContent," +
+      " docTitle: document.title }))()"
+  );
+  check(
+    "059 顶栏标出当前视图名(此前六个页签长得一样)",
+    typeof vt.label === "string" && vt.label.length > 0,
+    JSON.stringify(vt)
+  );
+  check(
+    "059 浏览器标签标题跟着视图走(此前恒为 Ricow)",
+    typeof vt.docTitle === "string" && vt.docTitle !== "Ricow" && vt.docTitle.indexOf("Ricow") >= 0,
+    String(vt.docTitle)
+  );
+  check("059 视图名写进 data-view(CSS 据此显隐会话区)", vt.view === "markets", String(vt.view));
+
+  // UX-03: 会话列表/会话名只在对话视图露脸(此前六视图常驻, 在"市场"里挂一串对话标题)。
+  const slHidden = await ev(
+    "(() => { const l = document.getElementById('session-list');" +
+      " return l ? getComputedStyle(l).display : 'missing'; })()"
+  );
+  check("059 非对话视图收起会话列表(此前六视图常驻)", slHidden === "none", String(slHidden));
+  await nav("chat");
+  const slShown = await ev(
+    "(() => { const l = document.getElementById('session-list');" +
+      " return l ? getComputedStyle(l).display : 'missing'; })()"
+  );
+  check("059 对话视图里会话列表仍然在", slShown !== "none", String(slShown));
+
+  // UX-01 补验: 光"顶栏有几个字"证明不了它**跟着视图走** —— 一个恒定占位符同样能过上面那条。
+  // 这里切到另一个视图再读一次: 两个名字必须不同, 且与侧栏那一项是同一份文案。
+  const vt2 = await ev(
+    "(() => ({ label: (document.getElementById('view-title') || {}).textContent," +
+      " nav: (document.querySelector('#nav a[href=\"#chat\"]') || {}).textContent," +
+      " docTitle: document.title }))()"
+  );
+  check(
+    "059 切视图后顶栏名跟着变(不是恒定占位符)",
+    typeof vt2.label === "string" && vt2.label.length > 0 && vt2.label !== vt.label,
+    JSON.stringify({ markets: vt.label, chat: vt2.label })
+  );
+  check(
+    "059 顶栏名与侧栏那一项同文案(防「导航写市场、顶栏写 Markets」的分叉)",
+    typeof vt2.nav === "string" && vt2.nav.trim() === vt2.label.trim(),
+    JSON.stringify(vt2)
+  );
+  check(
+    "059 切视图后标签标题也跟着变",
+    vt2.docTitle !== vt.docTitle && vt2.docTitle.indexOf("Ricow") >= 0,
+    JSON.stringify({ markets: vt.docTitle, chat: vt2.docTitle })
+  );
+
+  // UX-09: 弹窗可访问性 —— 焦点进弹窗、Tab 出不去、Esc 关得掉、关掉后焦点回原处。
+  // 此前两份 openModal 都没有 role/aria, 焦点留在背后页面, 且**非 Esc 关闭时监听不摘**
+  // (每次开关都往 document 上叠一层 keydown)。
+  await nav("strategies");
+  // 真人点按钮时焦点本来就在按钮上; JS 的 `.click()` **不移动焦点**, 而 `restoreTo` 取的正是
+  // 打开那一刻的 activeElement —— 不先 focus 就会把"关掉后焦点回原处"测成"回到 body",
+  // 测的是脚本自己而不是产品。
+  await ev(
+    "(() => { const b = document.getElementById('sg-new'); if (!b) return 'no-btn';" +
+      " b.focus(); b.click(); return 'ok'; })()"
+  );
+  await sleep(350);
+  const dlg = await ev(
+    "(() => { const d = document.querySelector('#modal-root [role=dialog]');" +
+      " if (!d) return 'no-dialog';" +
+      " const id = d.getAttribute('aria-labelledby');" +
+      " return { modal: d.getAttribute('aria-modal')," +
+      " labelled: !!(id && document.getElementById(id))," +
+      " focusIn: d.contains(document.activeElement) }; })()"
+  );
+  check(
+    "059 弹窗带 role=dialog 与 aria-modal(读屏器才知道这是个框)",
+    dlg && dlg.modal === "true",
+    JSON.stringify(dlg)
+  );
+  check("059 弹窗标题被 aria-labelledby 指向", dlg && dlg.labelled === true, JSON.stringify(dlg));
+  check("059 打开后焦点进入弹窗(不是留在背后页面上)", dlg && dlg.focusIn === true, JSON.stringify(dlg));
+  for (let i = 0; i < 4; i++) await key("Tab", "Tab", 9);
+  const trapped = await ev(
+    "(() => { const r = document.getElementById('modal-root');" +
+      " return r ? r.contains(document.activeElement) : false; })()"
+  );
+  check("059 Tab 走不出弹窗(焦点陷阱)", trapped === true, String(trapped));
+  await key("Escape", "Escape", 27);
+  await sleep(350);
+  const afterEsc = await ev(
+    "(() => ({ open: !!document.querySelector('#modal-root [role=dialog]')," +
+      " focus: document.activeElement ? document.activeElement.id : null }))()"
+  );
+  check("059 Esc 能关掉弹窗", afterEsc.open === false, JSON.stringify(afterEsc));
+  check("059 关掉后焦点回到触发它的按钮(监听也一并摘掉)", afterEsc.focus === "sg-new", JSON.stringify(afterEsc));
+
+  // UX-12: 卡片描述**真被截断**时才给「展开」, 点了就地展开(不跳详情), 再点收回。
+  // 两条一起验: 截断与按钮显隐必须一致(不截断的行不该凭空多一个按钮), 且展开真的变高。
+  const ux12 = await ev(
+    "(() => { const rows = Array.from(document.querySelectorAll('.sg-row'));" +
+      " let hit = null, mismatch = 0;" +
+      " for (const row of rows) {" +
+      "  const sum = row.querySelector('.sg-row-summary');" +
+      "  const btn = row.querySelector('.sg-row-more');" +
+      "  if (!sum || !btn) continue;" +
+      "  const trunc = sum.scrollWidth > sum.clientWidth + 1;" +
+      "  if (trunc !== !btn.hidden) mismatch += 1;" +
+      "  if (trunc && !btn.hidden && !hit) hit = { row: row, sum: sum, btn: btn };" +
+      " }" +
+      " if (!hit) return { found: false, rows: rows.length, mismatch: mismatch };" +
+      " const h0 = hit.row.getBoundingClientRect().height;" +
+      " hit.btn.click();" +
+      " const h1 = hit.row.getBoundingClientRect().height;" +
+      " const mid = { aria: hit.btn.getAttribute('aria-expanded')," +
+      "  cls: hit.sum.classList.contains('sg-row-summary-open'), txt: hit.btn.textContent.trim() };" +
+      " hit.btn.click();" +
+      " const h2 = hit.row.getBoundingClientRect().height;" +
+      " return { found: true, rows: rows.length, mismatch: mismatch, h0: h0, h1: h1, h2: h2," +
+      "  aria: mid.aria, cls: mid.cls, txt: mid.txt }; })()"
+  );
+  check("059 卡片描述被截断时才出现「展开」钮", ux12 && ux12.mismatch === 0, JSON.stringify(ux12));
+  check("059 至少有一张卡片真的被截断(否则上面那条是空跑)", ux12 && ux12.found === true, JSON.stringify(ux12));
+  check(
+    "059 点「展开」后卡片变高(完整描述就地可见, 不跳详情)",
+    ux12 && ux12.found && ux12.h1 > ux12.h0,
+    JSON.stringify(ux12)
+  );
+  check(
+    "059 展开态加了 open 类且 aria-expanded 为真",
+    ux12 && ux12.cls === true && ux12.aria === "true",
+    JSON.stringify(ux12)
+  );
+  // 「收起」这条必须带上"先真的展开过": 只比 h2≈h0 的话, 展开压根没生效时它照样绿
+  // (M7 变异就是这么放过去的 —— 三条里红了两条, 唯独这条还在绿)。
+  check(
+    "059 再点一次收起(高度回到原样)",
+    ux12 && ux12.found && ux12.h1 > ux12.h0 && Math.abs(ux12.h2 - ux12.h0) <= 1,
+    JSON.stringify(ux12)
+  );
+  checkNoErrors("059 标题/弹窗/卡片展开");
+
+  // UX-11: 命令面板「最近用过」—— 只记本次页面生命周期, 不落浏览器存储。
+  await ev("(() => { const b = document.getElementById('palette-btn'); if (b) b.click(); return 'ok'; })()");
+  await sleep(350);
+  const firstGroups = await ev(
+    "(() => Array.from(document.querySelectorAll('.palette-group')).map(e => e.textContent))()"
+  );
+  // 前置条件先钉住: 面板**真的**打开了。否则 `firstGroups` 是空数组,
+  // 「没有『最近用过』」对空数组恒真 —— 面板压根没打开也会绿。
+  check(
+    "059 命令面板真的打开了(有分组可点, 否则下面两条是空跑)",
+    Array.isArray(firstGroups) && firstGroups.length > 0,
+    JSON.stringify(firstGroups)
+  );
+  check(
+    "059 面板初次打开时没有「最近用过」(还没用过, 不摆空分组)",
+    Array.isArray(firstGroups) && firstGroups.length > 0 && !firstGroups.some((g) => g.indexOf("最近用过") >= 0),
+    JSON.stringify(firstGroups)
+  );
+  await key("Enter", "Enter", 13); // 执行高亮的第一条(视图跳转类, 无写动作)
+  await sleep(500);
+  await ev("(() => { const b = document.getElementById('palette-btn'); if (b) b.click(); return 'ok'; })()");
+  await sleep(350);
+  const secondGroups = await ev(
+    "(() => Array.from(document.querySelectorAll('.palette-group')).map(e => e.textContent))()"
+  );
+  check(
+    "059 执行过一条后再开面板, 顶部出现「最近用过」",
+    Array.isArray(secondGroups) && secondGroups[0] === "最近用过",
+    JSON.stringify(secondGroups)
+  );
+  await key("Escape", "Escape", 27);
+  await sleep(250);
+  checkNoErrors("059 命令面板最近用过");
+
+  // UX-16: 有未保存改动时切走要拦一下(此前改了参数点侧栏就直接丢了)。
+  await ev("location.hash = '#strategies/' + " + JSON.stringify(copyName));
+  await sleep(900);
+  const dirty = await ev(
+    "(() => { const ins = Array.from(document.querySelectorAll('#sg-params input.sg-input'));" +
+      " if (!ins.length) return 'no-input';" +
+      " ins[0].value = '0.777'; ins[0].dispatchEvent(new Event('input', { bubbles: true }));" +
+      " return 'ok'; })()"
+  );
+  // 前置条件先钉住: 改动必须**真的**被认成未保存 —— 否则下面几条不管过不过都说不清
+  // (059 第一版就是这么假绿的: 探针改的是第一格输入框, 而"改没改"的判据没被验过)。
+  const dirtyLit = await ev("document.getElementById('sg-params-dirty').hidden");
+  check("059 改动被认成未保存(拦截断言的前置条件)", dirtyLit === false, String(dirtyLit));
+  await ev("window.Ricow.navigate('#markets'), 'ok'");
+  await sleep(800);
+  const guard = await ev(
+    "(() => { const d = document.querySelector('#modal-root [role=dialog]');" +
+      " return { open: !!d, hash: location.hash, view: document.getElementById('app').dataset.view," +
+      " text: d ? d.textContent.slice(0, 60) : null }; })()"
+  );
+  check("059 有未保存改动时切走会先问一句", guard.open === true, JSON.stringify(guard));
+  check(
+    "059 没放行前画面还在策略详情(不是先切走再问)",
+    guard.view === "strategies" && guard.hash === "#strategies/" + copyName,
+    JSON.stringify(guard)
+  );
+  // 主位是「留下去保存」: 点它应当原地不动。
+  // 按钮按文案定位(不用 `.sg-btn-primary` 这类启发式): 文案就是给用户的那个承诺,
+  // 且这里两个钮的差别正是"留下 vs 放弃", 按类名挑会挑错对象。注意是「留在这里」不是「留下」。
+  const stayClick = await ev(
+    "(() => { const r = document.getElementById('modal-root');" +
+      " const b = Array.from(r.querySelectorAll('button')).find(x => x.textContent.indexOf('留在这里') >= 0);" +
+      " if (b) b.click(); return b ? 'ok' : 'no-btn'; })()"
+  );
+  check("059 确认框的主位确实是「留在这里」那个", stayClick === "ok", String(stayClick));
+  await sleep(700);
+  const stayed = await ev(
+    "(() => ({ hash: location.hash, modal: !!document.querySelector('#modal-root [role=dialog]') }))()"
+  );
+  check("059 选「留下」就还在详情页(改动没被丢掉)", stayed.hash === "#strategies/" + copyName, JSON.stringify(stayed));
+  check("059 选完弹窗就关了(不挡着后续操作)", stayed.modal === false, JSON.stringify(stayed));
+  // 另一条分支: 明确选「放弃改动, 离开」才真的走。
+  await ev("window.Ricow.navigate('#markets'), 'ok'");
+  await sleep(800);
+  await ev(
+    "(() => { const r = document.getElementById('modal-root');" +
+      " const b = Array.from(r.querySelectorAll('button')).find(x => x.textContent.indexOf('放弃改动') >= 0);" +
+      " if (b) b.click(); return b ? 'ok' : 'no-btn'; })()"
+  );
+  await sleep(900);
+  const left = await ev(
+    "(() => ({ hash: location.hash, view: document.getElementById('app').dataset.view," +
+      " modal: !!document.querySelector('#modal-root [role=dialog]') }))()"
+  );
+  check(
+    "059 选「放弃改动, 离开」才真的走掉",
+    left.hash === "#markets" && left.view === "markets" && left.modal === false,
+    JSON.stringify(left)
+  );
+  checkNoErrors("059 未保存离开确认");
+
+  // ---- ⑪ 补验: UX-05 / UX-06 / UX-07 / UX-13 ----
+  //
+  // 这四项 059 都动了, 但第一批断言**一条都没覆盖**。写第一批时只盯着"肉眼看得见"的那几处,
+  // 于是"改了什么"和"验了什么"是两回事。这里补齐, 免得下轮有人改动它们而走查照样全绿。
+
+  // UX-05: `R.api` 的前端超时。默认**不启用**(回测等长作业靠服务端 202 + 轮询, 不该被前端掐表),
+  // 传了才掐。用 stub 掉的 `fetch` 造一个永不返回的上游 —— 真实网络里那叫"连不上 / 服务没了",
+  // 界面上原本的表现是永远停在「加载中…」, 且没有任何可点的东西。
+  // 外面再套一层 5s 兜底: 万一超时没生效, 是断言红而不是整轮脚本卡死。
+  // stub 必须**尊重 signal**: 真实的 fetch 被 abort 时会 reject 一个 AbortError, 而这里正是靠
+  // 这一点区分"产品真的传了 signal" 和 "产品压根没掐表" —— 后者在这个 stub 下会永远挂着
+  // (于是落到外层 5s 兜底, 断言红)。
+  const STUB =
+    "window.fetch = (p, o) => new Promise((_, rej) => {" +
+    " if (o && o.signal) o.signal.addEventListener('abort', () => {" +
+    "  const e = new Error('The user aborted a request.'); e.name = 'AbortError'; rej(e); }); });";
+  const to = await ev(
+    "(async () => { const orig = window.fetch;" +
+      STUB +
+      " let msg = 'NO-THROW', ms = -1; const t0 = performance.now();" +
+      " try { await Promise.race([window.Ricow.api('/api/probe-never', { timeoutMs: 80 })," +
+      "  new Promise((_, rej) => setTimeout(() => rej(new Error('PROBE-GUARD')), 5000))]); }" +
+      " catch (e) { msg = e && e.message ? e.message : String(e); ms = performance.now() - t0; }" +
+      " window.fetch = orig; return { msg: msg, ms: ms }; })()"
+  );
+  check(
+    "059 请求超时后给中文原因(不是浏览器那句 The user aborted a request)",
+    to && typeof to.msg === "string" && to.msg.indexOf("超时") >= 0,
+    JSON.stringify(to)
+  );
+  check(
+    "059 超时按传入的上限发生(既不是立刻假超时, 也不是永远挂着)",
+    to && to.ms >= 70 && to.ms < 4000,
+    JSON.stringify(to)
+  );
+  const noTo = await ev(
+    "(async () => { const orig = window.fetch;" +
+      STUB +
+      " let settled = false;" +
+      " window.Ricow.api('/api/probe-never').then(() => { settled = true; }).catch(() => { settled = true; });" +
+      " await new Promise(r => setTimeout(r, 400));" +
+      " window.fetch = orig; return settled; })()"
+  );
+  check("059 不传上限时沿用旧行为(长作业不被前端掐表)", noTo === false, String(noTo));
+  checkNoErrors("059 前端超时(UX-05)");
+
+  // UX-06: 空状态统一。此前每个视图各写各的(有的只有一句灰字, 有的干脆空白)。
+  const es = await ev(
+    "(() => { const a = window.Ricow.emptyState('x');" +
+      " const b = window.Ricow.emptyState('y', { label: '去策略页', view: '#strategies' });" +
+      " return { plain: a.className, hasBtn: !!b.querySelector('.empty-cta-btn')," +
+      " btnText: (b.querySelector('.empty-cta-btn') || {}).textContent }; })()"
+  );
+  check("059 空状态统一走 R.emptyState(无 cta 时就是一句灰字)", es && es.plain === "empty", JSON.stringify(es));
+  check(
+    "059 空状态给 cta 时多出一个可点按钮(不是干瞪眼)",
+    es && es.hasBtn === true && es.btnText === "去策略页",
+    JSON.stringify(es)
+  );
+  checkNoErrors("059 空状态(UX-06)");
+
+  // UX-13: 「停止全部」是不可逆的危险动作, 没有任何实例时它无事可停 —— 不该亮在空表格上方。
+  // 判据写成"显隐 ⟺ 有没有实例", 这样不管本轮有没有实例都验到了逻辑, 而不是碰运气。
+  await nav("runs");
+  const ux13 = await ev(
+    "(() => { const b = document.getElementById('rn-kill-all');" +
+      " if (!b) return 'no-btn';" +
+      " const rows = document.querySelectorAll('#rn-tbody tr');" +
+      " let real = 0;" +
+      " for (const r of rows) { if (!r.classList.contains('rn-empty')) real += 1; }" +
+      " return { hidden: b.hidden, real: real }; })()"
+  );
+  check(
+    "059 「停止全部」的显隐跟着实例数走(空页面不摆最危险的动作)",
+    ux13 && ux13.hidden === (ux13.real === 0),
+    JSON.stringify(ux13)
+  );
+  checkNoErrors("059 危险动作按状态显隐(UX-13)");
+
+  // UX-07: 密钥页「0 条已保存」与「当前生效: …」并排出现过, 看着像数据自相矛盾 ——
+  // 其实是两样东西(密钥环 vs 正在生效的那一段), 但页面从没说过。补的那句要真的渲染出来。
+  await nav("keys");
+  const khZh = await ev(
+    "(() => { const p = document.querySelector('.keys-ring-hint'); return p ? p.textContent : 'missing'; })()"
+  );
+  check(
+    "059 密钥页说清「密钥环」与「当前生效」是两样东西",
+    typeof khZh === "string" && khZh.indexOf("密钥环") >= 0 && khZh.indexOf("当前生效") >= 0,
+    String(khZh).slice(0, 70)
+  );
+  await ev("window.Ricow.applyLang('en')");
+  await sleep(250);
+  const khEn = await ev(
+    "(() => { const p = document.querySelector('.keys-ring-hint'); return p ? p.textContent : 'missing'; })()"
+  );
+  await ev("window.Ricow.applyLang('zh')");
+  await sleep(250);
+  check(
+    "059 切英文后这句也是英文(没留一段中文在英文界面上)",
+    typeof khEn === "string" && khEn.indexOf("key ring") >= 0 && khEn.indexOf("currently active") >= 0,
+    String(khEn).slice(0, 70)
+  );
+  checkNoErrors("059 密钥页说明(UX-07)");
 
   // ---- ⑩ 全局收口: 全程零未捕获异常 ----
   check("全程零未捕获异常/控制台错误", pageErrors.length === 0, pageErrors.slice(0, 5).join(" | "));

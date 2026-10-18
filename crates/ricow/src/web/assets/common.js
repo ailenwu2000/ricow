@@ -121,14 +121,46 @@
   /// err.message 为中文一句(供行内展示),err.status/code/line 供调用方分支处理
   /// (如 code:"running"/"compile");非 JSON 老响应回退原文。
   /// `204 No Content`(如 POST /api/config/keys)无 JSON 体, 返回 null。
+  /// 059 UX-05: 可选的**前端超时**(`opts.timeoutMs`, 毫秒)。默认**不启用** —— 既有调用点
+  /// 行为不变(回测作业等本来就靠服务端 202 + 轮询, 不该被前端掐表)。
+  /// 要它的理由: `fetch` 自己没有超时, 上游一直不回就会**永远停在「加载中…」** ——
+  /// 用户分不清是网络慢、服务没起还是软件卡死, 也没有任何可点的东西。调用方显式传一个
+  /// 上限, 到点就把「加载中」换成「失败 + 重试」(错误盒由各视图自己渲染)。
   R.api = async function (path, options) {
     const opts = Object.assign({}, options);
+    const timeoutMs = Number(opts.timeoutMs) || 0;
+    delete opts.timeoutMs; // 不是 fetch 的选项, 别带进请求里
     opts.headers = Object.assign({ Authorization: "Bearer " + R.TOKEN }, opts.headers || {});
     if (opts.body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(opts.body);
     }
-    const res = await fetch(path, opts);
+    let res;
+    if (timeoutMs > 0) {
+      const ac = new AbortController();
+      opts.signal = ac.signal;
+      const timer = setTimeout(() => ac.abort(), timeoutMs);
+      try {
+        res = await fetch(path, opts);
+      } catch (err) {
+        // abort 抛的是浏览器原生的 AbortError, 原文("The user aborted a request.")
+        // 摆在界面上是句没用的话 —— 换成"超时"这个**真实原因**。
+        if (err && err.name === "AbortError") {
+          const e = new Error(
+            (R.lang === "en" ? "Timed out after " : "请求超时(超过 ") +
+              Math.round(timeoutMs / 1000) +
+              (R.lang === "en" ? "s with no response)" : " 秒无响应)")
+          );
+          e.timeout = true;
+          throw e;
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer); // 成功了也要清, 否则定时器白挂着
+      }
+    } else {
+      res = await fetch(path, opts);
+    }
     if (!res.ok) {
       let detail = "";
       try {
@@ -255,6 +287,9 @@
     }
     // 解释浮层开着就地换语言, 不必关掉重开(它是全局单例, 见下面的 R.glossary)。
     if (R.glossary) R.glossary.refresh();
+    // 059 UX-01/02: 顶栏视图名与浏览器标签标题取自导航项文本, 切语言后要跟着重刷 ——
+    // 否则会停在切换前那一门语言的视图名上。
+    if (R.refreshTitle) R.refreshTitle();
   };
 
   // ---------- 纯工具 ----------
@@ -461,6 +496,164 @@
     toastHost.appendChild(item);
     setTimeout(() => item.remove(), TOAST_MS);
   };
+
+  // ---------- 弹窗(全站唯一实现) ----------
+  //
+  // 059 UX-09: 此前 `strategies.js` 与 `runs.js` **各写一份** `openModal` / `modalActions`
+  // (除挂载点 `sg-modal-root` / `rn-modal-root` 外逐字相同), 且两份都缺三样东西:
+  //   ① 没有 `role="dialog"` / `aria-modal` —— 读屏软件读不出这是个对话框;
+  //   ② 打开后焦点不进弹窗, `Tab` 会跑到背后页面去, 键盘用户点不到弹窗里的按钮;
+  //   ③ `Esc` 的 `keydown` 监听**只在 Esc 分支里移除** —— 点「取消」或主钮关闭时监听
+  //      留在 `document` 上不动, 一次弹窗留一个, 越积越多。
+  // 现在实现收在这里(挂载点 `#modal-root` 见 index.html), 两个视图只管往 `card` 里放内容。
+  //
+  // 与 `R.emptyState` 同姿态: 只管"壳", 不替调用方决定内容; 关闭一律走返回的 `close()`。
+  R.modal = (function () {
+    /// 可聚焦元素(够用即可: 弹窗里只有按钮 / 输入框 / 下拉 / 链接)。
+    const FOCUSABLE =
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    let seq = 0;
+    const stack = []; // 已开的弹窗各自的 close(), 供 closeAll / open 前清场逐个调用
+
+    function host() {
+      let el = document.getElementById("modal-root");
+      if (!el) {
+        // 兜底: 骨架缺失时自建, 免得弹窗直接丢失(比崩一个 ReferenceError 好)。
+        el = document.createElement("div");
+        el.id = "modal-root";
+        document.body.appendChild(el);
+      }
+      return el;
+    }
+
+    function focusables(card) {
+      return Array.from(card.querySelectorAll(FOCUSABLE)).filter(
+        (el) => el.offsetWidth > 0 || el.offsetHeight > 0 || el === document.activeElement
+      );
+    }
+
+    function open(titleText) {
+      // 关闭后把焦点还给"打开它的那个元素" —— 否则键盘用户关完弹窗焦点回到 body, 得重新 Tab。
+      // 必须在清场**之前**取: 清场会连带把焦点还给上一个弹窗的触发元素。
+      const restoreTo = document.activeElement;
+      // ① 弹窗是单例 UI: 开新的必先清场。否则"上一个没关就又开一个"会在 `#modal-root`
+      // 里摞好几层 dialog —— 059 排查时见过 3 层: 遮罩互相盖住、`querySelector` 取到的还是
+      // 上一个弹窗的控件, 于是"输入框被清空/按钮放行"这类断言全成假象。
+      closeAll();
+      const overlay = document.createElement("div");
+      overlay.className = "sg-modal-overlay";
+      const card = document.createElement("div");
+      card.className = "sg-modal-card";
+      card.setAttribute("role", "dialog");
+      card.setAttribute("aria-modal", "true");
+      // 没有按钮时也要能被聚焦(否则 Tab 循环无处可去)。
+      card.tabIndex = -1;
+      const title = document.createElement("div");
+      title.className = "sg-modal-title";
+      title.textContent = titleText; // 标题也只走 textContent
+      title.id = "modal-title-" + ++seq;
+      card.setAttribute("aria-labelledby", title.id);
+      card.appendChild(title);
+      overlay.appendChild(card);
+      host().appendChild(overlay);
+      stack.push(close);
+
+      // 关闭后把焦点还给"打开它的那个元素" —— 否则键盘用户关完弹窗焦点回到 body, 得重新 Tab。
+      let onKey = null;
+
+      function close() {
+        // ③ 不论从哪条路径关闭(Esc / 遮罩 / 取消 / 主钮), 监听都在这里统一摘掉。
+        if (onKey) {
+          document.removeEventListener("keydown", onKey);
+          onKey = null;
+        }
+        const at = stack.indexOf(close);
+        if (at >= 0) stack.splice(at, 1);
+        overlay.remove();
+        if (restoreTo && document.contains(restoreTo) && typeof restoreTo.focus === "function") {
+          try {
+            restoreTo.focus();
+          } catch (_) {
+            /* 元素已不可聚焦时静默放过, 不因回焦失败影响关闭 */
+          }
+        }
+      }
+
+      overlay.addEventListener("mousedown", (ev) => {
+        if (ev.target === overlay) close();
+      });
+
+      onKey = function (ev) {
+        if (ev.key === "Escape") {
+          close();
+          return;
+        }
+        if (ev.key !== "Tab") return;
+        // ② 焦点陷阱: Tab / Shift+Tab 只在弹窗内循环。
+        const items = focusables(card);
+        if (!items.length) {
+          ev.preventDefault();
+          card.focus();
+          return;
+        }
+        const first = items[0];
+        const last = items[items.length - 1];
+        const active = document.activeElement;
+        if (!card.contains(active)) {
+          ev.preventDefault();
+          first.focus();
+        } else if (ev.shiftKey && active === first) {
+          ev.preventDefault();
+          last.focus();
+        } else if (!ev.shiftKey && active === last) {
+          ev.preventDefault();
+          first.focus();
+        }
+      };
+      document.addEventListener("keydown", onKey);
+
+      // 打开后焦点进弹窗(等一帧, 让调用方先把内容塞进 card —— 那时才有可聚焦元素)。
+      requestAnimationFrame(() => {
+        const items = focusables(card);
+        const target = items[0] || card;
+        try {
+          target.focus();
+        } catch (_) {
+          /* 同上 */
+        }
+      });
+
+      return { card, close };
+    }
+
+    /// 弹窗底部一行: 取消 + 主钮; 返回 { cancel, primary }。文案走公共字典。
+    function actions(card, primaryKeyOrLabel) {
+      const row = document.createElement("div");
+      row.className = "sg-modal-actions";
+      const cancel = document.createElement("button");
+      cancel.className = "sg-btn";
+      cancel.type = "button";
+      cancel.textContent = R.t("sgCancel");
+      const primary = document.createElement("button");
+      primary.className = "sg-btn sg-btn-primary";
+      primary.type = "button";
+      primary.textContent = R.t(primaryKeyOrLabel);
+      row.appendChild(cancel);
+      row.appendChild(primary);
+      card.appendChild(row);
+      return { cancel, primary };
+    }
+
+    /// 逐个关掉: 视图 deactivate 时清残留, 以及 `open()` 开新窗前清场。
+    ///
+    /// **不走 `innerHTML = ""`** —— 那样只摘 DOM, 每个弹窗自己挂在 document 上的 keydown
+    /// 监听会留着(它们只在 `close()` 里摘), 关得越多漏得越多。逐个走 `close()` 才两清。
+    function closeAll() {
+      for (const c of stack.slice()) c();
+    }
+
+    return { open, actions, closeAll };
+  })();
 
   // ---------- 术语表: 全局单例 ----------
   //

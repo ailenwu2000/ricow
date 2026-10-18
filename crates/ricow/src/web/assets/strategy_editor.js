@@ -92,6 +92,17 @@
     box.hidden = false;
   }
 
+  /// 059 UX-16: 同一个"改没改"判据, 供**离开确认**复用。
+  ///
+  /// `updateDirty()` 只负责把结果画到界面上, 不返回值 —— 离开确认要的是"是不是脏"这个
+  /// 布尔, 若在那里另写一个判断(比如只看代码), 就会出现"提示没亮但被拦下来"或反过来。
+  /// 故判据只此一处: 代码 / 参数(含交易对)任一与基线不同。
+  function isDirty() {
+    const codeEl = $("sg-code");
+    if (!codeEl) return false;
+    return codeEl.value !== st.savedCode || paramDiffs().length > 0;
+  }
+
   /// 053: 未保存状态 = 代码 **或** 参数(含交易对)任一改过。
   ///
   /// 此前只比代码编辑器, 参数改了界面一声不吭 —— 而回测又能用表单值跑出结果, 于是用户
@@ -638,6 +649,7 @@
 
   // ---------- 对外(外壳与其它子文件调用) ----------
   S.updateDirty = updateDirty;
+  S.isDirty = isDirty; // 059 UX-16: 离开确认复用同一判据
   S.refreshHighlight = refreshHighlight;
   S.syncSaveBtn = syncSaveBtn;
   S.syncAiBtn = syncAiBtn;

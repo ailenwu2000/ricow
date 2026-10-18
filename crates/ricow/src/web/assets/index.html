@@ -60,6 +60,13 @@
           >
             ☰
           </button>
+          <!--
+            059 UX-01: 顶栏原来只有 `#session-title`(会话名), 它**在六个视图下都显示** ——
+            切到市场/策略/运行/密钥/设置时顶栏仍写着「新会话」, 用户看不出自己在哪。
+            这里补一个**当前视图名**(由 router.js 写); 会话名则只在对话视图显示(见 style.css
+            的 `[data-view]` 规则)—— 它是"对话"这一视图的概念, 摆到密钥页没有意义。
+          -->
+          <span id="view-title" class="view-title"></span>
           <span id="session-title" class="muted"></span>
           <span id="status" class="status"></span>
           <!-- 034: 主题切换, 值存 ricow.toml 的 [ui].theme(与语言同一来源)。
@@ -223,6 +230,14 @@
           <h2 class="placeholder-title" data-zh="设置" data-en="Settings">设置</h2>
         </section>
       </main>
+
+      <!--
+        059 UX-09: **全站唯一的弹窗挂载点**。此前 `strategies.js` 与 `runs.js` 各自在视图骨架里
+        建一个容器(`sg-modal-root` / `rn-modal-root`)并各写一份 `openModal` —— 除挂载点外逐字
+        相同, 于是"弹窗能不能用 Esc 关 / 焦点进不进得去"这类行为要靠两份代码各自维护。
+        现在挂载点与实现都收进 `common.js` 的 `R.modal`, 两个视图只管往里放内容。
+      -->
+      <div id="modal-root"></div>
 
       <!--
         帮助抽屉(帮助计划第 1 条): 盖在当前视图上的一层, 不参与 hash 路由 —— 由 help.js

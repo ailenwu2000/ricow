@@ -46,6 +46,8 @@
     cmdHintTheme: "切换配色",
     cmdHintTerm: "看解释",
     cmdHintStrategy: "打开策略详情",
+    // 059 UX-11: 「最近用过」分组名。
+    cmdGroupRecent: "最近用过",
   });
   Object.assign(R.TEXT.en, {
     cmdBtnTitle: "Command palette (Ctrl/⌘ + K)",
@@ -66,6 +68,7 @@
     cmdHintTheme: "Switch colour scheme",
     cmdHintTerm: "See explanation",
     cmdHintStrategy: "Open strategy details",
+    cmdGroupRecent: "Recently used",
   });
 
   const t = (key) => R.t(key);
@@ -216,6 +219,16 @@
 
   let rows = []; // 平铺后的可选项(方向键走的就是这个序)
   let sel = 0; // 当前高亮下标
+  // 059 UX-11: 本次页面生命周期内**执行过**的条目, 最新的排最前, 最多 5 条。
+  // 只存内存 —— 不落浏览器存储(全站纪律, 见 assets.rs 的扫描断言), 刷新即空。
+  const RECENT_MAX = 5;
+  let recent = [];
+
+  function pushRecent(item) {
+    if (!item || !item.label) return;
+    // 按文案去重: 同一个条目再执行一次就把它提到最前, 不重复占两行。
+    recent = [item].concat(recent.filter((x) => x.label !== item.label)).slice(0, RECENT_MAX);
+  }
 
   const isOpen = () => {
     const box = $("palette");
@@ -261,12 +274,12 @@
     }
     empty.hidden = true;
 
-    for (const g of GROUP_ORDER) {
-      const group = items.filter((it) => it.group === g);
-      if (!group.length) continue;
+    /// 把一组画进列表并登记进 `rows`(方向键走的就是这个序)。
+    function appendGroup(title, group) {
+      if (!group.length) return;
       const head = document.createElement("div");
       head.className = "palette-group";
-      head.textContent = t(GROUP_KEY[g]);
+      head.textContent = title;
       list.appendChild(head);
       for (const item of group) {
         const idx = rows.length;
@@ -294,6 +307,15 @@
         rows.push(item);
       }
     }
+
+    // 059 UX-11: 没有搜索词时, 「最近用过」排在最前 —— 62 条静态结果里找常用的那几个,
+    // 只在**本次页面生命周期**内记(纯内存变量, 不落浏览器存储 —— 全站纪律), 刷新即清空,
+    // 也算不上"记住了用户什么"。
+    if (!q) appendGroup(t("cmdGroupRecent"), recent);
+
+    for (const g of GROUP_ORDER) {
+      appendGroup(t(GROUP_KEY[g]), items.filter((it) => it.group === g));
+    }
     count.textContent = rows.length + t("cmdCount");
     highlight(0);
   }
@@ -316,10 +338,12 @@
     const item = rows[sel];
     if (!item) return;
     if (item.detail) {
+      // 术语只是"看解释", 不算一次使用 —— 否则查三个术语就把「最近用过」挤满了。
       renderDetail(item);
       return;
     }
     close();
+    pushRecent(item); // 059 UX-11
     try {
       item.run();
     } catch (err) {

@@ -234,13 +234,21 @@
     }
   }
 
+  /// 059 UX-05: 列表请求的前端上限。
+  ///
+  /// 币安行情是**外网**请求 —— 上游挂起(本机断网 / 出口被拦 / 对面不回)时 `fetch` 不会自己
+  /// 超时, 列表就一直停在「加载中…」, 用户既看不到原因也没有可点的东西。给一个上限,
+  /// 到点把「加载中」换成「失败 + 重试」(错误盒见 `blockError`)。
+  /// 只给取列表这一路: 它是**唯一的冷启动必经路径**, 卡住就等于整个市场页不可用。
+  const LIST_TIMEOUT_MS = 10000;
+
   /// 只取列表(搜索 / 切换视野后调用; 视野已持久化在配置里, 不必再带 all)。
   async function fetchList(g) {
     blockLoading($("mk-list-body"));
     let path = "/api/markets";
     if (listState.q) path += "?q=" + encodeURIComponent(listState.q);
     try {
-      const data = await R.api(path);
+      const data = await R.api(path, { timeoutMs: LIST_TIMEOUT_MS });
       if (g !== gen) return;
       listState.data = data;
       renderList();
