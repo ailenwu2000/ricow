@@ -67,7 +67,7 @@
 |:--|:--|
 | `cargo test --workspace` | 见 converge.md |
 | 门禁五红 · fmt · clippy | 见 converge.md |
-| 新增单测 | P0-D 7 条 + kill 协议 2 条 + kill 报告 2 条 + kill 短语 1 条 |
+| 新增单测 | P0-D **8 条** + kill 协议 2 条 + kill 报告 2 条 + kill 短语 1 条 = **13 条**（原写"7 条"是漏数了 `guard_check_passes_when_notional_unknown`，2026-10-18 按 `order_guard.rs` 实测条数订正） |
 
 ## 四、明确不做
 

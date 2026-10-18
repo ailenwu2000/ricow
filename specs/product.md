@@ -59,13 +59,19 @@
 - **`ricow agent-kit`**(019): 生成 AGENTS.md / SKILL.md 操作手册(与内置 AI 系统提示同源), 供用户已有的 agent(Claude Code / Codex / Cursor)按手册直接驱动本机 CLI; **不做 MCP**(2026-09-15 定案)
 - Telegram 后置为远期可选, 当前不考虑(2026-08-24 决策)
 
-关键原则: **CLI 单入口直连同一引擎与下单路径, 安全模型一致**(confirm + 固定下单频率护栏 + Dry Run 默认; 平台不做投资判断, 见 D15/D17)。
+关键原则: **CLI 单入口直连同一引擎与下单路径, 安全模型一致**(confirm + 固定下单频率与单笔名义护栏 + Dry Run 默认; 平台不做投资判断, 见 D15/D17)。
 
 ## 六、功能范围(少而精)
 
-### 内置参考实现(2 个策略 + 1 执行组件库, 随版本发布)
+### 内置参考实现(8 个策略 + 1 执行组件库, 随版本发布)
 
-- **香农现货网格策略**: `strategies/spot/shannon_spot_grid.lua` — 香农现货网格(虚拟账本 = 本金 × 杠杆 1~5 决定目标持币量; 价格低于 `start_price` 才激活, 可在激活时市价买入初始仓; 平衡价上下 `atr_mult×ATR` 各挂一张限价单, 任一成交即以该成交价为新平衡价并立即重挂两侧; 卖量受真实持仓兜底(有多少挂多少); 趋势门控可选 `trend_gate`(默认关: 开时上涨趋势暂停卖出); 成本门槛硬校验(R7) + `strategy_state` 断点续接; **仓位清空即结束**; 适合震荡市, **不适合单边急涨(会跑输同敞口持有)与单边下跌**)
+> 权威清单 = `crates/ricow/src/strategies/catalog.rs` 的 `BUILTIN`(编译期 `include_str!` 嵌入)。
+> 现货 3 个(`strategies/spot/`): `paired_grid` / `shannon_grid` / `shannon_virtual_grid`;
+> 合约 5 个(`strategies/futures/`): `paired_grid_futures_long` / `shannon_grid_futures` /
+> `shannon_hedge_grid_futures` / `shannon_neutral_grid_futures` / `shannon_short_grid_futures`。
+> 早期文档里的 `shannon_spot_grid` 已不存在(现货网格在 `shannon_virtual_grid`)。
+
+- **香农现货网格策略**: `strategies/spot/shannon_virtual_grid.lua` — 香农现货网格(虚拟账本 = 本金 × 杠杆 1~5 决定目标持币量; 价格低于 `start_price` 才激活, 可在激活时市价买入初始仓; 平衡价上下 `atr_mult×ATR` 各挂一张限价单, 任一成交即以该成交价为新平衡价并立即重挂两侧; 卖量受真实持仓兜底(有多少挂多少); 趋势门控可选 `trend_gate`(默认关: 开时上涨趋势暂停卖出); 成本门槛硬校验(R7) + `strategy_state` 断点续接; **仓位清空即结束**; 适合震荡市, **不适合单边急涨(会跑输同敞口持有)与单边下跌**)
 - **现货动态非对称网格策略**: `strategies/spot/paired_grid.lua` — 固定金额(`order_amount`, 默认 10)配对网格; 价格低于 `start_price` 激活, 可选市价建仓(不计方向标志); 以最近成交价为参考价上下各挂一单(下方固定金额买单、上方配对卖单, 配对 = LIFO 保证卖价恒 > 买价); 方向标志(买 −1 / 卖 +1)驱动上下间距不对称放大(`1+|flag|×direction_offset`); 成交模式 `accumulate_mode`(u 积累 U / coin 积累币); 成交全撤重挂 + 追踪(无待配对仓时买单跟随上涨价格); 适合震荡市, **不适合单边**(下跌满仓套牢 / 上涨跑输持有)
 - **执行组件库**: exec — 用户 Lua 策略可直接调用的执行函数(引擎内置 Rust 实现, 加载时注册为全局 `exec` 表, 无需 require, 脚本内可覆盖): `exec.levels`(阶梯档位) / `exec.pullback_triggered`(回调触发) / `exec.ticks_per` + `exec.slice_due`(分批节奏) / `exec.detect_quote`(报价资产) / `exec.side_order`(对手价订单)
 
@@ -108,10 +114,11 @@
 ## 九、决策清单(PM 已定稿, 待你复核)
 
 - **D1** ✅ 目标用户优先序: **主用户优先, 纯 CLI 交付**(开源第一波用户必然是技术用户; MCP/TG 后置远期)
-- **D2** ✅ 产品形态: **一个引擎、CLI 单入口、共享下单路径**(confirm + 固定下单频率护栏 + Dry Run 默认; 原"RiskEngine"随 D17 删除)
-- **D3** ✅ 功能范围: v1 = **内置参考实现(1 策略样板 shannon_grid + 5 执行模式示例) + CLI 入口**(~~横截面选币~~ 已于 2026-09-15 删除);
-  自定义策略走 Lua(exec.* 执行组件); 原"6 策略"口径作废(2026-09-11 复核: 内置策略本体只剩 shannon_grid,
-  bs_momentum / bs_intraday_top5 两个策略均已下线, 结论见 specs/roadmap.md "已终止的探索")。ricow alert 降为后续评估项(少而精)
+- **D2** ✅ 产品形态: **一个引擎、CLI 单入口、共享下单路径**(confirm + 固定下单频率与单笔名义护栏 + Dry Run 默认; 原"RiskEngine"随 D17 删除)
+- **D3** ✅ 功能范围: v1 = **内置参考实现(8 个策略样板, 见 §六) + 5 种执行模式示例 + CLI 入口**(~~横截面选币~~ 已于 2026-09-15 删除);
+  自定义策略走 Lua(exec.* 执行组件); "6 策略"与"2 策略"两个旧口径均已作废 —— 2026-09-11 复核记的是
+  "只剩 shannon_grid"(bs_momentum / bs_intraday_top5 已下线), 其后 032/041/047/049 又陆续补回合约网格,
+  实际以 `catalog::BUILTIN` 为准。ricow alert 降为后续评估项(少而精)
 - **D4** ✅ 商业模式: **免费零费率 + 返佣主线(平台无关, 当前仅币安) + 定制技术开发/集成**(builder code 不做, Vault 降级远期)
 - **D5** ✅ 文档同步: 批准后改 requirements/product/roadmap 三处"MCP 明确不做", 补 `ricow scan` 命令(~~`ricow scan` 已于 2026-09-15 删除~~, 见下条)
 - ~~**D10**~~ ⚪ **已作废(2026-09-15, scan 删除)**: 横截面选币设计: 打分 7d×0.4+30d×0.6; 趋势 EMA20+ADX14; 候选池=动态全永续(去下架, 不分档, 分类后置); 默认成交额阈值 + 上市≥31根日线; 前 10/后 10 方向一致性排除; --top N 可配
@@ -154,7 +161,7 @@
 | 层 | 措施 |
 |:---|:-----|
 | 密钥 | 单一明文配置文件 `$RICOW_ROOT/ricow.toml`(Unix 0600 / Windows 仅当前用户 ACL; 019 D31/R4; OS Keyring 方案已于 2026-09-14 移除, 理由见 README); 币安 API key(禁提现, 仅交易权限); 私钥不出本机 |
-| 下单 | CLI 单入口直连下单路径, 三条 `place_order` 必过固定工程护栏 `order_guard`(100 单/秒, 平台不做投资判断 — 赚赔政策属于策略); 写操作强制用户侧批准(预览 → 人工确认 → 一次性 token); Dry Run 默认 |
+| 下单 | CLI 单入口直连下单路径, 三条 `place_order` 必过固定工程护栏 `order_guard`(**下单频率 100 单/秒** + **单笔名义 ≤ 报价资产权益×10**, 057-P0-D; 两者都是固定常量不进配置面, 只拦数量级笔误不拦"策略就是要重仓"; 平台不做投资判断 — 赚赔政策属于策略)。**注意装配差异**: 频率上限回测/Dry Run/实盘三条路径都生效, **名义上限只在 Dry Run 与实盘生效**(回测无实时权益基准, 取不到即放行)。写操作强制用户侧批准(预览 → 人工确认 → 一次性 token); Dry Run 默认 |
 | AI 生成代码 | Lua 沙箱(禁 require/loadstring, 指令预算, 无文件/网络/进程) + 编译门禁 + 沙箱回测门禁 + 用户 diff 确认 |
 | 网络 | 仅交易所 API + 用户自配 LLM API; 软件内无自动下载/自动更新 |
 | 遥测 | 无遥测、无数据上报 |

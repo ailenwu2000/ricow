@@ -1,5 +1,8 @@
 # 2026 AI-first 交易平台与 MCP 协议调研报告
 
+> 面向 hyper_local AI-first 重构(项目旧名), MCP 已于 2026-08-24 定案不做。
+> **文档性质(2026-10-18 统一标注)**: 本文件是 **某个时点的快照/调研档案, 不是活文档**。结论按当时事实记录, **不随代码演进更新**。判断 ricow 当前能力请以 `specs/roadmap.md` 与代码为准 —— 引用本文件当"现状"是已发生过的真实误判(见 `requirements-optimization-plan-2026-10.md` 附录 B)。
+
 > 调研时间: 2026-08-15 | 面向: hyper_local AI-first 重构
 > 数据来源: doc/competitors.md(2026-07 两轮子代理实测)、doc/ai-assistant.md、doc/requirements.md、research/*.json(2026-08-15 GitHub API 原始响应)。
 > 子代理会话网络请求被拒;Rust MCP 框架数据由父代理独立实测补充(见第五节)。

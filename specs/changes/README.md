@@ -62,6 +62,9 @@
 | 054 | `054-ai-strategy-flow`（AI 策略生成即验证 + 风险档位落数字 + 样本外切分 + 寻优接通 + 报告口径修复） |
 | 055 | **无档案目录** · 全仓已引用（编号被占，见下「055」一节） |
 | 056 | `056-startup-gate-convergence`（启动门禁收口：`start_daemon` 唯一闸 + `restart` 先判后停 + 运行态 `declared`/`duplicate_of` 可见性） |
+| 057 | `057-p0d-notional-guard`（P0-D 单笔名义护栏 `NOTIONAL_LIMIT_MULTIPLE = 10` + 跨实例 kill switch `ricow kill`/`POST /api/runs/kill` + 前端检查进 CI；含一份「刻意不为回测装名义上限」的设计说明） |
+
+> **057 的档案齐备性例外（2026-10-18 如实记录）**：057 目录只有 `spec.md` + `converge.md`，**缺 `plan.md` 与 `tasks.md`**，不满足下方「051 起一律齐备」。原因是当轮把「拍板 → 落码 → 实跑 → 收敛」压在一个提交内完成，跳过了计划/任务拆分这一步。**不回填**（补写的计划会与当时事实不符，违反「定稿不回改」）—— 但例外如实记在这里，别让下一个人以为「051 起齐备」是 100% 达成。053 同样是 051 后的例外（只有 `spec.md`，验收表塞在 spec 的「七、验收」节里，用 spec 兼当 converge）。
 
 ### 055：编号被占用但**没有目录**（2026-10-18 新增，与 045/046/048/050 同类）
 
@@ -101,6 +104,17 @@
 
 ## 档案齐备性说明
 
-部分目录缺 `tasks.md`/`spec.md`/`plan.md`：其中一部分是**调研/收尾归档**（如 `033-uniswap-v2-spot-grid`、
+部分目录缺 `tasks.md`/`spec.md`/`plan.md`：一部分是**调研/收尾归档**（如 `033-uniswap-v2-spot-grid`、
 `037-uniswap-v2-event-model`）而非完整 SDD 变更；另一部分是历史变更的欠账。宪法要求**新变更**齐
 `spec.md` + `plan.md` + `tasks.md`，历史欠账不追溯补齐（补写会与当时事实不符）。051 起新变更一律齐备。
+
+**但「一律齐备」已100% 达成（2026-10-18 核对）** —— 051 之后的两个变更各缺一份：
+
+| 目录 | 缺 | 缺的原因 |
+|:--|:--|:--|
+| `053-param-unsaved-hint` | `plan.md` / `tasks.md` / `converge.md` | 验收表塞进 `spec.md` 的「七、验收」节，用 spec 兼当 converge |
+| `057-p0d-notional-guard` | `plan.md` / `tasks.md` | 当轮把「拍板 → 落码 → 实跑 → 收敛」压在一个提交内，跳过计划/任务拆分 |
+
+另有一处文件名欠账：`052-webui-strategy-config/` 内 `tasks.md` 与 `new-tasks.md` **并存**（第二批任务
+写在后者），基线声明也因此有两个来源。**不回填、不改名** —— 重构历史档案收益低于"改出来的文档与
+当时事实不符"的风险。

@@ -1,5 +1,8 @@
 # 竞品调研报告(2026-08-16)
 
+> 与 `competitor-features-2026.md` 同轮调研, 后者是功能对照总表、本篇是总览+入口决策。
+> **文档性质(2026-10-18 统一标注)**: 本文件是 **某个时点的快照/调研档案, 不是活文档**。结论按当时事实记录, **不随代码演进更新**。判断 ricow 当前能力请以 `specs/roadmap.md` 与代码为准 —— 引用本文件当"现状"是已发生过的真实误判(见 `requirements-optimization-plan-2026-10.md` 附录 B)。
+
 > 调研时间: 2026-07 ~ 2026-08-16。方法: 3 子代理并行 + 父代理 GitHub API 实测, 抓取官方文档/README 原文。
 > 标注 "未查证" = 页面未给出该项, 非 "不存在"。
 > 原始资料: research/competitor-features-2026.md(功能对照总表)、research/competitor-orders-2026.md(订单策略)、research/ai-mcp-2026.md、research/telegram-bot-2026.md(原始 HTML 已随 backup 移除, 结论已提取)。

@@ -44,7 +44,9 @@
 
 ## 测试基线
 
-- **当前基线 (2026-10-18, 056 启动门禁收口 + 057 P0-D 名义护栏/跨实例 kill switch/前端检查进 CI 落地后实跑)**: `cargo test --workspace --no-fail-fast` = **1059 passed / 0 failed** —— 全目标零失败。较同口径上次 **1040**: **+19 通过**，增量全部来自 056(启动闸 3 条) 与 057(P0-D 护栏 7 条 + kill 协议 2 条 + kill 报告 2 条 + kill 短语 1 条 + strategy crate 282 → 290)，**一字未删未改**其它 target。**门禁六件 + 真机两路**: `cargo fmt --all -- --check` **0 差异** / `cargo clippy --workspace --all-targets -- -D warnings` **exit 0** / `bash scripts/ci_grep_gates.sh` **五条安全红线全绿** / `node scripts/web_frontend_check.mjs` **七段全绿**(057-G6 起进 `ci.yml` 的 `frontend` job) / CDP 真机走查进**新建的 `nightly.yml`** / 官方冒烟 `e2e_web.py`(干净 root + 无 AI 密钥 + `show_all_pairs=true`) **458 PASS / 0 FAIL**(与 054 同基线，**057/056 零回归**) / CDP 真机走查 `scripts/probe_web_ui.mjs` **全绿**(另 1 条 NOTE = `/favicon.ico` 404，遗留项)。
+- **当前基线 (2026-10-18, 056 启动门禁收口 + 057 P0-D 名义护栏/跨实例 kill switch/前端检查进 CI 落地后实跑)**: `cargo test --workspace --no-fail-fast` = **1056 passed / 0 failed / 22 ignored** —— 全目标零失败。较同口径上次 **1040**: **+16 通过 / ignored 不变(22)**, 增量全部来自 056 与 057(`ricow_strategy` **282 → 290** = 057 名义护栏 8 条; `ricow` bin **→ 547** = 056 启动闸 3 条 + 057 kill 报告 2 条 + kill 短语 1 条 + `StopAll` 协议 2 条 + 端点守卫), 其余 target **实测** 一字未变: `ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored。当前分解 547+67+18+128+290+3+3 = **1056**, 与总数自洽。
+  > **订正 (2026-10-18)**: 本行原先记 **1059 / +19**, 两处都错。真实值 **1056 / +16**(整仓实跑读出), 双向闭合可验: `1040 + 16 = 1056`, 且 `1043(056 单独实跑) + 13(057 新增) = 1056`; `ricow_strategy` 由 `cargo test -p ricow_strategy` 直接读出 **290**(原记 282 是 054 时旧值)。根因: 上一基线 1040 自己的分解就差 1(`538+67+18+128+282+3+3 = 1039`)—— **按分项加算这条路径历史上就出过错**。**新纪律: 基线一律整仓实跑读出**, 分项只作叙述且要当场验加总。
+  **门禁六件 + 真机两路**: `cargo fmt --all -- --check` **0 差异** / `cargo clippy --workspace --all-targets -- -D warnings` **exit 0** / `bash scripts/ci_grep_gates.sh` **五条安全红线全绿** / `node scripts/web_frontend_check.mjs` **七段全绿**(057-G6 起进 `ci.yml` 的 `frontend` job) / CDP 真机走查进**新建的 `nightly.yml`** / 官方冒烟 `e2e_web.py`(干净 root + 无 AI 密钥 + `show_all_pairs=true`) **458 PASS / 0 FAIL**(与 054 同基线，**057/056 零回归**) / CDP 真机走查 `scripts/probe_web_ui.mjs` **全绿**(另 1 条 NOTE = `/favicon.ico` 404，遗留项)。
 - ~~**上一基线 (2026-10-15, 054)**~~: `cargo test --workspace --no-fail-fast` = **1040 passed / 0 failed / 22 ignored**。较同口径上次 **1001**: **+39 通过 / ignored 不变(22)**，增量全部来自本轮新增用例、**一字未删未改**其它 target: ricow bin **500 → 538**(P1 生成即验证 / P2 结构化输入与风险档位表 / P3 样本外与 walk-forward / P4 `optimize` 接通 / P5 lint 第六类 + 手动改参可评估 + T37 摘要与参数中文名 + `read_doc` 分片 + 帮助层「平台不代做风控」); 其余 target 一字未变(ricow_binance 67 / ricow_core 18 / ricow_engine 128 / ricow_strategy 282 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。**门禁五件 + 真机两路**: `cargo fmt --all -- --check` **0 差异** / `cargo clippy --workspace --all-targets -- -D warnings` **exit 0、零代码告警**(只剩已知 Windows 增量锁 `os error 5` 噪声) / `bash scripts/ci_grep_gates.sh` **五条安全红线全绿** / `node scripts/web_frontend_check.mjs` **全绿** / `cargo test` 全绿；官方冒烟 `e2e_web.py`(干净 root + `show_all_pairs=true`) **458 PASS / 0 FAIL**(388 → 458，+70)，新增断言字样逐条命中；CDP 真机走查 `scripts/probe_web_ui.mjs` **100 PASS / 0 FAIL**(86 → 100，+14；另 1 条 NOTE = `/favicon.ico` 404，遗留项)。
 **055 复审补修(2026-10-15, 审核发现的两条严重缺陷)**: ① **杠杆上限被写成了实际杠杆** —— 档位的 `leverage_cap`(保守 2x / 稳健 3x / 激进 5x)此前落进 `[backtest].leverage`(**实际杠杆**), 而 `commands/run.rs` 启动实盘/demo 时读的正是这个字段、会**真的在交易所把杠杆设上** —— 等于用户点了个「保守」, 平台替他开了 2 倍杠杆(手写与内置策略默认都是 1x)。已改落盘到 `[backtest].max_leverage`(**上限**), 实际杠杆保持引擎默认 1x, 由用户自己决定开不开。② **验证回测不带杠杆上限** —— `verify_spec` 传 `max_leverage: None`(→ 默认 10x), 而保存时写的是档位的 2/3/5x, 于是合约策略**生成时看到的成绩与保存后看到的不是一回事**; 这是 T41 真跑修掉的「本金传 None」的同一个 bug 的另一半。已让验证回测按档位上限跑。**范围**: 对「AI 生成的策略能不能给一个普通投资者拿去配量化」做了一次**多角度审核**，落下 15 条缺陷、分四轮 42 项任务整改(逐条见 `specs/changes/054-ai-strategy-flow/`)。**四条主干**: ① **P1 生成即验证** —— Web 单发生成(`POST /api/strategies/ai-generate`)此前**完全不回测**，与对话路径(会跑真 K 线)割裂(审计 #1)；现在用**同一份未落盘的代码**跑一次真实 K 线回测，结果随产物一起回前端，用户不再需要先存盘才看得到它在历史上是什么表现。② **P2 结构化投资输入** —— 用户只会说「我想稳一点」，此前这句自然语言被**原样**塞进提示词，对模型没有任何约束力，保守的人和激进的人说同一句话会得到同一份策略(审计 #2)；现在必须先填**本金 + 风险档位**，档位表(`web/strategy_io/risk_profile.rs` **单点定义**)把「保守」落成**单笔 ≤ 10% / 网格间距 ≥ 0.8% / 回撤目标 ≤ 10%** 这类数字，本金写进 `[backtest].initial_cash`(它是结构化输入里**唯一真下场**的数字)。**真跑对照**(同一句话 + 同一笔 10000 U, 只换档位): 间距下限 **0.8%(保守) vs 0.4%(激进)** / 单笔 **8% vs 45%** / 回撤目标 **10% vs 35%** / 加仓层数 **4 vs 8**, 且两份代码不逐字相同 —— 档位不只进了提示词, 真落进了代码。③ **P3 样本外与 walk-forward** —— 样本内/样本外按**时间顺序**前 70% / 后 30% 切分(**随机切会制造前视偏差**，违反 `backtest.md §一` 最高约束，已在校验层直接拒掉 `mode=random`)，并给逐段向前推进的 walk-forward。④ **P5 收尾** —— lint 补第 6 类(既无止损线索也无仓位上限/爆仓监控 → **只警告不拦截**，静态判断不绝对可靠)、影响评估改用 `paramDiffs()` 判据(**手动改参也能评估**，此前只看 AI 回包)、生成时一并产出 `summary` 与参数中文名/说明(解决「详情页看不出这份策略在做什么」)、`read_doc` 超限分片返回 + 明示还有第 N 段、帮助层补「平台不代做风控」的用户可读版。策略来源 `origin` 用**注释标记** `# ricow:origin = ai`(推导而非存储，与 `declared`/`duplicate_of` 同哲学)。**真跑发现并修掉的两处**: ① **验证回测没用用户填的本金** —— `cash` 传 `None`，一律按默认 10 万跑；而提示词告诉模型的是「用户准备投入 {initial_cash} USDT」。用户填 1 万却看到 10 万的成交与盈亏(仓位是否拒单、手续费占比、网格能否铺满，在小资金下完全是另一回事)，与 spec §四-2「让回测口径与用户真实资金一致」直接冲突；已改成按用户本金跑，并把入参组装抽成 `verify_spec` 纯函数用单测钉住(跑回测要联网，测不了，只能靠真跑发现)。② **`skipBox` TDZ** —— `strategies.js` 里 `skipBox` 在 `const` 初始化前被 `slowHint.hidden = skipBox.checked` 引用，AI 生成弹窗一打开就 `ReferenceError`(语法检查 / 双语键 / 引用扫描 / Rust 单测 / Python 冒烟**四道静态门全绿**，只有 CDP 真机点击抓得到 —— 这就是保留 CDP 这一层的理由)。
 **055 复审的另外四条(B3–B6)也已全部落地**: ① **B3 档位目标事后核对** —— 档位此前只对模型有约束力, 生成完界面只把实测回撤显示成一个红数字, 从不说「你选的是 10%, 实测 25%, 未达到」; 现在紧贴指标卡给出目标/实测/判语(只核最大回撤 —— 其余档位项在回测指标里没有对应数字, 凑就是编造; 拿不到实测值就不摆核对框)。② **B4 lint 整份级警告独立配额** —— 8 条上限原本同时管逐行与整份级, 十行 config_f64(...) or ... 就能把「这份脚本会下单但没有任何止损线索」挤掉; 现在上限只管逐行, 整份级先算先放、排第一。③ **B5 AI 请求总超时** —— reqwest 默认不设超时, 上游一挂起页面就一直转圈(真跑实测 900s/1500s 无响应); 现在每次调用外套 300 秒总超时(可配 [ai].timeout_secs), 且超时**不重试**(一次就 300 秒, 重试三遍没人等得起)。④ **B6 两条生成路径口径对齐** —— 对话路径的 preview_strategy 此前**没有本金入参**, 助手问到了也没处传, 回测一律按默认 10 万跑; 现在新增 initial_cash(落到 params.cash, 与 CLI --param cash= 同一条链路), 没传时回包如实写明「这是默认本金, 不是你的资金规模」。
@@ -155,6 +157,12 @@
 | 042-strategy-js-split       | 策略视图拆分(`strategies.js` → 外壳 + 三份子文件)   | ✅ 已实施 (2026-10-07)                                                                      | 前端最大单文件(2626 行)拆分, **纯重构零行为变化**。拆为 `strategies.js`(**外壳**: `R.sg` 共享命名空间 / 工具 / 常量 / **状态袋 `S.st`**(13 槽) / 页面装配) + `strategy_form.js`(新建·复制·参数表单) + `strategy_editor.js`(详情编辑器: Lua 高亮 / 撤销 / 保存 / 清单编辑 / AI 改写入口) + `strategy_backtest.js`(指标卡 / 权益曲线 / 平仓明细 / 策略日志 / 寻优 / 历史)。两条硬约定: ① 跨文件引用一律**延迟别名**(`const f = (...a) => S.f(...a)`, **禁值别名**) —— 外壳与子文件依赖**双向**, 值别名会把对方尚未导出时的 `undefined` 固化; ② **加载顺序即契约** —— `assets.rs::ASSETS` 与 `index.html` 两处下标顺序由单测 `test_strategy_shell_loads_before_its_parts` 与「首页对齐」测试双向盯住。仅 `R.sg` 一个共享命名空间, 13 个可变状态全进 `S.st`, 拆分后无跨文件自由变量。**仍无构建链**(拆的是源码文件, 无 `import`/`export`, 全部 `include_str!`)。**踩到的坑**: `strategy_editor.js` 漏了 `S.onUndo = onUndo` 导出(外壳 `mount()` 直接挂到 `#sg-undo`)→ 打开策略页整片 `ReferenceError`, 而 `node --check` / grep 扫描 / Rust 单测 / Python 冒烟**四道静态门全绿**(都进不了浏览器运行期); 固化为**跨文件符号静态审计**(`tmp/audit_042.py`)+ **真机走查列为常规环节**。E2E 断言改为按四份文件**并集**看能力(否则纯文件搬家造一片假红)。测试 834 → **835 passed / 0 failed / 22 ignored**(+1), 冒烟 **159 PASS / 0 FAIL**; 见 `specs/changes/042-strategy-js-split/` |
 | 043-web-token-sse-fix       | token 303 换发后 SSE/WS 静默 401 修复              | ✅ 已实施 (2026-10-07)                                                                      | **起因**: 044 真机走查在动代码前抓到的既有回归。缺陷: 中间件取 token 的优先级是 `Bearer → 查询串 → cookie` 且**查询串优先、不判空**, 而顶部导航(`Sec-Fetch-Mode: navigate`)会 **303** 到去掉 token 的干净地址并种 `ricow_token` cookie —— 二次打开时地址栏带的是**空** `?token=`, 空串**盖掉**刚种的 cookie → **`EventSource`/WebSocket 全部 401, 而页面本身仍 200**(对话不流式 / 市场不实时 / 日志不刷新, 界面毫无异样 = 静默失效)。**为何全绿**: Python 冒烟每次请求都显式带 token, 永远走不到「空 query + cookie」这条组合 —— **这条路径只有真浏览器走得进去**。修复取**最小面**: 服务端一行未动, 改在**客户端记得住 token** —— `<head>` 加 `<meta name="ricow-token" content="__RICOW_TOKEN__">`(复用既有占位符替换), `common.js` 的 `R.TOKEN` 改为**查询串 → meta 载体**两级取值。刻意**不改**中间件语义(「新链接须能盖掉旧 cookie」是必要的, 否则进程重启换 token 后旧链接永不生效)。`e2e_web.py` 新增 **B2 段 8 条**(303 / Location 去掉 token / 种 HttpOnly cookie / **非导航不得重定向的反向对照** / 带 cookie 取首页 / meta 载体带 token); 真机以 CDP 取 `performance.getEntriesByType('resource')` 的 `responseStatus` 取证(修复前 401 / 修复后 200, 而带真实 token 的动态流为 **0** = 连接被挂着, 正是"看着像产品不响应"的成因)。`SKILL.md` 新增 §1.3 记录该坑与复跑方式。测试 835 → **836 passed / 0 failed / 22 ignored**(+1), 冒烟 159 → **167 PASS / 0 FAIL**; 见 `specs/changes/043-web-token-sse-fix/` |
 | 044-webui-ux-polish         | AI 对话 Markdown 渲染 + 日志搜索/过滤/跟随开关      | ✅ 已实施 (2026-10-07)                                                                      | 补齐 `tmp/webui_analysis.md` §四 P1 第 6、7 项。① **AI 对话 Markdown 渲染**: 新增 `web/assets/markdown.js`(受限子集: 围栏代码块 / 行内代码 / 加粗 / 斜体 / 删除线 / 链接 / 标题 / 列表 / 引用 / 水平线 / 表格), **只产 DOM** 返回 `DocumentFragment`, **不碰 `innerHTML`** —— AI 输出是**不可信内容**, DOM 路线既不用动安全扫描白名单, 也没有"转义漏一处即 XSS"的窗口; 链接只放行 `http:`/`https:`(其余降级纯文本), 外链带 `noopener noreferrer`。**只作用于助手气泡**: `renderRich(el, md)` 先按既有规则切出**报告段**(仍走卡片), 剩下的散文段才按 `md` 选渲染方式 —— 宿主 `line` 帧是**对齐纯文本**, 套 markdown 会打散对齐且与报告结构化(FR-025)抢同一段文本; 术语浮层跳过 `pre`/`code`(代码里的"手续费"不该变成可点术语)。② **日志面板三件套**: 关键字搜索(不分大小写, 改词即时生效) / 级别过滤(**诚实口径**: 日志原样存储不解析, 级别只能是行内关键字启发式, UI 文案自陈「按关键字粗略匹配」, 宿主说明行**始终显示**——它解释"日志为什么断了一截") / **跟随↔暂停**(`follow` 意图 + `atBottom()` 客观位置两个量, 用户上滚自动暂停且只计待读、点按钮回底 —— 原先无条件 `scrollTop = scrollHeight` 会**抢用户的滚动**); 计数诚实:「显示 M / 共 N 行」+ 注明本地最多 500 行。只读红线**未松**: 面板按钮换成**显式允许清单**(`log-follow` 等视图控件)+ 仍禁内联事件、仍禁交易所写动作 —— 加交易按钮照样红, **例外显式化而非意图弱化**。**无新依赖 / 无构建链**(手写渲染器, 不引 marked.js)。测试 836 → **838 passed / 0 failed / 22 ignored**(+2), 门禁五件全绿; 真机取证 = CDP 走查**问题 0 条**(15 条 markdown 断言含**三条注入负例全部未执行**、`<img>` 以字面串出现、宿主输出不套 markdown; 日志搜索命中 2 / `error` 1 / `warn` 1、暂停时 `scrollTop` 保持 0 且显「已暂停 · 1 条新」、点跟随回底)+ 官方冒烟 **两种形态各 181 PASS / 0 FAIL**。**收敛期教训**: 断言补在 skill 目录的脚本副本里而实际执行的是仓库 `tmp/` 那份 → 两次 167 PASS **全是假绿**(044 的 14 条一条没跑); 修法是每次跑前 `cp <skill>/e2e_web.py tmp/` 并复核日志里**确实出现**新增断言字样。见 `specs/changes/044-webui-ux-polish/` |
+| 051-audit-remediation| 架构与代码审核整改| ✅ 已收敛 (2026-10-11)| 只做整改: 文档回填 6 处 + 代码缺陷 13 处(B1–B13) + 伪通过治理 5 处(C1–C5); **不新增功能**。基线 966。逐条见 `specs/changes/051-audit-remediation/` |
+| 052-webui-strategy-config| Web UI 策略配置断层收口| ✅ 已收敛 (2026-10-12)| N1 删除策略 / N2 清单留空合法 / N3 AI 改参多轮 + 影响评估, 四路修法全不引新依赖。基线 1000, e2e 381。**注意目录内 `tasks.md` 与 `new-tasks.md` 并存**(第二批用后者), 属历史欠账 |
+| 053-param-unsaved-hint| 改参数「未保存」提示 + 改动前后对比| ✅ 已收敛 (2026-10-12)| 参数基线 + 行内「原 X → 改为 Y」+ 顶部改动清单 + 一键还原; 真跑 AI 后把两条回测口径写进 `AI_ASSESS_PREAMBLE`。基线 1001, e2e 388 |
+| 054-ai-strategy-flow| AI 策略生成流程审计整改| ✅ 已收敛 (2026-10-15)| 15 条缺陷 / 四轮 42 项: P1 生成即验证 / P2 结构化输入与风险档位表 / P3 样本外与 walk-forward / P4 `optimize` 接通 / P5 收尾。基线 1040, e2e 458 |
+| 056-startup-gate-convergence| 启动门禁收口 + 运行态可见性| ✅ 已收敛 (2026-10-18)| 门禁收口到 `ctrl::start_daemon` 一处(7 处调用点全覆盖) + **restart 先判后停**绑定落地 + `declared`/`duplicate_of` 只读回传。**刻意不为 restart 单独补闸**: 先判后停已覆盖, 单独加会让两套判定口径分叉 |
+| 057-p0d-notional-guard| P0-D 单笔名义护栏 + 跨实例 kill switch + 前端检查进 CI| ✅ 已收敛 (2026-10-18)| P0-D 取 ⓑ: `NOTIONAL_LIMIT_MULTIPLE = 10` 固定常量不进配置面; G4 `ricow kill` / `POST /api/runs/kill`; G6 前端检查进 CI 新建 `nightly.yml`。基线见本文「测试基线」 |
 
 > **023-ai-chat-ux(2026-09-18, 实施中)**: 对话体验重构 —— 中英双语(`[ui].lang` + `/lang`, AI 回复语言跟随)、每轮分隔线与轮次号 + `/history`、去术语化(面向用户不出现 `ricow xxx` 命令)、宿主持有菜单的选项式交互(菜单 A 5 项 / B 4 项)、**写操作全确认**(7 → 13 类, 唯一入口 `request_write_confirmation`)。确认词**分渠道**: 对话 = 当前语言**口语词**(`确认`/`确定`/`同意` · `confirm`/`confirmed`), 终端 = **逐字长短语**(`approve.rs` / `ctrl.rs` 一行不改); 见 `specs/changes/023-ai-chat-ux/`。
 
@@ -461,37 +469,27 @@
 7. ~~**AI 对话流程仍需简化**(2026-09-17 用户反馈, 原话: 「AI对话流程还需要简化。目前有点过于复杂」)~~ → **已立项 023-ai-chat-ux(2026-09-18)**: 向导首问语言、对话内确认改为随语言的**口语词**、去术语化表述、菜单选项式交互, 三项"用户要记的东西"都被收掉。
    - 现象(当时自查): 用户要理解的东西偏多 —— 首次向导 4 步(供应商 / 模型 / 密钥 / 可选连通校验, 外加可跳过的 demo 凭据)、对话内七类**逐字**确认短语、以及"裸入口 / `ai` 子命令 / 一堆 CLI 子命令"多档入口并存。(023 收敛了前两项; 入口档次未动。)
    - **约束(仍然有效)**: 逐字短语在**终端**是**安全机制**(不是可删的复杂度) —— 023 的解法是**分渠道**: 对话用当前语言口语词, 终端保持逐字长短语一行不改, 不削弱"写实必须本人确认"。
-8. **策略门禁覆盖面收口 + 运行态可见性**(2026-10-05 审计, 待用户定方案)
+8. **策略门禁覆盖面收口 + 运行态可见性**(2026-10-05 审计) —— ✅ **已收敛(056, 2026-10-18)**
    - **已核实的结论**: "门禁只挂启动/回测层、已在跑的实例不受影响"是**正确**的边界 ——
        
      实例启动时 `load_strategy` 只调用一次、运行期不重读 `.lua`(`ricow_engine/src/command.rs` 的 640/1019/1529),
        
      故"运行中实例刚变可疑"在时序上不存在;
-       
+     
      唯一的"持续门禁"手段是热停正在跑的实盘实例, 与 FR-024 纪律相悖。详见
-       
+     
      [`specs/research/strategy-gate-coverage-audit-2026-10.md`](research/strategy-gate-coverage-audit-2026-10.md)。
-   -
-   - **缺口 1(可见性)**: `GET /api/runs` / `.../status` 不带 `declared` / `duplicate_of`, 用户看不到运行中实例用的
-       
-     是不是未声明副本 → "会自己停止再重启"的前提在 UI 上不成立。建议加只读标记 + 前端徽章(纯展示、不触 daemon)。
-   - **缺口 2(覆盖面)**: `catalog::run_block` 目前只有 4 个调用点(CLI 回测 + Web 回测/寻优/启动),
-       
-     而启动路径的公共汇聚点 `ctrl::start_daemon`(`ctrl.rs:202`)自身**无闸**, 被 7 处调用
-       
-     (CLI start/restart + AI 五处 + Web start) → `commands/backtest.rs:919` 声称的"免得网页不让跑但命令行能跑"
-       
-     对**启动**这条线尚未成立(对话里让 AI "启动 X" 照样能起未声明副本)。建议收口到 `start_daemon` 一处盖全。
-   - **收口的顺序陷阱**: `ctrl::restart` 是"先 stop 后 start", 若闸只加在 `start_daemon`, 会出现
-       
-     "实例被停掉、没起来"(还可能带未平仓敞口) → 收口则**必须**配 restart **先判后停**;
-       
-     不收口则维持现状(restart 不判)。两者绑定, 不允许只做一半。
-   - **状态**: **2026-10-18 已拍板并开工** —— 门禁收口取 `ctrl::start_daemon` 一处盖全, 且**与 `restart` 先判后停绑定落地**。
-     变更档案 [`specs/changes/056-startup-gate-convergence/`](changes/056-startup-gate-convergence/spec.md)（编号 056: 目录最大 054,
-     但全仓已引用到 055, 按 `changes/README.md` 约定取最大 +1）。
-     本项**可见性部分**(`declared` / `duplicate_of` 回传)与门禁收口同批交付。
-9. **P0-D 操作级熔断 / 单笔名义上限**(2026-10-06, 037 显式不做, 待用户拍板)
+   - **两条缺口(2026-10-05 审计时状态, 现均已收口)**:
+     - **缺口 1(可见性) ✅ 已落**: `GET /api/runs` / `.../status` 原先不带 `declared` / `duplicate_of`, 用户看不到运行中实例
+       用的是不是未声明副本 → 现已随 056 回传这两个只读字段(`web/runs/mod.rs` 的 `RunItem`/`StatusReply` + `catalog_audit()`)。
+     - **缺口 2(覆盖面) ✅ 已落**: `catalog::run_block` 原先只有 4 个调用点, 启动路径的公共汇聚点 `ctrl::start_daemon` 自身无闸,
+       被 7 处调用(CLI start/restart + AI 五处 + Web start) → 现已收口到 `start_daemon` **首行**调闸 `startup_gate()`, 7 处全覆盖。
+       `commands/backtest.rs` 声称的"免得网页不让跑但命令行能跑"对**启动**这条线已成立。
+   - **收口的顺序陷阱(已按此实现)**: `ctrl::restart` 是"先 stop 后 start", 若闸只加在 `start_daemon` 而不配先判后停, 会出现
+     "实例被停掉、没起来"(还可能带未平仓敞口) → 故 056 把 **restart 先判后停**与收口绑定落地。**不允许只做一半。**
+   - **状态**: **2026-10-18 已收敛** —— 变更档案 [`specs/changes/056-startup-gate-convergence/`](changes/056-startup-gate-convergence/converge.md)（编号 056: 目录最大 054,
+     但全仓已引用到 055, 按 `changes/README.md` 约定取最大 +1）。四件套齐备, 3 条新单测实跑通过。
+9. **P0-D 操作级熔断 / 单笔名义上限**(2026-10-06, 037 显式不做) —— ✅ **已落码(057, 2026-10-18)**
    - **来源**: [`specs/research/framework-vs-commercial-2026-10.md`](research/framework-vs-commercial-2026-10.md) §四的 🔴 P0-D ——
        
      商用框架普遍有"单笔名义上限 + 异常速率熔断"作为**引擎级**的最后一层操作护栏; ricow 目前只有固定 100 单/秒的
@@ -520,9 +518,9 @@
      单测锁住, 不得被解读为"平台开始替用户做投资风控"。
    - **权益取不到即放行**(057 实现决策): 无权益基准时拒单会把**正常下单**误拒(比不拦更坏 —— 策略在合法时凭空停手);
      宁可漏拦一次数量级笔误。权益只取报价资产余额, 不加持仓市值(持仓市值要按逐仓/全仓与标记价算, 各市场口径不同, 算不准反误拒)。
-   - **同报告的其他项已收尾**: 🔴 P0-A / P0-B / P0-C 随 **037** 落地; 🟡 **P1-A ~ P1-F 六项随 038(2026-10-06)全部落地** ——
-       
-     至此 `framework-vs-commercial-2026-10.md` 的差距清单里**只剩 P0-D 这一项未做**。
+   - **同报告的其他项已收尾**: 🔴 P0-A / P0-B / P0-C 随 **037** 落地; 🟡 **P1-A ~ P1-F 六项随 038(2026-10-06)全部落地**。
+     **连同本项 P0-D, `framework-vs-commercial-2026-10.md` 的整份差距清单(P0 四项 + P1 六项)现已全部收口**。
+     > 该报告正文(2026-10-06 快照)里 P1 六项与 P0-D 仍以"未做"口吻陈述, 只就地标了 P0-A/B/C —— 已在该报告 §四 就地补标落地状态, 别把它当活文档读。
 
 ## 文档-实现缺口 (2026-09-11 审计)
 

@@ -41,8 +41,8 @@ git push origin v0.7.0
 - 工具: `dist`(原 cargo-dist) **0.32.0**; 配置在 `dist-workspace.toml`(根), CI 工作流 `.github/workflows/release.yml` 由 `dist generate` 生成 —— **两个文件都不要手改**(改配置后重跑 `dist generate`)。
 - 实际配置: `targets` = 5 个(见 §五 表); `installers = ["shell", "powershell", "homebrew", "msi"]`; `ci = "github"`; `hosting = "github"`;
   **`install-updater = false`**(FR-038/SC-011: 产物与安装器不得含自动更新组件);
-  `include = ["packaging/启动-ricow-AI助手.cmd", "packaging/启动-ricow-AI助手.sh", "packaging/启动-ricow-AI助手.command"]`(FR-039 / T035: 三平台启动入口随包分发)。
-- 启动入口(2026-09-17 补齐三平台, 同名不同后缀): `.cmd` = Windows 双击(`chcp 65001` + `ricow ai` + `pause`);
+  `include = ["INSTALL.md", "packaging/启动-ricow-AI助手.cmd", "packaging/启动-ricow-AI助手.sh", "packaging/启动-ricow-AI助手.command", "packaging/启动-ricow-Web.cmd", "packaging/启动-ricow-Web.sh", "packaging/启动-ricow-Web.command"]` —— **共 7 项**: 安装说明 + **AI 助手三平台**(FR-039 / T035) + **Web UI 三平台孪生**(025 FR-033)。权威值以 `dist-workspace.toml` 的 `include` 为准, 本文只作叙述。
+- 启动入口(2026-09-17 补齐三平台, 同名不同后缀; Web 版为 025 FR-033 加的孪生, **同名不同后缀、同一套查找链**, 差别只在启动行是 `ricow web` 还是 `ricow ai`): `.cmd` = Windows 双击(`chcp 65001` + `ricow ai` + `pause`);
   `.sh` = Linux/macOS 终端(`./启动-ricow-AI助手.sh`, 结束时若 stdin 是 tty 则等回车以免双击开的终端窗口秒关);
   `.command` = macOS 双击(Finder 直接执行 `.command`, 该文件只是 `exec` 同名 `.sh` 的薄壳, 逻辑只有一份)。Unix 侧**不动 locale**(UTF-8 是默认, 中文由 ricow 自己输出)。
 - 二进制查找链(2026-09-17 修订, `.cmd` 与 `.sh` 同一口径): 脚本同目录(`./ricow` / `ricow.exe`, 即压缩包布局) → 源码检出 `../target`

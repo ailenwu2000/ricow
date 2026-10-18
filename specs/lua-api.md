@@ -266,9 +266,13 @@ ticks_per_interval = exec.ticks_per(ctx:config_i64("interval_secs"), ctx:config_
 - 长度边界：组合信号模式返回该 pair 信号线截至当前执行日已收盘段，**尾窗封顶最近
   `SIGNAL_TAIL`(400) 根**（007 v2，R1 十年回测性能前提；打分只需 ≥253 根，400 留足
   ROC252/EMA200(t-20)/52w 高余量；超长段只裁旧根不裁未来，无前视不变）。单标的路径
-  （无 universe）维持最多最近 100 根不变（回归约束，行为边界）。
+  （无 universe）**同样按 `need_klines` 声明尾窗截断**（未声明则回落全量）—— 旧的「固定 100 根」
+  上限已撤销: 它没有任何设计依据，且会让声明 `need_klines = 249` 的策略拿不到够用的历史。
 - 成交轨 = 币安 bStock 1d（spot = bstock base+USDT；futures = fapi EQUITY us+USDT），
-  R1 研究回测可切 `--market us` = Nasdaq 日线近似（忽略 bStock 溢价/时差，报告注明）；
+> **注 (2026-10-18 订正)**: `ricow backtest --market` **只接受 `spot|futures`**（传 `us` 会被
+> `"--market 仅支持 spot|futures"` 直接拒绝，见 `commands/backtest.rs`）。本节已无内置消费者，
+> 「R1 研究回测切 Nasdaq 日线近似」是 007/008 时期的设想，**当前没有对应命令行开关**。
+> 若将来要恢复，需在 `backtest.rs` 的 market 白名单里显式加分支，不能照本文档直接执行。
   撮合/成交按成交轨 bar open；信号日 T（美股收盘）→ 成交于其后首根新 bar，引擎截断
   语义天然实现（T 日信号线 open_time < T+1 tick 时间）。
 - v2 策略参数（bs_momentum.lua 007）：`market_gate`（池内 SPY symbol；空 = 门不激活，
@@ -347,8 +351,8 @@ end
 策略文件统一放**项目根**的 `strategies/` 目录(运行时自动创建,已被 git 忽略,用户策略默认私有):
 
 ```
-<项目根>/strategies/<name>.toml        # 策略配置 (含参数)
-<项目根>/strategies/scripts/<name>.lua # Lua 脚本 (script_path 引用)
+<项目根>/strategies/<name>.toml           # 策略配置 (含参数)
+<项目根>/strategies/<market>/<name>.lua  # Lua 脚本 (script_path 引用; market = spot|futures)
 <项目根>/ricow.db                      # 运行时数据 (行情缓存/成交/盈亏快照)
 ```
 
@@ -357,31 +361,42 @@ end
 1. `ricow create --name <name> --pair <pair> --script <你的.lua>`(省略 `--script` 或写 `-` = 从 stdin 读全文)
    —— 引擎先做编译门禁, 再用真实 K 线沙箱回测, 通过则生成**不落盘**的 preview;
 2. `ricow approve`(必须在**你自己的交互终端**里逐字确认)拿到一次性 token;
-3. `ricow deploy <preview_id> --token <token>` 落盘 `strategies/<name>.toml` + `strategies/scripts/<name>.lua`(同名拒绝覆盖);
+3. `ricow deploy <preview_id> --token <token>` 落盘 `strategies/<name>.toml` + `strategies/<market>/<name>.lua`(同名拒绝覆盖);
 4. 回测:`ricow backtest --strategy <name>`(TOML 已含 pair 时可省 `--pair`);
 5. 启动:`ricow run <name>`(Dry Run;TOML 里 `enabled = false` 会被拒绝启动)。
 
 **没有独立的"策略模板文件"**: 样板就是下节 `strategies/spot/` 下的内置策略(031 起内置 = 示例, 与用户策略统一管理), 直接读它照写。
-手工建策略(不走 create 闭环)同样支持: 自己写 `strategies/<name>.toml` + `strategies/scripts/<name>.lua`,
+手工建策略(不走 create 闭环)同样支持: 自己写 `strategies/<name>.toml` + `strategies/<market>/<name>.lua`,
 TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝对路径);旧部署(TOML 内嵌 `script` 代码字符串)依然兼容。
 
 目录定位:默认取**当前工作目录**(在项目根运行 `ricow`);从其他目录运行可设
 `RICOW_ROOT=<项目根>`;数据库路径可单独用 `RICOW_DB=<path>` 覆盖。
 
-内置策略(shannon_spot_grid 香农现货网格 + paired_grid 现货动态非对称网格 + shannon_grid 香农网格)均为 Lua 脚本, 按市场分目录
-`strategies/spot/`(现货)与 `strategies/futures/`(合约), 每策略 = `<id>.lua`(逻辑) + `<id>.toml`(清单: 中文名/说明/参数 schema),
-参考实现见 `strategies/spot/`(git 跟踪, 与用户策略同目录, 复制即自定义):
+内置策略**共 8 个**(清单 = `crates/ricow/src/strategies/catalog.rs` 的 `BUILTIN`, 编译期 `include_str!` 嵌入,
+改文件不重编译不生效), 按市场分目录 `strategies/spot/`(现货 3 个)与 `strategies/futures/`(合约 5 个),
+每策略 = `<id>.lua`(逻辑) + `<id>.toml`(清单: 中文名/说明/参数 schema); 与用户策略同目录, 复制即自定义:
 
-- `strategies/spot/shannon_spot_grid.lua`(+ `shannon_spot_grid.toml`) — 香农现货网格(虚拟账本权重再平衡 + ATR 间距, 详见 §九)
-- `strategies/spot/paired_grid.lua`(+ `paired_grid.toml`) — 现货动态非对称网格(固定金额 + 配对卖价恒>买价 + 方向偏移, 详见 §九)
-- `strategies/spot/shannon_grid.lua`(+ `shannon_grid.toml`) — 香农网格(真实账本 1:1 权重模拟 + 动态 ATR 间距 + 最小间距下限, 033; 建仓/成交后按含费修正量恢复现金与仓位价值 1:1)
+**现货 `strategies/spot/`(3 个)**
 
-**内置脚本为编译期嵌入(include_str!), 直接改文件不重编译不生效**;
-自定义请复制 `strategies/spot/` 下的 `.lua` + `.toml` 到新 id 再改。
+- `paired_grid` — 现货动态非对称网格(固定金额 + 配对卖价恒>买价 + 方向偏移, 详见 §九)
+- `shannon_grid` — 香农网格(真实账本 1:1 权重模拟 + 动态 ATR 间距 + 最小间距下限, 033; 建仓/成交后按含费修正量恢复现金与仓位价值 1:1)
+- `shannon_virtual_grid` — 香农现货网格(虚拟账本权重再平衡 + ATR 间距, 详见 §九)
 
-直接 `ricow backtest --strategy shannon_spot_grid --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
+**合约 `strategies/futures/`(5 个)**
+
+- `paired_grid_futures_long` — 合约单向做多配对网格
+- `shannon_grid_futures` — 合约香农网格(单向)
+- `shannon_hedge_grid_futures` — 合约双向对冲网格
+- `shannon_neutral_grid_futures` — 合约中性(锁仓)网格
+- `shannon_short_grid_futures` — 合约单向做空网格
+
+> 磁盘上可能还有 `<id>.lua` 的 `.bak` 副本等临时文件, **它们不是内置 id**; 判定内置看 `catalog::is_builtin_id`。
+
+直接 `ricow backtest --strategy paired_grid --pair ETHUSDT` 即可运行(引擎自动注入内置脚本;
 **交易对必须带报价币**, 现货用 `ETHUSDT` 而非 `ETH`, 否则交易所返回 `Invalid symbol`);
-复制 `strategies/spot/` 下的 `.lua` + `.toml`(如 `shannon_spot_grid` / `paired_grid` / `shannon_grid`)到
+**注意内置清单的必填参数** —— 例如 `shannon_grid` 的 `start_price` 是 `required = true` 无默认值,
+不传会 `[FATAL] 缺少必填参数 start_price` 停机 0 成交, 须`--param start_price=<价>` 显式给值;
+复制 `strategies/spot/` 或 `strategies/futures/` 下的 `.lua` + `.toml`(8 个内置 id 之一)到
 新 `<id>`, 改清单里的 `id` 即自定义(`strategies/{spot,futures}/` 下除内置示例外均被 git 忽略,
 用户策略默认私有;想入库自行调整 `.gitignore`)。
 

@@ -31,7 +31,7 @@
 
 | 项 | 结果 |
 |:--|:--|
-| `cargo test --workspace --no-fail-fast` | ✅ 见下方基线 |
+| `cargo test --workspace --no-fail-fast` | ✅ **1056 passed / 0 failed / 22 ignored**（056 单独实跑为 1043，本轮新增 13 条）—— 当前权威基线见 `specs/roadmap.md`「测试基线」 |
 | `bash scripts/ci_grep_gates.sh` | ✅ 五条红线全绿 |
 | `cargo fmt --all -- --check` | ✅ 0 差异 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ |
