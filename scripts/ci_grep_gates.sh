@@ -9,6 +9,15 @@
 # 用法:
 #   bash scripts/ci_grep_gates.sh          # 退出码 0 = 全绿
 #
+# 姊妹脚本(**不进本脚本**, 各有各的触发方式):
+#   node scripts/web_frontend_check.mjs    # 前端静态检查: 语法 / 双语键一一对应 / 文案引用完整性 /
+#                                          # 首页 data-zh↔data-en 配对 / router.parseHash 边界 / 同名碰撞
+#     → **057-G6 起进 ci.yml 的 frontend job**(此前"故意不进": 顾虑是多绑一个 node 运行时。
+#       但 test job 的 matrix 本就三平台且 node 预装, 额外成本很小; 更硬的理由是 054 抓到过
+#       `skipBox` TDZ 真实缺陷而当时**四道静态门全绿**)。本脚本仍是**零依赖**, 所以不调它。
+#   node scripts/probe_web_ui.mjs          # CDP 真机走查: 需真浏览器 + headless, 进 nightly.yml。
+#                                          # 保留这一层的理由同上 —— 静态门结构上抓不到运行期缺陷。
+#
 # 新增红线时: 先想清楚"违反它的代价"与"误报概率"。宁可少一条, 不要留一条天天误报的。
 set -uo pipefail
 
@@ -29,6 +38,27 @@ if [ ! -t 1 ]; then RED=''; GREEN=''; DIM=''; RESET=''; fi
 # ---------------------------------------------------------------------------
 non_test_lines() {
     awk '
+        # 数花括号之前先剥掉**字符串字面量与行注释**。
+        #
+        # 2026-10-18 变异验证抓到的真缺陷: 测试块里只要有一句 `format!("{")`
+        # (字符串里的单个 `{`), 朴素的 gsub 计数就会 depth >= 1 且永不回落 ->
+        # 该块"永不结束" -> **它后面的整段生产代码被静默吞掉**, 红线全绿。
+        # 方向性: 吞掉 = 漏扫 = 假绿, 比"多扫测试代码(误报)"危险得多。
+        function strip_noise(s,   out, i, n, ch, ins) {
+            out = ""; ins = 0; n = length(s)
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (ins) {
+                    if (ch == "\\") { i++; continue }
+                    if (ch == "\"") { ins = 0 }
+                    continue
+                }
+                if (ch == "\"") { ins = 1; continue }
+                out = out ch
+            }
+            sub(/\/\/.*$/, "", out)
+            return out
+        }
         FNR == 1 { intest = 0; depth = 0; started = 0 }
         {
             if (intest == 0) {
@@ -40,8 +70,9 @@ non_test_lines() {
                 next
             }
             # intest == 1: 整块跳过, 直到花括号配平 (或单个以 ; 结尾的属性项)
-            o = gsub(/\{/, "{")
-            c = gsub(/\}/, "}")
+            clean = strip_noise($0)
+            o = gsub(/\{/, "{", clean)
+            c = gsub(/\}/, "}", clean)
             depth += o - c
             if (o > 0) started = 1
             if (started == 1 && depth <= 0) intest = 0

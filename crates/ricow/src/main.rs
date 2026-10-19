@@ -29,6 +29,11 @@ enum Command {
     Start(ctrl::StartArgs),
     /// 停止策略 (优雅停机; 清理由策略 on_stop 执行)
     Stop(ctrl::StopArgs),
+    /// **紧急按住全部**: 停止当前所有运行中的实例, 但 daemon 继续运行 (057-G4)
+    ///
+    /// 与 `stop --close-all` 的分工: `--close-all` 平**单个**实例的仓; 本命令按**全部**实例。
+    /// 平仓是独立的不可逆动作, 必须显式加 `--close-all`。
+    Kill(ctrl::KillArgs),
     /// 重启策略 (stop + start)
     Restart(ctrl::RestartArgs),
     /// 列出策略实例与状态
@@ -111,6 +116,7 @@ async fn main() {
         None => chat::run().await,
         Some(Command::Start(args)) => ctrl::start(args).await,
         Some(Command::Stop(args)) => ctrl::stop(args).await,
+        Some(Command::Kill(args)) => ctrl::kill(args).await,
         Some(Command::Restart(args)) => ctrl::restart(args).await,
         Some(Command::List(args)) => instances::list(args).await,
         Some(Command::Status(args)) => instances::status(args).await,

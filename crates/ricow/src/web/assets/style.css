@@ -29,6 +29,7 @@
   --ma-7: #e3b341;
   --ma-25: #58a6ff;
   --ma-99: #bc8cff;
+  --ai-badge: #bc8cff;
 }
 
 /* 034 白色浅色主题: 背景白、面板浅灰, 强调色加深保证对比度(WCAG AA)。 */
@@ -55,6 +56,7 @@
   --ma-7: #9a6a00;
   --ma-25: #0969da;
   --ma-99: #8250df;
+  --ai-badge: #8250df;
 }
 
 /* 034 红色主题: 深红褐面 + 珊瑚强调 —— 整体仍是暗色系, 红色为主色调。 */
@@ -81,6 +83,7 @@
   --ma-7: #f0c674;
   --ma-25: #7cc4ff;
   --ma-99: #d7b0ff;
+  --ai-badge: #d7b0ff;
 }
 * {
   box-sizing: border-box;
@@ -211,12 +214,29 @@ body {
   padding: 10px 16px;
   border-bottom: 1px solid var(--border);
 }
+/* 059 UX-01: 顶栏「当前视图名」。比会话名更醒目 —— 它是"我在哪一屏"的唯一答案,
+   会话名(#session-title)是它的补充, 且只在对话视图出现(见下面 [data-view] 规则)。 */
+#view-title {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--text);
+}
 #session-title {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+/* 059 UX-01/03: 会话名与会话列表都是**对话视图**的概念。
+   此前两者在六个视图下都常驻 —— 看密钥/设置时顶栏写着「新会话」、左栏挂着聊天列表,
+   既占空间又与当前任务无关。现在按 `#app` 上的 `data-view`(由 router.js 写)显隐:
+   JS 只写一个数据属性, 具体表现交给 CSS, 省掉两处各自改 style 的分叉。 */
+#app:not([data-view="chat"]) #session-title {
+  display: none;
+}
+#app:not([data-view="chat"]) #session-list {
+  display: none;
 }
 .status {
   color: var(--accent);
@@ -1257,11 +1277,20 @@ body {
   font-size: 0.78rem;
   font-weight: 600;
 }
-.mk-book-col.is-bid .mk-book-subhead {
-  color: var(--accent);
+/* C10: 盘口买卖配色 —— **买红卖绿**(国内行情惯例, 与全站"红 = 多头力量"自洽)。
+   注: 这与部分国际经纪商(bid 绿 / ask 红)相反, 按本项目"中国用户 + 涨红跌绿"的口径统一。 */
+.mk-book-col.is-bid {
+  --book-side: var(--error);
+  /* 深度条的底色: 主题红的 18% 透明版。`color-mix` 不被支持时整体退化为无色条(不报错)。 */
+  --depth-color: color-mix(in srgb, var(--error) 18%, transparent);
 }
+.mk-book-col.is-ask {
+  --book-side: var(--accent);
+  --depth-color: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.mk-book-col.is-bid .mk-book-subhead,
 .mk-book-col.is-ask .mk-book-subhead {
-  color: var(--error);
+  color: var(--book-side);
 }
 .mk-book-table {
   width: 100%;
@@ -1287,11 +1316,20 @@ body {
 .mk-book-table .num {
   text-align: right;
 }
-.is-bid .mk-book-table td:first-child {
-  color: var(--accent);
-}
+.is-bid .mk-book-table td:first-child,
 .is-ask .mk-book-table td:first-child {
-  color: var(--error);
+  color: var(--book-side);
+}
+/* C10 深度条: 每行按**累计量**从右缘往左铺一层淡色 —— 一眼看出哪一档堆得多。
+   条宽 `--depth-w` 由 markets.js 按累计量算好(买卖两侧各自归一化)。
+   刻意**不加 transition**: 盘口帧是高频更新的, 加过渡只会让条追不上数据(那才叫"抖");
+   于是也天然满足 `prefers-reduced-motion` —— 它本来就不动。 */
+.mk-book-row {
+  background-image: linear-gradient(
+    to left,
+    var(--depth-color, transparent) var(--depth-w, 0%),
+    transparent var(--depth-w, 0%)
+  );
 }
 
 /* K 线卡片 */
@@ -1373,6 +1411,12 @@ body {
   font-size: 1.15rem;
   font-weight: 600;
 }
+/* 058 kill switch: 表头变三段(标题/轮询提示/按钮)后靠自动左边距把按钮推到右侧,
+   不改 .sg-head 本身的 space-between —— 策略页也在用它, 两处共用同一骨架。 */
+.rn-kill-all {
+  margin-left: auto;
+  flex: none;
+}
 .sg-btn {
   display: inline-flex;
   align-items: center;
@@ -1403,6 +1447,24 @@ body {
 .sg-btn-primary:hover {
   background: var(--accent);
   border-color: var(--accent);
+}
+/* N1: 危险动作(删除)。用 --error 与常规 --accent 按钮分开 —— 这一步不可逆, 得一眼看出来。 */
+.sg-btn-danger {
+  border-color: var(--error);
+  color: var(--error);
+}
+.sg-btn-danger:hover {
+  background: var(--error);
+  border-color: var(--error);
+  color: var(--on-accent);
+}
+/* 删除确认框里"会保留什么"的清单: 写在确认按钮之前, 让用户点之前就看见。 */
+.sg-del-keep {
+  margin: 6px 0 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.7;
 }
 .sg-btn-mini {
   padding: 2px 10px;
@@ -1508,6 +1570,13 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* 059 UX-12: 展开态 —— 放行换行、不再截断(默认态见上方 nowrap+ellipsis)。 */
+.sg-row-summary-open {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: break-word;
+}
 .sg-row-actions {
   flex: none;
   display: flex;
@@ -1570,6 +1639,11 @@ body {
   border-color: var(--warn);
   color: var(--warn);
 }
+/* 054 D7: 「AI 生成」徽章 —— 中性色(紫), 既不是告警也不是背书; 只说来源, 不说验证。 */
+.sg-badge-ai {
+  border-color: var(--ai-badge);
+  color: var(--ai-badge);
+}
 .sg-hint {
   margin-bottom: 10px;
   padding: 8px 10px;
@@ -1604,6 +1678,42 @@ body {
 }
 .sg-card-body {
   min-width: 0;
+}
+/* 适用性卡片(帮助计划第 7 条): 置顶整宽, 在参数/代码之前; 清单四栏全空时整卡隐藏。
+   注意配色语义: 这里 `--accent` = "适用"、`--error` = "不适用", 是 好/坏 语义,
+   **不是** K 线/权益那条"涨红跌绿"(涨=--error, 跌=--accent)的行情语义 —— 同一批变量
+   两种语义在同一页并存是刻意的: 前者是标签, 后者是数字, 不混读。 */
+.sg-fit-card {
+  margin-bottom: 14px;
+}
+.sg-fit-row {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid var(--border);
+}
+.sg-fit-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.sg-fit-label {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+.sg-fit-value {
+  min-width: 0;
+  color: var(--fg);
+  font-size: 0.86rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.sg-fit-row.fit-good .sg-fit-label {
+  color: var(--accent);
+}
+.sg-fit-row.fit-bad .sg-fit-label {
+  color: var(--error);
 }
 /* Lua 编辑器横跨整行; 下面 AI / 回测各占一侧。 */
 .sg-code-card {
@@ -1693,6 +1803,139 @@ body {
   font-size: 0.8rem;
   font-weight: 600;
 }
+
+/* 053: 改动对比 —— 参数行**行内**的「原 X → 改为 Y」。
+   旧值用 muted + 删除线(它是要被换掉的那个), 新值用 warn(与「未保存」提示同色, 一眼连起来)。 */
+.sg-param-diff {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 0.76rem;
+}
+.sg-param-diff[hidden] {
+  display: none;
+}
+.sg-diff-old {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+.sg-diff-arrow {
+  color: var(--muted);
+}
+.sg-diff-new {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* 053: 改动对比汇总面板。参数多时行内标记会滚出视野, 这里给一份完整清单 + 一键还原。 */
+.sg-param-changes {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--raise-1);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+}
+.sg-param-changes[hidden] {
+  display: none;
+}
+.sg-changes-title {
+  margin-bottom: 6px;
+  color: var(--warn);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.sg-changes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.sg-change-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+.sg-change-name {
+  color: var(--fg);
+  font-weight: 600;
+}
+.sg-change-key {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.74rem;
+}
+/* 值贴右对齐: 名字长短不一时, 「原 → 新」这一列仍然竖直对齐, 扫读更快。 */
+.sg-change-val {
+  margin-left: auto;
+  font-size: 0.78rem;
+}
+/* 052 方案 4: 空参数表单的引导卡。放在「参数」卡里、`#sg-params` 之上, 清单为空时才出现。 */
+.sg-params-guide {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-dim);
+  border-radius: 8px;
+}
+.sg-params-guide[hidden] {
+  display: none;
+}
+.sg-guide-title {
+  margin-bottom: 4px;
+  color: var(--fg);
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+.sg-guide-body {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+.sg-guide-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* 052 方案 3: AI 卡的模式 chip(分段控件)。`.on` = 当前选中的那一档。 */
+.sg-seg {
+  display: inline-flex;
+  margin-bottom: 8px;
+  padding: 2px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.sg-seg-btn {
+  padding: 4px 12px;
+  background: none;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.sg-seg-btn:hover {
+  color: var(--fg);
+}
+.sg-seg-btn.on {
+  background: var(--accent-dim);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+/* 模式提示: 一句话说明当前模式, 比通用 `.sg-hint`(黄底警示)轻一档 —— 它不是警告。 */
+.sg-ai-hint {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
 .sg-input {
   width: 100%;
   padding: 7px 10px;
@@ -1726,14 +1969,122 @@ body {
   outline: none;
 }
 
+/* N3: AI 对话线程 —— 用户气泡靠右、AI 气泡靠左(与常见聊天一致, 一眼分得清谁说的)。
+   气泡里的正文一律 `pre-wrap`: 后端回的是带换行的多段中文, 按 HTML 折叠会把"逐项理由"
+   挤成一坨。 */
+.sg-ai-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.sg-ai-thread[hidden] {
+  display: none;
+}
+.sg-ai-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 88%;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.sg-ai-turn-user {
+  align-self: flex-end;
+  background: var(--raise-2);
+}
+.sg-ai-turn-bot {
+  align-self: flex-start;
+  border-left: 3px solid var(--accent-dim);
+}
+.sg-ai-who {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.sg-ai-body {
+  color: var(--fg);
+  font-size: 0.84rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.sg-ai-note {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+/* 改动对照: 只列真变了的键, 所以这张表通常很短 —— 它的价值就是"能一眼看完"。 */
+.sg-ai-changed {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+.sg-ai-changed-title {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+.sg-ai-change-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+.sg-ai-change-name {
+  color: var(--muted);
+}
+.sg-ai-change-num {
+  color: var(--fg);
+  font-family: var(--mono);
+}
+/* 「改前值只是清单默认值」这句提示不是装饰: 它区分"这组参数真的在跑"与"你还没确认过它"。 */
+.sg-ai-change-tag {
+  color: var(--warn);
+  font-size: 0.72rem;
+}
+.sg-ai-changed-none {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+/* N3-B: 改动影响评估面板(配色沿用引导卡, 但独立容器 —— 出现/消失的时机与引导卡无关)。 */
+.sg-ai-assess {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--raise-1);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-dim);
+  border-radius: 8px;
+}
+.sg-ai-assess[hidden] {
+  display: none;
+}
+.sg-ai-assess-result {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sg-ai-assess-block {
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.sg-ai-assess-block .sg-guide-body {
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* 回测作业区 */
 .sg-bt-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 10px;
-}
-.sg-bt-grid label {
+}.sg-bt-grid label {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -1874,6 +2225,42 @@ body {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+/* 054 P1: 生成后表单让位给验证结果面板(两个都得能藏 —— 本文件没有全局 [hidden] 规则)。 */
+.sg-modal-form[hidden],
+.sg-gen-verify[hidden],
+.sg-check input[hidden] {
+  display: none;
+}
+.sg-gen-verify {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 60vh;
+  overflow: auto;
+}
+/* 054 P3-1: 常驻风险提示条 —— 用告警色, 但不做勾选确认框(会稀释 live 启动那个门禁)。 */
+.sg-risk-notice-title {
+  color: var(--warn);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.sg-risk-notice {
+  padding: 8px 10px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.6;
+}
+.sg-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--fg);
 }
 .sg-field {
   display: flex;
@@ -2052,6 +2439,119 @@ body {
 .sg-mcard-sub {
   color: var(--muted);
   font-size: 0.7rem;
+}
+
+/* 054 P3-4: 成本假设行 —— 与指标卡同层(不折叠)。滑点为 0 单独点名(审计 #4)。 */
+.sg-cost-box {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.sg-cost-title {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.sg-cost-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 0.74rem;
+}
+.sg-cost-item {
+  display: inline-flex;
+  gap: 4px;
+  white-space: nowrap;
+}
+.sg-cost-key {
+  color: var(--muted);
+}
+.sg-cost-val {
+  font-family: var(--mono);
+  color: var(--fg);
+}
+.sg-cost-warn {
+  margin-top: 6px;
+  color: var(--warn);
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+.sg-cost-note {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+/* 055 B3: 档位目标 vs 实测 —— 紧贴指标卡; 未达标时左边框转红, 一眼能看见。
+   这里的红/绿是"通过 / 没做到"的意思, 与涨跌配色无关。 */
+.sg-tiercheck {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+}
+.sg-tiercheck-unmet {
+  border-left-color: var(--error);
+}
+.sg-tiercheck-title {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.sg-tiercheck-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  font-size: 0.76rem;
+  padding: 2px 0;
+}
+.sg-tiercheck-name {
+  min-width: 5.5rem;
+  color: var(--fg);
+}
+.sg-tiercheck-target,
+.sg-tiercheck-actual {
+  color: var(--muted);
+  font-family: var(--mono);
+}
+.sg-tiercheck-verdict {
+  margin-left: auto;
+  font-size: 0.72rem;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.sg-tiercheck-met {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.sg-tiercheck-unmet {
+  color: var(--error);
+  border-color: var(--error);
+}
+.sg-tiercheck-note {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.55;
+}
+.sg-verify-reason {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* 权益曲线容器(P0-2, Lightweight Charts 自适应父容器高度) */
@@ -2341,6 +2841,24 @@ body {
   gap: 6px;
   cursor: pointer;
   font-size: 0.8rem;
+}
+/* 058 kill switch: 后果说明与"daemon 仍在跑"两行。危险色只用在结论行, 保持克制。 */
+.rn-kill-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.84rem;
+}
+.rn-kill-warn {
+  color: var(--error);
+}
+.rn-kill-keep {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.rn-kill-keep-daemon {
+  color: var(--accent);
+  font-family: var(--mono);
 }
 .rn-log-tr > td {
   padding: 0 10px 10px;
@@ -2798,4 +3316,763 @@ body {
 }
 #stream .md-em {
   font-style: italic;
+}
+
+/* ── 帮助抽屉 (帮助计划第 1 条) ────────────────────────────────────────────────
+   顶栏常驻 `?` 打开; 盖在当前视图上的一层, 不参与 hash 路由。
+   整块只用主题变量 —— 深/白/红三套主题自动跟随, 不新增需要三处同步的颜色。 */
+.help-btn {
+  padding: 2px 9px;
+  font-size: 0.82rem;
+}
+.help-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  display: flex;
+  justify-content: flex-end;
+}
+.help-drawer[hidden] {
+  display: none;
+}
+.help-overlay {
+  position: absolute;
+  inset: 0;
+  background: var(--overlay);
+}
+.help-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(460px, 94vw);
+  height: 100%;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+}
+.help-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.help-title {
+  font-weight: 600;
+}
+.help-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px 28px;
+}
+.help-intro {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.65;
+}
+.help-sec {
+  margin-bottom: 20px;
+}
+.help-sec-title {
+  margin: 0 0 8px;
+  color: var(--accent);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+/* 上下文段落: 当前视图对应的那一段给一条左边条, 用户一眼看到"先读这个"。 */
+.help-ctx .help-sec-title {
+  margin-left: -11px;
+  padding-left: 8px;
+  border-left: 3px solid var(--accent);
+}
+.help-guide {
+  margin: 0;
+  padding-left: 20px;
+}
+.help-guide li {
+  margin-bottom: 8px;
+  line-height: 1.6;
+}
+.help-guide-h {
+  display: block;
+  color: var(--fg);
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+.help-guide-p {
+  display: block;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+.help-lead {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+.help-examples {
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+}
+.help-examples li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 6px;
+  padding: 7px 9px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.help-say {
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+}
+.help-say-note {
+  font-size: 0.78rem;
+}
+.help-btn-primary {
+  padding: 6px 12px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  color: var(--on-accent);
+  font-size: 0.84rem;
+  cursor: pointer;
+}
+.help-faq {
+  margin-bottom: 10px;
+}
+.help-faq-q {
+  margin-bottom: 3px;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+.help-faq-a {
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.65;
+}
+.help-terms-input {
+  box-sizing: border-box;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 6px 9px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  font-size: 0.85rem;
+}
+.help-terms-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.help-term-key {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+}
+.help-term-text {
+  color: var(--muted);
+  font-size: 0.83rem;
+  line-height: 1.6;
+}
+.help-terms-empty {
+  font-size: 0.84rem;
+}
+
+@media (max-width: 720px) {
+  .help-panel {
+    width: 100vw;
+  }
+}
+/* 抽屉打开时锁住背后页面滚动 —— 否则滚轮会把下面的视图滚走, 关掉后位置全乱。 */
+body.help-open {
+  overflow: hidden;
+}
+
+/* ── 对话起手卡 (帮助计划第 2 条) ──────────────────────────────────────────────
+   空会话时出现在对话流里; 一旦有内容(用户发送 / 宿主推帧)即由 chat.js 的 append() 撤掉 ——
+   它只服务"还不知道能说什么"的那几秒。整块只用主题变量。 */
+.starter {
+  margin: 4px 0 10px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.starter-title {
+  margin-bottom: 4px;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+.starter-lead {
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 0.83rem;
+  line-height: 1.6;
+}
+.starter-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  margin-bottom: 6px;
+  padding: 8px 10px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+.starter-item:last-child {
+  margin-bottom: 0;
+}
+.starter-item:hover {
+  border-color: var(--accent);
+}
+.starter-q {
+  font-size: 0.86rem;
+}
+.starter-note {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+/* ── B4: 空状态 → 可操作 CTA ──────────────────────────────────────────────────────
+   空状态原来只有一行灰字("无策略" / "—" / "无"), 用户看完还是不知道该干嘛。
+   `R.emptyState()` 在说明下补一个「下一步」按钮; 这里只管样子 —— 那个按钮是**导航**
+   (去策略页 / 新建 / 看全部交易对), 不是替你写入的动作。 */
+.empty-cta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+}
+.empty-cta .empty {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.empty-cta-btn {
+  padding: 4px 10px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--accent);
+  font-size: 0.78rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+.empty-cta-btn:hover {
+  border-color: var(--accent);
+}
+/* 会话列表的空态是个 <li>: 让 CTA 贴着列表左缘, 不跟着 li 的间距漂。 */
+.session-empty {
+  padding: 10px 8px;
+}
+/* 策略页: 一个自有策略都没有时的那条"下一步"。 */
+.sg-firststep {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.sg-firststep-t {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+/* ── B6: 全局通知(toast) ──────────────────────────────────────────────────────────
+   挂在 body 上而不是各视图的 msg 区: 复制完自动打开详情、保存完回列表, 提示都还在。
+   只承载成功 / 中性一路, 错误仍留在原地(贴着出错的控件)。 */
+.toast-host {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none; /* 不挡下面的东西; 单个 toast 自己收回来 */
+}
+.toast {
+  max-width: min(360px, 80vw);
+  padding: 8px 12px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  pointer-events: auto;
+  cursor: pointer;
+}
+.toast-ok {
+  border-left-color: var(--accent);
+}
+.toast-err {
+  border-left-color: var(--error);
+}
+.toast-info {
+  border-left-color: var(--muted);
+}
+@media (max-width: 720px) {
+  .toast-host {
+    right: 10px;
+    bottom: 10px;
+    left: 10px;
+    align-items: stretch;
+  }
+  .toast {
+    max-width: none;
+  }
+}
+
+/* ── B5: 首次运行引导条 ──────────────────────────────────────────────────────────
+   只在"全新装置"上出现一次(服务端事实驱动, 见 help.js 的 probeOnboard)。
+   它不挡路 —— 是一条可关闭的横条, 不是遮罩; 关掉后本次页面不再出现。 */
+.onboard {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  padding: 8px 14px;
+  background: var(--raised);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+.onboard-lead {
+  color: var(--fg);
+}
+.onboard-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+.onboard-steps li {
+  list-style: decimal;
+}
+.onboard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+.onboard-btn {
+  padding: 4px 10px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--on-accent);
+  font-family: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.onboard-ghost {
+  background: none;
+  border-color: var(--border);
+  color: var(--accent);
+}
+.onboard-ghost:hover {
+  border-color: var(--accent);
+}
+.onboard-close {
+  padding: 0 6px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.onboard-close:hover {
+  color: var(--fg);
+}
+@media (max-width: 720px) {
+  .onboard-actions {
+    margin-left: 0;
+  }
+}
+
+/* ── C12: 响应式补断点(对话 / 运行两个高频视图) ──────────────────────────────────
+   桌面优先**不变**: 宽屏布局一字未改, 下面只覆盖 ≤900px。
+   ① 侧栏改"覆盖式抽屉"(顶栏 ☰ 开合): 否则 1366 宽下一条 250px 的侧栏就把对话正文
+      挤成一条细缝, 而窄屏本来就不该长期占着这 250px。
+   ② 对话视图由"左右两栏"改"上下堆叠", 面板落到下方并封顶高度 —— 保持"对话是主角"。
+   ③ 宽表统一横向可滚, 不撑破视口。
+   `.side-toggle` 桌面隐藏; `.side-scrim` 只在抽屉开着时出现。 */
+.side-toggle {
+  display: none;
+}
+.side-scrim {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  .side-toggle {
+    display: inline-block;
+    flex: none;
+  }
+  #sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 60;
+    width: min(280px, 82vw);
+    transform: translateX(-100%);
+    transition: transform 0.18s ease;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+  #app.side-open #sidebar {
+    transform: translateX(0);
+  }
+  #app.side-open .side-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: var(--overlay);
+  }
+  /* 顶栏在窄屏要挤下 ☰ + 标题 + 主题 + 语言 + 帮助: 收紧间距。 */
+  #topbar {
+    gap: 8px;
+    padding: 8px 12px;
+  }
+  /* 对话: 上下堆叠; 面板在下方, 高度封顶(内部仍各自可滚)。 */
+  #view-chat {
+    flex-direction: column;
+  }
+  #panels {
+    flex: 0 0 auto;
+    width: 100%;
+    max-height: 46vh;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+  #stream {
+    padding: 14px 12px;
+  }
+  /* 宽表: 策略历史 / 寻优 / 运行实例 —— 窄屏改为横向滚动, 不撑破视口。 */
+  #sg-bt-history,
+  #sg-sw-result,
+  #sg-opt-result,
+  .sg-table-scroll {
+    overflow-x: auto;
+  }
+  .sg-hist-table {
+    min-width: 560px;
+  }
+  /* C8 多维寻优表比历史表多出 N 个维度列, 窄屏需要更宽的滚动区才不至于挤成一团。 */
+  .sg-opt-table {
+    min-width: 720px;
+  }
+}
+
+/* 用户显式要求"减少动效"时, 抽屉不做滑入过渡(直接出现)。 */
+@media (prefers-reduced-motion: reduce) {
+  #sidebar {
+    transition: none;
+  }
+}
+
+/* ── C8: 多维参数寻优 ────────────────────────────────────────────────────────────
+   与单参数扫描(`.sg-sweep-box`)同一块区域, 只是维度行可增删。
+   进度条只在 running 且后端给了 `{done,total}` 时出现 —— 没有进度就不画空槽。 */
+.sg-opt-hint {
+  margin: 6px 0 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+.sg-opt-dim {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.sg-opt-dim .sg-opt-key {
+  flex: 0 0 34%;
+}
+.sg-opt-dim .sg-opt-values {
+  flex: 1 1 auto;
+}
+.sg-opt-dim .sg-opt-del {
+  flex: none;
+}
+.sg-opt-progtext {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.sg-opt-prog {
+  flex: 1 1 120px;
+  min-width: 80px;
+  height: 6px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.sg-opt-prog-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+.sg-opt-cap {
+  margin: 8px 0 4px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.sg-opt-table th.sg-opt-sort {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.sg-opt-table th.sg-opt-sort:hover {
+  color: var(--fg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sg-opt-prog-fill {
+    transition: none;
+  }
+}
+
+/* ── 054 P4: 样本外检验 / 分段验证 / 滚动验证 ──────────────────────────────────────
+   各段**并排**而不是竖排一列: 「同一组参数在不同行情段上的表现」只有横着摆才看得出
+   差异; 竖排时眼睛要做的是"记住上一段的数字再比下一段", 那基本比不出来。 */
+.sg-val-note {
+  margin: 6px 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: var(--raised);
+  color: var(--fg);
+  font-size: 0.8rem;
+  line-height: 1.6;
+}
+/* 054 T37: 生成弹窗里的「这份策略在做什么」—— 保存前给用户看的一行摘要。 */
+.sg-gen-summary {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--raised);
+}
+.sg-gen-summary-text {
+  color: var(--fg);
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+.sg-val-chip {
+  display: inline-block;
+  margin: 0 6px 6px 0;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+.sg-val-chip.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.sg-val-segs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+.sg-val-seg {
+  flex: 1 1 160px;
+  min-width: 150px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--raised);
+}
+/* 样本外那一段单独描边: 它是这次检验真正要看的那一段。 */
+.sg-val-seg.sg-val-oos {
+  border-color: var(--accent);
+}
+.sg-val-seg-label {
+  color: var(--fg);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.sg-val-seg-range {
+  margin: 2px 0 6px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.sg-val-mrow {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sg-val-mitem {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 0.75rem;
+}
+.sg-val-mkey {
+  color: var(--muted);
+}
+.sg-val-mval.up {
+  color: var(--error);
+}
+.sg-val-mval.down {
+  color: var(--accent);
+}
+
+/* ── B7: 命令面板(Ctrl/⌘+K) ──────────────────────────────────────────────────────
+   靠上居中, 不是屏幕正中: 结果列表会随输入变长, 从上方长出来比从中间撑开更稳
+   (正中打开时, 列表一变长面板就整体上移, 眼睛得跟着重新找位置)。
+   遮罩比帮助抽屉更淡 —— 面板自身足够醒目, 不必把整页压暗。 */
+.palette {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+}
+.palette-overlay {
+  position: absolute;
+  inset: 0;
+  background: var(--overlay);
+}
+.palette-panel {
+  position: relative;
+  width: min(620px, 92vw);
+  margin: 12vh auto 0;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+  overflow: hidden;
+}
+.palette-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 12px 14px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 0.92rem;
+  outline: none;
+}
+.palette-list {
+  max-height: min(52vh, 420px);
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.palette-group {
+  padding: 8px 14px 4px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.palette-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+.palette-item.on {
+  background: var(--bg);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.palette-item-label {
+  color: var(--fg);
+  font-size: 0.86rem;
+}
+.palette-item-hint {
+  margin-left: auto;
+  font-size: 0.74rem;
+  text-align: right;
+}
+.palette-detail {
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+.palette-detail-name {
+  color: var(--fg);
+  font-size: 0.82rem;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.palette-detail-body {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+.palette-empty {
+  padding: 12px 14px;
+  font-size: 0.82rem;
+}
+.palette-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.palette-count {
+  flex: none;
+}
+.palette-keys {
+  margin-left: auto;
+}
+.palette-keys kbd {
+  padding: 1px 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+}
+/* 面板开着时页面不跟着滚(方向键在列表里走, 页面不该同时动)。 */
+body.palette-open {
+  overflow: hidden;
+}
+/* 顶栏那个入口: 与其它 ghost 钮同款, 只是字体用等宽(⌘K 是符号, 不是词)。 */
+.palette-btn {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+}
+@media (max-width: 720px) {
+  .palette-panel {
+    width: auto;
+    margin: 6vh 8px 0;
+  }
+  .palette-item-hint {
+    display: none; /* 窄屏优先保住条目名 */
+  }
+  .palette-keys {
+    display: none;
+  }
 }

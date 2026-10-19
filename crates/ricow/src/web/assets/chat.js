@@ -12,6 +12,39 @@
   const R = window.Ricow;
   const t = (key) => R.t(key);
 
+  // 对话视图自有文案(并入公共字典; 与 strategies.js / help.js 同手法)。静态标签走
+  // `data-zh`/`data-en`(见 index.html), 这里是运行时才拼的动态句子。
+  Object.assign(R.TEXT.zh, {
+    // 帮助计划第 2 条: 空会话的"起手卡" —— 解决"不知道怎么开口"。
+    starterTitle: "从这里开始试一句",
+    starterLead: "点一句填进输入框(也可以自己直接说, 用大白话就行), 按 Enter 发送。",
+    starterQ1: "我部署了哪些策略?",
+    starterN1: "看现状",
+    starterQ2: "内置模板都有哪些, 各自适合什么行情?",
+    starterN2: "挑一个起步",
+    starterQ3a: "回测 {id} 最近 90 天",
+    starterN3a: "跑一次回测",
+    starterQ3b: "给 SOLUSDT 写一个 50:50 再平衡策略",
+    starterN3b: "从想法到代码",
+    starterQ4: "你能帮我做哪些事?",
+    starterN4: "了解能力边界",
+  });
+  Object.assign(R.TEXT.en, {
+    starterTitle: "Start with one of these",
+    starterLead:
+      "Click one to drop it into the box (or just say it yourself — plain language works), then press Enter.",
+    starterQ1: "Which strategies do I have deployed?",
+    starterN1: "See what's there",
+    starterQ2: "What built-in templates exist, and which market does each suit?",
+    starterN2: "Pick a starting point",
+    starterQ3a: "Backtest {id} over the last 90 days",
+    starterN3a: "Run a backtest",
+    starterQ3b: "Write a 50:50 rebalance strategy for SOLUSDT",
+    starterN3b: "Idea to code",
+    starterQ4: "What can you help me with?",
+    starterN4: "Learn the boundaries",
+  });
+
   const els = {
     list: document.getElementById("session-list"),
     newBtn: document.getElementById("new-session"),
@@ -59,10 +92,8 @@
     langCmd: false, // 本轮发过 /lang 命令: turn_end 后从服务端重读一次语言(D12, 对话内切换全视图生效)
   };
 
-  // 术语表(FR-024 / FR-026): 服务端一次性给全, 前端只按当前语言挑一份 —— 切语言不重取。
-  const terms = new Map();
-  let termRe = null;
-  let termKey = null;
+  // 术语表(FR-024 / FR-026): 索引 / 浮层都在公共件 `R.glossary`(A2 起全局共享,
+  // 不再是对话视图私有) —— 本视图只负责把解释挂到自己的气泡上。
 
   /// 对话视图的语言切换: 先跑通用部分(common.js: html lang / 语言钮 / data-zh 遍历),
   /// 再把本视图持有的动态内容按新语言重渲染。
@@ -80,7 +111,7 @@
       node.textContent = noteText(node.dataset.note, node.dataset.reason);
     }
     syncLogTools(); // 044: 工具条上的**动态**文案(跟随/已暂停 + 计数)也要跟着语言走
-    if (!pop.hidden) renderPop(); // 浮层开着就地换语言, 不必关掉重开
+    // 解释浮层的语言切换由 `R.applyLang` 内部处理(它现在归公共件管)。
   }
 
   /// 回复期间禁用输入区并给出"正在思考"态(FR-009); 解除的唯一信号是 `turn_end` 帧。
@@ -106,9 +137,80 @@
   }
 
   function append(node, pinned) {
+    clearStarter(); // 有内容进来, 起手卡就该退场(它只服务"还不知道说什么"的那一刻)
     foldPrevious(); // 034: 新块进门前, 把上一块收成两行 —— 最新的一块始终完整可见
     els.stream.appendChild(node);
     if (pinned) els.stream.scrollTop = els.stream.scrollHeight;
+  }
+
+  // ---------- 起手卡 (帮助计划第 2 条) ----------
+  //
+  // 空会话在对话流里给一组**能点就填**的示例 —— 新用户面对一个空输入框最常见的卡点是
+  // "不知道能说什么、怎么说"。示例分四类: 看现状 / 挑模板 / 跑或写 / 问能力边界。
+  //
+  // 两条刻意的取舍:
+  //   ① 点击只**填进输入框并聚焦**, 不替用户发送 —— 用户始终握着"发不发"的决定权,
+  //      与"写操作必须本人确认"是同一种姿态。
+  //   ② 内容随"有没有自己的策略"变化: 有就指向真实策略 id, 没有就引导看模板/从零写。
+  //      故 `loadStrategies()` 回来后若卡片还在, 就重画一次(否则首次进页面永远是"没有策略"那版)。
+  let starterEl = null;
+
+  function clearStarter() {
+    if (starterEl) {
+      starterEl.remove();
+      starterEl = null;
+    }
+  }
+
+  function starterExamples() {
+    const mine = (state.strategyList || []).filter((s) => s.source === "user");
+    const list = [
+      { q: t("starterQ1"), p: t("starterN1") },
+      { q: t("starterQ2"), p: t("starterN2") },
+    ];
+    if (mine.length) {
+      list.push({ q: t("starterQ3a").replace("{id}", mine[0].id), p: t("starterN3a") });
+    } else {
+      list.push({ q: t("starterQ3b"), p: t("starterN3b") });
+    }
+    list.push({ q: t("starterQ4"), p: t("starterN4") });
+    return list;
+  }
+
+  function renderStarter() {
+    if (!els.stream) return;
+    clearStarter();
+    const box = document.createElement("div");
+    box.className = "starter";
+    const title = document.createElement("div");
+    title.className = "starter-title";
+    title.textContent = t("starterTitle");
+    box.appendChild(title);
+    const lead = document.createElement("div");
+    lead.className = "starter-lead";
+    lead.textContent = t("starterLead");
+    box.appendChild(lead);
+    for (const item of starterExamples()) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "starter-item";
+      const q = document.createElement("span");
+      q.className = "starter-q";
+      q.textContent = item.q; // 文案只走 textContent
+      const note = document.createElement("span");
+      note.className = "starter-note";
+      note.textContent = item.p;
+      btn.appendChild(q);
+      btn.appendChild(note);
+      btn.addEventListener("click", () => {
+        els.input.value = item.q;
+        els.input.focus();
+        autosize();
+      });
+      box.appendChild(btn);
+    }
+    els.stream.appendChild(box);
+    starterEl = box;
   }
 
   // ---------- 历史消息两行折叠 (034) ----------
@@ -224,20 +326,6 @@
 
   // ---------- 术语与回测报告 (FR-024 / FR-025 / FR-026) ----------
 
-  const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-  /// 取一次术语表并建索引: `/api/terms` 已把中英两份一起给全, 切换语言无需重取(FR-026)。
-  async function loadTerms() {
-    const keys = [];
-    for (const term of await R.api("/api/terms")) {
-      terms.set(term.key, term);
-      keys.push(term.key);
-    }
-    // 长名优先: `手续费占比` 不该被 `手续费` 从中间截断。
-    keys.sort((a, b) => b.length - a.length);
-    termRe = keys.length ? new RegExp(keys.map(escapeRe).join("|"), "g") : null;
-  }
-
   /// 报告段标题(`--- 风险/收益指标 (无风险利率 rf = 3.80%/年) ---`) → 标题节点; 其余行 null。
   function sectionTitle(line) {
     const matched = /^\s*---\s*(.+?)\s*---$/.exec(line);
@@ -256,12 +344,12 @@
     const matched = /^\s*(\S[^:]*?): (.+)$/.exec(line);
     if (!matched) return null;
     const label = matched[1].replace(/\s*\(.*$/, "").trim();
-    if (!terms.has(label)) return null;
+    if (!R.glossary.has(label)) return null;
     const row = document.createElement("div");
     row.className = "report-row";
     const name = document.createElement("span");
     name.className = "name";
-    name.appendChild(termButton(label));
+    name.appendChild(R.glossary.button(label));
     if (matched[1].length > label.length) {
       name.appendChild(document.createTextNode(matched[1].slice(label.length)));
     }
@@ -317,103 +405,8 @@
     flushCard();
     el.textContent = "";
     el.appendChild(frag);
-    decorateTerms(el);
-  }
-
-  /// 把正文里出现的术语包成可点击入口(FR-024); 已包好的不再进, 避免嵌套。
-  ///
-  /// 044: **代码块与行内代码里不挂术语** —— 代码里的 `手续费` / `成交量` 是标识符或字面量,
-  /// 变成可点术语会误导(而且点开浮层会盖住代码)。
-  function decorateTerms(root) {
-    if (!termRe) return;
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    const nodes = [];
-    while (walker.nextNode()) nodes.push(walker.currentNode);
-    for (const node of nodes) {
-      const parent = node.parentElement;
-      if (!parent) continue;
-      if (parent.classList.contains("term") || parent.closest("pre, code")) continue;
-      const text = node.nodeValue;
-      termRe.lastIndex = 0;
-      let matched = termRe.exec(text);
-      if (!matched) continue;
-      const frag = document.createDocumentFragment();
-      let last = 0;
-      while (matched) {
-        if (matched.index > last) {
-          frag.appendChild(document.createTextNode(text.slice(last, matched.index)));
-        }
-        frag.appendChild(termButton(matched[0]));
-        last = matched.index + matched[0].length;
-        matched = termRe.exec(text);
-      }
-      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
-      node.parentNode.replaceChild(frag, node);
-    }
-  }
-
-  function termButton(key) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "term";
-    btn.textContent = key;
-    btn.title = t("termHint");
-    btn.addEventListener("click", (ev) => {
-      ev.stopPropagation(); // 点术语是"看解释", 不该顺带触发展开的会话项
-      openTerm(key, btn);
-    });
-    return btn;
-  }
-
-  /// 解释浮层: 单例, 点术语开、点别处 / Esc 关。正文按**当前语言**现取(FR-024 / FR-028)。
-  const pop = document.createElement("div");
-  pop.className = "term-pop";
-  pop.hidden = true;
-  document.body.appendChild(pop);
-
-  function openTerm(key, anchor) {
-    if (!terms.has(key)) return;
-    termKey = key;
-    renderPop();
-    pop.hidden = false;
-    placePop(anchor);
-  }
-
-  function closeTerm() {
-    if (pop.hidden) return;
-    pop.hidden = true;
-    termKey = null;
-  }
-
-  function renderPop() {
-    const term = terms.get(termKey);
-    if (!term) return;
-    pop.textContent = "";
-    const name = document.createElement("div");
-    name.className = "term-name";
-    name.textContent = term.key;
-    const body = document.createElement("div");
-    body.className = "term-body";
-    body.textContent = R.lang === "en" ? term.en : term.zh;
-    const hint = document.createElement("div");
-    hint.className = "term-hint";
-    hint.textContent = t("termClose");
-    pop.appendChild(name);
-    pop.appendChild(body);
-    pop.appendChild(hint);
-  }
-
-  /// 贴在术语下方, 下方放不下就翻到上方, 并夹在视口内。
-  function placePop(anchor) {
-    const rect = anchor.getBoundingClientRect();
-    let left = Math.min(rect.left, window.innerWidth - pop.offsetWidth - 8);
-    left = Math.max(8, left);
-    let top = rect.bottom + 6;
-    if (top + pop.offsetHeight > window.innerHeight - 8) {
-      top = Math.max(8, rect.top - pop.offsetHeight - 6);
-    }
-    pop.style.left = left + "px";
-    pop.style.top = top + "px";
+    // 术语可点(FR-024): 索引与浮层在公共件里, 这里只挂载 —— 回测报告 / 指标卡走的是同一个入口。
+    R.glossary.decorate(el);
   }
 
   // ---------- SSE ----------
@@ -491,6 +484,19 @@
 
   function renderList() {
     els.list.textContent = "";
+    if (!state.rows.length) {
+      // B4: 零会话不该只是一片空白 —— 给一句"可以怎么用"和一个"新建"入口。
+      const li = document.createElement("li");
+      li.className = "session-empty";
+      li.appendChild(
+        R.emptyState(t("emptySessions"), {
+          label: t("newSession"),
+          onClick: () => els.newBtn.click(),
+        })
+      );
+      els.list.appendChild(li);
+      return;
+    }
     for (const row of state.rows) {
       const li = document.createElement("li");
       if (row.id === state.sessionId) li.className = "active";
@@ -534,7 +540,7 @@
     state.sessionId = id;
     state.secret = false;
     state.streaming = null;
-    closeTerm();
+    R.glossary.close(); // 换会话时收起解释浮层(它挂在 body 上, 不属于任何气泡)
     els.stream.textContent = "";
     setMasked(false);
     els.title.textContent = "";
@@ -550,6 +556,8 @@
     try {
       const messages = await R.api("/api/sessions/" + encodeURIComponent(id) + "/messages");
       for (const m of messages) appendMessage(m.role, m.content, m.sev);
+      // 帮助计划第 2 条: 全新会话(一条消息都没有)给一组可点示例 —— 免得对着空输入框发呆。
+      if (!messages.length) renderStarter();
     } catch (_) {
       // 空会话 / 读取失败: 对话流保持空白即可, 帧流会补上新的内容。
     }
@@ -669,16 +677,8 @@
     }
   });
 
-  // 浮层的关闭手势(FR-024): 点别处 / Esc; 滚动或改窗宽后位置不再贴合, 一并收起。
-  document.addEventListener("click", (ev) => {
-    if (pop.contains(ev.target)) return; // 浮层内的点击(选中文字)不该关掉它
-    closeTerm();
-  });
-  document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") closeTerm();
-  });
-  els.stream.addEventListener("scroll", closeTerm, { passive: true });
-  window.addEventListener("resize", closeTerm);
+  // 解释浮层的关闭手势(FR-024: 点别处 / Esc / 滚动 / 改窗宽)已随浮层迁入公共件 ——
+  // 它现在服务于全站而不只是对话视图, 故不再在这边重复绑一遍(绑两份会在切视图后互相打架)。
 
   // 历史消息折叠(034): 点收起的块展开、再点收起。
   // 例外都不抢手势: 点术语(顺带把它所在的折叠块展开, 否则解释会被截断看不见)、
@@ -720,25 +720,17 @@
   /// 刷新节奏: 用户可能刚在对话里下了单, 策略也可能正在后台跑 —— "当前持仓"得跟着动。
   const TRADE_POLL_MS = 5000;
 
-  function emptyRow(text) {
-    const div = document.createElement("div");
-    div.className = "empty";
-    div.textContent = text;
-    return div;
+  /// 只读面板里的一行说明(B4: 有下一步动作时由 `R.emptyState` 追加一个按钮)。
+  function emptyRow(text, cta) {
+    return R.emptyState(text, cta);
   }
 
   /// 时间戳 → 展示串。交易端点的 `updated_at` / `timestamp` 一律是**毫秒** —— 与会话列表的
-  /// 秒级 `updated_at` 不同口径, 不能复用 `R.formatTime`。
+  /// 秒级 `updated_at` 不同口径, 不能复用 `R.formatTime`。C11: 实现统一到 `R.fmt.time`,
+  /// 但**保留本处的缺值口径**(`0` / 空 → 空串, 不是 `—`: 这里没时间就是"没这行", 不是数据缺失)。
   function formatStamp(ms) {
     if (!ms) return "";
-    const locale = R.lang === "en" ? "en-US" : "zh-CN";
-    return new Date(ms).toLocaleString(locale, {
-      month: "numeric",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
+    return R.fmt.time(ms, true);
   }
 
   /// 一行小卡: `[[名, 值, 类], ...]` —— 名值分栏, 值用等宽(金额 / 数量对得齐)。
@@ -1093,12 +1085,17 @@
     const list = await R.api("/api/strategies");
     state.strategyList = list;
     renderStrategyList(list);
+    // 起手卡(帮助计划第 2 条)的示例随"有没有自己的策略"变 —— 目录比会话晚到, 补画一次。
+    if (starterEl) renderStarter();
   }
 
   function renderStrategyList(list) {
     els.strategyList.textContent = "";
     if (!list.length) {
-      els.strategyList.appendChild(emptyRow(t("noStrategies")));
+      // B4: 「无策略」直接给一个去策略页的入口 —— 别让用户在这里猜去哪儿建。
+      els.strategyList.appendChild(
+        emptyRow(t("noStrategies"), { label: t("goStrategies"), view: "strategies" })
+      );
       return;
     }
     for (const market of ["spot", "futures"]) {
@@ -1224,7 +1221,8 @@
       R.applyTheme("dark"); // 读不到(服务异常): 按深色兜底, 不影响其余功能
     }
     try {
-      await loadTerms();
+      // 术语表(A2): 取一次, 全站共享 —— 别的视图 `decorate` 也走这一个 promise。
+      await R.glossary.load();
     } catch (_) {
       // 术语表拿不到(服务异常): 术语不可点、报告按原样显示, 其余功能不受影响。
     }

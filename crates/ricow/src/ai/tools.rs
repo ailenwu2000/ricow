@@ -20,6 +20,7 @@
 //! 输出纪律(FR-015 / FR-016): 所有工具输出过 `clamp_output` 截断 + `redact` 打码,
 //! 截断必须显式标记(不静默丢内容)。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use rig::agent::{AgentHook, HookContext, ToolCall as ToolCallEvent, ToolCallAction};
@@ -85,8 +86,15 @@ pub const READ_ONLY_TOOLS: [&str; 15] = [
 ///
 /// 023 D12: 原 `start_dry_run` / `stop_run` 已删除 —— 写操作只有 `request_write_confirmation`
 /// 一条入口, 模型无法绕开确认。
-pub const VIRTUAL_TOOLS: [&str; 3] =
-    ["preview_strategy", "request_write_confirmation", "show_menu"];
+pub const VIRTUAL_TOOLS: [&str; 4] = [
+    "preview_strategy",
+    "request_write_confirmation",
+    "show_menu",
+    // 054 T33(审计 #6): 寻优接通 AI。放 L1 而不是 L0 的理由是**成本**而非权限 ——
+    // 它确实只读(不落盘、不写回), 但一格组合 = 一次全窗口回测, 上限 100 次;
+    // 摆进"便宜的只读"那一档会让模型把它当随手可查的快照用。
+    "optimize",
+];
 
 /// 工具是否被允许执行(L0 ∪ L1)。未列入一律拒绝(fail-closed)。
 pub fn is_allowed(name: &str) -> bool {
@@ -105,6 +113,102 @@ pub fn clamp_output(text: impl Into<String>) -> String {
     clamp_output_limited(text, MAX_OUTPUT_CHARS)
 }
 
+/// 回测报告的**分节保留优先级**(054 T8)。
+///
+/// 回测报告动辄上万字符(测试参数区会把生效配置全量 dump 一遍), 直接砍尾部的结果是
+/// 模型只看到「回测概览 + 测试参数」就到了上限 —— **恰恰丢掉它下一步决策最需要的
+/// 风险/收益指标与成交统计**。所以按重要性填预算, 最后才舍。
+///
+/// 顺序: 先看"赚没赚/风险多大", 再看"怎么成交的", 最后才是配置 dump(配置是输入不是结论)。
+const REPORT_SECTION_PRIORITY: [&str; 8] = [
+    "回测概览",
+    "风险/收益指标",
+    "成交统计",
+    "资产变化",
+    "基准对照",
+    "分侧统计 (hedge)",
+    "策略统计",
+    "测试参数 (生效配置全量)",
+];
+
+/// 回测报告专用截断: **按分节重要性填预算**, 而不是砍掉尾部。
+///
+/// 与 [`clamp_output`] 的分工: 普通工具输出(列表/日志/盘口)顺序即重要性, 砍尾部无害;
+/// 回测报告不是 —— 它的尾部是配置 dump, 头部是概览, 中间才是结论。
+pub fn clamp_report(text: impl Into<String>) -> String {
+    clamp_report_limited(text, MAX_OUTPUT_CHARS)
+}
+
+/// 按指定上限做分节截断(供单测注入小预算)。
+pub fn clamp_report_limited(text: impl Into<String>, limit: usize) -> String {
+    let text = text.into();
+    let total = text.chars().count();
+    if total <= limit {
+        return text;
+    }
+    let (header, sections) = split_report_sections(&text);
+    let mut out = header.clone();
+    let mut used = out.chars().count();
+    for (idx, name) in REPORT_SECTION_PRIORITY.iter().enumerate() {
+        let Some(body) = sections.get(*name) else { continue };
+        let need = body.chars().count();
+        if used + need <= limit {
+            out.push_str(body);
+            used += need;
+            continue;
+        }
+        // 整节放不下但还有余量 → 给"标题 + 开头部分"并**就地**标注本节被截断。
+        // 概览是「这一笔赚没赚」的唯一落点: 再紧也要给(哪怕只剩标题), 否则整份报告对模型无意义;
+        // 其余分节少于 120 字符的碎块不如不给 —— 半行指标比"没有这节"更误导。
+        let room = limit.saturating_sub(used);
+        let min_room = if idx == 0 { 1 } else { 120 };
+        if room >= min_room {
+            let head: String = body.chars().take(room).collect();
+            out.push_str(&head);
+            out.push_str("\n  ...(本节被截断)\n");
+            used = limit;
+        }
+        break;
+    }
+    let rest = total.saturating_sub(used);
+    out.push_str(&format!(
+        "\n[已截断: 剩余 {rest} 字符未显示 —— 报告共 {total} 字符, 已按「概览 / 风险指标 / \
+         成交统计」的优先级保留 {used} 字符。需要被省略的部分请换更小的窗口或更粗的周期重跑]"
+    ));
+    out
+}
+
+/// 把回测报告切成 `(头部, 分节名 → 分节全文)`(纯函数, 便于单测)。
+///
+/// 分节边界 = 以 `--- ` 包起来的标题行(与 `format_backtest_report` 的写法一致)。
+/// 分节名取**去掉括号后缀**的主名(如 `风险/收益指标 (无风险利率 rf = 3.80%/年)` → `风险/收益指标`),
+/// 否则利率一变就匹配不上优先级表。
+fn split_report_sections(text: &str) -> (String, HashMap<String, String>) {
+    let mut header = String::new();
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut cur: Option<(String, String)> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(inner) = t.strip_prefix("--- ").and_then(|s| s.strip_suffix(" ---")) {
+            if let Some((k, v)) = cur.take() {
+                map.insert(k, v);
+            }
+            let name = inner.split_once(" (").map(|(a, _)| a).unwrap_or(inner).trim().to_string();
+            cur = Some((name, format!("{line}\n")));
+        } else if let Some((_, v)) = cur.as_mut() {
+            v.push_str(line);
+            v.push('\n');
+        } else {
+            header.push_str(line);
+            header.push('\n');
+        }
+    }
+    if let Some((k, v)) = cur.take() {
+        map.insert(k, v);
+    }
+    (header, map)
+}
+
 /// 按指定上限截断(read_doc 用 [DOC_MAX_OUTPUT_CHARS], 其余用 [MAX_OUTPUT_CHARS])。
 pub fn clamp_output_limited(text: impl Into<String>, limit: usize) -> String {
     let text = text.into();
@@ -114,6 +218,39 @@ pub fn clamp_output_limited(text: impl Into<String>, limit: usize) -> String {
     }
     let kept: String = text.chars().take(limit).collect();
     format!("{kept}\n\n[输出已截断: 共 {total} 字符, 只显示前 {limit} 字符]")
+}
+
+/// 054 T38: 文档**分片**(纯函数) —— 取代 read_doc 超限时的静默截尾。
+///
+/// 存在理由: 权威文档会随 spec 一起长。一旦某篇超过单段上限, 老行为是砍掉尾部,
+/// 模型拿着 60% 却以为读完了全文(它甚至不知道后面还有 exec 组件与完整示例) ——
+/// 那比读不到更糟: 它会基于"文档里没有"去下结论。现在分片返回, 并且**明说还有第几段**。
+///
+/// 单段(未超限)时**不加任何标记** —— 保持与历史输出逐字一致(有单测盯着这份一致性)。
+pub fn doc_chunk(text: &str, part: usize, limit: usize) -> Result<String, String> {
+    let total = text.chars().count();
+    let parts = total.div_ceil(limit).max(1);
+    if part == 0 {
+        return Err(format!("part 从 1 起, 收到 {part}"));
+    }
+    if part > parts {
+        return Err(format!("这篇文档只有 {parts} 段(共 {total} 字符), 没有第 {part} 段"));
+    }
+    if parts == 1 {
+        return Ok(text.to_string());
+    }
+    let body: String = text.chars().skip((part - 1) * limit).take(limit).collect();
+    let head = format!("[第 {part}/{parts} 段 · 全文共 {total} 字符]\n");
+    let tail = if part < parts {
+        format!(
+            "\n[未完: 还有第 {} 段 —— 再用 read_doc(同一个 topic, part={}) 接着取]",
+            part + 1,
+            part + 1
+        )
+    } else {
+        "\n[全文结束]".to_string()
+    };
+    Ok(format!("{head}{body}{tail}"))
 }
 
 /// 凭据打码: 工具输出(尤其日志原文)可能夹带密钥, 出模型上下文前再过一遍。
@@ -348,7 +485,8 @@ fn tool_strategy_read(ctx: ToolCtx) -> DynamicTool {
 fn tool_read_doc(_ctx: ToolCtx) -> DynamicTool {
     DynamicTool::new(
         "read_doc",
-        "读取本产品的权威说明(策略 Lua API / 回测口径 / 风险披露 / 命令与门禁)。写策略或谈部署运行前先读。只读。",
+        "读取本产品的权威说明(策略 Lua API / 回测口径 / 风险披露 / 命令与门禁)。写策略或谈部署运行前先读。只读。\
+篇幅超过一段时**分片返回**: 回包末尾会写明「还有第 N 段」, 照它给的 part 再取一次即可 —— 不要凭前半篇下结论。",
         json!({
             "type": "object",
             "properties": {
@@ -356,6 +494,10 @@ fn tool_read_doc(_ctx: ToolCtx) -> DynamicTool {
                     "type": "string",
                     "enum": ["lua-api", "backtest", "risk", "commands"],
                     "description": "lua-api=策略可用的回调/指标/exec 组件; backtest=回测撮合与口径; risk=实盘风险披露与免责确认; commands=四档运行/落盘与实盘门禁/命令速查/易跑偏点"
+                },
+                "part": {
+                    "type": "integer",
+                    "description": "第几段(从 1 起)。只在回包说「还有第 N 段」时才需要带; 带错会明确报错并告诉一共有几段"
                 }
             },
             "required": ["topic"],
@@ -380,8 +522,13 @@ fn tool_read_doc(_ctx: ToolCtx) -> DynamicTool {
                         )))
                     }
                 };
-                // G1: 文档给专用上限(20k), 保证 lua-api/backtest 整篇可取; 仍有界并标记截断
-                Ok(ToolOutput::text(clamp_output_limited(text, DOC_MAX_OUTPUT_CHARS)))
+                // 054 T38: 超限不再静默截尾 —— 分片返回并明示"还有第 N 段"。
+                // 静默截尾最危险的副作用是模型**不知道自己只看了半篇**, 于是把"没看到"
+                // 当成"文档里没有", 理直气壮地下错结论。
+                let part = args.get("part").and_then(|v| v.as_i64()).unwrap_or(1).max(1) as usize;
+                let chunk = doc_chunk(&text, part, DOC_MAX_OUTPUT_CHARS)
+                    .map_err(ToolExecutionError::invalid_args)?;
+                Ok(ToolOutput::text(redact(&chunk)))
             })
         },
     )
@@ -423,6 +570,98 @@ fn tool_run_backtest(_ctx: ToolCtx) -> DynamicTool {
                 let text = commands::backtest::run_backtest(a)
                     .await
                     .map_err(|e| ToolExecutionError::other(format!("回测失败: {e}")))?;
+                // 054 T8: 回测报告按**分节重要性**截断(不能砍尾部 —— 尾部是配置 dump)。
+                Ok(ToolOutput::text(clamp_report(redact(&text))))
+            })
+        },
+    )
+}
+
+/// 054 T33(审计 #6): 参数寻优接通 AI —— 此前 `ricow optimize` 只在 CLI 里存在,
+/// AI 想"帮用户挑一组参数"只能自己拍脑袋写死数字。现在它与 CLI **同一条代码路径**
+/// (见 [`commands::optimize::run_optimize`]), 打分表逐字一致。
+///
+/// 两条硬边界:
+/// 1. **不提供 `--write-back`**: 写回参数 = 改用户正在跑的策略配置, 那不是"只读"。
+///    工具只返回打分表, 要改必须经用户本人确认(对话里说清楚, 由他去改或在界面上改)。
+/// 2. **结论必须配样本外检验**: 网格挑出来的"最优"是在**同一段历史上**比出来的,
+///    本身就是前视偏差的产物 —— 描述里明写这一点, 免得模型把它当成"更好的策略"。
+fn tool_optimize(_ctx: ToolCtx) -> DynamicTool {
+    DynamicTool::new(
+        "optimize",
+        "在真实历史 K 线上对**已部署策略**跑参数网格寻优, 返回打分表(与 `ricow optimize` 同一条代码路径)。\
+只读: 不落盘、不写回参数、不动资金。\
+**注意**: 表里的「最优」是在**同一段历史**上比出来的, 它证明的只是「这组参数在这段历史上最好」, \
+**不能**直接当成「更好的策略」 —— 要下结论必须先做样本外检验(切一段它没见过的数据再跑一次)。\
+组合数上限 100(每组 = 一次全窗口回测), 可能耗时数分钟。",
+        json!({
+            "type": "object",
+            "properties": {
+                "strategy": { "type": "string", "description": "已部署策略名(必须是 strategies/<name>.toml 已存在的)" },
+                "params": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "参数候选, 每项形如 \"key=v1,v2,v3\"; 多项 = 笛卡尔积。例: [\"spacing_pct=0.3,0.5,0.8\"]"
+                },
+                "days": { "type": "integer", "description": "回测天数, 默认 90" },
+                "interval": { "type": "string", "enum": ["1m", "5m", "15m", "1h", "4h", "1d"], "description": "K 线间隔, 默认 1h" },
+                "metric": { "type": "string", "enum": ["net_pnl", "sharpe", "annual_return"], "description": "排序指标, 默认 net_pnl" },
+                "search": { "type": "string", "enum": ["grid", "random"], "description": "搜索方式, 默认 grid" },
+                "samples": { "type": "integer", "description": "random 模式的抽样组数, 默认 20" }
+            },
+            "required": ["strategy", "params"],
+            "additionalProperties": false
+        }),
+        move |_c, args| {
+            Box::pin(async move {
+                let strategy = arg_str(&args, "strategy")?;
+                safe_strategy_name(&strategy)?;
+                let params = args
+                    .get("params")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        ToolExecutionError::invalid_args(
+                            "缺少 params(字符串数组, 每项 \"key=v1,v2\")".to_string(),
+                        )
+                    })?;
+                let a = commands::optimize::OptimizeArgs {
+                    strategy,
+                    params,
+                    days: args.get("days").and_then(|v| v.as_i64()).map(|d| d.clamp(1, 3650) as u32),
+                    start: None,
+                    end: None,
+                    interval: args
+                        .get("interval")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    search: args
+                        .get("search")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("grid")
+                        .to_string(),
+                    samples: args.get("samples").and_then(|v| v.as_i64()).unwrap_or(20).max(1)
+                        as usize,
+                    metric: args
+                        .get("metric")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("net_pnl")
+                        .to_string(),
+                    // 写回**永远关掉**: 改用户配置不是模型的权限(见函数头注释 1)。
+                    write_back: false,
+                };
+                let mut buf = Vec::new();
+                commands::optimize::run_optimize(a, &mut buf)
+                    .await
+                    .map_err(|e| ToolExecutionError::other(format!("寻优失败: {e}")))?;
+                let text = String::from_utf8_lossy(&buf).to_string();
                 Ok(ToolOutput::text(clamp_output(redact(&text))))
             })
         },
@@ -828,6 +1067,26 @@ fn tool_read_template(_ctx: ToolCtx) -> DynamicTool {
     )
 }
 
+/// 055 B6: `preview_strategy` 的本金入参(纯函数, 便于单测)。
+///
+/// 语义三条:
+/// - 没给 → `Ok(None)`: 这是**允许**的(助手可能正处在"先问用户"那一轮), 但调用方必须在
+///   结果里写明"这次跑的是默认本金";
+/// - 给了但 ≤ 0 / 非数字 → `Err`: 报错而不是静默忽略 —— 忽略等于偷偷换成本金默认值,
+///   用户以为按 1 万看的, 实际看的是 10 万。
+fn preview_initial_cash(args: &serde_json::Value) -> Result<Option<f64>, ToolExecutionError> {
+    let Some(v) = args.get("initial_cash") else {
+        return Ok(None);
+    };
+    let c = v.as_f64().ok_or_else(|| {
+        ToolExecutionError::invalid_args(format!("initial_cash 必须是数字, 收到: {v}"))
+    })?;
+    if !c.is_finite() || c <= 0.0 {
+        return Err(ToolExecutionError::invalid_args(format!("initial_cash 必须 > 0, 收到 {c}")));
+    }
+    Ok(Some(c))
+}
+
 /// L1 虚拟工具: 生成策略预览(编译门禁 → 真实 K 线沙箱回测 → preview_id)。
 ///
 /// **不落盘、不碰资金**(只写一条 previews 记录); 落盘必须由用户在对话内回一句确认词,
@@ -853,7 +1112,8 @@ fn tool_preview_strategy(_ctx: ToolCtx) -> DynamicTool {
                 "market": { "type": "string", "enum": ["spot", "futures"], "description": "市场, 默认 spot" },
                 "days": { "type": "integer", "description": "沙箱回测天数, 默认 90" },
                 "interval": { "type": "string", "enum": ["1m", "5m", "15m", "1h", "4h", "1d"], "description": "K 线间隔, 默认 1h" },
-                "params": { "type": "object", "description": "策略参数(字符串/数字/布尔), 如 {\"order_size\": 0.01}" }
+                "params": { "type": "object", "description": "策略参数(字符串/数字/布尔), 如 {\"order_size\": 0.01}" },
+                "initial_cash": { "type": "number", "description": "用户准备投入的本金(USDT), 如 10000 —— 回测按它跑。这是**必问项**: 用户没说过就先问, 绝不替他填一个数(替填等于替他做投资决定); 不传则回测按内置默认本金跑, 结果里会写明" }
             },
             "required": ["name", "pair", "script"],
             "additionalProperties": false
@@ -891,16 +1151,39 @@ fn tool_preview_strategy(_ctx: ToolCtx) -> DynamicTool {
                         params.push((k.clone(), cv));
                     }
                 }
+                // 055 B6: 本金 —— 与 Web 单发生成同一条纪律(那边本金是必填项)。
+                // 此前这条路径**根本没有本金入参**, 回测一律按内置默认 10 万跑: 用户说"我投 1 万",
+                // 助手问到了、却没有地方传, 看到的仍是 10 万下的成交与盈亏(仓位是否拒单、
+                // 手续费占比、网格能否铺满, 在小资金下完全是另一回事)。
+                let initial_cash = preview_initial_cash(&args)?;
+                if let Some(c) = initial_cash {
+                    // 落到 `params.cash` —— 与 CLI `--param cash=` **同名同义**, 走的是
+                    // `BacktestParams::resolve` 既有的三层合并, 不新增一套口径。
+                    // 与显式 params.cash 同时出现时以 initial_cash 为准(先移除再插入),
+                    // 免得两个字段各说一套又没人知道谁生效。
+                    params.retain(|(k, _)| k != "cash");
+                    params.push(("cash".into(), ricow_strategy::ConfigValue::Float(c)));
+                }
+                let cash_note = match initial_cash {
+                    Some(_) => String::new(),
+                    // 没传就**如实说**这次跑的是默认本金: 用户会拿这个数字当自己的。
+                    None => format!(
+                        "\n注意: 本次未传 initial_cash, 回测按内置默认本金 {} USDT 跑 —— 这不是用户的资金规模。\
+                         想按真实资金看, 先问用户准备投多少, 再带上 initial_cash 重跑。",
+                        ricow_strategy::BacktestParams::default().initial_cash
+                    ),
+                };
                 let out = commands::create::create_preview(
                     &name, &script, &pair, &market, params, days, &interval,
                 )
                 .await
                 .map_err(|e| ToolExecutionError::other(format!("生成预览失败: {e}")))?;
                 let text = format!(
-                    "{}\n编译门禁 ✓  沙箱回测 ✓  —— **尚未部署**(未写入任何策略文件)\npreview_id: {}\n下一步: 用户要落盘时调 request_write_confirmation(action=\"deploy\", preview_id=\"{}\") 登记确认, 宿主会渲染确认块; 用户在对话里回一句确认词后, 才由**宿主**执行落盘。用户确认之前不能说\"已部署\"。",
-                    out.report_text, out.preview_id, out.preview_id
+                    "{}\n编译门禁 ✓  沙箱回测 ✓  —— **尚未部署**(未写入任何策略文件)\npreview_id: {}\n下一步: 用户要落盘时调 request_write_confirmation(action=\"deploy\", preview_id=\"{}\") 登记确认, 宿主会渲染确认块; 用户在对话里回一句确认词后, 才由**宿主**执行落盘。用户确认之前不能说\"已部署\"。{}",
+                    out.report_text, out.preview_id, out.preview_id, cash_note
                 );
-                Ok(ToolOutput::text(clamp_output(redact(&text))))
+                // 054 T8: 预览回测同样是回测报告, 走分节截断。
+                Ok(ToolOutput::text(clamp_report(redact(&text))))
             })
         },
     )
@@ -2060,6 +2343,7 @@ pub fn build(ctx: ToolCtx) -> Vec<DynamicTool> {
         tool_strategy_read(ctx.clone()),
         tool_read_doc(ctx.clone()),
         tool_run_backtest(ctx.clone()),
+        tool_optimize(ctx.clone()),
         tool_instance_status(ctx.clone()),
         tool_fills(ctx.clone()),
         tool_positions(ctx.clone()),
@@ -2080,6 +2364,43 @@ pub fn build(ctx: ToolCtx) -> Vec<DynamicTool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 054 T38: 文档分片 —— 单段不加标记(与历史输出逐字一致), 多段必须明示"还有第 N 段"。
+    #[test]
+    fn test_doc_chunk_never_silently_truncates() {
+        // 单段: 原样返回, 一个字都不多加(有历史输出依赖这一点)。
+        assert_eq!(doc_chunk("abcdef", 1, 100).unwrap(), "abcdef");
+        assert_eq!(doc_chunk("", 1, 100).unwrap(), "");
+
+        // 三段的文档: 每段都报号, 中间段必须点名下一段。
+        let doc: String = "0123456789".repeat(3); // 30 字符
+        let p1 = doc_chunk(&doc, 1, 10).unwrap();
+        let p2 = doc_chunk(&doc, 2, 10).unwrap();
+        let p3 = doc_chunk(&doc, 3, 10).unwrap();
+        assert!(p1.contains("[第 1/3 段"), "{p1}");
+        assert!(p1.contains("还有第 2 段"), "中间段必须点名下一段: {p1}");
+        assert!(p2.contains("还有第 3 段"), "{p2}");
+        assert!(p3.contains("[全文结束]") && !p3.contains("还有第"), "{p3}");
+        // 三段拼起来(去掉头尾标记)必须等于全文 —— 分片不能丢字符。
+        let joined = [&p1, &p2, &p3]
+            .iter()
+            .map(|s| {
+                let body = s.split_once('\n').map(|x| x.1).unwrap_or("");
+                body.split("\n[未完")
+                    .next()
+                    .unwrap_or("")
+                    .split("\n[全文结束]")
+                    .next()
+                    .unwrap_or("")
+            })
+            .collect::<String>();
+        assert_eq!(joined, doc, "分片拼接须还原全文");
+
+        // 越界 / part=0: 报错且**报出总段数**, 让模型能自己纠正。
+        let e = doc_chunk(&doc, 9, 10).unwrap_err();
+        assert!(e.contains("只有 3 段"), "{e}");
+        assert!(doc_chunk(&doc, 0, 10).unwrap_err().contains("从 1 起"));
+    }
 
     #[test]
     fn test_allowed_is_exactly_the_registry() {
@@ -2191,6 +2512,73 @@ mod tests {
         assert!(out.contains("共 100 字符"));
     }
 
+    /// 054 T8: 回测报告截断的**唯一有效判据**不是"砍到多短", 而是"模型还看不看得到结论"。
+    #[test]
+    fn test_clamp_report_keeps_conclusion_sections_and_marks_truncation() {
+        let filler = |tag: &str, n: usize| format!("{}数据行\n", tag).repeat(n);
+        let report = format!(
+            "回测报告: demo ETHUSDT (90 天)\n\
+             {}  --- 回测概览 ---\n{}\
+             {}  --- 测试参数 (生效配置全量) ---\n{}\
+             {}  --- 风险/收益指标 (无风险利率 rf = 3.80%/年) ---\n{}\
+             {}  --- 成交统计 ---\n{}\
+             {}  --- 资产变化 (基准: 初始余额 100000 USDT) ---\n{}",
+            "",
+            filler("概览", 20),
+            "",
+            filler("参数", 300), // 最不重要且最长: 旧"砍尾部"方案会把它整段留下
+            "",
+            filler("风险", 20),
+            "",
+            filler("成交", 20),
+            "",
+            filler("资产", 20),
+        );
+
+        // ① 放得下 → 一字不动(不得为了"统一格式"硬加标记)。
+        assert_eq!(clamp_report(report.clone()), report);
+
+        // ② 预算只够放头部 + 概览 + 一点风险 → 结论区必须还在, 配置 dump 必须被舍掉。
+        let out = clamp_report_limited(report.clone(), 400);
+        assert!(out.contains("已截断"), "超长输入必须带截断标记: {out}");
+        assert!(out.contains("--- 回测概览 ---"), "概览必须保留: {out}");
+        assert!(out.contains("风险/收益指标"), "风险指标必须优先于配置: {out}");
+        assert!(
+            !out.contains("--- 测试参数 (生效配置全量) ---"),
+            "配置 dump 是输入不是结论, 必须先被舍: {out}"
+        );
+        assert!(out.chars().count() <= 400 + 200, "必须守预算: {}", out.chars().count());
+
+        // ③ 再紧一点: 连风险区都放不下时, 至少概览 + 显式标记还在(绝不静默丢内容)。
+        let tight = clamp_report_limited(report.clone(), 120);
+        assert!(tight.contains("已截断"), "{tight}");
+        assert!(tight.contains("--- 回测概览 ---"), "再紧也要保住概览: {tight}");
+
+        // ④ 分节器要把带括号后缀的标题归一(利率一变就匹配不上优先级表)。
+        let (header, sections) = split_report_sections(&report);
+        assert!(header.contains("回测报告: demo"), "{header}");
+        assert!(sections.contains_key("风险/收益指标"), "{:?}", sections.keys());
+        assert!(sections.contains_key("资产变化"), "{:?}", sections.keys());
+        assert!(sections.contains_key("测试参数"), "{:?}", sections.keys());
+    }
+
+    /// 054 T8: 分节截断与旧的顺序截断**必须是两套** —— 否则审计 #7 等于没修。
+    #[test]
+    fn test_clamp_report_differs_from_plain_tail_cut() {
+        let report = format!(
+            "回测报告: demo\n  --- 回测概览 ---\n{}\n  --- 测试参数 ---\n{}\n  --- 成交统计 ---\n{}",
+            "概览行\n".repeat(5),
+            "参数行\n".repeat(50),
+            "成交行\n".repeat(5),
+        );
+        let limit = 80;
+        let by_section = clamp_report_limited(report.clone(), limit);
+        let by_tail = clamp_output_limited(report.clone(), limit);
+        // 尾部截断会把"成交统计"整段丢掉(它在最后), 分节截断必须把它留下来。
+        assert!(!by_tail.contains("成交统计"), "前提: 旧方案确实丢了成交统计");
+        assert!(by_section.contains("成交统计"), "新方案必须保住成交统计: {by_section}");
+    }
+
     #[test]
     fn test_redact_masks_secrets_in_free_text() {
         let raw = "GET /api key=abc\nAuthorization: Bearer sk-abcdef123456\napi_key=deadbeef\n正常的一行行情: ETHUSDT 3500.5";
@@ -2284,13 +2672,53 @@ mod tests {
         assert_eq!(READ_ONLY_TOOLS.len(), 15);
         assert!(is_allowed("list_pairs"), "交易对视野是 L0 只读工具");
         assert!(is_allowed("list_templates") && is_allowed("read_template"), "模板面是 L0 只读");
-        assert_eq!(VIRTUAL_TOOLS.len(), 3);
+        assert_eq!(VIRTUAL_TOOLS.len(), 4);
+        // 054 T33: 寻优已接通(只读 + 不写回), 但不在 L0 —— 成本高两个数量级。
+        assert!(is_allowed("optimize"), "寻优必须可被 AI 调用(审计 #6)");
+        assert!(!READ_ONLY_TOOLS.contains(&"optimize"), "寻优属于 L1, 不是随手可查的只读");
         assert!(is_allowed("request_write_confirmation"));
         // 真正的写实名仍然一个都不在
         for forbidden in
             ["deploy", "execute_strategy", "start_demo", "stop_live", "stop_demo", "approve"]
         {
             assert!(!is_allowed(forbidden), "{forbidden} 不得是可调用工具");
+        }
+    }
+
+    /// 055 B6: 两条生成路径的**本金口径**必须对齐 —— Web 单发生成把本金当必填项并真的
+    /// 用它跑验证回测; 对话路径此前根本没有这个入参(问到了也没处传)。
+    #[test]
+    fn test_preview_strategy_carries_the_users_own_cash() {
+        // 没给 → None(允许: 助手可能正打算先问用户), 由调用方在结果里写明用的是默认本金。
+        assert_eq!(preview_initial_cash(&json!({})).unwrap(), None);
+        assert_eq!(preview_initial_cash(&json!({ "name": "a", "pair": "ETHUSDT" })).unwrap(), None);
+        // 给了就照收(1 万就是 1 万, 不换算不取整)。
+        assert_eq!(preview_initial_cash(&json!({ "initial_cash": 10000 })).unwrap(), Some(10000.0));
+        assert_eq!(preview_initial_cash(&json!({ "initial_cash": 500.5 })).unwrap(), Some(500.5));
+        // 非法 → 报错(不静默回落到默认本金: 那等于偷偷换一笔钱来跑)。
+        for bad in [
+            json!({ "initial_cash": 0 }),
+            json!({ "initial_cash": -1 }),
+            json!({ "initial_cash": "10000" }),
+        ] {
+            let err = preview_initial_cash(&bad).unwrap_err().to_string();
+            assert!(err.contains("initial_cash"), "{bad} 应报错: {err}");
+        }
+    }
+
+    /// 055 B6: 提示词必须把"问到了要传进去"写死 —— 只在对话里问一句是没用的。
+    #[test]
+    fn test_prompt_binds_asking_to_passing_the_cash_in() {
+        // 两种语言共用同一份 RULES(仅头部不同), 所以这一条对英文会话同样生效 ——
+        // 否则英文用户那条路径的助手根本不知道要传本金。
+        for lang in [Lang::Zh, Lang::En] {
+            let p = crate::ai::prompt::system_preamble(lang);
+            assert!(p.contains("initial_cash"), "提示词必须点名 initial_cash: {}", &p[..200]);
+            assert!(
+                p.contains("没问到就不得生成"),
+                "本金/风险偏好没问到就不得生成这条纪律必须在: {}",
+                &p[..200]
+            );
         }
     }
 

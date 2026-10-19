@@ -1,0 +1,77 @@
+name: nightly
+
+# nightly 真机走查 (057-G6)
+#
+# 为什么不进 ci.yml:
+#   `scripts/probe_web_ui.mjs` 需要**真浏览器 + CDP**(headless Edge/Chrome 的
+#   `--remote-debugging-port`)。它比静态门贵一个数量级, 且偶发受 runner 资源影响。
+#   而它的价值恰恰在于抓静态门抓不到的东西 —— 042 的 `strategy_editor.js` 漏导出导致
+#   整片 ReferenceError, 当时 node --check / grep / Rust 单测 / Python 冒烟**四道全绿**;
+#   054 又抓到 `skipBox` TDZ 真实缺陷。
+#   → 结论: 真机层**必须保留**, 但按 nightly 跑(每天一次), 不阻塞每次 push/PR。
+
+on:
+  schedule:
+    # UTC 每日 03:17 (刻意不用整点: 避开 GitHub Actions 高峰队列)
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: CDP 真机走查 (headless)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # 走查需要起一个真服务; 用固定数据目录, **不带任何 AI 密钥**
+      # (e2e 段的若干断言假设「没配 [ai].api_key」; 带上密钥会造假红)。
+      - name: Build
+        run: cargo build
+
+      - name: Launch headless browser
+        uses: browser-actions/setup-chrome
+        with:
+          chrome-version: stable
+
+      - name: Start ricow web (headless)
+        run: |
+          export RICOW_ROOT="$PWD/tmp/nightly-probe"
+          mkdir -p "$RICOW_ROOT"
+          ./target/debug/ricow web --no-open --port 18777 &
+          echo $! > /tmp/ricow.pid
+          # 等服务就绪 (最多 60s), 失败时 dump 日志而不是干等超时
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:18777/api/ping >/dev/null 2>&1; then
+              echo "ricow web ready after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:18777/api/ping || {
+            echo "::error::ricow web 未能启动"; exit 1; }
+
+      - name: CDP probe
+        run: node scripts/probe_web_ui.mjs
+
+      # 无论成败都收摊, 不留孤儿进程占端口
+      - name: Stop ricow (always)
+        if: always()
+        run: kill "$(cat /tmp/ricow.pid)" 2>/dev/null || true

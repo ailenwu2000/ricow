@@ -17,6 +17,12 @@
   // 跨文件符号(042 D2: 延迟查找)
   const gatherParams = (...a) => S.gatherParams(...a);
   const enterDetail = (...a) => S.enterDetail(...a);
+  // N3-B: 两次回测 + 评估的编排在回测子文件里(它管 `/api/backtest` 的作业语义)。
+  const runParamAssess = (...a) => S.runParamAssess(...a);
+  // 053: 参数侧标脏 —— 定义都在 strategy_form.js(表单与基线归它管), 这里只问结果。
+  const paramDiffs = (...a) => S.paramDiffs(...a);
+  const renderParamDiff = (...a) => S.renderParamDiff(...a);
+  const markParamBaseline = (...a) => S.markParamBaseline(...a);
 
   // ---------- 编辑器脏状态 / 高亮 / Tab / 撤销 (P1-4) ----------
 
@@ -86,11 +92,41 @@
     box.hidden = false;
   }
 
+  /// 059 UX-16: 同一个"改没改"判据, 供**离开确认**复用。
+  ///
+  /// `updateDirty()` 只负责把结果画到界面上, 不返回值 —— 离开确认要的是"是不是脏"这个
+  /// 布尔, 若在那里另写一个判断(比如只看代码), 就会出现"提示没亮但被拦下来"或反过来。
+  /// 故判据只此一处: 代码 / 参数(含交易对)任一与基线不同。
+  function isDirty() {
+    const codeEl = $("sg-code");
+    if (!codeEl) return false;
+    return codeEl.value !== st.savedCode || paramDiffs().length > 0;
+  }
+
+  /// 053: 未保存状态 = 代码 **或** 参数(含交易对)任一改过。
+  ///
+  /// 此前只比代码编辑器, 参数改了界面一声不吭 —— 而回测又能用表单值跑出结果, 于是用户
+  /// 合理地以为"已经改好了", 刷新后才发现没落盘。现在两侧各有一条提示, 都改时代码那条
+  /// 明说"两个都改了", 免得用户以为只改了代码。
+  /// 判据一律是**与基线比字符串**: 改了又改回去不算改动(与 `savedCode` 同一口径)。
   function updateDirty() {
     const codeEl = $("sg-code");
-    const dirty = codeEl.value !== st.savedCode;
-    $("sg-dirty").hidden = !dirty;
-    $("sg-dirty-text").textContent = st.aiDraft ? t("sgAiDirty") : t("sgDirty");
+    const codeDirty = codeEl.value !== st.savedCode;
+    const paramDirty = paramDiffs().length > 0;
+    $("sg-dirty").hidden = !codeDirty;
+    $("sg-dirty-text").textContent = st.aiDraft
+      ? t("sgAiDirty")
+      : paramDirty ? t("sgDirtyBoth") : t("sgDirty");
+    const pbox = $("sg-params-dirty");
+    if (pbox) {
+      pbox.hidden = !paramDirty;
+      if (paramDirty) $("sg-params-dirty-text").textContent = t("sgParamDirty");
+    }
+    // 行内「原 X → 改为 Y」与顶部改动清单同源, 一次算完一起刷。
+    renderParamDiff();
+    // 054 T36: 手动改参也要能评估影响 —— 改动集合一变就重刷评估面板(面板自己带签名,
+    // 集合没变不会重建, 所以打字不会把上一次的结论清掉)。
+    syncAssessPanel();
   }
 
   function onCodeKeydown(ev) {
@@ -175,13 +211,23 @@
       });
       st.savedCode = code;
       st.aiDraft = false;
+      // 053: 参数基线推进到"刚落盘的那组值" —— 否则保存成功后「参数有未保存修改」还亮着。
+      // 必须在 `updateDirty()` 之前(它拿基线比当前值), 且与 savedCode 同一处、同一口径。
+      markParamBaseline();
+      // N3-B: "保存成功了"就等于"实例 TOML 现在是这些值" —— 把 detailCtx 里的当前值同步过去。
+      // 不同步的话, 评估面板的「改前」会一直是**进页面时**读到的那份(可能是好几轮改动之前),
+      // 对比出来的数字看着像实测, 其实比错了对象。
+      if (st.detailCtx && st.detailCtx.detail) {
+        st.detailCtx.detail.current = params;
+        st.detailCtx.detail.pair = pair;
+      }
       updateDirty();
       refreshHighlight();
-      setMsg(
-        $("sg-savemsg"),
-        reply && reply.warnings && reply.warnings.length ? t("sgSavedWithWarn") : t("sgSaved"),
-        "ok"
-      );
+      // B6: 成功走**全局 toast** —— 在详情页保存完回列表时, 提示不至于随详情 DOM 一起消失
+      // (保存钮本身的"已变灰/未改动"状态也在, 但它说不清"刚才那次到底成没成")。
+      const savedMsg =
+        reply && reply.warnings && reply.warnings.length ? t("sgSavedWithWarn") : t("sgSaved");
+      R.toast(savedMsg, "ok");
       renderWarnings(reply && reply.warnings);
       syncSaveBtn("idle");
       refreshListQuietly();
@@ -227,50 +273,298 @@
       .catch(() => {});
   }
 
-  // ---------- AI 改 Lua ----------
+  // ---------- AI 改策略(N3: 多轮对话 + 说意图) ----------
+  //
+  // 两种模式:
+  //   「调整参数」= 多轮对话。用户只说**想要的效果**(「保守点」「更看好震荡行情」), 不指定键与值 ——
+  //                后端把它翻译成**一整组**参数取值, 并回一段讲清理由与风险的说明 + 逐键的前后对照;
+  //                前端只填参数表单, 代码一个字不动。
+  //   「改代码逻辑」= 原有的整份代码改写(草稿 + 编译门禁)。**仍是单轮**: 它每轮产出的是完整
+  //                代码, 上一轮那版已经在编辑器里了, 再叠历史没有增量信息(见后端 ai_edit_strategy)。
+  //
+  // 历史**只存在前端内存**(`st.aiThreads`): 服务端端点是纯一次问答, 不引入会话状态 ——
+  // 代价就是刷新即失, 所以卡片上明写这一点。回传时按 `用户: … / AI: …` 排成纯文本。
+  //
+  // 落盘时机两种模式完全一致: 都只是草稿, 用户点「保存」才写盘。
 
-  function syncAiBtn(busy) {
-    const btn = $("sg-ai-go");
-    btn.disabled = !!busy;
-    btn.textContent = busy ? t("sgAiBusy") : t("sgAiGo");
+  /// 当前模式的对话线程(数组引用, 可原地 push)。
+  function thread() {
+    return st.aiThreads[st.aiMode === "code" ? "code" : "params"];
   }
 
+  /// 把线程排成给模型的纯文本历史(不含本轮刚说的那句 —— 它单独走 `instruction`)。
+  /// 后端还会再做一次字符上限截断([`cap_history`]), 这里不做二次裁剪: 让"最近多少轮"这件事
+  /// 只有一个判据, 免得两处各截一半、结果谁也看不懂。
+  function historyText(mode) {
+    const turns = st.aiThreads[mode === "code" ? "code" : "params"];
+    const lines = [];
+    for (const turn of turns) {
+      if (turn.role === "user") lines.push(t("sgAiUserLabel") + ": " + turn.text);
+      else {
+        if (turn.advice) lines.push(t("sgAiBotLabel") + ": " + turn.advice);
+        if (turn.changed && turn.changed.length) {
+          lines.push(
+            t("sgAiBotLabel") + " " + t("sgAiChangedTitle") + ": " +
+              turn.changed.map((c) => c.key + " " + (c.before || "—") + "→" + c.after).join("; ")
+          );
+        }
+        if (turn.note) lines.push(t("sgAiBotLabel") + ": " + turn.note);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  /// 重画对话线程(纯 DOM, 数据全部来自 `st.aiThreads`)。
+  function renderThread() {
+    const box = $("sg-ai-thread");
+    if (!box) return;
+    box.innerHTML = "";
+    const turns = thread();
+    if (!turns.length) {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
+    for (const turn of turns) box.appendChild(turnBubble(turn));
+    // 新消息总在最下面 —— 不自动滚的话, 用户看到的是最旧那条, 会以为 AI 没回。
+    if (box.scrollIntoView) box.lastChild.scrollIntoView({ block: "nearest" });
+  }
+
+  function turnBubble(turn) {
+    const isUser = turn.role === "user";
+    const wrap = h("div", "sg-ai-turn " + (isUser ? "sg-ai-turn-user" : "sg-ai-turn-bot"));
+    wrap.appendChild(h("span", "sg-ai-who", isUser ? t("sgAiUserLabel") : t("sgAiBotLabel")));
+    if (turn.error) {
+      wrap.appendChild(h("div", "sg-ai-body sg-msg err", turn.error));
+      return wrap;
+    }
+    if (turn.text) wrap.appendChild(h("div", "sg-ai-body", turn.text));
+    if (turn.advice) wrap.appendChild(h("div", "sg-ai-body", turn.advice));
+    if (turn.note) wrap.appendChild(h("div", "sg-ai-body sg-ai-note", turn.note));
+    if (isUser) return wrap;
+
+    // 参数模式: 逐键前后对照(只列**真变了**的键; 后端算好的, 前端不重算)。
+    if (turn.changed) {
+      if (!turn.changed.length) {
+        wrap.appendChild(h("div", "sg-ai-body sg-ai-changed-none", t("sgAiChangedNone")));
+      } else {
+        const list = h("div", "sg-ai-changed");
+        list.appendChild(h("div", "sg-ai-changed-title", t("sgAiChangedTitle")));
+        for (const c of turn.changed) {
+          const row = h("div", "sg-ai-change-row");
+          row.appendChild(h("span", "sg-ai-change-name", c.name + " (" + c.key + ")"));
+          const before = c.before === undefined || c.before === null ? "—" : String(c.before);
+          row.appendChild(h("span", "sg-ai-change-num", before + " → " + c.after));
+          if (c.before_is_default) {
+            row.appendChild(h("span", "sg-ai-change-tag", t("sgAiChangedDefault")));
+          }
+          list.appendChild(row);
+        }
+        wrap.appendChild(list);
+      }
+    }
+    if (turn.warnings && turn.warnings.length) {
+      const ul = h("ul", "sg-warnlist-ul");
+      for (const w of turn.warnings) ul.appendChild(h("li", null, w));
+      wrap.appendChild(ul);
+    }
+    return wrap;
+  }
+
+  /// 提交一轮对话。两个模式的差异只在这一个函数里:
+  /// 参数模式带 history 且回包带 advice/changed; 代码模式单轮, 回包是代码。
   async function onAiEdit() {
     if (!st.detailCtx) return;
     const instruction = $("sg-ai-instr").value.trim();
     if (!instruction) {
-      setMsg($("sg-ai-msg"), t("sgAiPh"), "err");
+      setMsg($("sg-ai-msg"), t("sgAiEmpty"), "err");
       return;
     }
+    const mode = st.aiMode === "code" ? "code" : "params";
     const g = st.gen;
+    // 历史要在**推入本轮**之前取 —— 本轮的话单独走 `instruction`, 混进历史会被说两遍。
+    const history = historyText(mode);
+    thread().push({ role: "user", text: instruction });
+    renderThread();
+    $("sg-ai-instr").value = "";
     syncAiBtn(true);
     setMsg($("sg-ai-msg"), t("sgAiBusy"), "");
     try {
+      const body = { instruction: instruction, mode: mode };
+      if (mode === "params" && history) body.history = history;
       const reply = await R.api(
         "/api/strategies/" + encodeURIComponent(st.detailCtx.id) + "/ai-edit",
-        { method: "POST", body: { instruction: instruction } }
+        { method: "POST", body: body }
       );
       if (g !== st.gen) return;
-      // 成功: 服务端已过编译门禁; 替换编辑器, 撤销可回上次保存版本。
+      if (mode === "params") {
+        // 只填参数表单: 代码不动, 用户核对后点「保存」才写盘。
+        // 053: 填完必须标脏 —— AI 改的就是参数, 若界面不提示"未保存", 用户会以为 AI 已经改好了。
+        const filled = fillParamInputs(reply.params || {});
+        updateDirty();
+        thread().push({
+          role: "ai",
+          advice: reply.advice || "",
+          changed: reply.changed || [],
+          warnings: reply.warnings || [],
+          // 一个键都没填上 = 建议全落在表单之外: 这与"改了但没变"是两件事, 分开说。
+          note: filled ? t("sgAiParamsOk") : t("sgAiParamsEmpty"),
+        });
+        renderThread();
+        if (!reply.advice && !(reply.changed || []).length && !filled) {
+          setMsg($("sg-ai-msg"), t("sgAiParamsEmpty"), "err");
+        } else {
+          setMsg($("sg-ai-msg"), "", "");
+        }
+        syncAssessPanel();
+        return;
+      }
+      // code 模式: 服务端已过编译门禁; 替换编辑器, 撤销可回上次保存版本。
       $("sg-code").value = reply.code;
       st.aiDraft = true;
       updateDirty();
       refreshHighlight();
+      thread().push({ role: "ai", note: t("sgAiOk"), warnings: reply.warnings || [] });
+      renderThread();
       setMsg($("sg-ai-msg"), t("sgAiOk"), "ok");
       renderWarnings(reply.warnings);
     } catch (err) {
       if (g !== st.gen) return;
+      // 失败也进线程: 否则对话看起来像"用户的话没人接", 而且失败原因(比如清单为空、
+      // 没配密钥)正是下一句要接着说的上下文。
+      const message = (err && err.message) || String(err);
+      thread().push({ role: "ai", error: message });
+      renderThread();
       if (err && err.status === 403 && err.code === "need_keys") {
-        showNeedKeys(err.message || t("sgNeedKeys"));
+        showNeedKeys(message);
       } else if (err && err.code === "compile") {
         // 编译没过: 服务端没给可⽤代码, 编辑器内容**不替换**。
         setMsg($("sg-ai-msg"), t("sgAiCompilePrefix") + " " + compileText(err), "err");
         jumpToErrorLine(err.line);
       } else {
-        setMsg($("sg-ai-msg"), (err && err.message) || String(err), "err");
+        setMsg($("sg-ai-msg"), message, "err");
       }
     } finally {
       if (g === st.gen) syncAiBtn(false);
+    }
+  }
+
+  /// N3: 清空当前模式的对话(历史全在前端, 服务端没有可清的东西)。
+  function onAiClearThread() {
+    st.aiThreads[st.aiMode === "code" ? "code" : "params"] = [];
+    renderThread();
+    setMsg($("sg-ai-msg"), "", "");
+    syncAssessPanel();
+  }
+
+  // ---------- N3-B: 改完自动评估影响 ----------
+  //
+  // 三步: 跑「改前」(上次保存的参数) → 跑「改后」(表单里现在这些) → 让 AI 读两份**实测**指标。
+  // 前两步复用 `/api/backtest` 的既有作业(带 busy / 进度 / 结果保留那一整套), 这里只负责
+  // 串起来 + 如实展示进度与失败原因。真正跑回测的代码在 strategy_backtest.js。
+
+  /// 当前模式是否该显示评估面板: 参数模式 + **当前表单里真的有改动**。
+  ///
+  /// 054 T36: 判据从"AI 回包的 `changed`" 换成 `paramDiffs()` —— 只看 AI 回包时, 用户**自己**
+  /// 手动改的参数永远没有入口可评估(而手动改恰恰是最需要看影响的那一类: AI 至少还给了一段
+  /// 说明, 手改的人是凭感觉调的)。`paramDiffs()` 与基线比字符串, AI 改的同样算在内。
+  ///
+  /// **没有改动就不显示** —— 摆一个点了只会 400 的按钮, 比不摆还糟。
+  ///
+  /// 改动集合**没变就不重建**: 面板每重建一次就清空一次结果, 而 `updateDirty` 是每次按键
+  /// 都会跑的 —— 不判签名的话, 打字打到一半结论就被自己清掉了。
+  function syncAssessPanel() {
+    const box = $("sg-ai-assess");
+    if (!box) return;
+    const diffs = paramDiffs();
+    const sig = diffs.map((d) => d.key + "=" + d.after).join("|");
+    if (st.aiMode !== "params" || !diffs.length || !st.detailCtx) {
+      box.hidden = true;
+      box.innerHTML = "";
+      delete box.dataset.sig;
+      return;
+    }
+    if (box.dataset.sig === sig && !box.hidden) return;
+    box.dataset.sig = sig;
+    box.hidden = false;
+    box.innerHTML = "";
+    box.appendChild(h("div", "sg-guide-title", t("sgAiAssessTitle")));
+    box.appendChild(h("div", "sg-guide-body", t("sgAiAssessBody")));
+    const actions = h("div", "sg-guide-actions");
+    const btn = h("button", "sg-btn sg-btn-mini sg-btn-primary", t("sgAiAssessRun"));
+    btn.type = "button";
+    btn.id = "sg-ai-assess-go";
+    btn.addEventListener("click", onAssessParams);
+    actions.appendChild(btn);
+    box.appendChild(actions);
+    const msg = h("div", "sg-msg");
+    msg.id = "sg-ai-assess-msg";
+    msg.setAttribute("aria-live", "polite");
+    box.appendChild(msg);
+    box.appendChild(h("div", "sg-hint", t("sgAiAssessWindow")));
+    // 结果区: 由 onAssessParams 往里写。**每次重建面板就是一次清空** —— 面板只在"改动集合变了"
+    // 时重建, 所以清掉的那份结论本来就是关于**上一组**参数的, 留着比清掉更糟(会被当成本次的)。
+    const result = h("div", "sg-ai-assess-result");
+    result.id = "sg-ai-assess-result";
+    box.appendChild(result);
+  }
+
+  /// 「跑回测评估影响」: 现场取两套参数 → 串行两次回测 → 问 AI。
+  async function onAssessParams() {
+    if (!st.detailCtx) return;
+    const g = st.gen;
+    const id = st.detailCtx.id;
+    const msg = $("sg-ai-assess-msg");
+    const pair = ($("sg-pair").value || "").trim();
+    if (!pair) {
+      setMsg(msg, t("sgPairRequired"), "err");
+      return;
+    }
+    let newParams;
+    try {
+      newParams = gatherParams(false);
+    } catch (err) {
+      setMsg(msg, err.message, "err");
+      return;
+    }
+    // 改前 = **上次保存的参数**(进详情页时读到的实例值): AI 改动是草稿, 还没落盘,
+    // 所以这一份就是"当前在跑的那组"。改后 = 表单里现在这些(用户可能还手动调过)。
+    const baseParams = Object.assign({}, (st.detailCtx.detail && st.detailCtx.detail.current) || {});
+    // 054 T36: 改动清单直接取 `paramDiffs()`(AI 改的 + 手动改的都在里头), 不再只认 AI 回包。
+    // 两者形状一致 `[{key,name,before,after}]`, 后端 ai-assess 只用它做"改了哪几项"的说明。
+    const changed = paramDiffs();
+    const btn = $("sg-ai-assess-go");
+    if (btn) btn.disabled = true;
+    setMsg(msg, t("sgAiAssessRunningBase"), "");
+    try {
+      const out = await runParamAssess({
+        id: id,
+        pair: pair,
+        baseParams: baseParams,
+        newParams: newParams,
+        changed: changed,
+        g: g,
+        // 进度文案在**本卡片**里更新: 别去动回测卡的 msg 区, 那是另一个动作的地盘。
+        onStage: (stage) => {
+          if (g !== st.gen) return;
+          if (stage === "base") setMsg(msg, t("sgAiAssessRunningBase"), "");
+          else if (stage === "new") setMsg(msg, t("sgAiAssessRunningNew"), "");
+          else setMsg(msg, t("sgAiAssessAssessing"), "");
+        },
+      });
+      if (g !== st.gen) return;
+      setMsg(msg, "", "");
+      const result = $("sg-ai-assess-result");
+      if (result) {
+        const block = h("div", "sg-ai-assess-block");
+        block.appendChild(h("div", "sg-guide-body", out.advice));
+        result.appendChild(block);
+      }
+    } catch (err) {
+      if (g !== st.gen) return;
+      setMsg(msg, t("sgAiAssessFailed") + ((err && err.message) || String(err)), "err");
+    } finally {
+      if (g === st.gen && btn) btn.disabled = false;
     }
   }
 
@@ -286,14 +580,87 @@
     el.appendChild(go);
   }
 
+  /// 按**当前语言 + 当前模式**重刷模式相关文案(「执行」按钮 + 一行提示 + 输入框占位)。
+  ///
+  /// 同时写 `textContent` / `placeholder` 与 `data-zh` / `data-en`(-placeholder): 切语言时
+  /// `R.applyLang` 会先按 data 属性把静态标签就地换一轮, 若只改可见值, 换语言就会把当前模式的
+  /// 文案盖回**初始模式**那一份(N3 起占位文字也分模式, 这个坑从按钮扩大到了输入框)。
+  function applyAiModeText() {
+    const isParams = st.aiMode !== "code";
+    const goKey = isParams ? "sgAiGoParams" : "sgAiGoCode";
+    const hintKey = isParams ? "sgAiModeHintParams" : "sgAiModeHintCode";
+    for (const [el, key] of [
+      [$("sg-ai-go"), goKey],
+      [$("sg-ai-mode-hint"), hintKey],
+    ]) {
+      el.textContent = R.TEXT[R.lang][key];
+      el.dataset.zh = R.TEXT.zh[key];
+      el.dataset.en = R.TEXT.en[key];
+    }
+    const phKey = isParams ? "sgAiPhParams" : "sgAiPhCode";
+    const ph = $("sg-ai-instr");
+    ph.placeholder = R.TEXT[R.lang][phKey];
+    ph.dataset.zhPlaceholder = R.TEXT.zh[phKey];
+    ph.dataset.enPlaceholder = R.TEXT.en[phKey];
+    $("sg-ai-mode-params").classList.toggle("on", isParams);
+    $("sg-ai-mode-code").classList.toggle("on", !isParams);
+  }
+
+  /// 切模式(点 chip / 详情挂载时初始化)。顺手清掉上一条行内消息 ——
+  /// 那是**上一个模式**的结论, 留着会让人以为本次也成功了。
+  /// N3: 线程按模式分开(`st.aiThreads`), 所以切模式是"换一条对话", 不是"丢历史"。
+  function setAiMode(mode) {
+    st.aiMode = mode === "code" ? "code" : "params";
+    applyAiModeText();
+    setMsg($("sg-ai-msg"), "", "");
+    renderThread();
+    syncAssessPanel();
+  }
+
+  function syncAiBtn(busy) {
+    const btn = $("sg-ai-go");
+    btn.disabled = !!busy;
+    // 闲时按模式回写标签(切语言后 `refreshDynamic` → 这里, 也是它把文案换成新语言)。
+    if (busy) btn.textContent = t("sgAiBusy");
+    else applyAiModeText();
+  }
+
+  /// params 模式回包 → 填进参数表单。返回**真正填上**的键数。
+  ///
+  /// 只认表单里画得出来的行(清单声明的参数都在 `st.paramInputs` 里); `pair` 是独立字段
+  /// (`#sg-pair`), 单独处理。服务端已把清单外的键过滤掉了, 这里再兜一层:
+  /// 画不出来的键一律**不填**, 由调用方按返回的条数决定提示语 —— 绝不假报"已填好"。
+  function fillParamInputs(suggested) {
+    let n = 0;
+    for (const p of st.paramInputs) {
+      if (!Object.prototype.hasOwnProperty.call(suggested, p.key)) continue;
+      const v = suggested[p.key];
+      if (p.ty === "bool") p.input.checked = !!v;
+      else p.input.value = v === null || v === undefined ? "" : String(v);
+      n += 1;
+    }
+    const pair = suggested.pair;
+    if (typeof pair === "string" && pair.trim()) {
+      $("sg-pair").value = pair.trim();
+      n += 1;
+    }
+    return n;
+  }
+
   // ---------- 对外(外壳与其它子文件调用) ----------
   S.updateDirty = updateDirty;
+  S.isDirty = isDirty; // 059 UX-16: 离开确认复用同一判据
   S.refreshHighlight = refreshHighlight;
   S.syncSaveBtn = syncSaveBtn;
   S.syncAiBtn = syncAiBtn;
+  S.setAiMode = setAiMode;
   S.onCodeKeydown = onCodeKeydown;
   S.onSave = onSave;
   S.onAiEdit = onAiEdit;
+  // N3: 外壳 mount 直接挂这两个(清空对话按钮 / 切模式后重建线程与评估面板)。
+  S.onAiClearThread = onAiClearThread;
+  S.renderAiThread = renderThread;
+  S.syncAssessPanel = syncAssessPanel;
   // `onUndo` 也是外壳 `mount()` 直接挂到按钮上的回调(`$("sg-undo").addEventListener`),
   // 漏了这条导出 = 点开策略页整片 `ReferenceError: onUndo is not defined`(2026-10-07 真机走查抓到)。
   S.onUndo = onUndo;

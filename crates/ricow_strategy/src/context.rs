@@ -233,9 +233,20 @@ impl LiveContext {
         self.markets.read().ok()?.get(&pair_base.to_uppercase()).cloned()
     }
 
-    /// 工程护栏前置检查 (019-R5): 超频 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
+    /// 工程护栏前置检查 (019-R5 频率 + 057-P0-D 单笔名义): 超限 → 返回 `Rejected` ack
+    /// (不抛错, 策略循环不中断), 并记 warn 日志 + 事件流。
+    ///
+    /// 两条规则**共用一份判定** [`crate::order_guard::guard_check`] (先频率后名义),
+    /// 与 DryRun 侧同一份代码 —— 两条路径的护栏口径不允许漂移。
     fn guard_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {
-        let verdict = self.guard.borrow_mut().check(self.now_utc());
+        let price = req.price.or_else(|| self.price(&req.pair));
+        let notional = price.map(|p| p * req.size);
+        let verdict = crate::order_guard::guard_check(
+            &mut self.guard.borrow_mut(),
+            self.now_utc(),
+            notional,
+            self.equity_quote_balance(&req.pair),
+        );
         match verdict {
             Ok(()) => None,
             Err(e) => {
@@ -244,7 +255,7 @@ impl LiveContext {
                     name = %self.config.name,
                     pair = %req.pair,
                     side = ?req.side,
-                    "工程护栏拒单(下单频率超限): {e}"
+                    "工程护栏拒单: {e}"
                 );
                 // 拒单必须进事件流: "策略为什么没按预期下单" 最常见的答案就在这里。
                 let (pair, side, size) = (req.pair.clone(), format!("{:?}", req.side), req.size);
@@ -252,11 +263,21 @@ impl LiveContext {
                     ev.pair = Some(pair);
                     ev.side = Some(side);
                     ev.size = Some(size.to_string());
-                    ev.reason = Some(format!("工程护栏拒单(下单频率超限): {e}"));
+                    ev.reason = Some(format!("工程护栏拒单: {e}"));
                 });
                 Some(crate::order_guard::rejected_ack(req))
             }
         }
+    }
+
+    /// 该 pair 的报价资产余额 = 057-P0-D 名义护栏的权益基准。
+    ///
+    /// **刻意只取报价余额, 不加持仓市值**: 持仓市值要按逐仓/全仓与合约标记价算, 各市场口径不同,
+    /// 在护栏里算不准反而会误拒正常单。取不到 → `None` → 只判频率
+    /// (见 `order_guard::check_notional` 的「拿不到就不拦」原则)。
+    fn equity_quote_balance(&self, pair: &str) -> Option<rust_decimal::Decimal> {
+        let q = crate::order_guard::quote_asset_of(pair)?;
+        self.balance_cache.read().ok()?.get(q).map(|b| b.total())
     }
 
     fn resolve_key(&self, pair: &str) -> String {
@@ -901,8 +922,17 @@ impl DryRunContext {
     }
 
     /// 工程护栏前置检查 (019-R5): 超频 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
+    /// 工程护栏前置检查 (019-R5 频率 + 057-P0-D 单笔名义): 与 Live 侧共用
+    /// [`crate::order_guard::guard_check`] 同一份判定, 口径不允许漂移。
     fn guard_reject(&mut self, req: &OrderRequest) -> Option<OrderAck> {
-        let verdict = self.guard.borrow_mut().check(self.now_utc());
+        let price = req.price.or_else(|| self.price(&req.pair));
+        let notional = price.map(|p| p * req.size);
+        let verdict = crate::order_guard::guard_check(
+            &mut self.guard.borrow_mut(),
+            self.now_utc(),
+            notional,
+            self.equity_quote_balance(&req.pair),
+        );
         match verdict {
             Ok(()) => None,
             Err(e) => {
@@ -911,7 +941,7 @@ impl DryRunContext {
                     name = %self.config.name,
                     pair = %req.pair,
                     side = ?req.side,
-                    "工程护栏拒单(下单频率超限): {e}"
+                    "工程护栏拒单: {e}"
                 );
                 // 拒单必须进事件流: "策略为什么没按预期下单" 最常见的答案就在这里。
                 let (pair, side, size) = (req.pair.clone(), format!("{:?}", req.side), req.size);
@@ -919,11 +949,17 @@ impl DryRunContext {
                     ev.pair = Some(pair);
                     ev.side = Some(side);
                     ev.size = Some(size.to_string());
-                    ev.reason = Some(format!("工程护栏拒单(下单频率超限): {e}"));
+                    ev.reason = Some(format!("工程护栏拒单: {e}"));
                 });
                 Some(crate::order_guard::rejected_ack(req))
             }
         }
+    }
+
+    /// DryRun 权益基准 = 虚拟报价币余额 (键与 Live 同为报价资产)。
+    fn equity_quote_balance(&self, pair: &str) -> Option<rust_decimal::Decimal> {
+        let q = crate::order_guard::quote_asset_of(pair)?;
+        self.virtual_balance.read().ok()?.get(q).map(|b| b.total())
     }
 
     fn resolve_key(&self, pair: &str) -> String {

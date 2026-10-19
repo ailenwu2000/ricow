@@ -1,5 +1,8 @@
 # bs_momentum 真实回测亏损归因 + 美股动量策略调研(2026-09-09)
 
+> 该策略的 Lua 化引擎能力保留, 但唯一内置消费者 `bs_momentum.lua` 已删除, 现无内置策略使用。
+> **文档性质(2026-10-18 统一标注)**: 本文件是 **某个时点的快照/调研档案, 不是活文档**。结论按当时事实记录, **不随代码演进更新**。判断 ricow 当前能力请以 `specs/roadmap.md` 与代码为准 —— 引用本文件当"现状"是已发生过的真实误判(见 `requirements-optimization-plan-2026-10.md` 附录 B)。
+
 > 调研日期: 2026-09-09 | 方法: BSM_DUMP 导出逐笔成交/持仓快照/净值/成交轨价格, Python FIFO 配对 round-trip 归因;
 > 网络调研 = Antonacci dual momentum / momentum crashes 学术 / 调仓频率实证 / FTSE MIB 1120 组网格(来源 URL 见各节)
 > 本文只交付: 亏损归因事实 + 调研结论 + 修正方向候选。策略规格修改 = 产品决策, 待用户拍板后走 SDD。

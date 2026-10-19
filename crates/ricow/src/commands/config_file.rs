@@ -112,6 +112,9 @@ pub struct AiSection {
     pub api_key: Option<String>,
     /// 显式确认白名单外的自建/中转 AI 端点 (审计 H-7); 缺省 = 拒绝非白名单主机。
     pub allow_custom_base_url: Option<bool>,
+    /// 055 B5: 单次 AI 请求总超时(秒); 缺省 = [`crate::ai::config::DEFAULT_TIMEOUT_SECS`]。
+    /// 本机小模型(ollama)常比云端慢, 这是它的口子。
+    pub timeout_secs: Option<i64>,
 }
 
 impl Default for AiSection {
@@ -123,6 +126,7 @@ impl Default for AiSection {
             max_turns: None,
             api_key: None,
             allow_custom_base_url: None,
+            timeout_secs: None,
         }
     }
 }
@@ -143,13 +147,18 @@ pub struct MarketSection {
     pub show_all_pairs: bool,
 }
 
+/// `[ui].theme` 的合法取值(**单一来源**): 解析校验、错误文案、以及 Web 侧
+/// `/api/theme` 的白名单都按它走 —— 各写一份的后果是"下拉里能选、写盘却被拒"。
+pub const SUPPORTED_THEMES: [&str; 4] = ["dark", "light", "red", "auto"];
+
 /// 界面语言段(023): 对话宿主固定文案的语言。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UiSection {
     /// `None` = 尚未选择(首次向导会问一次); 仅接受 `"zh"` / `"en"`, 其它值硬失败。
     pub lang: Option<String>,
-    /// Web 界面主题(034): `None` = 未设置(前端按深色 `dark` 兜底);
-    /// 仅接受 `"dark"` / `"light"` / `"red"`, 其它值硬失败 —— 与 `[ui].lang` 同一纪律。
+    /// Web 界面主题(034 / D14): `None` = 未设置(前端按深色 `dark` 兜底);
+    /// 仅接受 `"dark"` / `"light"` / `"red"` / `"auto"`, 其它值硬失败 —— 与 `[ui].lang` 同一纪律。
+    /// `auto` = 跟随系统的深/浅色偏好(前端按 `prefers-color-scheme` 解成 dark/light, 故 CSS 不需要第四份变量)。
     pub theme: Option<String>,
 }
 
@@ -270,6 +279,7 @@ pub fn template_text() -> String {
          max_turns = {ai_max_turns}\n\
          # base_url = \"https://api.deepseek.com/v1\"   # 仅自定义/自建端点才需要\n\
          # allow_custom_base_url = true               # 白名单外厂商主机才需要: 显式确认后放行\n\
+         # timeout_secs = 300                         # 单次请求最多等多久(默认 300 秒); 本机小模型可放宽\n\
          \n\
          # ── ② 交易所凭据(用哪个环境就填哪个) ────────────────────────────\n\
          #   演示(测试网): demo.binance.com 登录 → API 管理 → 创建 Key(建议只开交易, 不开提现)\n\
@@ -292,7 +302,7 @@ pub fn template_text() -> String {
          # zh = 中文(默认) · en = English。对话内可用 /lang 切换。\n\
          [ui]\n\
          lang = \"{ui_lang}\"\n\
-         # Web 界面主题(034): dark = 深色(默认) · light = 白色浅色 · red = 红色。\n\
+         # Web 界面主题(034): dark = 深色(默认) · light = 白色浅色 · red = 红色 · auto = 跟随系统。\n\
          # theme = \"{ui_theme}\"\n\
          \n\
          # ── ⑤ daemon 监督 / Supervisor (038, 可选) ──────────────────────\n\
@@ -541,11 +551,17 @@ pub fn load(root: &Path) -> CoreResult<File> {
                 }
                 // [ui].theme(034): 白名单硬校验, 与 lang 同一纪律 —— 非法值宁可启动失败,
                 // 也不静默回退(否则用户改错一个字母会以为主题已生效)。
+                // "auto"(D14) = 跟随系统的深/浅色偏好, 前端按 `prefers-color-scheme` 解成 dark/light。
                 if let Some(v) = t.get("theme").and_then(|v| v.as_str()).map(str::trim) {
-                    if !matches!(v, "dark" | "light" | "red") {
+                    if !SUPPORTED_THEMES.contains(&v) {
                         return Err(CoreError::Auth(format!(
-                            "配置文件 {} 的 [ui].theme 仅接受 \"dark\" / \"light\" / \"red\", 实际为 \"{v}\"",
-                            p.display()
+                            "配置文件 {} 的 [ui].theme 仅接受 {}, 实际为 \"{v}\"",
+                            p.display(),
+                            SUPPORTED_THEMES
+                                .iter()
+                                .map(|s| format!("\"{s}\""))
+                                .collect::<Vec<_>>()
+                                .join(" / ")
                         )));
                     }
                     out.ui.theme = Some(v.to_string());
@@ -1572,10 +1588,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 034: 三个主题值都能读回; 外科式写盘保留注释; 模板正文必须是合法 TOML。
+    /// 034 / D14: 四个主题值都能读回; 外科式写盘保留注释; 模板正文必须是合法 TOML。
     #[test]
     fn test_ui_theme_roundtrip_and_template_valid() {
-        for theme in ["dark", "light", "red"] {
+        for theme in ["dark", "light", "red", "auto"] {
             let root = tmp_root("theme-ok");
             write(&root, &format!("[ui]\nlang = \"zh\"\ntheme = \"{theme}\"\n"));
             assert_eq!(load(&root).unwrap().ui.theme.as_deref(), Some(theme));

@@ -99,9 +99,10 @@ impl StrategyManifest {
         if m.params.iter().any(|p| p.key.is_empty()) {
             return Err(format!("清单 {} 有参数缺 key", m.id));
         }
-        if let Some(p) = m.params.iter().find(|p| p.name.is_empty()) {
-            return Err(format!("清单 {} 的参数 {} 缺中文名", m.id, p.key));
-        }
+        // N2 (2026-10-11): 参数中文名**允许留空**。用户是脚本的**使用者**, 不是作者 ——
+        // 他知道自己要调什么, 但不知道作者把那个旋钮叫什么, 不该被逼着起名。
+        // 留空时表现层回退显示键名(后端 `web::strategy_io::one_param_line`, 前端 `renderParams`)。
+        // 这里若继续拦截, "识别参数 → 保存清单" 就永远是 400, AI 调参数功能根本进不去。
         Ok(m)
     }
 
@@ -536,6 +537,20 @@ default_leverage = 2.0
     fn parse_rejects_empty_param_key() {
         let bad = MANIFEST.replace("key = \"start_price\"", "key = \"\"");
         assert!(StrategyManifest::parse(&bad).is_err());
+    }
+
+    /// N2 (2026-10-11): 参数中文名 / 说明留空**不再拒** —— 从脚本识别出来的参数本就没有名字与
+    /// 说明, 表现层回退显示键名。这条与 `parse_rejects_empty_param_key` 并排, 划出边界:
+    /// **键名必须有(那是对外契约), 名字可以没有(那只影响观感)**。
+    #[test]
+    fn parse_allows_blank_param_name_and_desc() {
+        let src = MANIFEST
+            .replace("name = \"开始价格\"", "name = \"\"")
+            .replace("desc = \"价格低于它才激活\"", "desc = \"\"");
+        let m = StrategyManifest::parse(&src).expect("留空的中文名/说明必须能解析(N2)");
+        let p = m.params.iter().find(|p| p.key == "start_price").unwrap();
+        assert!(p.name.is_empty(), "空中文名应原样保留, 不得被填上假数据");
+        assert!(p.desc.is_empty());
     }
 
     #[test]

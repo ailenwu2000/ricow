@@ -4,6 +4,7 @@
 //! 语义零改动); 无引擎改动。竞品对标 (Freqtrade hyperopt 简化版) —— 不做智能搜索与过拟合检测。
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 
 use clap::Args;
 use ricow_core::{CoreError, CoreResult};
@@ -12,7 +13,10 @@ use ricow_strategy::ConfigValue;
 use crate::commands::backtest::{parse_param, BacktestArgs, BacktestRunSpec};
 
 /// 单组合组合数护栏: 每组 = 一次全窗口回测, 超 100 组拒绝 (提示收窄网格)。
-const MAX_COMBOS: usize = 100;
+///
+/// C8: Web 的多维寻优端点**复用这一个常量**(`web::backtest_jobs`), 不另设一份 ——
+/// 否则"CLI 拒 101 组、网页放行 101 组"这种口径分叉迟早发生。
+pub(crate) const MAX_COMBOS: usize = 100;
 
 #[derive(Args)]
 pub struct OptimizeArgs {
@@ -141,23 +145,49 @@ struct ScoreRow {
     trades: u64,
     max_drawdown: rust_decimal::Decimal,
     sharpe: Option<f64>,
+    /// 054 T33: 年化收益(%) —— 报告里**本来就有**(`BacktestReport.annual_return`)。
+    ///
+    /// 此前 `--metric annual_return` 实际按 net_pnl 排序(见旧注释: "未持久化在报告中"),
+    /// 那是名不副实: 用户以为在按年化挑参数, 拿到的其实是"绝对赚得最多"的那组 ——
+    /// 而这两者在**不同窗口长度**下会给出不同的最优解。现在真的按年化排。
+    annual_return: Option<f64>,
     win_rate: f64,
     error: Option<String>,
 }
 
+/// 打分取值(纯函数, 便于单测锁住三个指标各自的排序)。
+///
+/// 缺值一律退成 `-inf` 而不是 0: 0 会排在"真的赚了 0"前面, 把算不出来的组合顶成最优。
 fn metric_of(r: &ScoreRow, metric: &str) -> f64 {
     match metric {
         "sharpe" => r.sharpe.unwrap_or(f64::NEG_INFINITY),
-        // net_pnl 也接受 annual_return 名义 (报告字段省略, 用净盈亏等价排序场景不存在 ——
-        // annual_return 未持久化在 BacktestReport 中, 按 net_pnl 排序并提示)。
-        "annual_return" | "net_pnl" => {
-            r.net_pnl.to_string().parse::<f64>().unwrap_or(f64::NEG_INFINITY)
-        }
+        "annual_return" => r.annual_return.unwrap_or(f64::NEG_INFINITY),
+        "net_pnl" => r.net_pnl.to_string().parse::<f64>().unwrap_or(f64::NEG_INFINITY),
         _ => f64::NEG_INFINITY,
     }
 }
 
+/// CLI 入口: 结果打到标准输出。
 pub async fn run(args: OptimizeArgs) -> CoreResult<()> {
+    run_optimize(args, &mut std::io::stdout()).await
+}
+
+/// 一行输出(统一出口, 便于 AI 工具把结果收成字符串而不必去抓 stdout)。
+fn w<W: Write>(sink: &mut W, line: String) -> CoreResult<()> {
+    writeln!(sink, "{line}")
+        .map_err(|e| CoreError::InvalidArgument(format!("写出优化结果失败: {e}")))
+}
+
+/// 寻优主体(054 T33: 输出可重定向 —— CLI 打 stdout, AI 工具收成字符串)。
+///
+/// 与 [`run`] **同一条代码路径**: AI 看到的打分表与用户在终端看到的逐字一致,
+/// 不另写一份"给模型看的摘要" —— 两份口径一旦分叉, 最难查的是"模型说的最优和 CLI 不一样"。
+/// `W: Send` 是必需的: AI 工具在 `Box::pin(async move)` 里跨 await 持有 sink,
+/// 而工具 future 要求 `Send` —— 用 `dyn Write`(不带 Send)会在那里编译不过。
+pub(crate) async fn run_optimize<W: Write + Send>(
+    args: OptimizeArgs,
+    sink: &mut W,
+) -> CoreResult<()> {
     let metric = args.metric.as_str();
     if !matches!(metric, "net_pnl" | "sharpe" | "annual_return") {
         return Err(CoreError::InvalidArgument(format!(
@@ -208,7 +238,15 @@ pub async fn run(args: OptimizeArgs) -> CoreResult<()> {
             combos.len()
         )));
     }
-    println!("优化: {} — {} 组组合 ({}, 指标 {metric})", args.strategy, combos.len(), args.search);
+    w(
+        sink,
+        format!(
+            "优化: {} — {} 组组合 ({}, 指标 {metric})",
+            args.strategy,
+            combos.len(),
+            args.search
+        ),
+    )?;
 
     // 逐组回测 (同一窗口; 失败组合记录不中断)。
     let mut rows: Vec<ScoreRow> = Vec::new();
@@ -252,6 +290,7 @@ pub async fn run(args: OptimizeArgs) -> CoreResult<()> {
                     trades: r.total_trades,
                     max_drawdown: r.max_drawdown,
                     sharpe: r.sharpe,
+                    annual_return: r.annual_return,
                     win_rate: r.win_rate,
                     error: None,
                 }
@@ -262,19 +301,23 @@ pub async fn run(args: OptimizeArgs) -> CoreResult<()> {
                 trades: 0,
                 max_drawdown: Default::default(),
                 sharpe: None,
+                annual_return: None,
                 win_rate: 0.0,
                 error: Some(e.to_string()),
             },
         };
-        println!(
-            "  [{}/{}] {} → {}",
-            i + 1,
-            combos.len(),
-            combo_key(combo),
-            row.error.as_deref().map(|e| format!("失败: {e}")).unwrap_or_else(|| {
-                format!("net_pnl={} trades={} dd={}", row.net_pnl, row.trades, row.max_drawdown)
-            })
-        );
+        w(
+            sink,
+            format!(
+                "  [{}/{}] {} → {}",
+                i + 1,
+                combos.len(),
+                combo_key(combo),
+                row.error.as_deref().map(|e| format!("失败: {e}")).unwrap_or_else(|| {
+                    format!("net_pnl={} trades={} dd={}", row.net_pnl, row.trades, row.max_drawdown)
+                })
+            ),
+        )?;
         rows.push(row);
     }
 
@@ -284,33 +327,39 @@ pub async fn run(args: OptimizeArgs) -> CoreResult<()> {
         let fb = b.error.is_some() as u8;
         fa.cmp(&fb).then(metric_of(b, metric).total_cmp(&metric_of(a, metric)))
     });
-    println!(
-        "\n{:<40} {:>14} {:>7} {:>12} {:>8} {:>7}",
-        "参数组合", "净盈亏", "成交数", "最大回撤", "夏普", "胜率%"
-    );
-    println!("{}", "-".repeat(92));
+    w(
+        sink,
+        format!(
+            "\n{:<40} {:>14} {:>7} {:>12} {:>8} {:>7}",
+            "参数组合", "净盈亏", "成交数", "最大回撤", "夏普", "胜率%"
+        ),
+    )?;
+    w(sink, "-".repeat(92))?;
     for r in &rows {
         let combo = combo_key(&r.combo);
         match &r.error {
-            Some(e) => println!("{:<40} 失败: {e}", truncate(&combo, 38)),
-            None => println!(
-                "{:<40} {:>14} {:>7} {:>12} {:>8} {:>7.1}",
-                truncate(&combo, 38),
-                r.net_pnl,
-                r.trades,
-                r.max_drawdown,
-                r.sharpe.map(|s| format!("{s:.2}")).unwrap_or_else(|| "-".into()),
-                r.win_rate * 100.0
-            ),
+            Some(e) => w(sink, format!("{:<40} 失败: {e}", truncate(&combo, 38)))?,
+            None => w(
+                sink,
+                format!(
+                    "{:<40} {:>14} {:>7} {:>12} {:>8} {:>7.1}",
+                    truncate(&combo, 38),
+                    r.net_pnl,
+                    r.trades,
+                    r.max_drawdown,
+                    r.sharpe.map(|s| format!("{s:.2}")).unwrap_or_else(|| "-".into()),
+                    r.win_rate * 100.0
+                ),
+            )?,
         }
     }
 
     // 最优行 + 写回。
     let best = rows.iter().find(|r| r.error.is_none());
     match best {
-        None => println!("\n全部组合失败, 无最优可写回"),
+        None => w(sink, "\n全部组合失败, 无最优可写回".to_string())?,
         Some(b) => {
-            println!("\n最优 (按 {metric}): {}", combo_key(&b.combo));
+            w(sink, format!("\n最优 (按 {metric}): {}", combo_key(&b.combo)))?;
             if args.write_back {
                 let pairs: HashMap<String, String> =
                     b.combo.iter().map(|(k, v)| (k.clone(), config_value_toml(v))).collect();
@@ -322,10 +371,16 @@ pub async fn run(args: OptimizeArgs) -> CoreResult<()> {
                 std::fs::write(&toml_path, new_text)
                     .map_err(|e| CoreError::InvalidArgument(format!("写 TOML 失败: {e}")))?;
                 for (k, (old, new)) in &changes {
-                    println!("  写回 {k}: {old} → {new}");
+                    w(sink, format!("  写回 {k}: {old} → {new}"))?;
                 }
             } else {
-                println!("提示: 加 --write-back 把最优参数写回 strategies/{}.toml", args.strategy);
+                w(
+                    sink,
+                    format!(
+                        "提示: 加 --write-back 把最优参数写回 strategies/{}.toml",
+                        args.strategy
+                    ),
+                )?;
             }
         }
     }
@@ -437,6 +492,41 @@ mod tests {
                 vec![ConfigValue::Float(10.0), ConfigValue::Float(20.0), ConfigValue::Float(30.0)],
             ),
         ]
+    }
+
+    /// 054 T33: 三个指标必须**各自**排序正确 —— 尤其 `annual_return` 不能再退化成 net_pnl。
+    ///
+    /// 构造三行: A 净盈亏最高、B 年化最高、C 夏普最高。三个指标各排一次, 第一名必须分别是
+    /// A / B / C。若 annual_return 仍按 net_pnl 排, 第二条断言就会红。
+    #[test]
+    fn test_metric_of_sorts_by_each_metric_independently() {
+        let row = |net: &str, ar: Option<f64>, sh: Option<f64>| ScoreRow {
+            combo: Vec::new(),
+            net_pnl: net.parse().unwrap(),
+            trades: 1,
+            max_drawdown: Default::default(),
+            sharpe: sh,
+            annual_return: ar,
+            win_rate: 0.0,
+            error: None,
+        };
+        let a = row("300", Some(5.0), Some(0.5)); // 净盈亏最高
+        let b = row("100", Some(90.0), Some(0.7)); // 年化最高
+        let c = row("50", Some(1.0), Some(3.0)); // 夏普最高
+        let best = |m: &str| {
+            [&a, &b, &c]
+                .iter()
+                .map(|r| metric_of(r, m))
+                .enumerate()
+                .fold((0, f64::NEG_INFINITY), |acc, (i, v)| if v > acc.1 { (i, v) } else { acc })
+        };
+        assert_eq!(best("net_pnl").0, 0, "net_pnl 应挑 A: {:?}", best("net_pnl"));
+        assert_eq!(best("annual_return").0, 1, "annual_return 应挑 B: {:?}", best("annual_return"));
+        assert_eq!(best("sharpe").0, 2, "sharpe 应挑 C: {:?}", best("sharpe"));
+        // 缺值退 -inf, 不得变成 0 而顶掉真实的最优。
+        let none = row("1", None, None);
+        assert_eq!(metric_of(&none, "annual_return"), f64::NEG_INFINITY);
+        assert_eq!(metric_of(&none, "sharpe"), f64::NEG_INFINITY);
     }
 
     #[test]

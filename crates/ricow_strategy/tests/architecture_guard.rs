@@ -107,8 +107,53 @@ fn collect_rs(dir: &str, out: &mut Vec<String>) {
 }
 
 /// 计算一行的大括号净增量 (`{` 数 − `}` 数), 用于定位块边界。
+///
+/// 数之前先跳过**字符串/字符字面量与行注释** —— 朴素的 `matches('{').count()` 会被
+/// `format!("{")` 这类字面量骗到, 让 `#[cfg(test)]` 块"永不结束", 后面的生产代码被整段吞掉。
+/// 见本文件末尾 `production_lines_survives_braces_inside_string_literals` 的回归测试。
 fn brace_delta(line: &str) -> i32 {
-    line.matches('{').count() as i32 - line.matches('}').count() as i32
+    let b: Vec<char> = line.chars().collect();
+    let mut open = 0i32;
+    let mut close = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            '"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == '"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '\'' => {
+                // char 字面量(`'{'` / `'\n'` / `'x'`)整体跳过; 生命周期标注 `&'a` 不匹配此形态。
+                let close_at = if i + 1 < b.len() && b[i + 1] == '\\' { i + 3 } else { i + 2 };
+                if close_at < b.len() && b[close_at] == '\'' {
+                    i = close_at + 1;
+                } else {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < b.len() && b[i + 1] == '/' => break,
+            '{' => {
+                open += 1;
+                i += 1;
+            }
+            '}' => {
+                close += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    open - close
 }
 
 /// 生产代码行 = 跳过 `#[cfg(test)]` 标记的项(测试模块/测试辅助方法, 测试用策略参数名合法)。
@@ -199,6 +244,30 @@ fn cli_must_not_read_or_write_strategy_params() {
             assert_no_strategy_param(&params, f, line, "规则 B");
         }
     }
+}
+
+/// 回归护栏(2026-10-18 假绿排查): `production_lines` 靠花括号配平跳过 `#[cfg(test)]` 块,
+/// 而朴素地数 `{` / `}` 会被**字符串字面量里的花括号**骗到 —— 测试块里只要有一句
+/// `format!("{")`, `skip_depth` 就再也回不到 0, 于是**它后面的整段生产代码被静默吞掉**,
+/// 守卫从此对那个文件失明。而且这是"越有测试越容易失明": 测试写得越多越可能踩到。
+///
+/// 同一种错法在 `scripts/ci_grep_gates.sh` 的 `non_test_lines` 里也有一份(已一并修)。
+#[test]
+fn production_lines_survives_braces_inside_string_literals() {
+    let src = concat!(
+        "#[cfg(test)]\n",
+        "mod t {\n",
+        "    fn f() -> String { format!(\"{\") }\n",
+        "}\n",
+        "fn prod() { let x = get_f64(\"atr_mult\"); }\n"
+    );
+    let prod = production_lines(src).join("\n");
+    assert!(
+        prod.contains("fn prod()"),
+        "cfg(test) 块里字符串中的花括号把后面的生产代码吞掉了(漏扫 = 架构守卫假绿): {prod}"
+    );
+    // 顺带钉住另一半: 测试块自身仍然要被跳过(别把修法做成"干脆不跳了")。
+    assert!(!prod.contains("mod t"), "cfg(test) 块本身必须仍被跳过: {prod}");
 }
 
 /// 清单参数键 == 同名 Lua 读取键(防清单与 Lua 漂移, FR-018)。

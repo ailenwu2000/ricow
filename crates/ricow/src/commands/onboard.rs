@@ -523,6 +523,9 @@ async fn probe(provider_id: &str, base_url: &str, model: &str, key: &str) -> Cor
         base_url: base_url.to_string(),
         model: model.to_string(),
         max_turns: 1,
+        // 055 B5: 连通校验就该比正常问答快得多 —— 传输层超时与外层 tokio 超时取同一个值,
+        // 免得"到底等 20 秒还是等 300 秒"在两处各说一套。
+        timeout_secs: PROBE_TIMEOUT.as_secs(),
     };
     match tokio::time::timeout(PROBE_TIMEOUT, provider::probe(&resolved, key)).await {
         Ok(r) => r,
@@ -587,6 +590,7 @@ mod tests {
                 max_turns: None,
                 api_key: api_key.map(|s| s.to_string()),
                 allow_custom_base_url: None,
+                timeout_secs: None,
             },
             exchange: ExchangeSection::default(),
             market: MarketSection::default(),

@@ -17,7 +17,7 @@ ricow CLI (clap)
 ricow_engine (headless 核心: 命令分发 / 回测 / 确认通道)
       │
       ▼
-ricow_strategy (Lua 沙箱 + ctx.* API + exec.* 组件 + 指标 / 回测 / SQLite / 固定 100/s 护栏)
+ricow_strategy (Lua 沙箱 + ctx.* API + exec.* 组件 + 指标 / 回测 / SQLite / 固定工程护栏 order_guard: 频率 100/s + 单笔名义 ≤ 权益×10)
       │
       ▼
 ricow_core: Exchange trait ─► ricow_binance
@@ -30,7 +30,7 @@ ricow_core: Exchange trait ─► ricow_binance
 |:--|:--|
 | ricow_core | 核心类型(Order/Position/Balance/Kline…)+ Exchange trait |
 | ricow_binance | Binance 现货 REST/HMAC/WS (place_order/cancel/account) + USDT-M 公共数据源 (`FuturesDataClient`: fapi K 线 / 首档 MMR 表) + **fapi 签名交易客户端 `FuturesClient`** (下单/账户/持仓/杠杆/双向持仓, 2026-09-04 testnet 联调新增; 域名 RICOW_BN_BASE_URL / RICOW_FAPI_BASE_URL 可配 demo 测试网) |
-| ricow_strategy | 策略引擎: Lua 沙箱 / ctx 与 exec 注册 / 指标(ta)/ 回测 / PnL / SQLite / **固定 100 单·秒⁻¹ 护栏 `order_guard`(2026-09-16 019-R5: 原 `risk.rs` 四条静态限额与装配器已删除)** |
+| ricow_strategy | 策略引擎: Lua 沙箱 / ctx 与 exec 注册 / 指标(ta)/ 回测 / PnL / SQLite / **固定工程护栏 `order_guard` = 下单频率 100 单·秒⁻¹ + 单笔名义 ≤ 报价资产权益×10**(两条都是固定常量不进配置面; 只拦数量级笔误不拦"策略就是要重仓"。2026-09-16 019-R5 删除原 `risk.rs` 四条静态限额与装配器; **名义上限为 057-P0-D 新增, 只在 Dry Run 与实盘装配 —— 回测无实时权益基准故不装**) |
 | ricow_engine | headless 核心: Engine 命令分发 / backtest_runner(单标的 + 组合) / confirm(preview+approve)/ loader / market / **美股层 `nasdaq`(Nasdaq 日线客户端) / `us_tickers`(bStock↔美股映射, 70 只快照) / `market_class`(bStock 现货池识别, 通用能力保留: 当前无内置消费者)** |
 | ricow | 二进制 `ricow`: clap 子命令分发 + **AI 助手 `ai/`(019: 提示词、工具白名单 L0 只读 + L1 虚拟、审批门 `ToolGuard`; 会话缝 `ai/session.rs`(`ChatSession` + `SessionSink`, 零 stdio); R3/R4 对话内确认状态机 `ai/confirm.rs` 7 动作)** + **Web UI `web/`(025: axum + SSE, 只绑 `127.0.0.1`, 一次性 token; 036 起按端点族拆文件 —— 骨架与装配在 `mod.rs`(服务 `bind`/`router`/`serve`、`Hub`/`WebState`/`WebError`), 端点族各归 `assets`/`auth`(token+来源门)/`sessions`/`settings`/`trades`/`logs`/`strategies` 各自带 `routes()` 与测试, 共享测试脚手架 `test_support.rs`(仅 cfg(test)), `strategy_io`/`runs` 目录化测试体下沉 `tests.rs`)** + 首次向导 `commands/onboard.rs` + 单一配置文件读写 `commands/config_file.rs`(含 `set_values` 白名单 9 键) |
 
@@ -56,7 +56,8 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - 停机 = 向子进程 stdin 写 `stop`(跨平台一致, 不依赖信号语义); 等待上限 30s, 超时如实报错且**不静默强杀**
 - 实例视图 = daemon 运行中实例 ∪ 台账(`run/<name>.json`, 含上次退出码/原因) ∪ 已部署清单(`strategies/*.toml`)
 - 启动方式: `std::process`(实测 `tokio::process` 在启动器退出时会带走子进程); daemon 自后台化用 `process_group(0)`(unix) / `creation_flags(DETACHED_PROCESS|CREATE_NO_WINDOW)`(windows), 均在 `forbid(unsafe_code)` 下可用
-- 不再注册 OS 服务(systemd/launchd/SCM), 无开机自启与自动重启(`packaging/locus@.service` 已删除)
+- 不注册 OS 服务(systemd/launchd/SCM), 无开机自启(`packaging/locus@.service` 已删除)。
+  **注意区分两件事**: 这里说的是"不由 OS 拉起进程"; **进程内**的崩溃自动重启是 038 P1-C 的 `[supervisor].restart_policy`(默认 `none` = 不重启, 见 §六 / §七), 由 daemon 自己按退出码决定是否重拉, **不是开机自启**
 - 运行状态与数据落本地 SQLite(`ricow.db`); 日志落 `logs/<name>.log`(启动时 >10MB 轮转 `.log.1`)
 - 实盘运行器已落地(011, 2026-09-13): `Engine::run_live` 与 `run_dry_run` **并列**(账户事实源与停机语义不同, 不合并); 启动装配账户快照 + 交易所过滤器 + 时钟预检 → 双流(盘口 + 用户流) → 成交回写落库 → 停机清理(停消费 → `on_stop` → 撤单兜底 → 可选平仓 → 残留复查, 幂等)
 - 合约实盘已落地(012, 2026-09-13): `BnFuturesExchange` 实现 `Exchange`(REST + `fstream` WS 盘口/用户流), 引擎按 `market` 分派装配与持仓语义(one-way / hedge), 停机兜底平仓按市场传 `reduceOnly` / `positionSide`; 时钟预检按市场取数(现货/合约服务器时间不同步, 实测差 1.5~1.9s)
@@ -75,10 +76,11 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   - **回测/实盘对称**: 同一份策略代码在回测与实盘零改动可运行, 两路径都走「声明 → 供给 → 读」, 不允许为任一路径在引擎里硬编码。
   - **on_init 幂等约定**: 声明阶段(`on_init` 里的 `need_klines`)只依赖 config, 不依赖 balance/K 线; 回测装配会先跑一次 `on_init` 收集声明再拉数, 故 `on_init` 必须可重复调用。
 - **exec.\*** 执行组件(引擎内置 Rust 实现, 加载时注册全局表, 脚本内可覆盖): `levels` / `pullback_triggered` / `detect_quote` / `ticks_per` / `slice_due` / `side_order`
-- 内置示例(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/strategies/catalog.rs`; 031 起内置与用户策略统一由 catalog 管理, 现货/合约分 `spot/`/`futures/` 目录):
+- 内置示例**共 6 个**(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/strategies/catalog.rs` 的 `BUILTIN`; 031 起内置与用户策略统一由 catalog 管理, 现货/合约分 `spot/`/`futures/` 目录。**逐条说明以 `catalog.rs` 与各 `.toml` 清单为准**):
   - `strategies/spot/linear_position_grid.lua` — 现货线性仓位网格(051): 仓位 = 币市值÷总权益随价格线性分布(`[p_low,p_high]` 内 `w(p)` 线性, 区间外钳制); 逐步建仓(低于 `start_price` 分批市价买) → 事件模型限价网格(ref±Δ 两侧挂单, 任一成交全撤重挂, Δ=max(`atr_mult×ATR`, `min_spacing_pct×价格`)) → 可选动态止盈; 落位恒按当前总权益实时计算(无沉淀资金); 出界 `out_of_range`(exit 撤单停机 / wait 暂停等回界)
-  - `strategies/futures/` — 合约网格系列: `paired_grid_futures_long`(配对做多) / `shannon_hedge_grid_futures`(对冲网格) / `shannon_grid_futures`(纯多头) / `shannon_neutral_grid_futures`(中性) / `shannon_short_grid_futures`(做空)
+  - `strategies/futures/` — 合约网格系列 5 个: `paired_grid_futures_long`(配对做多) / `shannon_hedge_grid_futures`(对冲网格) / `shannon_grid_futures`(纯多头) / `shannon_neutral_grid_futures`(中性) / `shannon_short_grid_futures`(做空)
   - ~~现货 `shannon_spot_grid` / `paired_grid` / `shannon_grid` / `shannon_virtual_grid`~~ — **已于 2026-10-09 删除**(现货只保留 linear_position_grid)
+  - **内置清单的必填参数无默认值** —— 例如 `linear_position_grid` 的 `start_price` / `p_low` / `p_high` 是 `required = true`, 不显式给值会 `[FATAL] 缺少必填参数` 停机 0 成交。直接跑内置策略前先看该策略 `.toml` 的 `params` schema。
   - ~~`strategies/builtin/bs_momentum.lua`~~ — **已于 2026-09-11 删除** (真实 bStock 成交轨期望 ≈0:
     spot 91 天 每 bar −0.0198% / futures 220 天 +0.0367%; 七年 R1 数字含幸存者偏误不作证据);
     同批删除的还有 `bs_intraday_top5.lua`(日内 Top5, 成本算术否决)。证据见 specs/research/。
@@ -93,9 +95,9 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 ## 五、CLI
 
-命令集(**以 `ricow --help` 实测为准**, 2026-10-06):
-`start [--demo]` / `stop [--close-all]` / `restart` / `list` / `status [name]` / `info` / `fills` / **`exposure`**(037) / **`align`**(038) / `logs` / `run [--live|--demo]` /
-`backtest` / `ticker` / `orderbook` / `pairs [--market] [--all]` / `create` / `approve` / `deploy` / `db` / `daemon {start|stop|status|run}` /
+命令集(**以 `ricow --help` 实测为准**, 2026-10-18):
+`start [--demo]` / `stop [--close-all]` / **`kill [--close-all]`**(057-G4: **紧急按住全部** —— 停止所有运行中实例但 **daemon 继续活着**; 与 `Request::Shutdown` 严格区分(那个停完连 daemon 一起退)、与 `stop --close-all` 分工不同(那个平单个实例的仓, 本命令按全部实例); 串行逐个 `self.stop`, `close_all` 默认 false, 确认走逐字短语 `确认停止全部` / `确认停止全部并平仓` —— 裸 `y` 不认; `stopped == 0` **不套"已全部停止"头衔**) / `restart`(056: **先判后停** —— 调闸不过就不动现有实例, 避免被拒策略"先停掉再拒绝启动"、带未平仓敞口静默下线) / `list` / `status [name]` / `info` / `fills` / **`exposure`**(037) / **`align`**(038) / `logs` / `run [--live|--demo]` /
+`backtest` / **`optimize`**(C8: 多维参数寻优, 与 Web 端点共用同一展开/护栏) / `ticker` / `orderbook` / `pairs [--market] [--all]` / `create` / **`new`**(按内置模板脚手架生成新策略) / `approve` / `deploy` / `db` / `daemon {start|stop|status|run}` /
 **`ai`**(019: 内置 AI 助手, 交互 / 单次 / `--plain`)/ **`agent-kit`**(019: `ricow agent-kit [--install [目录]]` 生成给外部 agent 的手册 —— AGENTS.md / SKILL.md / CLAUDE.md / lua-api.md, 与内置 AI 同源)/ **`web`**(025: Web UI 模式 —— 启动内置网页, 浏览器里完成全部对话与操作); `mcp` **不做**(2026-09-15 定案)。
 
 **裸入口(019 R4)**: `ricow` 不带子命令 → 直接进对话(`commands::chat`); 缺 AI key 且非本地 ollama 时先走首次向导(`commands::onboard`: 供应商选择 → 静默录入密钥 → 可选连通校验 → 外科式写回 `ricow.toml`), 币安凭据可跳过后用 `/keys demo` 补录。非 tty 一律双语报错 + 打印配置路径, exit 1(不静默降级)。原 clap 子命令全部保留, 变成同一 `ChatSession` 的薄壳。对话内斜杠命令: `/keys [ai|demo|live]` 查看/静默录入密钥(只回显尾 4 位)、`/market [bstock|all]` 查看/切换交易对视野(`[market] show_all_pairs`)。
@@ -113,7 +115,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - **前端脚本拆分(仍无构建链)**: 三件套拆为 `common.js`(API/双语/工具) + `router.js`(hash 路由) + 五视图模块(`chat.js` / `markets.js` / `strategies.js` / `runs.js` / `settings.js`) + `app.js`(装配), 全部 `include_str!` 编译期嵌入; K 线图用 **lightweight-charts UMD 内嵌**(无 CDN 依赖); 每份脚本 URL 仍由服务端按 token 回填。浏览器持久存储依旧零写入(SC-011 静态扫描锁死)。此后新增/变动见下文分节: `keys.js`(**033** 密钥管理页)、`strategies.js` 拆为外壳 + 三份子文件(**042**)、`markdown.js`(**044** 受限 Markdown → DOM 渲染器, 供助手气泡使用)。
 - **资产单一清单 + 开发回路(041, 2026-10-07)**: 全部可服务资产收敛为 `web/assets.rs` 的模块级 `const ASSETS`(文件名 / Content-Type / 内嵌副本) —— **运行时路由表与 `--web-assets-dir` 的磁盘白名单都由它派生**, 消除了最后一处手抄点(历史事故: 033 新增 `keys.js` 时三处手写清单**一处都没追加**, 存储红线 / 只读红线 / 首页对齐三项断言**集体漏扫且全绿**)。发布形态不变(**内嵌单二进制**); `ricow web --web-assets-dir <DIR>` 时改从**同一批文件名**热读磁盘 —— 改一行 JS 刷新即见, 免 `cargo build` 全量重编。安全形状: 磁盘寻址一律 `规范化目录.join(编译期常量名)`, **请求里的路径从不参与拼路径** → 无 `..` 穿越、无任意文件读取(结构上不可能, 而非过滤攻击串); 目录在**启动时**校验(存在 / 是目录 / 含 `index.html`), 否则 exit 1 并给可操作文案; 磁盘模式**缺文件 → 500 并点名文件**, **不静默退回内嵌**(同 040 的诚实性口径); `Cache-Control: no-store` **只加在磁盘来源**(内嵌来源行为一字未改, 有意的不对称); 走**同一批路由与同一道 token 门**, 不新开端口 / 不新增放行口。纪律扫描口径不放松 —— 扫描对象仍是内嵌副本, 而磁盘目录按约定就是下一次 `cargo build` 要内嵌的同一批文件。
-- **新增只读/写端点**(全部仍在 token 中间件之后): 密钥与配置 `GET/POST /api/config/keys`(密钥静默写入 ricow.toml 只回显尾 4 位; 通用配置走 `updates` 数组 —— 市场视野开关 `market.show_all_pairs` 同端点); 行情 `GET /api/markets*`(免 key 公共行情 + 盘口 + K 线); 策略 `GET/POST /api/strategies`(POST = 创建/覆盖保存: 编译门禁 + 运行中 409 + 保留名/互前缀拒绝)、`GET .../source`(Lua/TOML 原文)、`POST .../ai-edit`(LLM 草稿, 编译失败 400 带行号)、`POST /api/backtest`(202 拿 job_id 后台跑 CLI 同一内核)+ `GET /api/backtest/{job_id}` 轮询; 运行 `GET /api/runs`、`POST /api/strategies/{id}/{status|start|stop}`(启停复用 CLI 同一内核 `commands::ctrl`, daemon 自举幂等)、`GET /api/logs/{name}/stream`(SSE 行内日志, 与对话视图各一条独立流); **`GET /metrics`**(038: Prometheus 只读指标, 不新开端口, 见 §六「工程健壮性加固」)。
+- **新增只读/写端点**(全部仍在 token 中间件之后; 完整清单以 `web/mod.rs` 的 `.route()/.merge()` 为准): 密钥与配置 `GET/POST /api/config/keys`(密钥静默写入 ricow.toml 只回显尾 4 位; 通用配置走 `updates` 数组 —— 市场视野开关 `market.show_all_pairs` 同端点); 语言/主题 `GET/POST /api/lang`、`GET/POST /api/theme`(settings.rs); 行情 `GET /api/markets`(免 key 公共行情) + `GET /api/markets/{symbol}/orderbook` + `GET /api/markets/{symbol}/klines` + `GET /api/markets/{symbol}/stream`(040: SSE 实时, 见 §五 040 小节); 策略 `GET/POST /api/strategies`(GET = 清单, POST = 创建/覆盖保存: 编译门禁 + 运行中 409 + 保留名/互前缀拒绝; **052** 起可带 `copy_from=<源 id>` —— 复制/模板新建时把源策略的**参数清单**一并派生成副本自己的清单, 与 `overwrite=true` 互斥)、`GET /api/strategies/{id}`(单条详情)、`DELETE /api/strategies/{id}`(**N1**: 删用户策略**本体** —— 实例 TOML + 市场子目录脚本 + 清单 + 同目录 `*.bak`; 候选判据与 CLI/对话的删除**同一份** `commands::strategy_file_candidates`(031 之后脚本在市场子目录, 只删根目录 `.toml` 会留下孤儿文件 —— 这正是旧实现的实际缺陷); 内置 → 409 `reserved`、运行中 → 409 `running`; **回测历史与台账保留**, 前端确认框如实写明)、`GET .../source`(Lua/TOML 原文)、`POST .../ai-edit`(LLM 草稿, 编译失败 400 带行号; **052** 起 `mode:"params"` 改走「自然语言 → 已声明参数的取值」分支, 回 `{params}` 且一行代码都不碰, 缺省仍是 `code`; **N3** 起该分支可带 `history`(**前端持有的纯文本流水**, 后端按 4000 字上限保留最近部分 —— 服务端不引入会话状态), 回包多出 `advice`(为什么这么改 / 逐项理由 / 风险)与 `changed`(键 · 中文名 · 旧→新 · 是否只是清单默认值), `params` 仍是**整组**值; `code` 模式**仍是单轮**, 理由见 `strategy_io::ai_edit_strategy`)、`POST .../ai-assess`(**N3**: 吃"改了什么" + 同一窗口下改前/改后两份 `/api/backtest` 的 `metrics` 原件, 只把**实测**指标讲成人话; **不跑回测、不落盘** —— 回测仍走既有作业端点, 由前端串"跑改前 → 跑改后 → 问影响"三步; 没有改动 / 指标不是对象 / 无任何可比字段一律 400)、`POST .../manifest`(清单参数 schema 编辑, P2-8)、`POST /api/strategies/extract-params`(**052**: 无状态静态扫描 —— 只吃请求体里的 Lua 源码, 回 `{params:[{key,type,default?}]}` 参数骨架, 不读盘/不落盘/不碰 AI)、`POST /api/strategies/ai-name-params`(**N2-C**: 无状态 —— 吃编辑器里的 Lua 草稿, 待命名的**键集合由静态提取决定**(不让模型自己列键 —— 那会多出编造的键), AI 只按脚本文本给这些键起中文名与写一句说明, 代码里看不出用途的必须如实说"看不出"; 不落盘)、`POST /api/strategies/ai-generate`(P0-3: 结构化意图 → AI 生成 → 编译门禁, 不落盘)、**`GET /api/strategies/risk-profiles`**(**054 P2**: 风险档位数字表, 权威定义 `web/strategy_io/risk_profile.rs` **单点**, 前端下拉与后端保存读同一份); 回测 `POST /api/backtest`(202 拿 job_id 后台跑 CLI 同一内核)+ `GET /api/backtest/{job_id}` 轮询 + `POST /api/backtest/sweep`(P2-7 单参数网格)+ `POST /api/backtest/optimize`(C8 多维笛卡尔积, 复用 CLI `ricow optimize` 展开与护栏); 交易面板只读 `GET /api/trades/{fills,orders,positions,pnl}`(026); 运行 `GET /api/runs`、`GET /api/strategies/{id}/status`(单实例状态, **GET**)、`POST /api/strategies/{id}/start`、`POST /api/strategies/{id}/stop`(启停复用 CLI 同一内核 `commands::ctrl`, daemon 自举幂等)、**`POST /api/runs/kill`**(057-G4: 跨实例紧急按住, 回 `{stopped, report}`; 与 CLI `ricow kill` 同一内核, **`confirm` 字段必须逐字匹配** `确认停止全部` / `确认停止全部并平仓`, 裸 `y` 不认); **058 起有 Web 端入口** —— 运行视图表头 `#rn-kill-all` 按钮(`runs.js`), 弹窗内逐字输入同一短语, 勾「同时撤单平仓」后短语变长为 `确认停止全部并平仓` 且输入框清空)、`POST /api/risk-ack`(风险披露确认)、`GET /api/logs`(策略日志清单)、`GET /api/logs/{name}/tail`(尾部快照)、`GET /api/logs/{name}/stream`(SSE 行内日志, 与对话视图各一条独立流); **`GET /metrics`**(038: Prometheus 只读指标, 不新开端口, 见 §六「工程健壮性加固」)。
 - **Web 渠道确认规则(宪法 1.2.0, FR-027~029)**: 页面直控写操作的确认 = 页面显式交互(确认对话框/表单提交); live 不降级 —— 启动模态逐字输 `确认实盘 <策略名>`, 首次 live 另须风险披露确认(逐字输 `确认风险`, 落盘 `risk_ack.json`), daemon 侧门禁复用不变。
 
 **密钥管理页(033, 2026-10-02)**: 密钥由「唯一一份生效值」升级为**带别名的密钥环(vault)** —— 左侧导航新增第 6 个一级视图「密钥」(`#keys`, 位于「运行」与「设置」之间), 视图脚本 `web/assets/keys.js`(仍 `include_str!` 编译期嵌入, 无构建链)。
@@ -127,10 +129,12 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 **UI 主题 + 现代字体 + 历史消息折叠(034, 2026-10-03)**: 纯前端 + 一个只读配置项, 无新表、无新确认渠道。
 
-- **主题三选一**: 顶栏(语言钮旁) `#theme-select` 下拉, `dark`(默认)/`light`(白色)/`red`(红色);
+- **主题四选一**: 顶栏(语言钮旁) `#theme-select` 下拉, `dark`(默认)/`light`(白色)/`red`(红色)/`auto`(跟随系统, D14);
   值存 `ricow.toml` 的 `[ui].theme`(`UiSection.theme`, 白名单 `UI_KEYS`/`WRITABLE` 各加一项, 非法值硬失败),
   新端点 `GET/POST /api/theme`(镜像 `/api/lang`, 但**不**给会话线程送控制行 —— 纯外观);
   `common.js` 的 `R.applyTheme` 切 `<html data-theme>` 并广播 `ricow:theme` 事件。
+  `auto` 存的是**偏好**, 实际生效的 `data-theme` 由 `matchMedia("(prefers-color-scheme: light)")` 解出
+  —— 故 CSS 侧仍是三份变量, 系统换色时只重解一次, 不新增第四份配色。
 - **CSS 全面变量化**: `:root` = 深色兜底, `[data-theme="light"]` / `[data-theme="red"]` 各覆盖一份变量;
   034 收敛了此前写死的 20 处颜色(`#1d232b`×16 / `#06231b`×4 / 7 处 rgba)为新变量
   `--raised / --on-accent / --accent-soft(-2) / --danger-border / --overlay / --raise-1/2`,
@@ -164,6 +168,8 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 **对话 Markdown + 日志工具条(044, 2026-10-07)**: 补齐 `tmp/webui_analysis.md` §四 P1 第 6、7 项。① **AI 对话 Markdown 渲染**: 新增 `web/assets/markdown.js`(受限子集: 围栏代码块 / 行内代码 / 加粗 / 斜体 / 删除线 / 链接 / 标题 / 列表 / 引用 / 水平线 / 表格), **只产 DOM**(`createElement`/`textContent`/`createTextNode` → `DocumentFragment`), **不碰 `innerHTML`** —— AI 输出是**不可信内容**, DOM 路线既不用动安全扫描白名单, 也没有"转义漏一处即 XSS"的窗口; 链接只放行 `http:`/`https:`(其余降级纯文本), 外链带 `noopener noreferrer`。**只作用于助手气泡**: `renderRich(el, md)` 先按既有规则切出**报告段**(仍走卡片), 剩下的散文段才按 `md` 选渲染方式 —— 宿主 `line` 帧是**对齐纯文本**, 套 markdown 会把对齐打散且与报告结构化(FR-025)抢同一段文本; 术语浮层(`decorateTerms`)新增跳过 `pre`/`code`(代码里的"手续费"不该变成可点术语)。② **日志面板三件套**: 关键字搜索(不分大小写, 改词即时生效) / 级别过滤(**诚实口径**: 日志原样存储不解析, 级别只能是行内关键字启发式, UI 文案自陈「按关键字粗略匹配」; 宿主说明行**始终显示** —— 它解释"日志为什么断了一截") / **跟随↔暂停**(`follow` 意图 + `atBottom()` 客观位置两个量, 用户上滚自动暂停且只计待读、点按钮回底 —— 原先无条件 `scrollTop = scrollHeight` 会**抢用户的滚动**); 计数诚实:「显示 M / 共 N 行」并注明本地最多保留 500 行。只读红线**未松**: 面板按钮换成**显式允许清单**(`log-follow` 等视图控件)+ 仍禁内联事件、仍禁交易所写动作 —— 加交易按钮照样红, **例外显式化而非意图弱化**。仍**无新依赖 / 无构建链**(手写渲染器)。见 `specs/changes/044-webui-ux-polish/converge.md`。
 
+**策略配置断层修复(052, 2026-10-11)**: 修掉「Web UI 复制新建策略后，用户完全不知道该配什么」这个**数据在复制那一刻就丢了**的问题。根因: 参数「有哪些 / 叫什么 / 默认多少 / 什么意思」四件事**全在清单(manifest)里、不在 Lua 里**, 而复制只搬 `.lua`(内置清单是编译期 `include_str!`, 磁盘上没有可复制的源文件) → 副本变成 `declared=false` 的裸脚本 → 详情页参数表单**只剩一个交易对框**; 同时 `ai-edit` 被设计成**只改代码**(提示词要求"与指令无关的原有逻辑逐字保留") —— 用户说「间距调大点」拿到的是**代码被改了**。四路修法(全部不引新依赖、不改前端构建链): ① **复制/模板新建带清单** —— `POST /api/strategies` 新增 `copy_from=<源 id>`, 后端 `derive_manifest` 只改 `id`/`market` 其余照搬, **落盘顺序 = 先写清单 → 再 `write_strategy_files` → 脚本失败则 `rollback_manifest`**(先写清单的好处: 它失败时一个字都还没落盘, 无需回滚脚本; 反向则要回滚两个文件); 与 `overwrite=true` 互斥 400, 源未声明清单也 400(直说"裸脚本复制不带来参数说明, 请在副本页点识别")。② **`POST /api/strategies/extract-params`** —— **无状态**静态扫描: 只吃请求体里的 Lua 源码, 六种调用形态(`num(`/`cfg_str(`/`ctx:config_f64|i64|str|bool(`)取键, 类型取 **API 语义**, 默认值取**字面量兜底**(变量键一律跳过, 所以辅助函数体不会被误当成参数); 先遮罩注释/引号串/长括号串再扫, 结果**按源码位置排序**去重(与标记表顺序无关)。**无状态是刻意的**: 编辑器里可能是未保存的草稿, "这份脚本读了哪些参数"是代码本身的属性。③ **`ai-edit` 加 `mode:"params"`** —— 缺省仍是 `code`(老前端不带该字段照常), `params` 分支把话翻译成**已声明参数**的取值回 `{params}`, **一行代码都不碰**; 双保险 = 提示词只准用清单里的键 + 回包侧 `keep_manifest_params` **丢弃清单外的键并如实回 warning**(点名"新增参数必须同时改 Lua", 引导去「改代码逻辑」), 全丢则 400 `no_params`。④ **空参数表单的引导卡** —— 不再只丢一句红字: 「从脚本识别参数」+「问 AI 怎么配」两个动作, 判据全是服务端事实(`detail.params` 过滤保留键后为空), 且清单为空时第二个动作**只把用户推去走第一步**(后端 `mode=params` 清单为空本就是 400, 不假装能直接问)。前端侧: AI 卡加**分段 chip**(默认停在「调参数」—— 用户的困惑正是"不知道该配什么", 先给一条不动代码的路), 「执行」按钮与提示语的 `data-zh`/`data-en` **随模式同步改写**(否则切语言会被旧模式文案盖回)。见 `specs/changes/052-webui-strategy-config/`。
+
 ~~`keyring`~~ / ~~`setup`~~ / ~~`credentials`~~ / ~~`config`~~ —— 2026-09-14 随单一配置文件方案**全部删除**(019 D31: 文件即界面)。
 
 - 建策略(002, 写操作不得一步落盘): `ricow create --name <n> --pair <p> [--script <file|->] [--param k=v] [--days N] [--interval] [--market spot|futures]`
@@ -194,7 +200,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   - 数据缺口校验(038 P1-D): 取数后按周期步长扫 `open_time` 连续性, 有缺口即**硬报错**(列前 5 处 + 如实说明"另有 N 处未列出"),
     不再拿稀疏 K 线静默回测出一份看着正常的报告
   - 数据源按市场分支: 现货走交易所 REST; 合约 (futures) 走 fapi 公共数据源 (K 线; MMR 按 symbol 内置首档表,表外回落 1.0%)
-  - 直跑模式: `--strategy {linear_position_grid|lua}` — 内置脚本经 BUILTIN 常量表注入(需 --pair)
+  - 直跑模式: `--strategy {<内置 id>|lua}` — 内置 id 经 `strategies::catalog::find` 命中后, 由 `commands/mod.rs::resolve_builtin_script` 注入**编译期嵌入**的 Lua 源码并把 type 改 `lua`(需 --pair, 同时按清单回填 `market`/`position_mode`/杠杆与参数默认值); 内置 id 清单见 `strategies/catalog.rs::BUILTIN`(共 6 个: `linear_position_grid` / `paired_grid_futures_long` / `shannon_hedge_grid_futures` / `shannon_grid_futures` / `shannon_neutral_grid_futures` / `shannon_short_grid_futures`)
   - 部署模式: `--strategy <name>` 命中 `strategies/<name>.toml` 加载(`script_path` 引用文件或内嵌 `script`)
 - 启动: `ricow start <name>`(经 daemon 后台运行) / `ricow run <name>`(前台调试; 默认 Dry Run, TOML `enabled=false` 拒绝启动)
 - ~~选币: `ricow scan …`~~ —— **已于 2026-09-15 删除**(020-platform-scope-trim: 选币/研究入口与"运行策略的平台"定位正交; 用户拍板删除, 不留废弃代码)
@@ -203,7 +209,8 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - `RICOW_ROOT`(数据目录, 决策 D4): 显式覆盖 > 当前目录已有 `ricow.db`/`strategies/` 时沿用现状 > 平台标准目录
   (Windows `%APPDATA%\ricow` / macOS `~/Library/Application Support/ricow` / Linux `$XDG_DATA_HOME|~/.local/share`+`/ricow`)
-- `RICOW_DB`(默认 `RICOW_ROOT/ricow.db`): SQLite, **共 10 张表** — `klines`(交易所 K 线缓存, **主键含 `market` 维度**隔离现货/合约)/ `fills`(成交, 含 `strategy_id`)/ `pnl_snapshots`(盈亏快照)/ `previews`(写操作预览)/ `us_klines`(美股 Nasdaq 日线, 信号轨与交易日历; **缓存不回源, 需手工增量补最后若干天**)/ `funding_fees`(资金费流水, `tran_id` 幂等)/ `web_sessions` + `web_messages`(025: 会话与对话流水, 外键级联删除)/ `orders` + `positions`(026: 订单与当前持仓, 各带 `mode`)
+- `RICOW_DB`(默认 `RICOW_ROOT/ricow.db`): SQLite, **共 11 张表** — `klines`(交易所 K 线缓存, **主键含 `market` 维度**隔离现货/合约)/ `fills`(成交, 含 `strategy_id`)/ `strategy_state`(策略断点续接状态)/ `pnl_snapshots`(盈亏快照)/ `previews`(写操作预览)/ `us_klines`(美股 Nasdaq 日线, 信号轨与交易日历; **缓存不回源, 需手工增量补最后若干天**)/ `funding_fees`(资金费流水, `tran_id` 幂等)/ `web_sessions` + `web_messages`(025: 会话与对话流水, 外键级联删除)/ `orders` + `positions`(026: 订单与当前持仓, 各带 `mode`)
+  > 表清单以 `crates/ricow_strategy/src/db.rs` 的**基线建表块**为准(共 **11 张表**; 该块内 `CREATE TABLE IF NOT EXISTS` 语句 11 条 —— 注意文件里第 12 处同名文字是**注释**, `grep -c` 会多数一条)
   > **schema 版本化(035, 2026-10-03)**: 迁移由 `PRAGMA user_version` 驱动(`SCHEMA_VERSION` 常量)。
   > `migrate()` 分两步: ① **幂等基线建表**(全新库直接建出最新结构); ② **版本迁移**(仅 `v < SCHEMA_VERSION` 时执行并推进版本号)。
   > **版本已最新时零写事务直接返回** —— 这消除了旧实现"每次 `open` 都重跑全量建表"在多连接池同库并发下的偶发 `SQLITE_BUSY`;
@@ -303,7 +310,11 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 - **平台不做投资判断**(2026-09-16, 019-R5; 宪法 §安全要求已同步修订) —— 赚赔政策属于策略, 平台只做执行 + 数据 + 门禁 + 状态:
   - **已删除**: `risk.rs` 的四条静态限额规则(最大持仓 / 单日最大亏损 / 最小订单 / 最大滑点)、`RiskSettings` / `RiskEngine` 装配器、`config.rs` 的 `RiskConfig` 与 `validate_risk()`、死模块 `scheduler.rs`; 老策略 TOML 残留的 `[risk]` 段与 `risk_*` 参数被 serde 忽略(**不再生效**, 装载不报错), 不做迁移脚本。
   - 策略自管: 用只读 `ctx:net_pnl()` / `ctx:equity()` 实现止损/回撤/仓位政策(内置 `linear_position_grid` 的动态止盈为参考写法); ~~平台级两级亏损熔断~~ 已于 2026-09-15 删除(020)。
-  - **保留**: 固定工程护栏 `ricow_strategy::order_guard` —— 三条 `place_order` 顶部统一拦截**下单频率上限**(滑动窗口 1s, 固定 100/s, 回测 / Dry Run / 实盘同一装配, 计数对全部 pair 共享), 防 bug 风暴下单被交易所限流封禁; **固定常量、不读任何配置、无配置面**。
+  - **保留**: 固定工程护栏 `ricow_strategy::order_guard` —— 三条 `place_order` 顶部拦截两条规则, **判定顺序刻意 = 先频率后名义**(`guard_check`):
+    1. **下单频率上限**: 滑动窗口 1s, 固定 100/s, 计数对全部 pair 共享, 防 bug 风暴下单被交易所限流封禁。**回测 / Dry Run / 实盘三条路径同一装配**。
+    2. **单笔名义上限**(057-P0-D 新增): `NOTIONAL_LIMIT_MULTIPLE = 10`, 单笔名义 > 报价资产权益 × 10 即拒。**只拦数量级笔误**(把 1000 当 0.1、漏小数点), **不拦"策略就是要重仓"** —— 那是仓位政策 = 投资判断。权益**只取报价资产余额, 不加持仓市值**(逐仓/全仓/标记价各市场口径不同, 算不准反误拒); **取不到即放行**(没基准时拒单会把正常下单误拒, 比不拦更坏)。
+    **装配差异(刻意)**: 名义上限**只在 Dry Run 与实盘生效**, 回测**不装** —— 回测没有实时权益基准, 取不到即放行。这不是漏做。
+    两条都是**固定常量、不读任何配置、无配置面**。详见 `specs/changes/057-p0d-notional-guard/`。
   - 被拒请求返回 `Rejected` ack(与资金不足同形)并计入回测报告"拒单次数", 同时 `tracing::warn!(target: "order_guard")` 输出关键数值; 策略循环不中断。详见 `specs/backtest.md` §二.6 与 `specs/changes/019-ai-assistant/spec.md` §七 R5。
   - > 修正记录(2026-09-12): 004 之前 RiskEngine 的唯一调用点是无消费者的 `StrategyScheduler`, 三条真实下单路径**均未过风控** —— 即四条静态规则当时实际从未生效; 已随 004 接入, 又随 2026-09-16 R5 整体删除。
 - Dry Run 默认, 确认后切实盘(011 落地): 门禁**双条件** = TOML `live_enabled=true` **且** 命令行 `--live`(缺一即按 Dry Run 运行并打印原因; `ricow start` 同口径, 台账 `mode` 与实际运行器一致)
@@ -353,7 +364,59 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
 
 - 交易流程: BN testnet(demo 环境)真实调用, 禁 mock Exchange 替身、禁假 token、禁主网下单(requirements 第七节硬性纪律)
 - 纯逻辑(指标 / 打分 / 参数校验 / 撮合记账): 单元测试, 已知向量
-- **基线(2026-10-07, 044 Web UI 体验补强后实跑)**: `cargo test --workspace --no-fail-fast` = **838 passed / 0 failed / 22 ignored**(全目标零失败)。
+- **基线(2026-10-18, 059 假绿排查: 安全红线门 / 架构守卫的花括号配平漏扫、前端门 A 段无条件 pass 修掉后实跑)**: `cargo test --workspace --no-fail-fast` = **1060 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+1**(整仓实跑 1060 − 上一基线 1059), 来自 `architecture_guard` **3 → 4**: `production_lines_survives_braces_inside_string_literals` —— 它锁的是本轮查出的**假绿**: `brace_delta` 朴素地数 `{`/`}`，`#[cfg(test)]` 块里只要有一句 `format!("{")`，`skip_depth` 就永不归零，**该块之后的生产代码被整段静默吞掉**，架构守卫从此对那个文件失明(而且"测试写得越多越容易失明")。同一种错法在 `scripts/ci_grep_gates.sh` 的 `non_test_lines` 里也有一份，已一并修。其余 target **实测** 一字未变(`ricow` bin 550 / `ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 290 / `ai_live_smoke` 3 通过 + 9 ignored)。当前分解 550+3+67+18+128+290+4 = **1060**, ignored 分解 1+9+0+3+3+1+2+0+0+2+1+0 = **22**, 与总数自洽。
+- ~~基线(2026-10-18, 058 kill switch 的 Web 端入口 + AI 按资金量给建议 落地后实跑)~~: `cargo test --workspace --no-fail-fast` = **1059 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+3**(整仓实跑 1059 − 上一基线 1056), 全部来自 058 的 `ai::provider::tests`(`ricow` bin **547 → 550**): 本金必须进提示词 / 拿不到本金不许编数 / 档位知识只判可行性不做投资判断; 其余 target **实测** 一字未变(`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 290 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。当前分解 550+3+67+18+128+290+3+3 = **1059**, 与总数自洽。
+  > **1059 撞号提醒**: `specs/roadmap.md` 上一轮曾把 1059 订正掉(那是按分项加算算出的错值, 真实值 1056)。058 这次**真跑读出**恰是 1059 且双向闭合 —— **巧合撞号, 不是回到那个错值**。
+- ~~基线(2026-10-18, 056 + 057)~~: = **1056 passed / 0 failed / 22 ignored**。
+  增量 = **+16**(整仓实跑 1056 − 上一基线 1040), 与本轮同源: `ricow` bin 与 `ricow_strategy` 两处增长 —— `ricow_strategy` **282 → 290**(+8 = 057 名义护栏 8 条: 上限 / 边界含等号 / 权益取不到放行 / 权益非正放行 / 数量级笔误 / 报价资产后缀匹配 / 频率优先于名义 / 报价资产识别不到放行), `ricow` bin **→ 547**(含 056 启动闸 3 条 + 057 kill 报告 2 条 + kill 短语 1 条 + `StopAll` 协议 2 条 + 端点守卫); 其余 target **实测** 一字未变
+  (`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。当前分解 547+67+18+128+290+3+3 = **1056**, 与总数自洽。
+  > **订正 (2026-10-18)**: 本节原记 **1040 / bin 538 / strategy 282**, 是 054 时的值, 未随 056/057 回填(同段落的 e2e 数却已是 458 —— 区块内部本就不自洽)。现按 `cargo test --workspace --no-fail-fast` 与 `cargo test -p ricow` 实读校正。`specs/roadmap.md` 曾按加算写成 1059/+19, 亦已订正为 1056/+16。
+  > **一条新纪律**: 上一基线 1040 自己的分解 `538+67+18+128+282+3+3 = 1039`, **差 1** —— 说明"按分项加算"这条路径历史上就出过错。**基线数字必须整仓实跑读出**, 逐 target 分解只作辅助叙述, 且要当场验一下分项目加是否等于总数。
+  同口径真机(056/057 后): 官方冒烟 `e2e_web.py`(干净 root + 无 AI 密钥 + `show_all_pairs=true`) **458 PASS / 0 FAIL**(与 054 同基线, 零回归); CDP 真机走查 `scripts/probe_web_ui.mjs` **全绿**(另 1 条 NOTE = `/favicon.ico` 404)。注意 **054 时的 `100 PASS / 0 FAIL`** 是那一轮的数, 本轮不再以数字声明 —— 探针含循环复用与 `checkNoErrors` 聚合, 静态调用数 ≠ 运行期 PASS 数。
+  同口径真机: 官方冒烟 `e2e_web.py`(干净 root + `show_all_pairs=true`) **458 PASS / 0 FAIL**(较 053 的 388 **+70**, 054 新增 L 段 50 条: 风险档位表 / 生成端点校验 / `mode=random` 被拒 / `origin=ai` 落盘与徽章 / 前端接线); CDP 真机走查 `scripts/probe_web_ui.mjs` **100 PASS / 0 FAIL**(较 86 **+14**; 054 段为**行为级**断言: 真点开 AI 生成弹窗、断言档位下拉选项**等于**后端 `/api/strategies/risk-profiles` 的键、档位含义文案含数字、自定义档行真的出现, 再建一个 `origin=ai` 探针策略并写摘要, 断言详情页真的渲染出「这份策略在做什么」与「AI 生成」徽章)。
+  本轮是**审计整改**: 对「AI 生成的策略能不能给一个普通投资者拿去配量化」做多角度审核, 落下 15 条缺陷、分四轮 42 项任务。
+  四条主干: ① **P1 生成即验证** —— Web 单发生成此前**完全不回测**(与对话路径割裂, 审计 #1), 现在用同一份**未落盘**的代码
+  跑一次真实 K 线回测, 结果随产物回前端。② **P2 结构化投资输入** —— 「我想稳一点」此前原样进提示词、对模型无约束力(审计 #2);
+  现在本金 + 风险档位**必填**, 档位表(`web/strategy_io/risk_profile.rs` 单点定义)把档位落成数字, 本金写进 `[backtest].initial_cash`。**真跑对照**(同一句话 + 同一笔 10000 U, 只换档位): 间距下限 **0.8%(保守) vs 0.4%(激进)** / 单笔 **8% vs 45%** / 回撤目标 **10% vs 35%** / 加仓层数 **4 vs 8**, 且两份代码不逐字相同 —— 档位不只进了提示词, 真落进了代码。
+  ③ **P3 样本外与 walk-forward** —— 按**时间顺序**前 70% / 后 30% 切分(`mode=random` 在校验层直接拒: 会制造前视偏差,
+  违反 `backtest.md §一`), 并给逐段推进的 walk-forward。④ **P5 收尾** —— lint 第六类(**只警告不拦截**)、影响评估改用
+  `paramDiffs()` 判据(手动改参也能评估)、生成时一并产出 `summary` 与参数中文名、`read_doc` 分片、帮助层「平台不代做风控」。
+  **真跑发现并修掉的两处**: ① 验证回测此前 `cash: None`, 一律按默认 10 万跑, 而提示词说的是用户填的本金
+  (填 1 万却看到 10 万的成交与盈亏) —— 已改成按用户本金跑, 并抽 `verify_spec` 纯函数加单测钉住。② `strategies.js` 的
+  `skipBox` TDZ: `const` 初始化前被引用, AI 生成弹窗一打开就 `ReferenceError` —— 四道静态门全绿, 只有 CDP 抓得到。
+**055 复审的另外四条(B3–B6)也已全部落地**: ① **B3 档位目标事后核对** —— 档位此前只对模型有约束力, 生成完界面只把实测回撤显示成一个红数字, 从不说「你选的是 10%, 实测 25%, 未达到」; 现在紧贴指标卡给出目标/实测/判语(只核最大回撤 —— 其余档位项在回测指标里没有对应数字, 凑就是编造; 拿不到实测值就不摆核对框)。② **B4 lint 整份级警告独立配额** —— 8 条上限原本同时管逐行与整份级, 十行 config_f64(...) or ... 就能把「这份脚本会下单但没有任何止损线索」挤掉; 现在上限只管逐行, 整份级先算先放、排第一。③ **B5 AI 请求总超时** —— reqwest 默认不设超时, 上游一挂起页面就一直转圈(真跑实测 900s/1500s 无响应); 现在每次调用外套 300 秒总超时(可配 [ai].timeout_secs), 且超时**不重试**(一次就 300 秒, 重试三遍没人等得起)。④ **B6 两条生成路径口径对齐** —— 对话路径的 preview_strategy 此前**没有本金入参**, 助手问到了也没处传, 回测一律按默认 10 万跑; 现在新增 initial_cash(落到 params.cash, 与 CLI --param cash= 同一条链路), 没传时回包如实写明「这是默认本金, 不是你的资金规模」。
+  见 `specs/changes/054-ai-strategy-flow/`。
+- **前基线(2026-10-12, 053 改参数未保存提示 + 改动前后对比后实跑)**: `cargo test --workspace --no-fail-fast` = **1001 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+1**, 与本轮同源: `ricow` bin **499 → 500**(`ai::provider::tests::test_assess_preamble_states_benchmark_and_ratio_caveats` ——
+  锁住评估提示词里「基准从首次成交起算」「成交极少时比率指标失真」两条口径); 其余 target 一字未变
+  (`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 282 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。
+  同口径真机: 官方冒烟 `e2e_web.py`(干净 root + `show_all_pairs=true`) **388 PASS / 0 FAIL**(较 052 的 381 **+7**, 新增 7 条
+  053 静态断言); CDP 真机走查 `scripts/probe_web_ui.mjs` **86 PASS / 0 FAIL**(较 75 **+11**; 053 段为**行为级**断言:
+  真把参数值改掉并派发 `input` 事件, 再断言「参数未保存」提示亮起、改动面板同时含改前改后值、一键还原后值退回且提示消失)。
+  本轮两件事: ① **修缺陷** —— `updateDirty` 此前只比代码编辑器, 改了参数(手动或 AI 改)**界面完全不提示**,
+  而回测又能拿表单值跑出结果(用户原话「AI 修改策略以后…需要点击保存吗」即由此而来)。修法 = 参数基线(渲染时取、
+  保存后推进)+ 行内「原 X → 改为 Y」+ 卡片顶部改动对比清单(放 `#sg-params` 外, 免被 `innerHTML=""` 抹掉)+ 一键还原;
+  判据统一为**与基线比字符串**。② **真跑后修提示词** —— 用真实密钥跑通 N3 多轮改参 + 影响评估后发现 `ai-assess`
+  把「两次基准收益不同」误判成「数据口径不一致」, 实为**设计**(基准从**首次成交**起算, 见 `ricow_strategy/src/backtest.rs:1491-1495`),
+  且把成交 3 笔时失真的夏普 −737 当成重大恶化; 两条口径已写进 `AI_ASSESS_PREAMBLE`。见 `specs/changes/053-param-unsaved-hint/`。
+- **前基线(2026-10-12, 052 策略配置断层修复 + N1/N2/N3 追加需求后实跑)**: `cargo test --workspace --no-fail-fast` = **1000 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+17**, 与本轮同源: `ricow` bin **482 → 499**(`web::strategy_io::tests` 的 N1 删除候选集合 + N2 留空可保存 + N3 `cap_history` / `split_advice_and_json` / `diff_params` / `metrics_brief` / `changed_lines` / `ai_assess` 离线守卫 / `ai_edit_params` 接受 `history` 等); 其余 target 一字未变
+  (`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 282 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。
+  同口径真机: 官方冒烟 `e2e_web.py`(干净 root + `show_all_pairs=true`) **381 PASS / 0 FAIL**(较 052 第一批的 329 **+52**, 新增断言字样逐条 `grep` 均为 1; **零 FAIL** —— 此前 372 PASS / 9 FAIL 的**两个**根因(本机 `api.binance.com` 不可达 + `show_all_pairs=false` 时 `ETHUSDT` 不在视野)在网络恢复与视野放开后**全部翻绿**, 与代码无关); CDP 真机走查 `scripts/probe_web_ui.mjs` **75 PASS / 0 FAIL**(较 65 **+10**)。
+  前端静态门 `scripts/web_frontend_check.mjs` 新增 **G 段同名碰撞**(字典块内重复键 / 同文件内重复 DOM id 字面量) —— 这类缺陷"语法合法、双语齐、引用有定义", 四道静态门结构上抓不到。见 `specs/changes/052-webui-strategy-config/`。
+- **前基线(2026-10-11, 052 第一批：`copy_from` / `extract-params` / `ai-edit?mode=params` 后实跑)**: `cargo test --workspace --no-fail-fast` = **983 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+17**, 与本变更同源: `ricow` bin **465 → 482**(`strategies::params` 静态提取 7 例 + `web::strategy_io::tests` 的 `copy_from` / `derive_manifest` / `parse_ai_mode` / `keep_manifest_params` / `extract_json_object` / `extract_params` 端点 / `ai_edit_params` 离线护栏等 10 例); 其余 target 一字未变
+  (`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 282 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。
+  同口径真机: 官方冒烟 `e2e_web.py`(干净 root, `show_all_pairs=true`) **329 PASS / 0 FAIL**(较 051 的 283 **+46**, 新增断言字样逐条 `grep -cF` 均为 1); CDP 真机走查 `scripts/probe_web_ui.mjs` **65 PASS / 0 FAIL**(较 43 **+22**)。见 `specs/changes/052-webui-strategy-config/`。
+- **前基线(2026-10-11, 051 架构与代码审核整改后实跑)**: `cargo test --workspace --no-fail-fast` = **966 passed / 0 failed / 22 ignored**(全目标零失败)。
+  增量 = **+5**, 与本变更同源: `ricow` bin **460 → 465**(`web::backtest_jobs`: panic 转 error 的 `guarded()` 保险丝 / 根目录脱敏 / 内部键统一闸; `commands::backtest`: CPU 段 `block_in_place` 的两种 runtime 分支); 其余 target 一字未变
+  (`ricow_binance` 67 / `ricow_core` 18 / `ricow_engine` 128 / `ricow_strategy` 282 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。
+  同口径真机: 官方冒烟 `e2e_web.py`(干净 root, `show_all_pairs=true`) **283 PASS / 0 FAIL**(日志含本轮新增的「POST 写端点 401 矩阵」断言字样); CDP 真机走查入库为 `scripts/probe_web_ui.mjs` **43 PASS / 0 FAIL**。见 `specs/changes/051-audit-remediation/`。
+- **前基线(2026-10-10, Web UI 帮助计划 A–D 批次后实跑, 当时未单独记档, 由 051 起点反推)**: **961 passed / 0 failed / 22 ignored**。
+  较 044 的 838 = **+123**: `ricow` bin **434 → 460**(+26) + `ricow_binance` **62 → 67**(+5) + `ricow_engine` **119 → 128**(+9) + `ricow_strategy` **199 → 282**(+83)。
+- **前基线(2026-10-07, 044 Web UI 体验补强后实跑)**: `cargo test --workspace --no-fail-fast` = **838 passed / 0 failed / 22 ignored**(全目标零失败)。
   增量 = **+2**, 与本变更同源: `ricow` bin **432 → 434**(`web::assets`: markdown 渲染器仅产 DOM / 加载顺序 `markdown.js` 先于 `chat.js`); 其余 target 一字未变
   (`ricow_binance` 62 / `ricow_core` 18 / `ricow_engine` 119 / `ricow_strategy` 199 / `architecture_guard` 3 / `ai_live_smoke` 3 通过 + 9 ignored)。
   同口径真机: 官方冒烟 `e2e_web.py` **两种形态各 181 PASS / 0 FAIL**(内嵌 / `--web-assets-dir`); CDP 真机走查「问题 0 条」。

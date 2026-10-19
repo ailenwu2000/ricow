@@ -81,6 +81,11 @@ pub(super) struct RunItem {
     pair: Option<String>,
     source: &'static str,
     pnl: Option<PnlSummary>,
+    /// 056 FR-4: 该实例是否**已声明参数清单**。`false` = 裸 `.lua`, 用户看不到自己跑的是
+    /// 一个没有参数说明的副本 —— 这正是"目录里明知有问题仍能起"的来源。
+    declared: bool,
+    /// 056 FR-4: 若它是某个内置脚本的逐字副本, 这里给出那个内置 id (`None` = 不是副本)。
+    duplicate_of: Option<String>,
 }
 
 /// `GET .../status` 响应(data-model §8; `pnl` 缺失序列化为 null, 不 skip)。
@@ -94,6 +99,10 @@ pub(super) struct StatusReply {
     pair: Option<String>,
     source: &'static str,
     pnl: Option<PnlSummary>,
+    /// 056 FR-4: 见 [`RunItem::declared`]。
+    declared: bool,
+    /// 056 FR-4: 见 [`RunItem::duplicate_of`]。
+    duplicate_of: Option<String>,
 }
 
 /// `POST .../start` 成功响应(契约 200 `{pid, mode}`)。
@@ -107,6 +116,16 @@ struct StartReply {
 #[derive(Debug, Serialize)]
 pub(super) struct StopReply {
     stopped: bool,
+    report: String,
+}
+
+/// `POST /api/runs/kill` 成功响应 (057-G4)。
+///
+/// `stopped` 是**成功停掉的实例数**(不是 bool) —— 批量动作必须让用户看清"停了几个",
+/// 否则一个布尔值无法区分"停光了"与"停了一半"。
+#[derive(Debug, Serialize)]
+pub(super) struct KillAllReply {
+    stopped: usize,
     report: String,
 }
 
@@ -153,6 +172,7 @@ fn fmt_asof(ts_ms: i64) -> String {
 
 /// 台账视图 + 最近 PnL → 运行项(`GET /api/runs` 单项)。
 fn build_run_item(daemon_online: bool, v: &InstanceView, pnl: Option<PnlSummary>) -> RunItem {
+    let audit = catalog_audit(&v.name);
     RunItem {
         name: v.name.clone(),
         running: v.running,
@@ -162,7 +182,22 @@ fn build_run_item(daemon_online: bool, v: &InstanceView, pnl: Option<PnlSummary>
         pair: v.pair.clone(),
         source: source_of(daemon_online, true),
         pnl,
+        declared: audit.0,
+        duplicate_of: audit.1,
     }
+}
+
+/// 056 FR-4: 查一个 id 的目录审计事实 `(declared, duplicate_of)`。
+///
+/// **如实而非猜测**: 查不到条目 (内置策略不在用户 `strategies/` 下, 或未知 id) 时回
+/// `(true, None)` —— 内置资产由编译期 `include_str!` 保证, 本就恒已声明; 把它报成
+/// `declared:false` 会让前端给内置策略挂上"未声明"的假警告。
+fn catalog_audit(name: &str) -> (bool, Option<String>) {
+    crate::strategies::catalog::all()
+        .into_iter()
+        .find(|e| e.manifest.id == name)
+        .map(|e| (e.declared, e.duplicate_of))
+        .unwrap_or((true, None))
 }
 
 /// 组装 status 响应(纯函数): 有视图取视图字段; 无视图如实给 unknown(不伪造 running),
@@ -175,26 +210,36 @@ fn build_status(
     pnl: Option<PnlSummary>,
 ) -> StatusReply {
     match view {
-        Some(v) => StatusReply {
-            name: v.name.clone(),
-            running: v.running,
-            mode: mode_or_unknown(v.mode.as_deref()),
-            pid: v.pid,
-            uptime_secs: v.uptime_secs,
-            pair: v.pair.clone().or(pair_fallback),
-            source: source_of(daemon_online, true),
-            pnl,
-        },
-        None => StatusReply {
-            name: name.to_string(),
-            running: false,
-            mode: "unknown".to_string(),
-            pid: None,
-            uptime_secs: None,
-            pair: pair_fallback,
-            source: source_of(daemon_online, false),
-            pnl,
-        },
+        Some(v) => {
+            let audit = catalog_audit(&v.name);
+            StatusReply {
+                name: v.name.clone(),
+                running: v.running,
+                mode: mode_or_unknown(v.mode.as_deref()),
+                pid: v.pid,
+                uptime_secs: v.uptime_secs,
+                pair: v.pair.clone().or(pair_fallback),
+                source: source_of(daemon_online, true),
+                pnl,
+                declared: audit.0,
+                duplicate_of: audit.1,
+            }
+        }
+        None => {
+            let audit = catalog_audit(name);
+            StatusReply {
+                name: name.to_string(),
+                running: false,
+                mode: "unknown".to_string(),
+                pid: None,
+                uptime_secs: None,
+                pair: pair_fallback,
+                source: source_of(daemon_online, false),
+                pnl,
+                declared: audit.0,
+                duplicate_of: audit.1,
+            }
+        }
     }
 }
 
@@ -399,6 +444,45 @@ pub(super) async fn stop_strategy(
     }
     let report = crate::commands::ctrl::stop_daemon(&state.root, &id, req.close_all).await?;
     Ok(Json(StopReply { stopped: true, report }))
+}
+
+/// `POST /api/runs/kill` (057-G4): **kill switch** —— 停止全部运行中实例, daemon 继续运行。
+///
+/// 契约:
+/// - 请求体 `{ "close_all": bool }` (可省略, 缺省 `false` —— 平仓是不可逆动作, 必须显式要)
+/// - 200 `{ "stopped": <成功停掉的实例数>, "report": "<说明文本>" }`
+///
+/// **确认纪律与终端渠道一致**: 停全部是批量不可逆动作, Web 侧同样要求逐字短语 ——
+/// 请求体必须带 `"confirm": "确认停止全部"` (带 `--close-all` 语义时为 `确认停止全部并平仓`),
+/// 否则 400。这样"误触一次全部静默下线"在两条渠道上都不可能发生。
+pub(super) async fn post_kill_all(
+    State(state): State<WebState>,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<KillAllReply>, WebError> {
+    let Json(raw) =
+        payload.map_err(|e| WebError::bad_request(format!("请求体不是合法 JSON: {e}")))?;
+    let close_all = raw.get("close_all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let expect = if close_all { "确认停止全部并平仓" } else { "确认停止全部" };
+    // 逐字短语: 裸 y/yes 不认(与 `ai::confirm` / 终端 `require_explicit_phrase` 同一纪律)。
+    match raw.get("confirm").and_then(|v| v.as_str()) {
+        Some(s) if s == expect => {}
+        _ => {
+            return Err(WebError::bad_request_code(
+                format!("停止全部是不可逆动作, 需逐字确认: 请在 confirm 字段填「{expect}」"),
+                "confirm_required",
+            ))
+        }
+    }
+    let data = crate::supervisor::client::Client::connect(&state.root)
+        .await?
+        .call_ok(crate::supervisor::proto::Request::StopAll { close_all })
+        .await?;
+    let stopped = data.get("stopped").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let note = data.get("note").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(Json(KillAllReply {
+        stopped,
+        report: crate::commands::ctrl::kill_report_text(stopped, note),
+    }))
 }
 
 /// `POST /api/risk-ack` (FR-026): 首次风险披露确认落盘; 短语必须逐字「确认风险」。

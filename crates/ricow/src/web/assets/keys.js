@@ -29,6 +29,10 @@
     keysDescExchange:
       "一套 = 别名 + 环境 + API Key + API Secret。选用后, 该环境的凭据立即生效(实盘主网用于 live / Dry Run, 测试网用于 demo)。",
     keysAdd: "+ 新增",
+    // 059 UX-07: 解释「密钥环(左侧列表)」与「当前生效(下面那行)」是两码事。
+    keysRingHint:
+      "注意这是两样东西:左上角数字是**密钥环**里存了几套;每组下面那行是**当前正在生效**的那一段。" +
+      "两者可以不一样(比如直接改过 ricow.toml)。点「选用这套」就是把密钥环里的某一套写进「当前生效」。",
     keysEmptyAi: "还没有保存过 AI 密钥。点「+ 新增」加一套, 起个别名便于日后切换。",
     keysEmptyExchange: "还没有保存过币安凭据。点「+ 新增」加一套(建议实盘只开交易权限、关闭提现)。",
     keysPick: "从左侧选一套查看/编辑, 或点「+ 新增」。",
@@ -39,6 +43,8 @@
     keysLblAlias: "别名",
     keysPhAlias: "如「工作号 DeepSeek」「备用 Kimi」",
     keysLblProvider: "服务商 (provider)",
+    keysLblModel: "模型 (model)",
+    keysLblBaseUrl: "接入地址 (base_url)",
     keysLblEnv: "环境",
     keysEnvLive: "实盘主网 (live)",
     keysEnvDemo: "测试网 demo",
@@ -59,10 +65,7 @@
     keysFromEntry: "来自「",
     keysFromEntryEnd: "」",
     keysClear: "清除当前生效",
-    keysClearLive: "清除主网凭据",
-    keysClearDemo: "清除测试网凭据",
     keysTailPre: "尾号 ",
-    keysSaving: "保存中…",
     keysSaved: "已保存",
     keysSaveFailed: "保存失败: ",
     keysLoadFailed: "加载密钥列表失败: ",
@@ -94,6 +97,11 @@
     keysDescExchange:
       "A set = alias + environment + API Key + API Secret. Once used, that environment's credentials take effect immediately (mainnet for live / Dry Run, testnet for demo).",
     keysAdd: "+ Add",
+    // 059 UX-07: 见 zh 侧同名键的注释。
+    keysRingHint:
+      "Note these are two different things: the number at the top-left is how many sets are stored in the **key ring**; " +
+      "the line under each group is the **currently active** section. They can differ (e.g. if ricow.toml was edited " +
+      "directly). \"Use this set\" copies one set from the ring into the active section.",
     keysEmptyAi: "No AI keys saved yet. Click \"+ Add\" and give it an alias so you can switch later.",
     keysEmptyExchange: "No Binance credentials saved yet. Click \"+ Add\" (prefer a trading-only key with withdrawals off).",
     keysPick: "Pick a set on the left to view or edit, or click \"+ Add\".",
@@ -104,6 +112,8 @@
     keysLblAlias: "Alias",
     keysPhAlias: "e.g. Work DeepSeek, Backup Kimi",
     keysLblProvider: "Provider",
+    keysLblModel: "Model",
+    keysLblBaseUrl: "Base URL",
     keysLblEnv: "Environment",
     keysEnvLive: "Mainnet (live)",
     keysEnvDemo: "Testnet demo",
@@ -124,10 +134,7 @@
     keysFromEntry: "from \"",
     keysFromEntryEnd: "\"",
     keysClear: "Clear active credentials",
-    keysClearLive: "Clear mainnet credentials",
-    keysClearDemo: "Clear testnet credentials",
     keysTailPre: "ends with ",
-    keysSaving: "Saving…",
     keysSaved: "Saved",
     keysSaveFailed: "Save failed: ",
     keysLoadFailed: "Failed to load keys: ",
@@ -418,7 +425,10 @@
     $("view-keys").innerHTML =
       '<div class="keys-wrap">' +
       '<div class="settings-head keys-head"><h2 class="settings-title">' + esc(t("keysTitle")) + "</h2>" +
-      '<p class="settings-lead">' + esc(t("keysLead")) + "</p></div>" +
+      '<p class="settings-lead">' + esc(t("keysLead")) + "</p>" +
+      // 059 UX-07: 「0 条已保存」与「当前生效: …」并排出现过, 看着像数据自相矛盾 ——
+      // 其实是两样东西(密钥环 vs 正在生效的那一段), 但页面从没说过。补一句就够。
+      '<p class="settings-lead keys-ring-hint">' + esc(t("keysRingHint")) + "</p></div>" +
       aiCard() +
       exchangeCard() +
       '<div id="keys-msg" class="settings-msg" aria-live="polite"></div>' +
@@ -528,12 +538,13 @@
   }
 
   /// 统一的"发请求 → 刷新 → 报结果"收尾; 失败时错误文案照实显示。
+  /// 成功一路走**全局 toast**(B6): 提示挂在 body 上, 离开密钥页也还在。
   async function run(req, okText, failPrefix) {
     busy = true;
     try {
       await req();
       await refresh();
-      showMsg(okText, true);
+      R.toast(okText, "ok");
     } catch (err) {
       showMsg(failPrefix + (err && err.message), false);
     } finally {
@@ -570,7 +581,7 @@
         sel.ai = alias;
         draft.ai = false;
         await refresh();
-        showMsg(t("keysSaved"), true);
+        R.toast(t("keysSaved"), "ok");
       } catch (err) {
         showMsg(t("keysSaveFailed") + (err && err.message), false);
       } finally {
@@ -598,7 +609,7 @@
       sel.exchange = alias;
       draft.exchange = false;
       await refresh();
-      showMsg(t("keysSaved"), true);
+      R.toast(t("keysSaved"), "ok");
     } catch (err) {
       showMsg(t("keysSaveFailed") + (err && err.message), false);
     } finally {

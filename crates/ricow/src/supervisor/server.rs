@@ -204,6 +204,7 @@ impl Server {
                 self.start(&name, live, demo, confirmed).await
             }
             Request::Stop { name, close_all } => self.stop(&name, close_all).await,
+            Request::StopAll { close_all } => self.stop_all_instances(close_all).await,
             Request::Shutdown => {
                 let _ = self.shutdown_tx.send(true);
                 Response::ok(Some(serde_json::json!({ "shutting_down": true })))
@@ -376,6 +377,61 @@ impl Server {
     }
 
     /// 停止策略: 名字判定 → 下发停机指令 → 等待退出 → 台账记录; 超时如实报告且不静默强杀。
+    /// kill switch (057-G4): 逐个停止**当前全部运行中**实例。
+    ///
+    /// ## 为什么逐个走 `self.stop` 而不是 `stop_all`
+    /// `stop_all` 是 daemon **自身退出**时的收摊路径(把 `children` 整体 drain), 不对外承诺
+    /// 每实例的清理提示/台账/超时回执; 而 kill switch 是**用户主动**的紧急动作, 必须让每个
+    /// 实例都拿到完整停机语义 —— 复用 `self.stop` 才有一致的逐实例回执。
+    ///
+    /// ## 为什么**串行**而不是并发
+    /// 停机要下发 stdin 指令并等子进程退出(最长 30s/实例)。并发会让 N 个实例一起等,
+    /// 但更重要的是: 串行时若中途某个实例超时, 后续实例仍会被处理; 而 panic/abort 类中断下,
+    /// 已停的停了、未停的原样还在跑, 状态始终是"逐个确定"的, 不会有一批悬在中间。
+    ///
+    /// ## 报告口径
+    /// **一个都不在跑 ≠ 成功**。如实回"当前没有运行中的实例", 不套"已全部停止"头衔 ——
+    /// 否则用户会以为危险已解除(027 同一原则)。
+    async fn stop_all_instances(&self, close_all: bool) -> Response {
+        let names: Vec<String> = {
+            let state = self.state();
+            state.children.keys().cloned().collect()
+        };
+        // 排序只为报告可复现(HashMap 顺序不定, 同一状态两次调用报出不同顺序会让人以为是两次不同的事)。
+        let mut names = names;
+        names.sort();
+
+        if names.is_empty() {
+            return Response::ok(Some(serde_json::json!({
+                "stopped": [],
+                "note": "当前没有运行中的实例 (无需停止)",
+            })));
+        }
+
+        let mut stopped = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        for name in names {
+            let resp = self.stop(&name, close_all).await;
+            match (resp.ok, resp.data) {
+                (true, Some(data)) => stopped.push(data),
+                _ => notes.push(format!("{name}: 停止未成功 (见该实例的单独回执)")),
+            }
+        }
+
+        // 只要有一个没停成就**不能**说"全部停止" —— 那会让用户以为风险已解除。
+        let note = if notes.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "已停止 {}/{} 个; 未成功: {}",
+                stopped.len(),
+                stopped.len() + notes.len(),
+                notes.join("; ")
+            ))
+        };
+        Response::ok(Some(serde_json::json!({ "stopped": stopped, "note": note })))
+    }
+
     async fn stop(&self, name: &str, close_all: bool) -> Response {
         let handle = { self.state().children.remove(name) };
         let Some(mut handle) = handle else {
