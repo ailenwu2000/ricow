@@ -9,6 +9,7 @@
 //! - `futures_data`: USDT-M 合约 (fapi) 公共数据源 (K 线 + MMR 元数据, 无密钥)
 
 mod client;
+mod earn;
 mod futures;
 mod futures_client;
 mod futures_data;

@@ -1,7 +1,7 @@
 //! 回测引擎: 历史 K 线逐根驱动, OHLC 合成撮合。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -249,6 +249,13 @@ pub struct BacktestContext {
     position_lots: HashMap<(String, OrderSide), Vec<(Decimal, Decimal)>>,
     /// 现货资金簿 (quote + base 余额表, 行为不变); 合约模式不用 (见 futures_cash)。
     virtual_balance: HashMap<String, Balance>,
+    /// Simple Earn 虚拟理财钱包 (060, 仅现货现金腿): 键 = 资产, 值 = 在理财数量。
+    /// 划转非成交: 不动 positions/lots、不计 fill; 权益聚合按面值加回 (现金→理财逐分守恒)。
+    virtual_earn: HashMap<String, Decimal>,
+    /// 理财支持资产白名单 (061): 配置键 `earn_supported_assets` 逗号串解析 (大写集合)。
+    /// 缺省 = {"USDT"}; 显式空串 = 全不支持。不支持资产: earn_balance → None、
+    /// earn_subscribe/earn_redeem → false (模拟真实交易所"该资产无赚息功能"的降级路径)。
+    earn_supported_assets: HashSet<String>,
     /// 合约账户模型 (K3, 逐仓钱包转账; 现货模式恒 ZERO):
     /// 现金 (未入钱包的 quote) + 每交易对一个逐仓钱包 + 账户级资金费净额 + 强平计数。
     futures_cash: Decimal,
@@ -381,6 +388,14 @@ impl BacktestContext {
                 p.margin_mode = v.to_string();
             }
         }
+        // 理财支持资产白名单 (061): 逗号串 → 大写集合。缺省 "USDT"; 显式 "" = 全不支持
+        // (区分 None=未配置 与 Some("")=配置了空值, 后者是用户主动关闭理财模拟)。
+        let earn_supported_assets: HashSet<String> = match config.get_str("earn_supported_assets") {
+            Some(s) => {
+                s.split(',').map(|a| a.trim().to_uppercase()).filter(|a| !a.is_empty()).collect()
+            }
+            None => HashSet::from(["USDT".to_string()]),
+        };
         // 统一覆盖回写 (Y7, 2026-09-09 bs_momentum Lua 化): resolve 出最终值后写回
         // config.params — 策略 (Lua ctx:config_f64 / Rust 通用) 读到的费率/滑点/杠杆/
         // MMR/资金费与撮合层 FeeModel/账户模型完全同源一致 (未显式配置的默认 10bps 等
@@ -416,6 +431,8 @@ impl BacktestContext {
             fee_model,
             quote_asset,
             virtual_positions: HashMap::new(),
+            virtual_earn: HashMap::new(),
+            earn_supported_assets,
             position_lots: HashMap::new(),
             virtual_balance: balance_map,
             futures_cash: if is_futures { initial_cash } else { Decimal::ZERO },
@@ -608,6 +625,11 @@ impl BacktestContext {
         self.set_cash(self.cash() + delta);
     }
 
+    /// 理财钱包合计 (060 权益聚合用: 现金→理财逐分守恒, 按面值加回)。
+    fn earn_total(&self) -> Decimal {
+        self.virtual_earn.values().copied().sum()
+    }
+
     /// hedge 模式判定 (013): hedge 才按侧独立钱包/独立强平。
     fn is_hedge(&self) -> bool {
         self.config.position_mode == "hedge"
@@ -778,7 +800,8 @@ impl BacktestContext {
                 let px = self.portfolio_prices.get(&p.pair).copied().unwrap_or(p.entry_price);
                 pos_value += p.size * px;
             }
-            cash + pos_value
+            // 理财腿按面值加回 (060): 划转是资产位置变化, 不是亏损。
+            cash + pos_value + self.earn_total()
         }
     }
 
@@ -1150,7 +1173,7 @@ impl BacktestContext {
 
     /// 按给定价格估值总权益 (K8): 现货 = 现金 + Σ(持仓 × price);
     /// 合约 = 现金 + Σ逐仓钱包 + Σ未实现 (各仓按方向计价)。
-    fn mark_to_market(&self, price: &Decimal) -> Decimal {
+    pub(crate) fn mark_to_market(&self, price: &Decimal) -> Decimal {
         let cash = self.cash();
         if self.is_futures() {
             let mut equity = cash;
@@ -1173,7 +1196,8 @@ impl BacktestContext {
             for p in self.virtual_positions.values() {
                 pos_value += p.size * *price;
             }
-            cash + pos_value
+            // 理财腿按面值加回 (060): 划转是资产位置变化, 不是亏损。
+            cash + pos_value + self.earn_total()
         }
     }
 
@@ -1411,12 +1435,9 @@ impl BacktestContext {
                 }
             };
         let final_cash = self.cash();
-        // 期末总权益 (K8): 合约 = 现金 + Σ钱包 + Σ未实现 (mark_to_market 统一)。
-        let final_equity = if self.is_futures() {
-            self.mark_to_market(&final_price)
-        } else {
-            final_cash + final_pos_size * final_price
-        };
+        // 期末总权益 (K8): 合约 = 现金 + Σ钱包 + Σ未实现; 现货 = 现金 + 持仓市值 + 理财面值
+        // (060 D4: 理财腿计入权益, 划转是资产位置变化不是亏损; 与逐 bar 曲线同一 mark_to_market 口径)。
+        let final_equity = self.mark_to_market(&final_price);
         let initial = self.initial_equity;
         let pct = |v: Decimal| -> f64 {
             if initial <= Decimal::ZERO {
@@ -2082,7 +2103,8 @@ impl BacktestContext {
             self.first_fill_time = self.current_bar.as_ref().map(|b| b.open_time);
             self.first_fill_side = Some(req.side);
             self.first_fill_size = Some(req.size);
-            self.entry_equity = Some(self.cash() + self.net_size_of(&key) * fill_price);
+            self.entry_equity =
+                Some(self.cash() + self.net_size_of(&key) * fill_price + self.earn_total());
         }
         let (close, open) = self.split_fill(req);
         let is_maker = matches!(req.order_type, OrderType::Limit);
@@ -2321,6 +2343,62 @@ impl Context for BacktestContext {
         } else {
             self.virtual_balance.get(asset).map(|b| b.total())
         }
+    }
+
+    /// 理财余额 (060, 仅现货): 在理财数量按面值计; 合约端无理财概念 → None;
+    /// 资产不在支持白名单 (061) → None (模拟"该资产无赚息功能", 策略据此静默降级)。
+    fn earn_balance(&self, asset: &str) -> Option<Decimal> {
+        if self.is_futures() {
+            return None;
+        }
+        let key = asset.to_uppercase();
+        if !self.earn_supported_assets.contains(&key) {
+            return None;
+        }
+        Some(*self.virtual_earn.get(&key).unwrap_or(&Decimal::ZERO))
+    }
+
+    /// 申购 (现货 free → 理财钱包, 即时)。现金不足 → false, 策略下周期重试。
+    /// 资产不在支持白名单 (061) → false。
+    fn earn_subscribe(&mut self, asset: &str, amount: Decimal) -> bool {
+        let key = asset.to_uppercase();
+        if self.is_futures() || amount <= Decimal::ZERO {
+            return false;
+        }
+        if !self.earn_supported_assets.contains(&key) {
+            return false;
+        }
+        let free = self.virtual_balance.get(&key).map(|b| b.free).unwrap_or(Decimal::ZERO);
+        if free < amount {
+            return false;
+        }
+        self.virtual_balance.get_mut(&key).unwrap().free -= amount;
+        *self.virtual_earn.entry(key).or_default() += amount;
+        true
+    }
+
+    /// 赎回 (理财钱包 → 现货 free, 即时)。在理财不足 → false。
+    /// 资产不在支持白名单 (061) → false。
+    fn earn_redeem(&mut self, asset: &str, amount: Decimal) -> bool {
+        let key = asset.to_uppercase();
+        if self.is_futures() || amount <= Decimal::ZERO {
+            return false;
+        }
+        if !self.earn_supported_assets.contains(&key) {
+            return false;
+        }
+        let parked = *self.virtual_earn.get(&key).unwrap_or(&Decimal::ZERO);
+        if parked < amount {
+            return false;
+        }
+        *self.virtual_earn.entry(key.clone()).or_default() -= amount;
+        let e = self.virtual_balance.entry(key.clone()).or_insert_with(|| Balance {
+            asset: key.clone(),
+            free: Decimal::ZERO,
+            locked: Decimal::ZERO,
+        });
+        e.free += amount;
+        true
     }
 
     fn place_order(&mut self, req: OrderRequest) -> CoreResult<OrderAck> {

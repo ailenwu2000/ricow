@@ -56,6 +56,8 @@ fn strategy_params() -> Vec<String> {
 /// (`leverage` 等)。它们由 CLI 按名写回 params 池(apply_backtest_cli)、引擎按名读取, 策略也可读
 /// (如展示引擎实际杠杆) —— 语义是**引擎/CLI 配置**, 不是策略参数, 故不进黑名单, 也不要求清单
 /// 声明(声明反而与 CLI flag 重复)。032 审核口径。
+/// 061 追加: `universe` = CLI 组合回测分流的多标的列表(路由配置, CLI 按名读取拆 pair);
+/// `earn_supported_assets` = 回测理财支持资产白名单(引擎 earn_* 降级按名读取, 模拟端能力)。
 fn is_engine_channel_key(k: &str) -> bool {
     matches!(
         k,
@@ -66,6 +68,8 @@ fn is_engine_channel_key(k: &str) -> bool {
             | "max_leverage"
             | "mmr_pct"
             | "margin_mode"
+            | "universe"
+            | "earn_supported_assets"
             | "funding_rate_8h"
             | "fee_maker_bps"
             | "fee_taker_bps"

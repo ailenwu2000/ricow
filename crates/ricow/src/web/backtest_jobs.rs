@@ -1587,8 +1587,9 @@ mod tests {
         //     判据。此前只有本端点漏了这道闸, 同一参数面出现两套规则(`script_path` 尤其危险:
         //     它是一条"让引擎去读任意路径"的通道)。
         for bad in ["pair", "script", "script_path"] {
-            let json =
-                format!(r#"{{"strategy":"linear_position_grid","params":{{"{bad}":"/etc/passwd"}}}}"#);
+            let json = format!(
+                r#"{{"strategy":"linear_position_grid","params":{{"{bad}":"/etc/passwd"}}}}"#
+            );
             let res = raw(port, "POST", "/api/backtest?token=tok-ok", Some(&json)).await;
             assert_eq!(status_of(&res), 400, "内部键 '{bad}': {res}");
             assert!(body_of(&res).contains(bad), "错误要点名该键: {res}");
@@ -1624,7 +1625,8 @@ mod tests {
         // 051 复核 B9: 内部键判据统一到 helper 后文案改为"引擎内部键(...), 收到: 'x'",
         // 故断言从"含 param 字样"改成**更强**的"点名内部键 + 回显收到的键"(空键仍走原分支)。
         for bad in ["", "pair", "script", "script_path"] {
-            let json = format!(r#"{{"strategy":"linear_position_grid","param":"{bad}","values":[1,2]}}"#);
+            let json =
+                format!(r#"{{"strategy":"linear_position_grid","param":"{bad}","values":[1,2]}}"#);
             let res = raw(port, "POST", "/api/backtest/sweep?token=tok-ok", Some(&json)).await;
             assert_eq!(status_of(&res), 400, "param='{bad}': {res}");
             if bad.is_empty() {
@@ -1636,12 +1638,14 @@ mod tests {
         }
 
         // ③ values 档位数量越界(1 档 / 11 档)→ 400。
-        let res = post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1]}"#).await;
+        let res =
+            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1]}"#).await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("values"), "{res}");
         let eleven: String = (0..11).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-        let json =
-            format!(r#"{{"strategy":"linear_position_grid","param":"atr_mult","values":[{eleven}]}}"#);
+        let json = format!(
+            r#"{{"strategy":"linear_position_grid","param":"atr_mult","values":[{eleven}]}}"#
+        );
         let res = raw(port, "POST", "/api/backtest/sweep?token=tok-ok", Some(&json)).await;
         assert_eq!(status_of(&res), 400, "{res}");
 
@@ -1657,23 +1661,26 @@ mod tests {
         .await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("interval"), "{res}");
-        let res =
-            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1,2],"days":0}"#)
-                .await;
+        let res = post(
+            r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1,2],"days":0}"#,
+        )
+        .await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("days"), "{res}");
         let res =
             post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1,2],"market":"fx"}"#)
                 .await;
         assert_eq!(status_of(&res), 400, "{res}");
-        let res =
-            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1,2],"cash":-1}"#)
-                .await;
+        let res = post(
+            r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[1,2],"cash":-1}"#,
+        )
+        .await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("cash"), "{res}");
         // 档位取值不是标量(null/对象/数组)→ config_values 类型转换当场 400。
         let res =
-            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[null,2]}"#).await;
+            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[null,2]}"#)
+                .await;
         assert_eq!(status_of(&res), 400, "{res}");
 
         // ⑥ 非 JSON → 400。
@@ -1684,7 +1691,8 @@ mod tests {
         //    注意: 登记成功后会 spawn 后台逐档跑; 但 `#[tokio::test]` 是当前线程运行时,
         //    本测试函数一返回运行时即关闭、spawn 任务被丢弃 —— 不会真正取数(保持离线)。
         let res =
-            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[0.5,1.0]}"#).await;
+            post(r#"{"strategy":"linear_position_grid","param":"atr_mult","values":[0.5,1.0]}"#)
+                .await;
         assert_eq!(status_of(&res), 202, "合法寻优应立即 202: {res}");
         let body = body_of(&res);
         let job_id = serde_json::from_str::<serde_json::Value>(body)
@@ -1785,9 +1793,10 @@ mod tests {
         assert!(body_of(&res).contains("重复"), "{res}");
 
         // ③ 每维档位数量越界(1 档)→ 400。
-        let res =
-            post(r#"{"strategy":"linear_position_grid","params":[{"key":"grid_step","values":[1]}]}"#)
-                .await;
+        let res = post(
+            r#"{"strategy":"linear_position_grid","params":[{"key":"grid_step","values":[1]}]}"#,
+        )
+        .await;
         assert_eq!(status_of(&res), 400, "{res}");
         assert!(body_of(&res).contains("2..=10"), "{res}");
 

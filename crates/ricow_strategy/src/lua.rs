@@ -120,6 +120,8 @@ pub(crate) struct LuaCtxData {
     /// 方向仓逐侧标记价 (032): key 同上。`ctx:pos_mark`。
     directional_mark: HashMap<String, f64>,
     balances: HashMap<String, f64>,
+    /// Simple Earn 理财余额快照 (060): 键 = 报价资产, 值 = 在理财数量。空 = 该端不支持理财。
+    earn: HashMap<String, f64>,
     /// 已实现净盈亏 (报价币计, 已扣手续费): `ctx:net_pnl()`。020 新增 ——
     /// 平台不再代做亏损熔断, 回撤/止损规则由策略自己实现, 这是它的输入。
     net_pnl: f64,
@@ -160,6 +162,7 @@ impl LuaCtxData {
             directional_liq: HashMap::new(),
             directional_mark: HashMap::new(),
             balances: HashMap::new(),
+            earn: HashMap::new(),
             net_pnl: 0.0,
             equity: 0.0,
             config_f64_map: HashMap::new(),
@@ -412,6 +415,18 @@ impl UserData for LuaCtxData {
             t.set(key, value)?;
             Ok(())
         });
+        // Simple Earn 活期理财 (060): `ctx:earn_balance(asset)` 读快照 (nil = 该端不支持理财, 策略降级);
+        // `ctx:earn_subscribe/earn_redeem(asset, amount)` 写入 `_RICOW_EARN_OPS` 全局表队列,
+        // 回调返回后由 `drain_earn_ops` 经 ctx 执行 —— "提交申请、下一周期再看"语义天然成立。
+        methods.add_method("earn_balance", |_, data, asset: String| {
+            Ok(data.earn.get(&asset.to_uppercase()).copied())
+        });
+        methods.add_method("earn_subscribe", |lua, _, (asset, amount): (String, f64)| {
+            push_earn_op(lua, "subscribe", &asset, amount)
+        });
+        methods.add_method("earn_redeem", |lua, _, (asset, amount): (String, f64)| {
+            push_earn_op(lua, "redeem", &asset, amount)
+        });
         // 高周期上一根已收盘 close: `ctx:close_tf(pair, tf)`。
         methods.add_method("close_tf", |_, data, (pair, tf): (String, String)| {
             let Some(now_ms) = data.now.map(|t| t.timestamp_millis()) else {
@@ -478,6 +493,26 @@ fn position_side_label(pos: &Position) -> &'static str {
     } else {
         "short"
     }
+}
+
+/// 把一笔理财划转请求写入 `_RICOW_EARN_OPS` 全局表队列 (060, 仿 `_RICOW_DECLARATIONS`)。
+/// true = 已受理入队 (实际划转在回调返回后由 `drain_earn_ops` 执行)。
+fn push_earn_op(lua: &Lua, op: &str, asset: &str, amount: f64) -> mlua::Result<bool> {
+    let g = lua.globals();
+    let t = match g.get::<Option<Table>>("_RICOW_EARN_OPS")? {
+        Some(t) => t,
+        None => {
+            let t = lua.create_table()?;
+            g.set("_RICOW_EARN_OPS", &t)?;
+            t
+        }
+    };
+    let row = lua.create_table()?;
+    row.set("op", op)?;
+    row.set("asset", asset.to_uppercase())?;
+    row.set("amount", amount)?;
+    t.set(t.raw_len() + 1, row)?;
+    Ok(true)
 }
 
 impl LuaStrategy {
@@ -596,6 +631,15 @@ impl LuaStrategy {
                 }
             }
         }
+        // Simple Earn 理财余额快照 (060): 与 balances 同口径只同步常见报价资产;
+        // 该端不支持理财 (None) → 不填, Lua 侧 `ctx:earn_balance` 返回 nil, 策略据此降级。
+        for asset in ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI"] {
+            if let Some(v) = ctx.earn_balance(asset) {
+                if let Some(f) = v.to_f64() {
+                    data.earn.insert(asset.to_string(), f);
+                }
+            }
+        }
         // 盈亏状态快照 (020): 策略自管风控的输入 —— 已实现净盈亏与总权益。
         data.net_pnl = ctx.pnl().net_pnl().to_f64().unwrap_or(0.0);
         let cash: f64 = data.balances.values().sum();
@@ -604,13 +648,14 @@ impl LuaStrategy {
             // (032 复审: 漏加钱包会把开仓锁定保证金当消失权益 → 权益/WARN 虚低。)
             cash + ctx.wallets_total().to_f64().unwrap_or(0.0) + unrealized
         } else {
-            // 现货: 现金 + 持仓市值 (数量 × 现价)。
+            // 现货: 现金 + 持仓市值 (数量 × 现价) + 理财市值 (060, 现金腿按面值)。
             let holdings: f64 = data
                 .position_sizes
                 .iter()
                 .filter_map(|(pair, size)| data.prices.get(pair).map(|p| size * p))
                 .sum();
-            cash + holdings
+            let earn_total: f64 = data.earn.values().sum();
+            cash + holdings + earn_total
         };
         // config_*_map 从 ctx.config().params 构建 (而非 self.config): BacktestContext::new
         // 会把 resolve 后的最终撮合参数 (fee/slippage/leverage/mmr/funding) 回写进 ctx 的
@@ -653,6 +698,41 @@ impl LuaStrategy {
             let Ok(tf) = row.get::<String>("tf") else { continue };
             let Ok(min_bars) = row.get::<u32>("min_bars") else { continue };
             ctx.need_klines(&role, &tf, min_bars);
+        }
+    }
+
+    /// 执行回调期间累积的理财划转队列 (060): 读 `_RICOW_EARN_OPS` → 逐条经 ctx 划转 → 重置队列。
+    /// 未受理 (交易所不支持 / 余额不足) → WARN + 跳过该条, 不中断策略 —— 策略下一周期重新决策。
+    fn drain_earn_ops(&self, ctx: &mut dyn Context) {
+        let g = self.lua.globals();
+        let Ok(Some(t)) = g.get::<Option<Table>>("_RICOW_EARN_OPS") else {
+            return;
+        };
+        if t.raw_len() == 0 {
+            return;
+        }
+        for row in t.sequence_values::<Table>() {
+            let Ok(row) = row else { continue };
+            let Ok(op) = row.get::<String>("op") else { continue };
+            let Ok(asset) = row.get::<String>("asset") else { continue };
+            let Ok(amount) = row.get::<f64>("amount") else { continue };
+            let Some(amt) = Decimal::from_f64_retain(amount) else { continue };
+            let ok = if op == "subscribe" {
+                ctx.earn_subscribe(&asset, amt)
+            } else {
+                ctx.earn_redeem(&asset, amt)
+            };
+            if !ok {
+                tracing::warn!(
+                    target: "lua_strategy", instance = %self.instance_id,
+                    op = %op, asset = %asset, amount = amount,
+                    "理财划转未受理 (本笔跳过, 下周期重试)"
+                );
+            }
+        }
+        // 重置队列: 每个回调周期独立入队, 不得带到下一周期重复执行。
+        if let Ok(fresh) = self.lua.create_table() {
+            let _ = g.set("_RICOW_EARN_OPS", fresh);
         }
     }
 
@@ -818,12 +898,11 @@ impl Strategy for LuaStrategy {
         let mut data = LuaCtxData::new();
         self.fill_snapshot(ctx, &mut data);
 
-        let result = match self.call("on_tick", data, vec![]) {
-            Some(v) => v,
-            None => return vec![],
-        };
+        let result = self.call("on_tick", data, vec![]);
+        // 理财划转队列在回调返回后执行 (与订单产出解耦; 队列空时 no-op)。
+        self.drain_earn_ops(ctx);
         match result {
-            Value::Table(t) => self.parse_orders(&t),
+            Some(Value::Table(t)) => self.parse_orders(&t),
             _ => vec![],
         }
     }
@@ -836,7 +915,9 @@ impl Strategy for LuaStrategy {
         let Ok(t) = self.fill_to_table(&fill) else {
             return vec![];
         };
-        match self.call("on_fill", data, vec![Value::Table(t)]) {
+        let result = self.call("on_fill", data, vec![Value::Table(t)]);
+        self.drain_earn_ops(ctx);
+        match result {
             Some(Value::Table(orders)) => self.parse_orders(&orders),
             _ => vec![],
         }
@@ -855,6 +936,7 @@ impl Strategy for LuaStrategy {
         let mut data = LuaCtxData::new();
         self.fill_snapshot(ctx, &mut data);
         self.call("on_stop", data, vec![]);
+        self.drain_earn_ops(ctx);
     }
 
     /// 取走 `_RICOW_STATE` 的当前内容 (030): 引擎落库用。

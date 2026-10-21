@@ -345,7 +345,11 @@ impl BinanceClient {
         serde_json::from_str(&text).map_err(|e| CoreError::Parse(format!("{e}: {text}")))
     }
 
-    async fn signed_get(&self, path: &str, extra: &[(String, String)]) -> CoreResult<Value> {
+    pub(crate) async fn signed_get(
+        &self,
+        path: &str,
+        extra: &[(String, String)],
+    ) -> CoreResult<Value> {
         let mut params = extra.to_vec();
         self.add_timestamp_and_sign(&mut params)?;
         let qs = build_query_string(&params);
@@ -360,7 +364,11 @@ impl BinanceClient {
         check_bn_response(resp).await
     }
 
-    async fn signed_post(&self, path: &str, params: &[(String, String)]) -> CoreResult<Value> {
+    pub(crate) async fn signed_post(
+        &self,
+        path: &str,
+        params: &[(String, String)],
+    ) -> CoreResult<Value> {
         let mut p = params.to_vec();
         self.add_timestamp_and_sign(&mut p)?;
         let qs = build_query_string(&p);
@@ -375,7 +383,11 @@ impl BinanceClient {
         check_bn_response(resp).await
     }
 
-    async fn signed_delete(&self, path: &str, params: &[(String, String)]) -> CoreResult<Value> {
+    pub(crate) async fn signed_delete(
+        &self,
+        path: &str,
+        params: &[(String, String)],
+    ) -> CoreResult<Value> {
         let mut p = params.to_vec();
         self.add_timestamp_and_sign(&mut p)?;
         let qs = build_query_string(&p);

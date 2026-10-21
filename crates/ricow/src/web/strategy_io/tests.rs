@@ -208,7 +208,8 @@ async fn test_strategy_endpoints_require_token_offline() {
     }
 
     // 对 token 取得到内置源码(证明拦的不是"路由不存在")。
-    let res = raw(port, "GET", "/api/strategies/linear_position_grid/source?token=tok-ok", None).await;
+    let res =
+        raw(port, "GET", "/api/strategies/linear_position_grid/source?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 200);
     assert!(body_of(&res).contains("on_tick"));
 }
@@ -219,7 +220,8 @@ async fn test_get_source_builtin_unknown_and_traversal_404() {
     let root = tmp_root("source");
     let port = boot(root).await;
 
-    let res = raw(port, "GET", "/api/strategies/linear_position_grid/source?token=tok-ok", None).await;
+    let res =
+        raw(port, "GET", "/api/strategies/linear_position_grid/source?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 200, "{res}");
     let body = body_of(&res);
     assert!(body.contains(r#""id":"linear_position_grid""#), "{body}");
@@ -406,7 +408,8 @@ async fn test_post_save_roundtrip_compile_guard_and_conflicts() {
 /// manifest 参数摘要: 键名/类型/必填/枚举/默认都要来自清单数据(不硬编码参数名)。
 #[test]
 fn test_manifest_summary_renders_schema() {
-    let entry = catalog::find("linear_position_grid").expect("内置清单 linear_position_grid 必须存在");
+    let entry =
+        catalog::find("linear_position_grid").expect("内置清单 linear_position_grid 必须存在");
     let s = manifest_summary(&entry.manifest);
     assert!(s.contains(&entry.manifest.id) && s.contains(&entry.manifest.name), "{s}");
     assert!(s.contains("键名") && s.contains("类型"), "{s}");
@@ -444,16 +447,24 @@ async fn test_ai_edit_validation_and_need_keys_offline() {
     let post = |ins: &str| format!(r#"{{"instruction":"{ins}"}}"#);
 
     // ① 空 / 纯空白指令 → 400(不触网、不查策略)。
-    let res =
-        raw(port, "POST", "/api/strategies/linear_position_grid/ai-edit?token=tok-ok", Some(&post("   ")))
-            .await;
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/linear_position_grid/ai-edit?token=tok-ok",
+        Some(&post("   ")),
+    )
+    .await;
     assert_eq!(status_of(&res), 400, "{res}");
     assert!(body_of(&res).contains("instruction"), "{res}");
 
     // ② 非 JSON → 400。
-    let res =
-        raw(port, "POST", "/api/strategies/linear_position_grid/ai-edit?token=tok-ok", Some("{ not json"))
-            .await;
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/linear_position_grid/ai-edit?token=tok-ok",
+        Some("{ not json"),
+    )
+    .await;
     assert_eq!(status_of(&res), 400, "{res}");
 
     // ③ 未知 id → 404(与 source 同口径, 先于任何 AI 调用)。
@@ -655,7 +666,8 @@ async fn test_ai_generate_validation_offline() {
 
     // ② 内置保留名 → 409 code=reserved。
     let res = post(
-        r#"{"name":"linear_position_grid","market":"spot","pair":"ETHUSDT","idea":"随便"}"#.to_string(),
+        r#"{"name":"linear_position_grid","market":"spot","pair":"ETHUSDT","idea":"随便"}"#
+            .to_string(),
     )
     .await;
     assert_eq!(status_of(&res), 409, "{res}");
@@ -1142,7 +1154,8 @@ fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// `derive_manifest` 只改 id / market, 其余(含参数 schema 与展示元数据)逐字照搬。
 #[test]
 fn test_derive_manifest_rewrites_only_id_and_market() {
-    let src = catalog::find("paired_grid_futures_long").expect("内置 paired_grid_futures_long 应在目录里");
+    let src = catalog::find("paired_grid_futures_long")
+        .expect("内置 paired_grid_futures_long 应在目录里");
     let d = derive_manifest(&src.manifest, "paired_grid-1", "futures");
     assert_eq!(d.id, "paired_grid-1", "id 必须改成新策略名(落盘文件名按它)");
     assert_eq!(d.market, "futures");
@@ -1455,7 +1468,8 @@ async fn test_delete_strategy_endpoint() {
     assert!(body_of(&res).is_empty(), "401 须空体: {res}");
 
     // 内置 → 409 reserved(与保存同口径, 单一来源 catalog::is_builtin_id)。
-    let res = raw(port, "DELETE", "/api/strategies/paired_grid_futures_long?token=tok-ok", None).await;
+    let res =
+        raw(port, "DELETE", "/api/strategies/paired_grid_futures_long?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 409, "{res}");
     assert!(body_of(&res).contains("reserved"), "{res}");
 
@@ -1976,8 +1990,13 @@ async fn test_ai_assess_offline_guards() {
     assert!(body_of(&res).contains("need_keys"), "{res}");
 
     // 未带 token → 401(与其他策略端点一致)。
-    let res =
-        raw(port, "POST", "/api/strategies/paired_grid_futures_long/ai-assess", Some(&body.to_string())).await;
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/paired_grid_futures_long/ai-assess",
+        Some(&body.to_string()),
+    )
+    .await;
     assert_eq!(status_of(&res), 401, "{res}");
 
     for (k, v) in ["RICOW_AI_API_KEY", "RICOW_AI_BASE_URL", "RICOW_AI_MODEL"].iter().zip(saved) {

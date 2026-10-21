@@ -255,7 +255,7 @@ pub fn build_interval_ticks(
 /// 流程与 `run_backtest` 对齐: on_init → 逐 tick [step_portfolio(推进 + 撮合前 tick
 /// 残留限价单) → drain_fills/on_fill(撮合成交先入账) → on_tick 产单 → place_order
 /// (市价即时按本 tick 各 pair bar open 成交; 资金不足拒单计数) → drain_fills/on_fill]
-/// → report_portfolio。
+/// → on_stop → report_portfolio (策略统计 state_snapshot 透传进报告)。
 ///
 /// `signal_klines` (bs_momentum Lua 化, 2026-09-09): 美股信号日线 (键 = 原始 pair 名,
 /// 装配层按窗口截取), 构造 ctx 后装载 — 组合信号模式下 ctx:klines(pair) 返回按全局
@@ -280,8 +280,11 @@ pub fn run_portfolio_backtest(
         settle_orders(&mut ctx, strategy, orders, 0);
     }
 
+    // 与 run_backtest 对齐 (061): 收尾回调 on_stop 先跑, 策略统计透传进报告。
+    strategy.on_stop(&mut ctx);
     let mut report = ctx.report_portfolio();
     report.strategy_logs = strategy.take_logs();
+    report.strategy_stats = strategy.state_snapshot();
     report
 }
 
@@ -589,6 +592,66 @@ mod tests {
         let snap = s.state_snapshot();
         let seen = snap.iter().find(|(k, _)| k == "seen_status").map(|(_, v)| v.clone()).unwrap();
         assert_eq!(seen, "cancelled", "撤单必须经 on_order_update 回传给 Lua");
+    }
+
+    #[test]
+    fn test_run_portfolio_smart_position_e2e() {
+        // 061 e2e: 真实 smart_position.lua 经 run_portfolio_backtest 全链路 —
+        // tick0 双币各建 target_pct×w_i=25% 腿, tick24 闲置现金入理财,
+        // on_stop 统计透传进报告, 期末权益含理财腿面值。
+        const SP_LUA: &str = include_str!("../../../strategies/spot/smart_position.lua");
+        let mut cfg = strategy_config();
+        cfg.params.insert("script".into(), ConfigValue::String(SP_LUA.into()));
+        cfg.params.insert("pair".into(), ConfigValue::String("ETHUSDT".into()));
+        cfg.params.insert("universe".into(), ConfigValue::String("ETHUSDT,SOLUSDT".into()));
+        cfg.params.insert("interval".into(), ConfigValue::String("1h".into()));
+        // TOML 默认值注入 (对齐 CLI 生效配置口径: config_f64 缺失键返回 0 而非 nil)。
+        for (k, v) in [
+            ("target_pct", 0.5),
+            ("cycle_days", 1.0),
+            ("rebalance_threshold_pct", 2.0),
+            ("earn_enabled", 1.0),
+            ("earn_buffer_pct", 0.5),
+            ("earn_apr", 0.02),
+            ("min_notional", 5.0),
+            ("fee_side", 0.001),
+        ] {
+            cfg.params.insert(k.into(), ConfigValue::Float(v));
+        }
+        let mut s = LuaStrategy::from_source(SP_LUA, cfg.clone()).expect("脚本应编译通过");
+
+        let ticks: Vec<Vec<(String, Kline)>> = (0..48)
+            .map(|h| {
+                let ms = h * 3_600_000;
+                vec![
+                    ("ETHUSDT".to_string(), kline_at(ms, 100)),
+                    ("SOLUSDT".to_string(), kline_at(ms, 100)),
+                ]
+            })
+            .collect();
+
+        let report = run_portfolio_backtest(cfg, balance(10_000), &ticks, &mut s, HashMap::new());
+
+        assert_eq!(report.rejected_count, 0, "资金充足不应拒单");
+        assert_eq!(report.fills.len(), 2, "平 bar 全程仅两笔建仓成交");
+        assert!(report.fills.iter().any(|f| f.pair == "ETHUSDT"), "ETH 建仓成交");
+        assert!(report.fills.iter().any(|f| f.pair == "SOLUSDT"), "SOL 建仓成交");
+
+        let stat = |k: &str| -> String {
+            report
+                .strategy_stats
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(stat("stat_universe"), "ETHUSDT,SOLUSDT", "on_stop 统计应透传进报告");
+        let earn_final: f64 = stat("stat_earn_final").parse().unwrap();
+        assert!(earn_final > 4900.0 && earn_final < 5000.0, "tick24 闲置现金入理财: {earn_final}");
+
+        // 期末权益含理财腿 (mark_to_market_portfolio 计入面值): 平 bar 仅建仓费磨损 ≈5。
+        let fe = report.final_equity.to_f64().unwrap();
+        assert!((fe - 9995.0).abs() < 5.0, "final_equity 应含理财腿且≈初始−费: {fe}");
     }
 
     // ------------------------------------------------------------------

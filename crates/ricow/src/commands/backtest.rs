@@ -1297,10 +1297,559 @@ pub(crate) async fn run_backtest(args: BacktestArgs) -> CoreResult<String> {
     let slippage_ladder = parse_ladder(args.sensitivity.as_deref(), DEFAULT_SLIPPAGE_LADDER)?;
     let fee_ladder = parse_ladder(args.sensitivity_fee.as_deref(), DEFAULT_FEE_LADDER)?;
     let spec = BacktestRunSpec::from_cli_args(crate::commands::project_root(), args);
+    // 061: 组合回测分流 — universe 键生效值含 ≥2 个交易对时走组合路径 (统一时间轴多标的)。
+    // 配置装载只读磁盘 TOML/注入默认, 轻量; 单标的路径不消费本结果, 行为逐字不变。
+    if let Some(pairs) = portfolio_universe(&spec)? {
+        if slippage_ladder.is_some() || fee_ladder.is_some() {
+            return Err(CoreError::InvalidArgument(
+                "组合回测暂不支持敏感性扫描 (--sensitivity/--sensitivity-fee)".into(),
+            ));
+        }
+        return run_portfolio_backtest_cli(&spec, pairs).await;
+    }
     if slippage_ladder.is_some() || fee_ladder.is_some() {
         return run_backtest_sensitivity(spec, slippage_ladder, fee_ladder).await;
     }
     run_backtest_core(spec).await
+}
+
+/// 061 组合分流判定: 装载生效配置后读 `universe` (引擎通道键, 逗号串)。
+/// 少于 2 个交易对 (缺键 / 空串 / 单币) → None = 单标的路径 (行为逐字不变)。
+fn portfolio_universe(spec: &BacktestRunSpec) -> CoreResult<Option<Vec<String>>> {
+    let config = load_run_config(
+        &spec.root,
+        &spec.strategy,
+        spec.pair.as_deref(),
+        spec.script_path.as_deref(),
+        spec.params.clone(),
+    )?;
+    let Some(raw) = config.get_str("universe") else { return Ok(None) };
+    let pairs: Vec<String> =
+        raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+    if pairs.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(pairs))
+}
+
+/// 061: CLI 组合回测路径 — 多标的 universe 按统一时间轴喂 `run_portfolio_backtest`
+/// (与 bs_momentum 组合同一撮合账本)。逐 pair 镜像 [`run_backtest_inner`] 的
+/// 窗口/预算/缓存/并发分页拉数/gaps 硬校验/预热硬校验; 报告为自定义组合文本
+/// (概览 + 分标的明细 + 策略统计透传); 导出复用 [`export_backtest`]; run card 写一张。
+async fn run_portfolio_backtest_cli(
+    spec: &BacktestRunSpec,
+    pairs: Vec<String>,
+) -> CoreResult<String> {
+    let t_total = Instant::now();
+    let interval = spec.interval.clone();
+    let hours_per_bar = match interval.as_str() {
+        "1m" => 1.0 / 60.0,
+        "5m" => 5.0 / 60.0,
+        "15m" => 0.25,
+        "1h" => 1.0,
+        "4h" => 4.0,
+        "1d" => 24.0,
+        other => {
+            return Err(CoreError::InvalidArgument(format!(
+                "unsupported interval: {other} (1m/5m/15m/1h/4h/1d)"
+            )))
+        }
+    };
+    let end_ms: Option<i64> = match spec.end.as_deref() {
+        Some(d) => Some(parse_ymd_ms(d)?),
+        None => None,
+    };
+    let (days, end_ms) = match spec.start.as_deref() {
+        Some(s) => {
+            let s_ms = parse_ymd_ms(s)?;
+            let e_ms = end_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
+            let d = (((e_ms - s_ms) as f64) / 86_400_000.0).round().max(1.0) as u32;
+            (d, Some(e_ms))
+        }
+        None => (spec.days, end_ms),
+    };
+    let limit = ((days as f64) * 24.0 / hours_per_bar) as u32;
+    // 逐 pair 同口径挡"根数爆炸" (每标的各载一份完整序列)。
+    check_bar_budget(limit, days, &interval)?;
+
+    let exchange = crate::commands::bn_exchange()?;
+    let mut config = load_run_config(
+        &spec.root,
+        &spec.strategy,
+        spec.pair.as_deref(),
+        spec.script_path.as_deref(),
+        spec.params.clone(),
+    )?;
+    if let Some(m) = &spec.market {
+        if m != "spot" && m != "futures" {
+            return Err(CoreError::InvalidArgument(format!(
+                "--market 仅支持 spot|futures, 收到 '{m}'"
+            )));
+        }
+        config.market = m.clone();
+    }
+    if let Some(p) = &spec.position_mode {
+        if p != "one-way" && p != "hedge" {
+            return Err(CoreError::InvalidArgument(format!(
+                "--position-mode 仅支持 one-way|hedge, 收到 '{p}'"
+            )));
+        }
+        config.position_mode = p.clone();
+    }
+    let params = apply_backtest_overrides(spec.backtest_overrides(), &mut config)?;
+    if spec.interval_explicit {
+        config.params.insert("interval".into(), ConfigValue::String(interval.clone()));
+    } else {
+        config.params.entry("interval".into()).or_insert(ConfigValue::String(interval.clone()));
+    }
+    // pair 兜底 = universe 首项 (引擎通道键, 展示/取数兼容; 组合语义由 Lua 按 universe 驱动)。
+    if config.get_str("pair").is_none() {
+        config.params.insert("pair".into(), ConfigValue::String(pairs[0].clone()));
+    }
+
+    // 声明收集 (warmup): 与单标的路径同口径 — on_init 幂等, 只依赖 config。
+    let mut declare_strategy = ricow_engine::load_strategy(&config)?;
+    let mut declare_ctx = ricow_strategy::BacktestContext::new(
+        config.clone(),
+        Balance { asset: "USDT".into(), free: Decimal::ZERO, locked: Decimal::ZERO },
+    );
+    declare_strategy.on_init(&mut declare_ctx);
+    let declarations = declare_ctx.declarations();
+    let main_tf_ms = declarations
+        .iter()
+        .find(|d| d.role == "primary")
+        .and_then(|d| ricow_strategy::tf_ms_of(&d.tf))
+        .unwrap_or((hours_per_bar * 3_600_000.0) as i64);
+    let mut warmup_bars: u32 = 0;
+    for d in &declarations {
+        if d.role != "aux" {
+            continue;
+        }
+        let Some(tf_ms) = ricow_strategy::tf_ms_of(&d.tf) else { continue };
+        let need = ((i64::from(d.min_bars) * tf_ms + main_tf_ms - 1) / main_tf_ms) as u32;
+        warmup_bars = warmup_bars.max(need.max(1));
+    }
+    let fetch_limit = limit + warmup_bars;
+
+    let kline_market = spec.klines_market.as_deref().unwrap_or(&config.market);
+    let market_key = kline_market.to_string();
+    let fapi = if kline_market == "futures" {
+        let f = ricow_binance::FuturesDataClient::new()?;
+        if spec.mmr_pct.is_none() && config.market == "futures" {
+            config.params.insert(
+                "mmr_pct".into(),
+                ConfigValue::Float(ricow_binance::tier1_mmr_pct(&pairs[0])),
+            );
+        }
+        Some(std::sync::Arc::new(f))
+    } else {
+        None
+    };
+    let step_ms_i = (hours_per_bar * 3_600_000.0) as i64;
+    let now_ms = Utc::now().timestamp_millis();
+    let window_end = end_ms.unwrap_or(now_ms);
+    let cache_eligible = window_end <= now_ms - step_ms_i;
+    let cache_db = crate::commands::open_cache_db(&spec.root).await;
+
+    // 逐 pair 取数 (镜像单标的管线: 缓存 → 并发分页 → 裁剪 → gaps → 预热校验)。
+    let mut kmap: HashMap<String, Vec<ricow_core::Kline>> = HashMap::new();
+    let mut all_cached = true;
+    for pair in &pairs {
+        crate::commands::pairs::ensure_pair_in_scope(&spec.root, pair, &config.market).await?;
+        let mut klines: Vec<ricow_core::Kline> = Vec::new();
+        if cache_eligible {
+            if let Some(db) = &cache_db {
+                let start_ms = window_end - (fetch_limit as i64) * step_ms_i;
+                match db
+                    .get_klines_range(
+                        &market_key,
+                        pair,
+                        &interval,
+                        start_ms,
+                        window_end,
+                        fetch_limit,
+                    )
+                    .await
+                {
+                    Ok(cached) if cached.len() as u32 >= fetch_limit => {
+                        klines = cached;
+                        tracing::info!(pair = %pair, interval = %interval, bars = klines.len(), "组合回测命中本地 K 线缓存");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "读 K 线缓存失败, 回退直连交易所"),
+                }
+            }
+        }
+        if klines.is_empty() {
+            all_cached = false;
+            let window_start = window_end - (fetch_limit as i64) * step_ms_i;
+            let windows = ricow_binance::plan_windows(
+                window_start,
+                window_end,
+                step_ms_i,
+                ricow_binance::KLINE_PAGE_BARS,
+            );
+            let conc = 16usize;
+            let pages = windows.len();
+            let t_fetch = std::time::Instant::now();
+            let got = if let Some(f) = &fapi {
+                let f = f.clone();
+                let p = pair.clone();
+                let iv = interval.clone();
+                ricow_binance::fetch_klines_concurrent(&windows, conc, move |_, s, e| {
+                    let (f, p, iv) = (f.clone(), p.clone(), iv.clone());
+                    async move { f.get_klines_window(&p, &iv, s, e).await }
+                })
+                .await?
+            } else {
+                let ex = exchange.clone();
+                let p = pair.clone();
+                let iv = interval.clone();
+                ricow_binance::fetch_klines_concurrent(&windows, conc, move |_, s, e| {
+                    let (ex, p, iv) = (ex.clone(), p.clone(), iv.clone());
+                    async move { ex.get_klines_window(&p, &iv, s, e).await }
+                })
+                .await?
+            };
+            klines = ricow_binance::merge_pages(got, fetch_limit as usize);
+            eprintln!(
+                "[timing] {pair} K线拉数 = {:.2}s ({} 片×≤{} 根, 并发 {conc})",
+                t_fetch.elapsed().as_secs_f64(),
+                pages,
+                ricow_binance::KLINE_PAGE_BARS
+            );
+            if let Some(db) = &cache_db {
+                if let Err(e) = db.insert_klines(&market_key, pair, &interval, &klines).await {
+                    tracing::warn!(error = %e, "K 线回填缓存失败 (不影响回测)");
+                }
+            }
+        }
+        if klines.is_empty() {
+            return Err(CoreError::Exchange(format!("no klines for {pair}")));
+        }
+        // `--end` 不含语义: 裁掉终点 bar (与单标的路径同口径)。
+        let klines = match end_ms {
+            Some(e) => klines
+                .into_iter()
+                .filter(|k| k.open_time.timestamp_millis() < e)
+                .collect::<Vec<_>>(),
+            None => klines,
+        };
+        if klines.is_empty() {
+            return Err(CoreError::Exchange(format!("no klines in window for {pair}")));
+        }
+        let gaps = ricow_strategy::gaps::find_gaps(&klines, step_ms_i);
+        if !gaps.is_empty() {
+            return Err(CoreError::InvalidArgument(ricow_strategy::gaps::gap_error_message(
+                pair, &interval, &gaps,
+            )));
+        }
+        if warmup_bars > 0 {
+            let e_ms = end_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
+            let start_ms = e_ms - (limit as i64) * step_ms_i;
+            let available =
+                klines.partition_point(|k| k.open_time.timestamp_millis() < start_ms) as u32;
+            let actual = warmup_bars.min(available);
+            if actual != warmup_bars {
+                return Err(CoreError::InvalidArgument(format!(
+                    "预热段不足, 拒绝回测: 标的 {pair} 请求 {warmup_bars} 根高周期历史, \
+                     交易所只有 {actual} 根 —— 指标初值会失真。请扩大窗口或减少高周期数据需求。"
+                )));
+            }
+        }
+        kmap.insert(pair.clone(), klines);
+    }
+    let data_source = if all_cached { "local-cache" } else { "binance-rest" };
+
+    let initial_cash = Decimal::from_f64_retain(params.initial_cash)
+        .ok_or_else(|| CoreError::InvalidArgument("initial_cash 非法".into()))?;
+    let initial_balance =
+        Balance { asset: "USDT".into(), free: initial_cash, locked: Decimal::ZERO };
+    let universe_repr = pairs.join(",");
+    let ticks = ricow_engine::build_interval_ticks(&kmap, step_ms_i);
+
+    // run card 快照须在 config move 进引擎前采集 (与单标的路径同口径)。
+    let card_strategy = RunCardStrategy {
+        name: spec.strategy.clone(),
+        kind: config.strategy_type.clone(),
+        source_sha256: config
+            .get_str("script")
+            .map(|s| sha256_hex(s.as_bytes()))
+            .unwrap_or_else(|| "none".to_string()),
+        source_bytes: config.get_str("script").map(str::len).unwrap_or(0),
+    };
+    let card_params = params_json(&config);
+    let card_window_meta = (config.market.clone(), config.position_mode.clone());
+    let total_bars: usize = kmap.values().map(|v| v.len()).sum();
+
+    let mut strategy = ricow_engine::load_strategy(&config)?;
+    let t_engine0 = t_total.elapsed();
+    let report = block_in_place_if_multithread(|| {
+        ricow_engine::run_portfolio_backtest(
+            config.clone(),
+            initial_balance,
+            &ticks,
+            &mut *strategy,
+            HashMap::new(),
+        )
+    });
+    eprintln!(
+        "[timing] 组合引擎回放 = {:.2}s ({} 个 tick × {} 标的, 共 {} 根 bar)",
+        (t_total.elapsed() - t_engine0).as_secs_f64(),
+        ticks.len(),
+        pairs.len(),
+        total_bars
+    );
+
+    let meta = PortfolioReportMeta {
+        strategy: &spec.strategy,
+        universe: &universe_repr,
+        days,
+        interval: &interval,
+        data_source,
+        initial_cash,
+        market: &config.market,
+    };
+    let text = format_portfolio_report(&meta, &report, &kmap);
+    // 导出: 复用单标的四件套 (fills.csv 已含 pair 列); stem 用 universe 串安全化形态。
+    if let Some(dir) = &spec.export_dir {
+        let mut merged: Vec<ricow_core::Kline> = kmap.values().flatten().cloned().collect();
+        merged.sort_by_key(|k| k.open_time);
+        export_backtest(
+            dir,
+            &spec.strategy,
+            &sanitize_ident(&universe_repr),
+            &config,
+            &merged,
+            &report,
+            &text,
+        )?;
+    }
+    // run card 写一张 (window.pair = universe 串); 失败只 warn, 不回滚成功的回测。
+    let card = RunCard {
+        schema_version: RUN_CARD_SCHEMA_VERSION,
+        generated_at: Utc::now().to_rfc3339(),
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        strategy: card_strategy,
+        params: card_params,
+        window: RunCardWindow {
+            pair: universe_repr.clone(),
+            interval: interval.clone(),
+            market: card_window_meta.0,
+            position_mode: card_window_meta.1,
+            requested_bars: fetch_limit,
+            warmup_bars,
+            bars: total_bars,
+            first_open_time_ms: kmap
+                .values()
+                .flat_map(|v| v.iter().map(|k| k.open_time.timestamp_millis()))
+                .min(),
+            last_open_time_ms: kmap
+                .values()
+                .flat_map(|v| v.iter().map(|k| k.open_time.timestamp_millis()))
+                .max(),
+            end_ms,
+            data_source: data_source.to_string(),
+        },
+        metrics: RunCardMetrics {
+            total_trades: report.total_trades,
+            rejected_count: report.rejected_count,
+            net_pnl: report.net_pnl.to_string(),
+            realized_pnl: report.realized_pnl.to_string(),
+            total_fees: report.total_fees.to_string(),
+            win_rate: report.win_rate,
+            max_drawdown: report.max_drawdown.to_string(),
+            annual_return: report.annual_return,
+            annual_volatility: report.annual_volatility,
+            sharpe: report.sharpe,
+            sortino: report.sortino,
+            calmar: report.calmar,
+            profit_factor: report.profit_factor,
+            turnover_ratio: report.turnover_ratio,
+            equity_change_pct: report.equity_change_pct,
+            benchmark_return_pct: report.benchmark_return_pct,
+        },
+    };
+    if let Err(e) = write_run_card(&spec.root, &card) {
+        tracing::warn!(error = %e, "组合回测 run card 落盘失败 (不影响回测结果)");
+    }
+    Ok(text)
+}
+
+/// 061: 组合报告头部元数据 (窗口/周期/数据源/投入资金)。
+#[derive(Clone, Copy)]
+struct PortfolioReportMeta<'a> {
+    strategy: &'a str,
+    universe: &'a str,
+    days: u32,
+    interval: &'a str,
+    data_source: &'a str,
+    initial_cash: Decimal,
+    market: &'a str,
+}
+
+/// 061: 组合回测文本报告 — 概览 (资金/权益/盈亏分解/成本/风险) + 分标的明细
+/// (成交/成交额/手续费/期末持仓, 由 fills 按 pair 聚合 + 末 tick 持仓快照) + 策略统计透传。
+fn format_portfolio_report(
+    meta: &PortfolioReportMeta<'_>,
+    report: &ricow_strategy::BacktestReport,
+    kmap: &HashMap<String, Vec<ricow_core::Kline>>,
+) -> String {
+    let PortfolioReportMeta {
+        strategy,
+        universe,
+        days,
+        interval,
+        data_source,
+        initial_cash,
+        market,
+    } = *meta;
+    let opt2 = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "n/a".to_string());
+    let mut out = String::new();
+    out.push_str(&format!("组合回测报告: {strategy} [{universe}]\n"));
+    let market_label = if market == "futures" { "合约组合" } else { "现货组合" };
+    out.push_str(&format!(
+        "  窗口: {days} 天, {interval} K 线, {market_label}, 数据源 {data_source}\n"
+    ));
+    // ---- 概览 (规范 v1 口径: 绝对值优先, 盈亏两口径分解) ----
+    out.push_str("  --- 组合概览 ---\n");
+    out.push_str(&format!("  投入资金: {initial_cash} USDT\n"));
+    out.push_str(&format!(
+        "  期末总权益: {} USDT ({:+.2}%)\n",
+        report.final_equity.round_dp(2),
+        report.equity_change_pct
+    ));
+    out.push_str(&format!(
+        "  净盈亏 (已实现, 扣费): {} USDT = 已实现 {} − 手续费 {}\n",
+        report.net_pnl.round_dp(2),
+        report.realized_pnl.round_dp(2),
+        report.total_fees.round_dp(2)
+    ));
+    let unrealized = report.final_equity - initial_cash - report.net_pnl;
+    out.push_str(&format!(
+        "  期末持仓未实现盈亏: {} USDT (总权益变化 = 净盈亏 + 未实现)\n",
+        unrealized.round_dp(2)
+    ));
+    out.push_str(&format!("  期末现金: {} USDT\n", report.final_cash.round_dp(2)));
+    out.push_str(&format!(
+        "  成交笔数: {} (拒单 {}), 盈利/亏损笔数: {} / {}\n",
+        report.total_trades, report.rejected_count, report.winning_trades, report.losing_trades
+    ));
+    out.push_str(&format!("  胜率: {:.2}%\n", report.win_rate * 100.0));
+    match (report.best_trade, report.worst_trade) {
+        (Some(b), Some(w)) => {
+            out.push_str(&format!("  最佳/最差单笔: {} / {} USDT\n", b.round_dp(2), w.round_dp(2)))
+        }
+        _ => out.push_str("  最佳/最差单笔: n/a\n"),
+    }
+    out.push_str(&format!(
+        "  总成交额: {} USDT (单边累计), 手续费 {} USDT (占比 {:.4}%)\n",
+        report.total_turnover.round_dp(2),
+        report.total_fees.round_dp(2),
+        report.fee_ratio * Decimal::from(100)
+    ));
+    out.push_str(&format!(
+        "  最大回撤: {:.2}%, 夏普 {}, 索提诺 {}, Calmar {}\n",
+        report.max_drawdown * Decimal::from(100),
+        opt2(report.sharpe),
+        opt2(report.sortino),
+        opt2(report.calmar)
+    ));
+    // ---- 分标的明细: fills 按 pair 聚合买/卖笔数、成交额、手续费; 期末持仓取末 tick 快照 ----
+    out.push_str("  --- 分标的明细 ---\n");
+    struct PerPair {
+        buys: u64,
+        sells: u64,
+        turnover: Decimal,
+        fees: Decimal,
+    }
+    let mut agg: HashMap<String, PerPair> = HashMap::new();
+    for f in &report.fills {
+        let e = agg.entry(f.pair.clone()).or_insert(PerPair {
+            buys: 0,
+            sells: 0,
+            turnover: Decimal::ZERO,
+            fees: Decimal::ZERO,
+        });
+        match f.side {
+            ricow_core::OrderSide::Buy => e.buys += 1,
+            ricow_core::OrderSide::Sell => e.sells += 1,
+        }
+        e.turnover += f.fill_price * f.fill_size;
+        e.fees += f.fee;
+    }
+    let final_holdings: HashMap<String, Decimal> = report
+        .holdings_snapshots
+        .last()
+        .map(|snap| snap.iter().cloned().collect())
+        .unwrap_or_default();
+    let cols: [usize; 6] = [14, 6, 6, 14, 12, 14];
+    let mut line = String::from("  ");
+    for (i, h) in ["标的", "买", "卖", "成交额", "手续费", "期末持仓"].iter().enumerate()
+    {
+        line.push_str(&pad_display(h, cols[i]));
+    }
+    out.push_str(&format!("{}\n", line.trim_end()));
+    // 行序 = universe 声明序 (确定性输出)。
+    for pair in universe.split(',') {
+        let Some(a) = agg.get(pair) else {
+            // 无成交的标的: 也如实列一行 (期末持仓可能有值 —— 例如仅赎回未交易)。
+            let pos = final_holdings.get(pair).copied().unwrap_or(Decimal::ZERO);
+            out.push_str(&format!(
+                "  {}{}{}{}{}{}\n",
+                pad_display(pair, cols[0]),
+                pad_display("0", cols[1]),
+                pad_display("0", cols[2]),
+                pad_display("0", cols[3]),
+                pad_display("0", cols[4]),
+                pad_display(&pos.round_dp(6).to_string(), cols[5])
+            ));
+            continue;
+        };
+        let pos = final_holdings.get(pair).copied().unwrap_or(Decimal::ZERO);
+        out.push_str(&format!(
+            "  {}{}{}{}{}{}\n",
+            pad_display(pair, cols[0]),
+            pad_display(&a.buys.to_string(), cols[1]),
+            pad_display(&a.sells.to_string(), cols[2]),
+            pad_display(&a.turnover.round_dp(2).to_string(), cols[3]),
+            pad_display(&a.fees.round_dp(4).to_string(), cols[4]),
+            pad_display(&pos.round_dp(6).to_string(), cols[5])
+        ));
+    }
+    // 期末持仓市值 (按各标的末根收盘价估值; 权益口径 = 现金 + Σ市值 + 理财面值)。
+    // 行序 = universe 声明序 (确定性输出)。
+    let mut mv_total = Decimal::ZERO;
+    let mut mv_parts: Vec<String> = Vec::new();
+    for pair in universe.split(',') {
+        let Some(size) = final_holdings.get(pair) else { continue };
+        if *size <= Decimal::ZERO {
+            continue;
+        }
+        let px = kmap.get(pair).and_then(|v| v.last()).map(|k| k.close).unwrap_or(Decimal::ZERO);
+        let mv = *size * px;
+        mv_total += mv;
+        mv_parts.push(format!("{pair} {}×{}={}", size.round_dp(6), px, mv.round_dp(2)));
+    }
+    if mv_parts.is_empty() {
+        out.push_str("  期末持仓市值: 0 (无持仓)\n");
+    } else {
+        out.push_str(&format!(
+            "  期末持仓市值: {} USDT ({})\n",
+            mv_total.round_dp(2),
+            mv_parts.join(", ")
+        ));
+    }
+    // ---- 策略统计 (state_snapshot 透传, 引擎不解释键名; 与单标的报告同风格) ----
+    if !report.strategy_stats.is_empty() {
+        out.push_str("  --- 策略统计 ---\n");
+        let mut stats = report.strategy_stats.clone();
+        stats.sort();
+        for (k, v) in &stats {
+            out.push_str(&format!("  {k} = {v}\n"));
+        }
+    }
+    out
 }
 
 /// `ConfigValue` → 展示字符串 (报告"测试参数"区块用)。

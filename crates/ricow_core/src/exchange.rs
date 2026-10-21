@@ -4,8 +4,9 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use futures::Stream;
+use rust_decimal::Decimal;
 
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult};
 use crate::types::{
     Balance, FundingIncome, Kline, Market, OrderAck, OrderBook, OrderBookUpdate, OrderInfo,
     OrderRequest, Position, UserEvent,
@@ -91,6 +92,22 @@ pub trait Exchange: Send + Sync {
     /// 默认实现 = 空(现货无资金费概念), 合约实现覆盖之。
     async fn funding_income(&self, _start_ms: i64, _limit: u32) -> CoreResult<Vec<FundingIncome>> {
         Ok(Vec::new())
+    }
+
+    /// Simple Earn 活期理财 (060): 查询 `asset` 当前在理财的数量。
+    /// 默认实现 = 不支持; 支持理财的交易所(币安现货)覆盖之。
+    async fn earn_balance(&self, _asset: &str) -> CoreResult<Decimal> {
+        Err(CoreError::InvalidArgument("该交易所不支持 Simple Earn 活期理财".into()))
+    }
+
+    /// 申购活期理财 (060)。
+    async fn earn_subscribe(&self, _asset: &str, _amount: Decimal) -> CoreResult<()> {
+        Err(CoreError::InvalidArgument("该交易所不支持 Simple Earn 活期理财".into()))
+    }
+
+    /// 赎回活期理财 (060): 活期可部分赎回; 到账时点由上层语义处理(实盘可能非即时)。
+    async fn earn_redeem(&self, _asset: &str, _amount: Decimal) -> CoreResult<()> {
+        Err(CoreError::InvalidArgument("该交易所不支持 Simple Earn 活期理财".into()))
     }
 
     /// 订阅用户事件 (成交/订单更新)

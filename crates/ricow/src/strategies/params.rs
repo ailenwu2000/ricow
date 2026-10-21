@@ -628,4 +628,35 @@ local c = num(ctx, "b_key", 9)
             "interval 的**字面量**兜底是 1h(清单默认 1m 是生效值, 由 resolve_builtin_script 回填)"
         );
     }
+
+    /// 060 smart_position: 同款端到端一致性。`interval` 两侧都是 `1h`(时间闸才是频率开关,
+    /// 清单与代码兜底无偏差), 故无需 known_skew 豁免。
+    #[test]
+    fn smart_position_keys_match_manifest_exactly() {
+        let lua = include_str!("../../../../strategies/spot/smart_position.lua");
+        let toml_src = include_str!("../../../../strategies/spot/smart_position.toml");
+
+        let got = extract_param_hints(lua);
+        let manifest = crate::strategies::catalog::StrategyManifest::parse(toml_src)
+            .expect("内置清单应恒可解析");
+
+        let mut got_keys: Vec<&str> = got.iter().map(|h| h.key.as_str()).collect();
+        let mut want_keys: Vec<&str> = manifest.params.iter().map(|p| p.key.as_str()).collect();
+        got_keys.sort_unstable();
+        want_keys.sort_unstable();
+        assert_eq!(got_keys, want_keys, "提取出的键集合必须与清单声明一致");
+
+        for h in &got {
+            let declared =
+                manifest.params.iter().find(|p| p.key == h.key).and_then(|p| p.default.clone());
+            // 一侧没有字面量兜底(required / nil 检查直读) → 不在此断言范围。
+            if let (Some(a), Some(b)) = (&h.default, &declared) {
+                let same = match (a, b) {
+                    (ConfigValue::String(x), ConfigValue::String(y)) => x == y,
+                    _ => a.as_f64() == b.as_f64(),
+                };
+                assert!(same, "参数 {} 的默认值不一致: 提取 {a:?} vs 清单 {b:?}", h.key);
+            }
+        }
+    }
 }

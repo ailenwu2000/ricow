@@ -65,11 +65,28 @@ pub(crate) fn parse_open_orders(resp: &Value, pair: &str) -> Vec<OrderInfo> {
 /// Binance 现货交易所实现。
 pub struct BnSpotExchange {
     client: BinanceClient,
+    /// Simple Earn `asset → productId` 内存缓存 (首次用到时经 list 端点解析)。
+    earn_products: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl BnSpotExchange {
     pub fn new(client: BinanceClient) -> Self {
-        Self { client }
+        Self { client, earn_products: std::sync::Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// 解析资产的活期 productId: 命中缓存直接返回; 未命中查 list 取首个产品并缓存。
+    async fn earn_product_id(&self, asset: &str) -> CoreResult<String> {
+        let key = asset.to_uppercase();
+        if let Some(pid) = self.earn_products.lock().unwrap().get(&key) {
+            return Ok(pid.clone());
+        }
+        let list = self.client.earn_flexible_list(&key).await?;
+        let (pid, _) = list
+            .into_iter()
+            .next()
+            .ok_or_else(|| ricow_core::CoreError::Parse(format!("{key} 无可用活期理财产品")))?;
+        self.earn_products.lock().unwrap().insert(key, pid.clone());
+        Ok(pid)
     }
 }
 
@@ -177,6 +194,20 @@ impl Exchange for BnSpotExchange {
     async fn get_position(&self, _pair: &str) -> CoreResult<Option<Position>> {
         // 现货无持仓概念, 始终返回 None。
         Ok(None)
+    }
+
+    async fn earn_balance(&self, asset: &str) -> CoreResult<Decimal> {
+        self.client.earn_position_amount(asset).await
+    }
+
+    async fn earn_subscribe(&self, asset: &str, amount: Decimal) -> CoreResult<()> {
+        let product_id = self.earn_product_id(asset).await?;
+        self.client.earn_subscribe(&product_id, amount).await
+    }
+
+    async fn earn_redeem(&self, asset: &str, amount: Decimal) -> CoreResult<()> {
+        let product_id = self.earn_product_id(asset).await?;
+        self.client.earn_redeem(&product_id, amount).await
     }
 
     async fn subscribe_orderbook(

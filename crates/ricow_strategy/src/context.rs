@@ -55,6 +55,23 @@ pub trait Context: Send {
         Decimal::ZERO
     }
     fn balance(&self, asset: &str) -> Option<Decimal>;
+
+    /// Simple Earn 活期理财 (060): 该资产当前在理财的数量。
+    /// 默认 None = 该端不支持理财 (合约/未接入的市场); 实盘查询失败也收敛为 None (降级)。
+    fn earn_balance(&self, _asset: &str) -> Option<Decimal> {
+        None
+    }
+
+    /// 申购活期理财 (现金腿 → 理财)。true = 已受理 (回测/DryRun 即时划转; 实盘异步到账由上层周期处理)。
+    fn earn_subscribe(&mut self, _asset: &str, _amount: Decimal) -> bool {
+        false
+    }
+
+    /// 赎回活期理财 (理财 → 现货现金)。true = 已受理。
+    fn earn_redeem(&mut self, _asset: &str, _amount: Decimal) -> bool {
+        false
+    }
+
     fn place_order(&mut self, req: OrderRequest) -> CoreResult<OrderAck>;
     fn cancel_order(&mut self, pair: &str, order_id: &str) -> CoreResult<()>;
     fn update_orderbook(&mut self, pair: &str, ob: OrderBook);
@@ -132,6 +149,10 @@ pub struct LiveContext {
     orderbook_cache: RwLock<HashMap<String, OrderBook>>,
     position_cache: RwLock<HashMap<String, Position>>,
     balance_cache: RwLock<HashMap<String, Balance>>,
+    /// Simple Earn 理财余额缓存 (060): 键 = 资产大写, 值 = (在理财数量或查询失败, 缓存时刻 ms)。
+    /// on_tick 由盘口高频驱动, 60s TTL 防 /sapi 频控 (429); 失败同样缓存 (None) ——
+    /// demo 测试网不支持理财端点时, 每 60s 才重试一次, 不会逐 tick 打网络。
+    earn_cache: RwLock<HashMap<String, (Option<Decimal>, i64)>>,
     klines_cache: RwLock<HashMap<String, Vec<Kline>>>,
     /// 高周期序列缓存 (023 引入; 2026-09-18 扩为多套): 键 = `pair|tf`。
     /// 由 `set_tf_klines` 预装(装配层已剔除不完整桶); `tf_klines` 按当前时刻取可见前缀。
@@ -179,6 +200,7 @@ impl LiveContext {
             orderbook_cache: RwLock::new(HashMap::new()),
             position_cache: RwLock::new(HashMap::new()),
             balance_cache: RwLock::new(HashMap::new()),
+            earn_cache: RwLock::new(HashMap::new()),
             klines_cache: RwLock::new(HashMap::new()),
             tf_cache: RwLock::new(HashMap::new()),
             declarations: Vec::new(),
@@ -399,6 +421,47 @@ impl LiveContext {
         Ok(())
     }
 
+    /// Simple Earn 申购/赎回桥接 (060): Exchange 错误一律收敛为 `false` + WARN ——
+    /// demo 测试网不支持 /sapi 理财端点, 该错误绝不上抛中断策略 (降级为纯调仓)。
+    /// 成功后失效理财余额缓存并回刷现货余额 (划转同时改变两侧余额)。
+    fn earn_transfer(&self, asset: &str, amount: Decimal, subscribe: bool) -> bool {
+        let key = asset.to_uppercase();
+        if amount <= Decimal::ZERO {
+            return false;
+        }
+        let Ok(exchange) = self.resolve_exchange("") else {
+            return false;
+        };
+        let (a, sub) = (key.clone(), subscribe);
+        let fut = async move {
+            if sub {
+                exchange.earn_subscribe(&a, amount).await
+            } else {
+                exchange.earn_redeem(&a, amount).await
+            }
+        };
+        match self.run_async(fut) {
+            Ok(()) => {
+                if let Ok(mut c) = self.earn_cache.write() {
+                    c.remove(&key);
+                }
+                let _ = self.run_async(self.refresh_balance(&key));
+                tracing::info!(
+                    target: "strategy.live", asset = %key, sub = subscribe,
+                    amount = %amount, "Simple Earn 划转已受理"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "strategy.live", asset = %key, sub = subscribe,
+                    "Simple Earn 划转失败 (本笔跳过): {e}"
+                );
+                false
+            }
+        }
+    }
+
     fn run_async<F: std::future::Future>(&self, fut: F) -> F::Output {
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| self.rt.block_on(fut))
@@ -531,6 +594,43 @@ impl Context for LiveContext {
 
     fn balance(&self, asset: &str) -> Option<Decimal> {
         self.balance_cache.read().ok()?.get(asset).map(|b| b.total())
+    }
+
+    /// 理财余额: 60s TTL 缓存 (on_tick 高频驱动); 查询失败收敛为 None + WARN (降级)。
+    fn earn_balance(&self, asset: &str) -> Option<Decimal> {
+        let key = asset.to_uppercase();
+        const TTL_MS: i64 = 60_000;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some((cached, ts)) = self.earn_cache.read().ok()?.get(&key).copied() {
+            if now_ms - ts < TTL_MS {
+                return cached;
+            }
+        }
+        let exchange = self.resolve_exchange("").ok()?;
+        let a = key.clone();
+        match self.run_async(async move { exchange.earn_balance(&a).await }) {
+            Ok(v) => {
+                if let Ok(mut c) = self.earn_cache.write() {
+                    c.insert(key, (Some(v), now_ms));
+                }
+                Some(v)
+            }
+            Err(e) => {
+                if let Ok(mut c) = self.earn_cache.write() {
+                    c.insert(key.clone(), (None, now_ms));
+                }
+                tracing::warn!(target: "strategy.live", asset = %key, "理财余额查询失败 (视为无理财): {e}");
+                None
+            }
+        }
+    }
+
+    fn earn_subscribe(&mut self, asset: &str, amount: Decimal) -> bool {
+        self.earn_transfer(asset, amount, true)
+    }
+
+    fn earn_redeem(&mut self, asset: &str, amount: Decimal) -> bool {
+        self.earn_transfer(asset, amount, false)
     }
 
     fn update_orderbook(&mut self, pair: &str, ob: OrderBook) {
@@ -807,6 +907,8 @@ pub struct DryRunContext {
     orderbook_cache: RwLock<HashMap<String, OrderBook>>,
     virtual_positions: RwLock<HashMap<String, Position>>,
     virtual_balance: RwLock<HashMap<String, Balance>>,
+    /// Simple Earn 虚拟理财钱包 (060, 仅现金腿): 键 = 资产, 值 = 在理财数量。划转即时。
+    virtual_earn: HashMap<String, Decimal>,
     /// 合约逐侧保证金钱包 (032 DryRun hedge): 键 = 方向仓键 (`{pair}|{side_tag}`), 值 = 冻结名义/杠杆。
     /// 现货/one-way 不用 (净仓模型)。开仓冻结、平仓回笼、两侧全平转回现金。
     wallets: HashMap<String, Decimal>,
@@ -886,6 +988,7 @@ impl DryRunContext {
             orderbook_cache: RwLock::new(HashMap::new()),
             virtual_positions: RwLock::new(HashMap::new()),
             virtual_balance: RwLock::new(balance_map),
+            virtual_earn: HashMap::new(),
             wallets: HashMap::new(),
             liq_warned: std::collections::HashSet::new(),
             leverage,
@@ -919,6 +1022,46 @@ impl DryRunContext {
         );
         build(&mut ev);
         writer.emit(&ev);
+    }
+
+    /// Simple Earn 划转 (060, 即时): 申购 = 现货 free → 理财钱包; 赎回 = 反向。
+    /// 余额不足/金额非正 → false (策略下周期重试); 完全不碰 positions/lots (划转非成交)。
+    fn earn_transfer(&mut self, asset: &str, amount: Decimal, subscribe: bool) -> bool {
+        let key = asset.to_uppercase();
+        if amount <= Decimal::ZERO {
+            return false;
+        }
+        if subscribe {
+            let mut vb = match self.virtual_balance.write() {
+                Ok(g) => g,
+                Err(_) => return false,
+            };
+            let Some(b) = vb.get_mut(&key) else {
+                return false;
+            };
+            if b.free < amount {
+                return false;
+            }
+            b.free -= amount;
+            drop(vb);
+            *self.virtual_earn.entry(key).or_default() += amount;
+        } else {
+            let parked = *self.virtual_earn.get(&key).unwrap_or(&Decimal::ZERO);
+            if parked < amount {
+                return false;
+            }
+            let mut vb = match self.virtual_balance.write() {
+                Ok(g) => g,
+                Err(_) => return false,
+            };
+            let Some(b) = vb.get_mut(&key) else {
+                return false;
+            };
+            b.free += amount;
+            drop(vb);
+            *self.virtual_earn.entry(key).or_default() -= amount;
+        }
+        true
     }
 
     /// 工程护栏前置检查 (019-R5): 超频 → 返回 `Rejected` ack (不抛错, 策略循环不中断), 并记 warn 日志。
@@ -1465,6 +1608,18 @@ impl Context for DryRunContext {
 
     fn balance(&self, asset: &str) -> Option<Decimal> {
         self.virtual_balance.read().ok()?.get(asset).map(|b| b.total())
+    }
+
+    fn earn_balance(&self, asset: &str) -> Option<Decimal> {
+        Some(*self.virtual_earn.get(&asset.to_uppercase()).unwrap_or(&Decimal::ZERO))
+    }
+
+    fn earn_subscribe(&mut self, asset: &str, amount: Decimal) -> bool {
+        self.earn_transfer(asset, amount, true)
+    }
+
+    fn earn_redeem(&mut self, asset: &str, amount: Decimal) -> bool {
+        self.earn_transfer(asset, amount, false)
     }
 
     fn update_orderbook(&mut self, pair: &str, ob: OrderBook) {

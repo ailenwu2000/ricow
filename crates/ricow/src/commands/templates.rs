@@ -92,7 +92,8 @@ mod tests {
     #[test]
     fn list_text_lists_builtin_strategies() {
         let text = list_text();
-        for must in ["linear_position_grid", "paired_grid_futures_long", "现货线性仓位网格"] {
+        for must in ["linear_position_grid", "paired_grid_futures_long", "现货线性仓位网格"]
+        {
             assert!(text.contains(must), "清单缺少: {must}");
         }
     }

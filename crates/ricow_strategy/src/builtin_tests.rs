@@ -505,7 +505,6 @@ fn bar_at_f(hour: i64, px: f64) -> Kline {
     }
 }
 
-
 /// 033: 主序列 —— h<at 为 base, 之后为 then(触发 start_price 激活门槛), 每根带 ±1 振幅
 /// (振幅只为让重采样后的 1h ATR 非零, 平段 ATR=0 会被"ATR 未就绪"拦下)。
 fn univ2_main(n: i64, base: i64, then: i64, at: i64) -> Vec<Kline> {
@@ -2078,4 +2077,500 @@ fn test_linear_grid_ledger_and_snapshot() {
     assert_eq!(snap.get("built").map(|s| s.as_str()), Some("1"), "built 应持久化");
     assert!(snap.contains_key("build_done_steps"), "build_done_steps 应持久化");
     assert!(snap.contains_key("last_step_ts"), "last_step_ts 应持久化");
+}
+
+// ============================================================================
+// 现货智能持仓 (smart_position) 集成测试 (060)
+// 周期调仓(时间闸+阈值闸) + Simple Earn 活期理财: 闲置现金腿申购、现金不足先赎回
+// 下周期再调。市价单即时成交(bar.open), 默认 taker 10bps = fee_side 默认 0.001 同源。
+// ============================================================================
+
+const SMART_POSITION: &str = include_str!("../../../strategies/spot/smart_position.lua");
+
+fn sp_cfg(extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut params = vec![
+        ("pair", ConfigValue::String("ETHUSDT".into())),
+        ("target_pct", ConfigValue::Float(0.5)),
+        ("cycle_days", ConfigValue::Float(1.0)),
+        ("rebalance_threshold_pct", ConfigValue::Float(2.0)),
+        ("earn_enabled", ConfigValue::Float(1.0)),
+        ("earn_buffer_pct", ConfigValue::Float(0.5)),
+        ("earn_apr", ConfigValue::Float(0.02)),
+        ("min_notional", ConfigValue::Float(5.0)),
+        ("fee_side", ConfigValue::Float(0.001)),
+        ("interval", ConfigValue::String("1h".into())),
+    ];
+    params.extend_from_slice(extra);
+    config(SMART_POSITION, &params)
+}
+
+/// 逐 bar 下单批次 → 全序列中某方向的市价单列表。
+fn sp_market_orders(out: &[Vec<Vec<OrderRequest>>], side: OrderSide) -> Vec<(usize, OrderRequest)> {
+    let mut v = Vec::new();
+    for (i, bar) in out.iter().enumerate() {
+        for batch in bar {
+            for o in batch {
+                if o.action == OrderAction::Place
+                    && o.side == side
+                    && o.order_type == OrderType::Market
+                {
+                    v.push((i, o.clone()));
+                }
+            }
+        }
+    }
+    v
+}
+
+fn sp_snap(st: &mut LuaStrategy, ctx: &mut BacktestContext) -> HashMap<String, String> {
+    st.on_stop(ctx);
+    st.state_snapshot().into_iter().collect()
+}
+
+fn sp_f64(snap: &HashMap<String, String>, key: &str) -> f64 {
+    snap.get(key).unwrap_or_else(|| panic!("缺失 {key}")).parse().unwrap()
+}
+
+#[test]
+fn test_smart_position_build_then_earn_subscribe() {
+    // bar0 首周期: 空仓偏离 -50pp → 市价买至 50% 目标; bar24 二周期: 阈内不调仓,
+    // 闲置现金(留 0.5% 权益缓冲)入理财。48 根 1h 平 bar @100。
+    let bars: Vec<Kline> = (0..48).map(|h| bar_at_f(h, 100.0)).collect();
+    let (out, mut ctx, mut st) = run_univ2(sp_cfg(&[]), &bars, None);
+
+    let buys = sp_market_orders(&out, OrderSide::Buy);
+    let sells = sp_market_orders(&out, OrderSide::Sell);
+    assert_eq!(buys.len(), 1, "全程应恰 1 笔市价买(bar0 建仓到位)");
+    assert_eq!(buys[0].0, 0);
+    assert!(sells.is_empty(), "不应有卖单");
+    let size = buys[0].1.size.to_f64().unwrap();
+    assert!((size - 5000.0 / (100.0 * 1.001)).abs() < 1e-3, "买量=Δ/(p(1+f)): {size}");
+
+    let earn = ctx.earn_balance("USDT").unwrap().to_f64().unwrap();
+    let cash = ctx.balance("USDT").unwrap().to_f64().unwrap();
+    // 权益 ≈ 9995(扣建仓费 5.0): 缓冲 0.5% ≈ 50, 其余现金全进理财。
+    assert!(earn > 4900.0 && earn < 5000.0, "理财应吸收闲置现金: {earn}");
+    assert!(cash > 40.0 && cash < 60.0, "现货现金应≈权益×0.5%: {cash}");
+    let eq = ctx.mark_to_market(&dec!(100)).to_f64().unwrap();
+    assert!((eq - 9995.005).abs() < 0.5, "权益 = 现金+市值+理财(仅费损耗): {eq}");
+
+    let snap = sp_snap(&mut st, &mut ctx);
+    assert_eq!(sp_f64(&snap, "stat_rebalance_count"), 1.0);
+    assert_eq!(sp_f64(&snap, "stat_buy_count"), 1.0);
+    assert_eq!(sp_f64(&snap, "stat_sell_count"), 0.0);
+    assert_eq!(sp_f64(&snap, "stat_pending_redeem_count"), 0.0);
+    assert_eq!(sp_f64(&snap, "stat_earn_supported"), 1.0);
+    assert!(sp_f64(&snap, "stat_earn_usdt_days") > 0.0, "理财计时应有累计");
+    // 账本交叉核对(成交+划转意图 vs 引擎): 逐分对齐。
+    assert!(sp_f64(&snap, "stat_ledger_diff_cash").abs() < 0.01);
+    assert!(sp_f64(&snap, "stat_ledger_diff_pos").abs() < 0.01);
+    assert!(sp_f64(&snap, "stat_ledger_diff_earn").abs() < 0.01);
+}
+
+#[test]
+fn test_smart_position_over_threshold_sell() {
+    // 24 根 @100(建仓) → 24 根 @100(理财申购) → 涨至 110: cur≈52.4% 偏离 +2.36pp ≥ 2
+    // → 市价卖回目标。
+    let mut bars: Vec<Kline> = (0..48).map(|h| bar_at_f(h, 100.0)).collect();
+    bars.extend((48..96).map(|h| bar_at_f(h as i64, 110.0)));
+    let (out, mut ctx, mut st) = run_univ2(sp_cfg(&[]), &bars, None);
+
+    let sells = sp_market_orders(&out, OrderSide::Sell);
+    assert_eq!(sells.len(), 1, "涨破阈值应恰 1 笔市价卖(bar48 周期)");
+    assert_eq!(sells[0].0, 48);
+    let notional = sells[0].1.size.to_f64().unwrap() * 110.0;
+    assert!((notional - 248.0).abs() < 5.0, "卖名义≈Δ≈248: {notional}");
+    assert_eq!(sp_market_orders(&out, OrderSide::Buy).len(), 1, "买入仍仅建仓一笔");
+
+    let snap = sp_snap(&mut st, &mut ctx);
+    assert_eq!(sp_f64(&snap, "stat_sell_count"), 1.0);
+    // 账本交叉核对: 卖单周期不申购理财(划转 drain 先于成交, 按滚动现金申购会被拒),
+    // 下周期现金落账后再申购 → 无被拒划转, 三项逐分对齐。
+    assert!(sp_f64(&snap, "stat_ledger_diff_cash").abs() < 0.01);
+    assert!(sp_f64(&snap, "stat_ledger_diff_earn").abs() < 0.01);
+    assert!(sp_f64(&snap, "stat_ledger_diff_pos").abs() < 0.01);
+}
+
+#[test]
+fn test_smart_position_cash_shortfall_redeems_then_rebalances() {
+    // 建仓(bar0)+申购(bar24)后暴跌至 80: 需买入但现货现金不足 → bar48 只提交赎回申请
+    // (零订单), bar72 资金就绪才补买。防"要求即时到账"。
+    let mut bars: Vec<Kline> = (0..48).map(|h| bar_at_f(h, 100.0)).collect();
+    bars.extend((48..120).map(|h| bar_at_f(h as i64, 80.0)));
+    let (out, mut ctx, mut st) = run_univ2(sp_cfg(&[]), &bars, None);
+
+    // bar48 周期: 无任何订单(赎回走划转队列, 不产订单)。
+    assert!(out[48].iter().all(|b| b.is_empty()), "现金不足周期不得下单");
+    let buys = sp_market_orders(&out, OrderSide::Buy);
+    let bars_seen: Vec<usize> = buys.iter().map(|(i, _)| *i).collect();
+    assert_eq!(bars_seen, vec![0, 72], "bar0 建仓 + bar72 赎回后就绪补买");
+
+    let earn = ctx.earn_balance("USDT").unwrap().to_f64().unwrap();
+    assert!(earn > 4400.0 && earn < 4600.0, "应赎回差额≈452: {earn}");
+
+    let snap = sp_snap(&mut st, &mut ctx);
+    assert_eq!(sp_f64(&snap, "stat_pending_redeem_count"), 1.0, "恰一次赎回申请");
+    assert_eq!(sp_f64(&snap, "stat_buy_count"), 2.0);
+    assert!(sp_f64(&snap, "stat_ledger_diff_cash").abs() < 0.01);
+    assert!(sp_f64(&snap, "stat_ledger_diff_earn").abs() < 0.01);
+}
+
+#[test]
+fn test_smart_position_earn_disabled_no_loop() {
+    // 理财关闭 + 价格恒定: 建仓一笔后永不再动(时间闸+阈值闸防循环调仓)。
+    let bars: Vec<Kline> = (0..120).map(|h| bar_at_f(h, 100.0)).collect();
+    let (out, mut ctx, mut st) =
+        run_univ2(sp_cfg(&[("earn_enabled", ConfigValue::Float(0.0))]), &bars, None);
+    assert_eq!(sp_market_orders(&out, OrderSide::Buy).len(), 1);
+    assert_eq!(sp_market_orders(&out, OrderSide::Sell).len(), 0);
+    assert!(out[1..].iter().all(|bar| bar.iter().all(|b| b.is_empty())), "建仓后零订单");
+    assert_eq!(ctx.earn_balance("USDT").unwrap(), Decimal::ZERO, "关闭理财不得划转");
+    let snap = sp_snap(&mut st, &mut ctx);
+    assert_eq!(sp_f64(&snap, "stat_earn_enabled"), 0.0);
+}
+
+#[test]
+fn test_smart_position_param_fatal() {
+    // target_pct 越界 → FATAL 停机零订单。
+    let bars: Vec<Kline> = (0..24).map(|h| bar_at_f(h, 100.0)).collect();
+    let (out, _ctx, st) =
+        run_univ2(sp_cfg(&[("target_pct", ConfigValue::Float(1.5))]), &bars, None);
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "target_pct>1 应 FATAL");
+    assert!(out.iter().all(|bar| bar.iter().all(|b| b.is_empty())), "FATAL 后不得下单");
+}
+
+#[test]
+fn test_backtest_earn_transfer_preserves_equity() {
+    // D4 锚点: 理财划转是资产位置变化, 不是盈亏 —— 申购/赎回前后 mark_to_market 逐分不变;
+    // balance() 不混入理财; 超额划转拒绝。
+    let cfg = sp_cfg(&[]);
+    let mut ctx = BacktestContext::new(
+        cfg,
+        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+    );
+    let eq0 = ctx.mark_to_market(&dec!(100));
+    assert!(ctx.earn_subscribe("USDT", dec!(3000)));
+    assert_eq!(ctx.mark_to_market(&dec!(100)), eq0, "申购不得改变权益");
+    assert_eq!(ctx.balance("USDT").unwrap(), dec!(7000), "balance 只含现货现金");
+    assert_eq!(ctx.earn_balance("USDT"), Some(dec!(3000)));
+    assert!(ctx.earn_redeem("USDT", dec!(1500)));
+    assert_eq!(ctx.mark_to_market(&dec!(100)), eq0, "赎回不得改变权益");
+    assert!(!ctx.earn_redeem("USDT", dec!(8000)), "在理财不足 → 拒绝");
+    assert!(!ctx.earn_subscribe("USDT", dec!(99999)), "现货现金不足 → 拒绝");
+    assert!(!ctx.earn_subscribe("USDT", Decimal::ZERO), "非正金额 → 拒绝");
+}
+
+#[test]
+fn test_backtest_earn_unsupported_for_futures() {
+    // 合约端无理财概念: earn_balance=None, 划转一律拒绝(策略据此降级由 Lua 侧覆盖)。
+    let mut cfg = sp_cfg(&[]);
+    cfg.market = "futures".into();
+    let mut ctx = BacktestContext::new(
+        cfg,
+        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+    );
+    assert_eq!(ctx.earn_balance("USDT"), None);
+    assert!(!ctx.earn_subscribe("USDT", dec!(100)));
+    assert!(!ctx.earn_redeem("USDT", dec!(100)));
+}
+
+#[test]
+fn test_earn_ops_queue_drains_once() {
+    // `_RICOW_EARN_OPS` 入队 → 回调返回后 drain 执行 → **清表**: 同一笔划转不得跨周期重复执行。
+    let script = r#"
+        done = false
+        function on_tick(ctx)
+            if not done then
+                done = true
+                ctx:earn_subscribe("USDT", 100)
+            end
+            return {}
+        end
+    "#;
+    let cfg = config(script, &[("pair", ConfigValue::String("ETHUSDT".into()))]);
+    let mut st = LuaStrategy::from_source(script, cfg.clone()).expect("脚本应编译");
+    let mut ctx = BacktestContext::new(
+        cfg,
+        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+    );
+    ctx.step_bar(bar_at_f(0, 100.0));
+    st.on_init(&mut ctx);
+    let _ = st.on_tick(&mut ctx);
+    assert_eq!(ctx.earn_balance("USDT"), Some(dec!(100)), "drain 应执行划转");
+    let _ = st.on_tick(&mut ctx);
+    assert_eq!(ctx.earn_balance("USDT"), Some(dec!(100)), "队列已清, 不得重复执行");
+    assert_eq!(ctx.balance("USDT").unwrap(), dec!(9900));
+}
+
+#[test]
+fn test_smart_position_report_final_equity_includes_earn_leg() {
+    // 回归锚点 (060): 报告 final_equity / equity_change_pct 必须含理财腿。
+    // 修复前现货分支 = cash + pos×price, 静默丢理财面值 → 报告"总价值"头条失真
+    // (实测 SOL 一年: 7934 → 3958, -20.7% 被误报成 -60.4%)。
+    let bars: Vec<Kline> = (0..48).map(|h| bar_at_f(h, 100.0)).collect();
+    let (_out, ctx, _st) = run_univ2(sp_cfg(&[]), &bars, None);
+    let rep = ctx.report();
+    let bare = rep.final_cash + rep.final_pos_size * rep.final_price;
+    assert!(
+        rep.final_equity > bare,
+        "final_equity 应含理财腿: {} vs 裸权益 {}",
+        rep.final_equity,
+        bare
+    );
+    // 划转不改权益: 平 bar 无市场波动, 期末权益 ≈ 初始 − 交易费。
+    let drift = (rep.final_equity - dec!(10000)).abs();
+    assert!(drift < dec!(50), "权益应≈初始(仅手续费磨损): drift {drift}");
+    // equity_change_pct 与 final_equity 同源。
+    let pct = ((rep.final_equity - dec!(10000)) / dec!(10000)).to_f64().unwrap() * 100.0;
+    assert!(
+        (rep.equity_change_pct - pct).abs() < 1e-9,
+        "口径分叉: {} vs {}",
+        rep.equity_change_pct,
+        pct
+    );
+}
+
+// ── 061 组合语义 (universe ≥ 2 币) ──────────────────────────────────────────
+
+/// 061 组合配置: 单币默认参数 + universe 覆盖 (pair 保持 ETHUSDT = universe 首项)。
+fn sp_cfg2(universe: &str, extra: &[(&str, ConfigValue)]) -> StrategyConfig {
+    let mut p = vec![("universe", ConfigValue::String(universe.into()))];
+    p.extend_from_slice(extra);
+    sp_cfg(&p)
+}
+
+/// 061 组合 tick 序列: ETH/SOL 两币同小时 bar 合成统一时间轴
+/// (与 build_interval_ticks 产出同型: 每 tick 按 pair 名升序)。
+fn sp_ticks2(eth_bars: &[Kline], sol_bars: &[Kline]) -> Vec<Vec<(String, Kline)>> {
+    assert_eq!(eth_bars.len(), sol_bars.len(), "两币序列等长");
+    eth_bars
+        .iter()
+        .zip(sol_bars)
+        .map(|(e, s)| vec![("ETHUSDT".to_string(), e.clone()), ("SOLUSDT".to_string(), s.clone())])
+        .collect()
+}
+
+/// 061 组合 runner: 复刻 `run_portfolio_backtest` 逐 tick 时序
+/// (step_portfolio → 撮合成交先入账 → on_tick 产单 → settle 事件闭环)。
+fn run_sp_portfolio(
+    cfg: StrategyConfig,
+    ticks: &[Vec<(String, Kline)>],
+) -> (Vec<Vec<Vec<OrderRequest>>>, BacktestContext, LuaStrategy) {
+    let mut strategy = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
+        .expect("内置脚本应编译通过");
+    let mut ctx = BacktestContext::new(
+        cfg,
+        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+    );
+    strategy.on_init(&mut ctx);
+    let mut out: Vec<Vec<Vec<OrderRequest>>> = Vec::new();
+    for bars in ticks {
+        ctx.step_portfolio(bars);
+        out.push(Vec::new());
+        // 引擎口径: 前 tick 残留成交先派发 (市价即时成交下通常为空)。
+        settle_univ2(&mut ctx, &mut strategy, Vec::new(), &mut out, 0);
+        let orders = strategy.on_tick(&mut ctx);
+        settle_univ2(&mut ctx, &mut strategy, orders, &mut out, 0);
+    }
+    (out, ctx, strategy)
+}
+
+#[test]
+fn test_smart_position_portfolio_equal_weight_build_and_earn() {
+    // 等权 2 币: tick0 各币按 target_pct×w_i=25% 市价建腿 (Δ=2500),
+    // tick24 阈内不调、闲置现金入理财。48 根 1h 平 bar @100。
+    let eth: Vec<Kline> = (0..48).map(|h| bar_at_f(h, 100.0)).collect();
+    let ticks = sp_ticks2(&eth, &eth.clone());
+    let (out, mut ctx, mut st) = run_sp_portfolio(sp_cfg2("ETHUSDT,SOLUSDT", &[]), &ticks);
+
+    let buys = sp_market_orders(&out, OrderSide::Buy);
+    assert_eq!(buys.len(), 2, "tick0 每币恰一笔建仓买");
+    assert!(buys.iter().all(|(i, _)| *i == 0), "两腿同在 tick0 发出");
+    let size_of = |pair: &str| {
+        buys.iter()
+            .find(|(_, o)| o.pair == pair)
+            .unwrap_or_else(|| panic!("缺 {pair} 买腿"))
+            .1
+            .size
+            .to_f64()
+            .unwrap()
+    };
+    let expect = 2500.0 / (100.0 * 1.001);
+    assert!((size_of("ETHUSDT") - expect).abs() < 1e-3, "ETH 买量=Δ/(p(1+f))");
+    assert!((size_of("SOLUSDT") - expect).abs() < 1e-3, "SOL 买量=Δ/(p(1+f))");
+    assert!(sp_market_orders(&out, OrderSide::Sell).is_empty(), "不应有卖单");
+
+    let earn = ctx.earn_balance("USDT").unwrap().to_f64().unwrap();
+    let cash = ctx.balance("USDT").unwrap().to_f64().unwrap();
+    assert!(earn > 4900.0 && earn < 5000.0, "tick24 闲置现金入理财: {earn}");
+    assert!(cash > 40.0 && cash < 60.0, "现货现金≈权益×0.5%: {cash}");
+
+    let snap = sp_snap(&mut st, &mut ctx);
+    assert_eq!(sp_f64(&snap, "stat_buy_count"), 2.0);
+    assert_eq!(sp_f64(&snap, "stat_earn_supported"), 1.0);
+    assert!(sp_f64(&snap, "stat_ledger_diff_cash").abs() < 0.01);
+    assert!(sp_f64(&snap, "stat_ledger_diff_pos").abs() < 0.01);
+    assert!(sp_f64(&snap, "stat_ledger_diff_earn").abs() < 0.01);
+}
+
+#[test]
+fn test_smart_position_portfolio_weights_allocation() {
+    // weights=0.7,0.3: tick0 各币按 target_pct×w_i 落位 (Δ=3500/1500)。
+    let eth: Vec<Kline> = (0..24).map(|h| bar_at_f(h, 100.0)).collect();
+    let ticks = sp_ticks2(&eth, &eth.clone());
+    let (out, mut ctx, mut st) = run_sp_portfolio(
+        sp_cfg2("ETHUSDT,SOLUSDT", &[("weights", ConfigValue::String("0.7,0.3".into()))]),
+        &ticks,
+    );
+    let buys = sp_market_orders(&out, OrderSide::Buy);
+    assert_eq!(buys.len(), 2);
+    let size_of = |pair: &str| {
+        buys.iter()
+            .find(|(_, o)| o.pair == pair)
+            .unwrap_or_else(|| panic!("缺 {pair} 买腿"))
+            .1
+            .size
+            .to_f64()
+            .unwrap()
+    };
+    assert!((size_of("ETHUSDT") - 3500.0 / (100.0 * 1.001)).abs() < 1e-3, "ETH 权重 0.7 → Δ=3500");
+    assert!((size_of("SOLUSDT") - 1500.0 / (100.0 * 1.001)).abs() < 1e-3, "SOL 权重 0.3 → Δ=1500");
+    let snap = sp_snap(&mut st, &mut ctx);
+    assert_eq!(snap.get("stat_weights").unwrap(), "0.7000,0.3000");
+}
+
+#[test]
+fn test_smart_position_portfolio_weights_invalid_halts() {
+    // weights 个数不匹配 / 合计≠1 → FATAL 停机 (stat_halted=1, 零订单)。
+    let eth: Vec<Kline> = (0..48).map(|h| bar_at_f(h, 100.0)).collect();
+    let ticks = sp_ticks2(&eth, &eth.clone());
+    for bad in ["0.7", "0.6,0.6"] {
+        let (out, mut ctx, mut st) = run_sp_portfolio(
+            sp_cfg2("ETHUSDT,SOLUSDT", &[("weights", ConfigValue::String(bad.into()))]),
+            &ticks,
+        );
+        assert!(out.iter().all(|b| b.iter().all(|x| x.is_empty())), "weights={bad} 停机后不得下单");
+        let snap = sp_snap(&mut st, &mut ctx);
+        assert_eq!(sp_f64(&snap, "stat_halted"), 1.0, "weights={bad} 应 FATAL");
+    }
+}
+
+#[test]
+fn test_smart_position_portfolio_mixed_quote_halts() {
+    // universe 混报价 (ETHUSDT + BTCUSDC): 全池共用单一报价币 → on_init 即 FATAL 停机。
+    let cfg = sp_cfg2("ETHUSDT,BTCUSDC", &[]);
+    let mut st = LuaStrategy::from_source(cfg.get_str("script").unwrap(), cfg.clone())
+        .expect("内置脚本应编译通过");
+    let mut ctx = BacktestContext::new(
+        cfg,
+        Balance { asset: "USDT".into(), free: dec!(10000), locked: Decimal::ZERO },
+    );
+    st.on_init(&mut ctx);
+    assert_eq!(st.global_f64("fatal"), Some(1.0), "混报价 universe 应 FATAL");
+    let orders = st.on_tick(&mut ctx);
+    assert!(orders.is_empty(), "停机后不得产单");
+}
+
+#[test]
+fn test_smart_position_portfolio_per_coin_threshold_only_outlier() {
+    // 逐币阈值闸: ETH 100→120 (dev≈+3.6pp ≥2 → 卖回目标), SOL 恒 100
+    // (dev≈−1.2pp <2 → 不动)。理财关闭: 卖+申购同周期是 Lua 已知账本漂移
+    // 场景 (见 over_threshold_sell 注释), 本测试聚焦阈值闸语义。
+    let mut eth: Vec<Kline> = (0..48).map(|h| bar_at_f(h, 100.0)).collect();
+    eth.extend((48..96).map(|h| bar_at_f(h as i64, 120.0)));
+    let sol: Vec<Kline> = (0..96).map(|h| bar_at_f(h, 100.0)).collect();
+    let ticks = sp_ticks2(&eth, &sol);
+    let (out, mut ctx, mut st) = run_sp_portfolio(
+        sp_cfg2("ETHUSDT,SOLUSDT", &[("earn_enabled", ConfigValue::Float(0.0))]),
+        &ticks,
+    );
+    let sells = sp_market_orders(&out, OrderSide::Sell);
+    assert_eq!(sells.len(), 1, "只调越界的 ETH 一腿");
+    assert_eq!(sells[0].0, 48);
+    assert_eq!(sells[0].1.pair, "ETHUSDT");
+    let notional = sells[0].1.size.to_f64().unwrap() * 120.0;
+    assert!((notional - 373.5).abs() < 6.0, "卖名义≈Δ≈373: {notional}");
+    assert_eq!(sp_market_orders(&out, OrderSide::Buy).len(), 2, "买入仅 tick0 两腿建仓");
+    assert!(out[72..].iter().all(|b| b.iter().all(|x| x.is_empty())), "调回后阈内零订单");
+    let snap = sp_snap(&mut st, &mut ctx);
+    assert_eq!(sp_f64(&snap, "stat_sell_count"), 1.0);
+    assert_eq!(sp_f64(&snap, "stat_buy_count"), 2.0);
+    assert!(sp_f64(&snap, "stat_ledger_diff_cash").abs() < 0.01);
+}
+
+#[test]
+fn test_smart_position_portfolio_earn_unsupported_silent() {
+    // earn_supported_assets="" → earn_balance 恒 None: 理财静默关闭、零划转、
+    // 不报错, 调仓腿照常跑 (061 T2 降级路径)。
+    let eth: Vec<Kline> = (0..48).map(|h| bar_at_f(h, 100.0)).collect();
+    let ticks = sp_ticks2(&eth, &eth.clone());
+    let (out, mut ctx, mut st) = run_sp_portfolio(
+        sp_cfg2("ETHUSDT,SOLUSDT", &[("earn_supported_assets", ConfigValue::String("".into()))]),
+        &ticks,
+    );
+    assert_eq!(sp_market_orders(&out, OrderSide::Buy).len(), 2, "调仓照常: tick0 两腿建仓");
+    assert_eq!(ctx.earn_balance("USDT"), None, "白名单空 → 不支持");
+    let cash = ctx.balance("USDT").unwrap().to_f64().unwrap();
+    assert!(cash > 4990.0 && cash < 5010.0, "现金零划转: {cash}");
+    let snap = sp_snap(&mut st, &mut ctx);
+    assert_eq!(sp_f64(&snap, "stat_earn_supported"), 0.0);
+    assert_eq!(sp_f64(&snap, "stat_earn_final"), 0.0);
+    assert!(sp_f64(&snap, "stat_ledger_diff_cash").abs() < 0.01);
+}
+
+#[test]
+fn test_smart_position_portfolio_redeem_skip_then_next_cycle() {
+    // ETH 100→80 越界需买、现货现金不足 → tick48 只提交赎回申请零订单;
+    // tick72 资金就绪补买。SOL 恒 100 全程阈内不动 (dev≈+1.3pp <2)。
+    let mut eth: Vec<Kline> = (0..48).map(|h| bar_at_f(h, 100.0)).collect();
+    eth.extend((48..120).map(|h| bar_at_f(h as i64, 80.0)));
+    let sol: Vec<Kline> = (0..120).map(|h| bar_at_f(h, 100.0)).collect();
+    let ticks = sp_ticks2(&eth, &sol);
+    let (out, mut ctx, mut st) = run_sp_portfolio(sp_cfg2("ETHUSDT,SOLUSDT", &[]), &ticks);
+
+    assert!(out[48].iter().all(|b| b.is_empty()), "现金不足周期不得下单");
+    let buys = sp_market_orders(&out, OrderSide::Buy);
+    let bars_of = |pair: &str| -> Vec<usize> {
+        buys.iter().filter(|(_, o)| o.pair == pair).map(|(i, _)| *i).collect()
+    };
+    assert_eq!(bars_of("ETHUSDT"), vec![0, 72], "ETH: tick0 建仓 + tick72 赎回后就绪补买");
+    assert_eq!(bars_of("SOLUSDT"), vec![0], "SOL 全程仅建仓一笔");
+    assert!(sp_market_orders(&out, OrderSide::Sell).is_empty(), "SOL 阈内不卖");
+
+    let earn = ctx.earn_balance("USDT").unwrap().to_f64().unwrap();
+    assert!(earn > 4600.0 && earn < 4650.0, "赎回差额≈327: {earn}");
+
+    let snap = sp_snap(&mut st, &mut ctx);
+    assert_eq!(sp_f64(&snap, "stat_pending_redeem_count"), 1.0, "恰一次赎回申请");
+    assert_eq!(sp_f64(&snap, "stat_buy_count"), 3.0);
+    assert!(sp_f64(&snap, "stat_ledger_diff_cash").abs() < 0.01);
+    assert!(sp_f64(&snap, "stat_ledger_diff_earn").abs() < 0.01);
+}
+
+#[test]
+fn test_backtest_earn_supported_assets_whitelist() {
+    // 061 T2: 白名单缺省 {USDT}; 不支持资产 earn_balance=None、划转 false;
+    // 显式 ""= 全不支持; 逗号串大小写/空白不敏感。
+    let mut ctx = BacktestContext::new(
+        sp_cfg(&[]),
+        Balance { asset: "USDT".into(), free: dec!(1000), locked: Decimal::ZERO },
+    );
+    assert_eq!(ctx.earn_balance("USDT"), Some(Decimal::ZERO));
+    assert_eq!(ctx.earn_balance("TSLAB"), None);
+    assert!(!ctx.earn_subscribe("TSLAB", dec!(100)));
+    assert!(!ctx.earn_redeem("TSLAB", dec!(100)));
+
+    let mut ctx2 = BacktestContext::new(
+        sp_cfg(&[("earn_supported_assets", ConfigValue::String("".into()))]),
+        Balance { asset: "USDT".into(), free: dec!(1000), locked: Decimal::ZERO },
+    );
+    assert_eq!(ctx2.earn_balance("USDT"), None, "显式空串 = 全不支持");
+    assert!(!ctx2.earn_subscribe("USDT", dec!(100)));
+
+    let mut ctx3 = BacktestContext::new(
+        sp_cfg(&[("earn_supported_assets", ConfigValue::String("usdt, TSLAB".into()))]),
+        Balance { asset: "USDT".into(), free: dec!(1000), locked: Decimal::ZERO },
+    );
+    assert!(ctx3.earn_subscribe("usdt", dec!(100)), "大小写/空白不敏感");
+    assert_eq!(ctx3.earn_balance("TSLAB"), Some(Decimal::ZERO));
 }

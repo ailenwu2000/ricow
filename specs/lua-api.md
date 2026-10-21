@@ -134,6 +134,18 @@ end
 > Dry Run 虚拟净仓 (DryRunContext) 遵循同一不变式: `position_size > 0` 时 `position_side` = 建仓方向, 归零即报 `"none"`;
 > 平仓归零后按原持仓方向再次开仓不会残留旧方向、数量不会累加 (2026-09-19 由 `specs/changes/024-dryrun-position-side/` 修复)。
 
+### Simple Earn 活期理财 (060)
+
+| 函数 | 返回 | 说明 |
+|:-----|:-----|:-----|
+| `ctx:earn_balance(asset)` | number? | 该资产当前在活期理财的面值。`nil` = 该端不支持理财 (合约) 或实盘查询失败 (吞错 + WARN 降级, 60s TTL 缓存防 429); 策略须 `if v == nil then` 降级为"无理财" |
+| `ctx:earn_subscribe(asset, amount)` | boolean | 提交申购申请 (现货现金 → 理财)。`true` = **已受理入队**, 回调返回后由引擎执行; 不代表已到账 |
+| `ctx:earn_redeem(asset, amount)` | boolean | 提交赎回申请 (理财 → 现货现金)。`true` = 已受理。实盘异步到账, "本周期不调仓、下一周期再试"语义由策略侧周期闸天然成立 |
+
+> 三端行为: 回测/Dry Run = 即时划转 (虚拟理财腿按面值计入权益, `ctx:equity()`/报告总价值均含该腿, 划转不是亏损);
+> 实盘现货 = 真实调用币安 SAPI (`/sapi/v1/simple-earn/flexible/*`); 合约 = 恒 `nil`/`false`。
+> demo 测试网不支持 sapi 理财端点: 查询失败收敛为 `nil` + WARN, 策略照常跑交易腿 (降级)。
+
 ### 配置参数（策略参数化）
 
 | 函数 | 返回 | 说明 |
