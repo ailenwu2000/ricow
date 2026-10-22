@@ -702,7 +702,7 @@ pub(crate) async fn quick_params(
 const CASH_TIER_GUIDE: &str = "\
 1. 本金低于 1000 USDT: 网格/分批挂单类策略很可能**跑不起来** —— 建仓就吃掉大半资金, 剩下的钱挂不出下一档, \
 表现为\"只有 1 笔成交\"。此时应把单笔金额压到本金的 1%~2%, 或直接建议改用小资金友好的策略形态 \
-(如 paired_grid 这类按固定间距挂单、单笔金额小的), 并如实说明原形态在这个资金量下为什么不行。\
+(如按固定间距挂单、单笔金额小的网格形态), 并如实说明原形态在这个资金量下为什么不行。\
 2. 本金在 1000~10000 USDT: 多数网格策略可运行, 但单笔金额必须控制在**本金的一两个百分点**以内, \
 否则一档就把可用资金吃掉大半; 手续费占比也会明显高于大本金, 要提醒用户这一点。\
 3. 本金在 10000~100000 USDT: 常规网格参数基本可用, 重点看单笔金额是否与本金匹配。\
@@ -1150,7 +1150,7 @@ mod tests {
     fn test_cash_tier_guide_judges_feasibility_not_investment() {
         assert!(CASH_TIER_GUIDE.contains("1000"), "必须有金额门槛: {CASH_TIER_GUIDE}");
         assert!(
-            CASH_TIER_GUIDE.contains("paired_grid"),
+            CASH_TIER_GUIDE.contains("固定间距挂单"),
             "小资金应指向小资金友好的形态: {CASH_TIER_GUIDE}"
         );
         // 禁止的话术: 承诺收益 / 劝用户加钱 / 替用户选策略

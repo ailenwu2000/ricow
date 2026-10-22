@@ -519,10 +519,10 @@ async function main() {
   // 内置显示名从 API 现取, 不硬编码中文名 —— 清单改名不会把这条变成假红。
   const pairName = await ev(
     "window.Ricow.api('/api/strategies').then(function (rs) {" +
-      " var r = rs.filter(function (x) { return x.id === 'paired_grid'; })[0];" +
+      " var r = rs.filter(function (x) { return x.id === 'shannon_grid_futures'; })[0];" +
       " return r ? r.name : null; })"
   );
-  check("取到 paired_grid 的显示名(供列表定位)", typeof pairName === "string" && pairName.length > 0, String(pairName));
+  check("取到 shannon_grid_futures 的显示名(供列表定位)", typeof pairName === "string" && pairName.length > 0, String(pairName));
   const copyClicked = await ev(
     "(() => { const rows = Array.from(document.querySelectorAll('#sg-listview .sg-row'));" +
       " const row = rows.filter(function (r) { const n = r.querySelector('.sg-row-name');" +

@@ -1,15 +1,15 @@
-# 合约香农网格 策略清单
+# 合约做多香农网格 策略清单
 #
 # 清单是表现层数据(参数键不进引擎代码); 引擎/CLI/绑定层零策略参数名 ——
 # 本文件 [[params]] 的 key 不得与引擎按名读取的参数同名(leverage/mmr_pct 等),
 # 杠杆走清单顶层 default_leverage 字段, 由 resolve_builtin_script 回填 [backtest].leverage。
 
 id = "shannon_grid_futures"
-name = "合约香农网格"
+name = "合约做多香农网格"
 market = "futures"
 position_mode = "hedge"
 default_leverage = 2
-summary = "USDT-M 合约香农网格(纯多头, 无对冲腿): 总资金=投入×杠杆, 总资金一半开多建仓, 虚拟账本恒 1:1 再平衡, 平衡价 − 买间距 / + 卖间距挂开多/平多单(基础间距 = atr_mult×ATR 与下限取大); 方向 flag 驱动趋势侧间距指数放大(flag_spacing_mult, 默认 1.2); 爆仓价实时监控"
+summary = "USDT-M 合约做多香农网格(纯多头, 无对冲腿): 总资金=投入×杠杆, 总资金一半开多建仓, 虚拟账本恒 1:1 再平衡, 平衡价 − 买间距 / + 卖间距挂开多/平多单(基础间距 = atr_mult×ATR 与下限取大); 方向 flag 驱动趋势侧间距指数放大(flag_spacing_mult, 默认 1.2); 爆仓价实时监控"
 description = """合约版香农网格(hedge 模式只下 LONG 侧, 无对冲腿): 杠杆 1~5 倍(默认 2),
 总资金 = 投入资金 × 杠杆。价格低于 start_price 激活, 用总资金一半市价开多建仓(成交价 = 第一平衡价格);
 以虚拟账本(虚拟现金 + 虚拟仓位, 仓位与实际一致)计算, 平衡价 − 买间距挂开多单、平衡价 + 卖间距挂平多单

@@ -76,9 +76,10 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   - **回测/实盘对称**: 同一份策略代码在回测与实盘零改动可运行, 两路径都走「声明 → 供给 → 读」, 不允许为任一路径在引擎里硬编码。
   - **on_init 幂等约定**: 声明阶段(`on_init` 里的 `need_klines`)只依赖 config, 不依赖 balance/K 线; 回测装配会先跑一次 `on_init` 收集声明再拉数, 故 `on_init` 必须可重复调用。
 - **exec.\*** 执行组件(引擎内置 Rust 实现, 加载时注册全局表, 脚本内可覆盖): `levels` / `pullback_triggered` / `detect_quote` / `ticks_per` / `slice_due` / `side_order`
-- 内置示例**共 6 个**(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/strategies/catalog.rs` 的 `BUILTIN`; 031 起内置与用户策略统一由 catalog 管理, 现货/合约分 `spot/`/`futures/` 目录。**逐条说明以 `catalog.rs` 与各 `.toml` 清单为准**):
+- 内置示例**共 5 个**(**编译期 include_str! 嵌入二进制**, 登记表 = `crates/ricow/src/strategies/catalog.rs` 的 `BUILTIN`; 031 起内置与用户策略统一由 catalog 管理, 现货/合约分 `spot/`/`futures/` 目录。**逐条说明以 `catalog.rs` 与各 `.toml` 清单为准**):
   - `strategies/spot/linear_position_grid.lua` — 现货线性仓位网格(051): 仓位 = 币市值÷总权益随价格线性分布(`[p_low,p_high]` 内 `w(p)` 线性, 区间外钳制); 逐步建仓(低于 `start_price` 分批市价买) → 事件模型限价网格(ref±Δ 两侧挂单, 任一成交全撤重挂, Δ=max(`atr_mult×ATR`, `min_spacing_pct×价格`)) → 可选动态止盈; 落位恒按当前总权益实时计算(无沉淀资金); 出界 `out_of_range`(exit 撤单停机 / wait 暂停等回界)
-  - `strategies/futures/` — 合约网格系列 5 个: `paired_grid_futures_long`(配对做多) / `shannon_hedge_grid_futures`(对冲网格) / `shannon_grid_futures`(纯多头) / `shannon_neutral_grid_futures`(中性) / `shannon_short_grid_futures`(做空)
+  - `strategies/spot/smart_position.lua` — 现货智能持仓(多标的组合按权重维持目标占比 + 闲置 USDT 现金腿 Simple Earn 吃息)
+  - `strategies/futures/` — 合约网格系列 3 个: `shannon_grid_futures`(纯多头) / `shannon_neutral_grid_futures`(中性) / `shannon_short_grid_futures`(做空)
   - ~~现货 `shannon_spot_grid` / `paired_grid` / `shannon_grid` / `shannon_virtual_grid`~~ — **已于 2026-10-09 删除**(现货只保留 linear_position_grid)
   - **内置清单的必填参数无默认值** —— 例如 `linear_position_grid` 的 `start_price` / `p_low` / `p_high` 是 `required = true`, 不显式给值会 `[FATAL] 缺少必填参数` 停机 0 成交。直接跑内置策略前先看该策略 `.toml` 的 `params` schema。
   - ~~`strategies/builtin/bs_momentum.lua`~~ — **已于 2026-09-11 删除** (真实 bStock 成交轨期望 ≈0:
@@ -200,7 +201,7 @@ ricow CLI ──本机 TCP(127.0.0.1:随机端口 + token)──▶ ricow daemon
   - 数据缺口校验(038 P1-D): 取数后按周期步长扫 `open_time` 连续性, 有缺口即**硬报错**(列前 5 处 + 如实说明"另有 N 处未列出"),
     不再拿稀疏 K 线静默回测出一份看着正常的报告
   - 数据源按市场分支: 现货走交易所 REST; 合约 (futures) 走 fapi 公共数据源 (K 线; MMR 按 symbol 内置首档表,表外回落 1.0%)
-  - 直跑模式: `--strategy {<内置 id>|lua}` — 内置 id 经 `strategies::catalog::find` 命中后, 由 `commands/mod.rs::resolve_builtin_script` 注入**编译期嵌入**的 Lua 源码并把 type 改 `lua`(需 --pair, 同时按清单回填 `market`/`position_mode`/杠杆与参数默认值); 内置 id 清单见 `strategies/catalog.rs::BUILTIN`(共 6 个: `linear_position_grid` / `paired_grid_futures_long` / `shannon_hedge_grid_futures` / `shannon_grid_futures` / `shannon_neutral_grid_futures` / `shannon_short_grid_futures`)
+  - 直跑模式: `--strategy {<内置 id>|lua}` — 内置 id 经 `strategies::catalog::find` 命中后, 由 `commands/mod.rs::resolve_builtin_script` 注入**编译期嵌入**的 Lua 源码并把 type 改 `lua`(需 --pair, 同时按清单回填 `market`/`position_mode`/杠杆与参数默认值); 内置 id 清单见 `strategies/catalog.rs::BUILTIN`(共 5 个: `linear_position_grid` / `smart_position` / `shannon_grid_futures` / `shannon_neutral_grid_futures` / `shannon_short_grid_futures`)
   - 部署模式: `--strategy <name>` 命中 `strategies/<name>.toml` 加载(`script_path` 引用文件或内嵌 `script`)
 - 启动: `ricow start <name>`(经 daemon 后台运行) / `ricow run <name>`(前台调试; 默认 Dry Run, TOML `enabled=false` 拒绝启动)
 - ~~选币: `ricow scan …`~~ —— **已于 2026-09-15 删除**(020-platform-scope-trim: 选币/研究入口与"运行策略的平台"定位正交; 用户拍板删除, 不留废弃代码)
