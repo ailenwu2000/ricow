@@ -395,7 +395,7 @@ TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝�
 
 **合约 `strategies/futures/`(3 个)**
 
-- `shannon_grid_futures` — 合约香农网格(单向)
+- `shannon_grid_futures` — 合约做多香农网格(单向)
 - `shannon_neutral_grid_futures` — 合约中性(锁仓)网格
 - `shannon_short_grid_futures` — 合约单向做空网格
 

@@ -1,4 +1,4 @@
--- 合约香农网格 (shannon_grid_futures)
+-- 合约做多香农网格 (shannon_grid_futures)
 --
 -- ═══ 语义 ═══
 --   USDT-M 合约(hedge 模式, 只下 LONG 侧)香农网格: 价格低于 start_price 激活, 用总资金(投入×杠杆)
