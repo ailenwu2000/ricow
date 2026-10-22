@@ -384,19 +384,18 @@ TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝�
 目录定位:默认取**当前工作目录**(在项目根运行 `ricow`);从其他目录运行可设
 `RICOW_ROOT=<项目根>`;数据库路径可单独用 `RICOW_DB=<path>` 覆盖。
 
-内置策略**共 6 个**(清单 = `crates/ricow/src/strategies/catalog.rs` 的 `BUILTIN`, 编译期 `include_str!` 嵌入,
+内置策略**共 5 个**(清单 = `crates/ricow/src/strategies/catalog.rs` 的 `BUILTIN`, 编译期 `include_str!` 嵌入,
 改文件不重编译不生效), 按市场分目录 `strategies/spot/`(现货)与 `strategies/futures/`(合约),
 每策略 = `<id>.lua`(逻辑) + `<id>.toml`(清单: 中文名/说明/参数 schema); 与用户策略同目录, 复制即自定义:
 
-**现货 `strategies/spot/`(1 个)**
+**现货 `strategies/spot/`(2 个)**
 
 - `linear_position_grid` — 现货线性仓位网格(仓位 = 币市值÷总权益随价格线性分布, 逐步建仓 + 事件模型限价网格 + 动态止盈, 落位恒按当前总权益实时计算; 原现货 `paired_grid` / `shannon_grid` / `shannon_virtual_grid` 已于 2026-10-09 删除)
+- `smart_position` — 现货智能持仓(多标的组合按权重维持目标占比 + 闲置 USDT 现金腿理财吃息)
 
-**合约 `strategies/futures/`(5 个)**
+**合约 `strategies/futures/`(3 个)**
 
-- `paired_grid_futures_long` — 合约单向做多配对网格
 - `shannon_grid_futures` — 合约香农网格(单向)
-- `shannon_hedge_grid_futures` — 合约双向对冲网格
 - `shannon_neutral_grid_futures` — 合约中性(锁仓)网格
 - `shannon_short_grid_futures` — 合约单向做空网格
 

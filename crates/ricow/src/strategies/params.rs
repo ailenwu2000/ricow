@@ -459,20 +459,20 @@ local s = num(ctx, "spacing_pct", 0.01)
         assert!(got[0].desc.is_none(), "注释里只有裸键(无说明)时, 说明必须留空");
     }
 
-    /// N2-B 真机: 内置 `paired_grid_futures_long.lua` 注释块里的说明能被带出来。
+    /// N2-B 真机: 内置 `shannon_grid_futures.lua` 注释块里的说明能被带出来。
     ///
     /// 这条是**跨文件**断言, 价值在于钉住两个互相独立的来源: 键来自代码里的
-    /// `num(ctx, "spacing_pct", …)`, 说明来自注释块里的 `--   spacing_pct   网格间距…`。
+    /// `num(ctx, "atr_mult", …)`, 说明来自注释块里的 `--   atr_mult   基础间距…`。
     /// 两边一旦有一天对不上(改名、改注释), 说明会整体丢光 —— 而那时**页面只是变裸键,
     /// 不会报错**, 属静默劣化, 所以需要一条测试钉住。
     #[test]
-    fn builtin_paired_grid_futures_comment_docs_cover_read_params() {
-        let code = include_str!("../../../../strategies/futures/paired_grid_futures_long.lua");
+    fn builtin_shannon_grid_futures_comment_docs_cover_read_params() {
+        let code = include_str!("../../../../strategies/futures/shannon_grid_futures.lua");
         let got = extract_param_hints(code);
-        let s = got.iter().find(|h| h.key == "spacing_pct").expect("应提取到 spacing_pct");
+        let s = got.iter().find(|h| h.key == "atr_mult").expect("应提取到 atr_mult");
         assert_eq!(
             s.desc.as_deref(),
-            Some("网格间距(小数, 0.01=1%), 默认 0.01"),
+            Some("基础间距 = atr_mult × ATR, 默认 1.5"),
             "内置脚本注释里的说明必须逐字带出(证明是搬走而不是加工)"
         );
         assert!(

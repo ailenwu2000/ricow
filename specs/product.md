@@ -63,12 +63,12 @@
 
 ## 六、功能范围(少而精)
 
-### 内置参考实现(6 个策略 + 1 执行组件库, 随版本发布)
+### 内置参考实现(5 个策略 + 1 执行组件库, 随版本发布)
 
 > 权威清单 = `crates/ricow/src/strategies/catalog.rs` 的 `BUILTIN`(编译期 `include_str!` 嵌入)。
-> 现货 1 个(`strategies/spot/`): `linear_position_grid`;
-> 合约 5 个(`strategies/futures/`): `paired_grid_futures_long` / `shannon_grid_futures` /
-> `shannon_hedge_grid_futures` / `shannon_neutral_grid_futures` / `shannon_short_grid_futures`。
+> 现货 2 个(`strategies/spot/`): `linear_position_grid` / `smart_position`;
+> 合约 3 个(`strategies/futures/`): `shannon_grid_futures` /
+> `shannon_neutral_grid_futures` / `shannon_short_grid_futures`。
 
 - **现货线性仓位网格策略**: `strategies/spot/linear_position_grid.lua` — 仓位 = 币市值÷总权益随价格线性分布(`[p_low,p_high]` 内线性, 低价高仓位、高价低仓位); 逐步建仓(价格低于 `start_price` 分批市价买入) → 事件模型限价网格(成交价上下 `atr_mult×ATR` 两侧挂单, 任一成交全撤重挂) → 可选动态止盈; 落位恒按当前总权益实时计算(无沉淀资金); 出界处理 `out_of_range`(exit 撤单停机不清仓 / wait 暂停等回界); 适合区间震荡市
 - ~~**香农现货网格 / 现货动态非对称网格 / 现货香农网格 / 现货虚拟香农网格**~~ — **已于 2026-10-09 删除**(现货只保留 linear_position_grid; 合约网格系列 `strategies/futures/` 不受影响)

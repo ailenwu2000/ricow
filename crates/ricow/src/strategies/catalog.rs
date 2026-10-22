@@ -157,11 +157,6 @@ impl CatalogEntry {
 /// 内置示例(编译期嵌入): (策略 id, 清单 TOML, Lua 源码)。
 const BUILTIN: &[(&str, &str, &str)] = &[
     (
-        "paired_grid_futures_long",
-        include_str!("../../../../strategies/futures/paired_grid_futures_long.toml"),
-        include_str!("../../../../strategies/futures/paired_grid_futures_long.lua"),
-    ),
-    (
         "linear_position_grid",
         include_str!("../../../../strategies/spot/linear_position_grid.toml"),
         include_str!("../../../../strategies/spot/linear_position_grid.lua"),
@@ -170,11 +165,6 @@ const BUILTIN: &[(&str, &str, &str)] = &[
         "smart_position",
         include_str!("../../../../strategies/spot/smart_position.toml"),
         include_str!("../../../../strategies/spot/smart_position.lua"),
-    ),
-    (
-        "shannon_hedge_grid_futures",
-        include_str!("../../../../strategies/futures/shannon_hedge_grid_futures.toml"),
-        include_str!("../../../../strategies/futures/shannon_hedge_grid_futures.lua"),
     ),
     (
         "shannon_grid_futures",
@@ -508,7 +498,7 @@ options = ["u", "coin"]
     fn parse_manifest_with_position_mode_and_leverage() {
         // 032: futures 清单声明 position_mode + default_leverage → 正确解析。
         let src = r#"
-id = "paired_grid_futures"
+id = "some_futures_grid"
 name = "合约双向配对网格"
 market = "futures"
 summary = "多空双向网格"

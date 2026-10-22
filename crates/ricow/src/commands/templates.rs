@@ -92,8 +92,7 @@ mod tests {
     #[test]
     fn list_text_lists_builtin_strategies() {
         let text = list_text();
-        for must in ["linear_position_grid", "paired_grid_futures_long", "现货线性仓位网格"]
-        {
+        for must in ["linear_position_grid", "shannon_grid_futures", "现货线性仓位网格"] {
             assert!(text.contains(must), "清单缺少: {must}");
         }
     }
@@ -109,7 +108,7 @@ mod tests {
     fn names_contains_builtin() {
         let names = names();
         assert!(names.iter().any(|n| n == "linear_position_grid"));
-        assert!(names.iter().any(|n| n == "paired_grid_futures_long"));
+        assert!(names.iter().any(|n| n == "shannon_grid_futures"));
     }
 
     #[test]

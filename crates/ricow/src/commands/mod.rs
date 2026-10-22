@@ -839,10 +839,10 @@ mod tests {
         // (报告"测试参数"/params.json 全量可见); 用户显式值不被覆盖; 必填无 default 不注入。
         let mut params = HashMap::new();
         params.insert("pair".into(), ConfigValue::String("ETHUSDT".into()));
-        params.insert("spacing_pct".into(), ConfigValue::Float(0.02));
+        params.insert("atr_mult".into(), ConfigValue::Float(2.0));
         let config = StrategyConfig {
             name: "t".into(),
-            strategy_type: "paired_grid_futures_long".into(),
+            strategy_type: "shannon_grid_futures".into(),
             enabled: true,
             exchange: "binance".into(),
             params,
@@ -855,16 +855,17 @@ mod tests {
         let resolved = resolve_builtin_script(config).unwrap();
         // 声明了 default 的键被注入(f64 / string 两类)
         assert_eq!(
-            resolved.params.get("direction_offset").and_then(|v| v.as_f64()),
-            Some(0.2),
+            resolved.params.get("min_spacing_pct").and_then(|v| v.as_f64()),
+            Some(0.002),
             "清单默认值应注入生效 params"
         );
         assert_eq!(resolved.params.get("fee_side").and_then(|v| v.as_f64()), Some(0.0005));
         assert_eq!(resolved.params.get("interval").and_then(|v| v.as_str()), Some("1h"));
         // 用户显式值不被覆盖
-        assert_eq!(resolved.params.get("spacing_pct").and_then(|v| v.as_f64()), Some(0.02));
-        // 必填且无 default(pair)不注入
+        assert_eq!(resolved.params.get("atr_mult").and_then(|v| v.as_f64()), Some(2.0));
+        // 必填且无默认值的键(pair / start_price)不注入
         assert_eq!(resolved.params.get("pair").and_then(|v| v.as_str()), Some("ETHUSDT"));
+        assert!(!resolved.params.contains_key("start_price"), "必填无默认不注入");
         // market/position_mode/杠杆回填不受注入影响
         assert_eq!(resolved.market, "futures");
         assert_eq!(resolved.position_mode, "hedge");

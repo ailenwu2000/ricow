@@ -20,10 +20,6 @@ strategies/spot/*
 !strategies/futures/
 strategies/futures/*
 !strategies/futures/.gitkeep
-!strategies/futures/paired_grid_futures_long.lua
-!strategies/futures/paired_grid_futures_long.toml
-!strategies/futures/shannon_hedge_grid_futures.lua
-!strategies/futures/shannon_hedge_grid_futures.toml
 !strategies/futures/shannon_grid_futures.lua
 !strategies/futures/shannon_grid_futures.toml
 !strategies/futures/shannon_neutral_grid_futures.lua

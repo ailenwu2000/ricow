@@ -1154,19 +1154,18 @@ fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// `derive_manifest` 只改 id / market, 其余(含参数 schema 与展示元数据)逐字照搬。
 #[test]
 fn test_derive_manifest_rewrites_only_id_and_market() {
-    let src = catalog::find("paired_grid_futures_long")
-        .expect("内置 paired_grid_futures_long 应在目录里");
-    let d = derive_manifest(&src.manifest, "paired_grid-1", "futures");
-    assert_eq!(d.id, "paired_grid-1", "id 必须改成新策略名(落盘文件名按它)");
+    let src = catalog::find("shannon_grid_futures").expect("内置 shannon_grid_futures 应在目录里");
+    let d = derive_manifest(&src.manifest, "shannon_grid-1", "futures");
+    assert_eq!(d.id, "shannon_grid-1", "id 必须改成新策略名(落盘文件名按它)");
     assert_eq!(d.market, "futures");
     assert_eq!(d.name, src.manifest.name, "中文名照搬(副本与源是同一个策略)");
     assert_eq!(d.summary, src.manifest.summary);
     assert_eq!(d.params.len(), src.manifest.params.len(), "参数 schema 必须整份带过来");
     let keys: Vec<&str> = d.params.iter().map(|p| p.key.as_str()).collect();
     assert!(keys.contains(&"pair"), "保留键 pair 也照搬(表单侧自会跳过)");
-    assert!(keys.contains(&"spacing_pct"));
+    assert!(keys.contains(&"atr_mult"));
     // 跨市场复制: market 必须改写, 否则 catalog 的 check_dir 会整条跳过。
-    let d2 = derive_manifest(&src.manifest, "paired_grid-f", "spot");
+    let d2 = derive_manifest(&src.manifest, "shannon_grid-s", "spot");
     assert_eq!(d2.market, "spot");
     assert!(d2.check_dir("spot").is_ok());
 }
@@ -1181,7 +1180,7 @@ async fn test_copy_from_writes_manifest_and_lights_up_params() {
     std::env::set_var("RICOW_ROOT", &root);
     let port = boot(root.clone()).await;
 
-    let src = catalog::find("paired_grid_futures_long").expect("内置源");
+    let src = catalog::find("shannon_grid_futures").expect("内置源");
     let n_params = src.manifest.params.len();
     let code = src.code.clone();
 
@@ -1191,8 +1190,8 @@ async fn test_copy_from_writes_manifest_and_lights_up_params() {
         "/api/strategies?token=tok-ok",
         Some(
             &serde_json::json!({
-                "name": "paired_grid-1", "market": "spot", "pair": "BTCUSDT",
-                "code": code, "params": {}, "overwrite": false, "copy_from": "paired_grid_futures_long"
+                "name": "shannon_grid-1", "market": "spot", "pair": "BTCUSDT",
+                "code": code, "params": {}, "overwrite": false, "copy_from": "shannon_grid_futures"
             })
             .to_string(),
         ),
@@ -1202,25 +1201,25 @@ async fn test_copy_from_writes_manifest_and_lights_up_params() {
     let body = body_of(&res);
     assert!(body.contains("manifest_path"), "响应应回报清单落盘路径: {body}");
 
-    // 清单落在 strategies/spot/paired_grid-1.toml(与内置清单同目录同构)。
-    let mf = root.join("strategies").join("spot").join("paired_grid-1.toml");
+    // 清单落在 strategies/spot/shannon_grid-1.toml(与内置清单同目录同构)。
+    let mf = root.join("strategies").join("spot").join("shannon_grid-1.toml");
     assert!(mf.is_file(), "清单须随复制落盘: {}", mf.display());
     let text = std::fs::read_to_string(&mf).unwrap();
-    assert!(text.contains(r#"id = "paired_grid-1""#), "清单 id 必须改写: {text}");
-    assert!(text.contains("spacing_pct"), "{text}");
+    assert!(text.contains(r#"id = "shannon_grid-1""#), "清单 id 必须改写: {text}");
+    assert!(text.contains("atr_mult"), "{text}");
 
     // 目录里这一条现在是"已声明"的, 参数表单据此渲染。
-    let entry = catalog::find("paired_grid-1").expect("复制后应能扫到");
+    let entry = catalog::find("shannon_grid-1").expect("复制后应能扫到");
     assert!(entry.declared, "复制后必须是 declared=true(参数表单才有内容)");
     assert_eq!(entry.manifest.params.len(), n_params, "参数 schema 应与源一致");
 
     // 详情端点同样点亮(前端参数表单的数据源)。
-    let res = raw(port, "GET", "/api/strategies/paired_grid-1?token=tok-ok", None).await;
+    let res = raw(port, "GET", "/api/strategies/shannon_grid-1?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 200, "{res}");
     let body = body_of(&res);
     assert!(body.contains(r#""declared":true"#), "{body}");
-    assert!(body.contains(r#""key":"spacing_pct""#), "{body}");
-    assert!(body.contains("网格间距"), "参数中文名应随清单带过来: {body}");
+    assert!(body.contains(r#""key":"atr_mult""#), "{body}");
+    assert!(body.contains("ATR 乘数"), "参数中文名应随清单带过来: {body}");
 
     // 不带 copy_from 的普通新建: 清单不落盘, 仍是未声明(既有行为不变)。
     let res = raw(
@@ -1270,7 +1269,7 @@ async fn test_copy_from_rejects_unknown_source_and_overwrite_combo() {
     // copy_from + overwrite=true → 400(复制是新建语义)。
     let res = post(serde_json::json!({
         "name": "c2", "market": "spot", "pair": "BTCUSDT", "code": code,
-        "copy_from": "paired_grid_futures_long", "overwrite": true
+        "copy_from": "shannon_grid_futures", "overwrite": true
     }))
     .await;
     assert_eq!(status_of(&res), 400, "{res}");
@@ -1343,7 +1342,7 @@ async fn test_extract_params_endpoint() {
     let root = tmp_root("extract");
     let port = boot(root).await;
 
-    let lua = include_str!("../../../../../strategies/futures/paired_grid_futures_long.lua");
+    let lua = include_str!("../../../../../strategies/futures/shannon_grid_futures.lua");
     let res = raw(
         port,
         "POST",
@@ -1353,11 +1352,12 @@ async fn test_extract_params_endpoint() {
     .await;
     assert_eq!(status_of(&res), 200, "{res}");
     let body = body_of(&res);
-    for key in ["spacing_pct", "accumulate_mode", "pair", "interval", "min_pair_profit"] {
+    for key in ["pair", "interval", "atr_interval", "atr_period", "atr_mult", "start_price"] {
         assert!(body.contains(&format!(r#""key":"{key}""#)), "缺 {key}: {body}");
     }
-    // 类型取 API 语义: `num` → f64, `cfg_str` → string。
-    assert!(body.contains(r#""key":"spacing_pct","type":"f64""#), "{body}");
+    // 类型取 API 语义: `num` → f64, `ctx:config_str` → string。
+    assert!(body.contains(r#""key":"atr_mult","type":"f64""#), "{body}");
+    assert!(body.contains(r#""key":"pair","type":"string""#), "{body}");
 
     // 空代码 → 400(没代码就无从识别); 无 token → 401(token 门禁之后)。
     let res = raw(
@@ -1468,8 +1468,7 @@ async fn test_delete_strategy_endpoint() {
     assert!(body_of(&res).is_empty(), "401 须空体: {res}");
 
     // 内置 → 409 reserved(与保存同口径, 单一来源 catalog::is_builtin_id)。
-    let res =
-        raw(port, "DELETE", "/api/strategies/paired_grid_futures_long?token=tok-ok", None).await;
+    let res = raw(port, "DELETE", "/api/strategies/shannon_grid_futures?token=tok-ok", None).await;
     assert_eq!(status_of(&res), 409, "{res}");
     assert!(body_of(&res).contains("reserved"), "{res}");
 
@@ -1669,32 +1668,48 @@ fn test_current_values_text_is_sorted_and_readable() {
 /// 键过滤: 清单外的键丢弃 + warning; 类型不符丢弃 + warning; 枚举取值必须合法。
 #[test]
 fn test_keep_manifest_params_filters_and_warns() {
-    let manifest = catalog::find("paired_grid_futures_long").unwrap().manifest;
+    let manifest = catalog::find("shannon_grid_futures").unwrap().manifest;
     let suggested = HashMap::from([
-        ("spacing_pct".to_string(), ConfigValue::Float(0.02)),
-        ("atr_period".to_string(), ConfigValue::Integer(14)), // 清单里没有 → 丢
-        ("order_amount".to_string(), ConfigValue::Integer(20)), // f64 参数收整数 → 归一成浮点
-        ("accumulate_mode".to_string(), ConfigValue::String("coin".into())),
-        ("direction_offset".to_string(), ConfigValue::String("x".into())), // 类型不符 → 丢
+        ("atr_mult".to_string(), ConfigValue::Float(2.0)),
+        ("spacing_pct".to_string(), ConfigValue::Float(0.02)), // 清单里没有 → 丢
+        ("min_notional".to_string(), ConfigValue::Integer(20)), // f64 参数收整数 → 归一成浮点
+        ("fee_side".to_string(), ConfigValue::String("x".into())), // 类型不符 → 丢
     ]);
     let (kept, warns) = keep_manifest_params(suggested, &manifest);
-    assert_eq!(kept.len(), 3, "{kept:?}");
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(matches!(kept.get("atr_mult"), Some(ConfigValue::Float(f)) if (*f - 2.0).abs() < 1e-9));
     assert!(
-        matches!(kept.get("order_amount"), Some(ConfigValue::Float(f)) if (*f - 20.0).abs() < 1e-9)
+        matches!(kept.get("min_notional"), Some(ConfigValue::Float(f)) if (*f - 20.0).abs() < 1e-9)
     );
-    assert!(matches!(kept.get("accumulate_mode"), Some(ConfigValue::String(s)) if s == "coin"));
-    assert!(!kept.contains_key("atr_period"), "清单外的键绝不能写进 TOML");
-    assert!(!kept.contains_key("direction_offset"), "类型不符必须丢");
+    assert!(!kept.contains_key("spacing_pct"), "清单外的键绝不能写进 TOML");
+    assert!(!kept.contains_key("fee_side"), "类型不符必须丢");
 
     let joined = warns.join("\n");
-    assert!(joined.contains("atr_period") && joined.contains("不在本策略清单里"), "{joined}");
+    assert!(joined.contains("spacing_pct") && joined.contains("不在本策略清单里"), "{joined}");
     assert!(joined.contains("改代码逻辑"), "要告诉用户正确路径: {joined}");
-    assert!(joined.contains("direction_offset") && joined.contains("需要数值"), "{joined}");
+    assert!(joined.contains("fee_side") && joined.contains("需要数值"), "{joined}");
 
-    // 枚举取值不在可选集里 → 丢并点名可选值。
+    // 枚举取值校验(内置清单已无 enum 参数 → 内联构造一份带枚举项的清单)。
+    let mut enum_manifest = manifest;
+    enum_manifest.params.push(ManifestParam {
+        key: "accumulate_mode".into(),
+        name: "积累模式".into(),
+        ty: ParamType::Enum,
+        desc: String::new(),
+        default: None,
+        required: false,
+        options: Some(vec!["u".into(), "coin".into()]),
+    });
+    let (kept, _warns) = keep_manifest_params(
+        HashMap::from([("accumulate_mode".to_string(), ConfigValue::String("coin".into()))]),
+        &enum_manifest,
+    );
+    assert!(matches!(kept.get("accumulate_mode"), Some(ConfigValue::String(s)) if s == "coin"));
+
+    // 取值不在可选集里 → 丢并点名可选值。
     let (kept, warns) = keep_manifest_params(
         HashMap::from([("accumulate_mode".to_string(), ConfigValue::String("wat".into()))]),
-        &manifest,
+        &enum_manifest,
     );
     assert!(kept.is_empty());
     assert!(warns[0].contains("wat") && warns[0].contains("u/coin"), "{warns:?}");
@@ -1723,7 +1738,7 @@ async fn test_ai_edit_params_offline_guards() {
     let res = raw(
         port,
         "POST",
-        "/api/strategies/paired_grid_futures_long/ai-edit?token=tok-ok",
+        "/api/strategies/shannon_grid_futures/ai-edit?token=tok-ok",
         Some(&serde_json::json!({"instruction": "间距调大点", "mode": "magic"}).to_string()),
     )
     .await;
@@ -1734,7 +1749,7 @@ async fn test_ai_edit_params_offline_guards() {
     let res = raw(
         port,
         "POST",
-        "/api/strategies/paired_grid_futures_long/ai-edit?token=tok-ok",
+        "/api/strategies/shannon_grid_futures/ai-edit?token=tok-ok",
         Some(&serde_json::json!({"instruction": "把间距改成 0.02", "mode": "params"}).to_string()),
     )
     .await;
@@ -1817,27 +1832,27 @@ fn test_split_advice_and_json_separates_narrative_from_object() {
 /// 改动对照: 只列真变了的键; `before` 的两种来源必须**分开标注**(那是运行事实, 不能混)。
 #[test]
 fn test_diff_params_reports_only_real_changes_with_source() {
-    let manifest = catalog::find("paired_grid_futures_long").unwrap().manifest;
+    let manifest = catalog::find("shannon_grid_futures").unwrap().manifest;
     let kept = HashMap::from([
-        ("spacing_pct".to_string(), ConfigValue::Float(0.02)), // 变了
-        ("order_amount".to_string(), ConfigValue::Float(10.0)), // 与默认值相同 → 不算改动
+        ("atr_mult".to_string(), ConfigValue::Float(2.0)), // 变了
+        ("fee_side".to_string(), ConfigValue::Float(0.0005)), // 与默认值相同 → 不算改动
     ]);
 
     // ① 从没保存过实例值: before 取清单默认值, 并标明"只是默认值"。
     let changed = diff_params(&kept, None, &manifest);
     assert_eq!(changed.len(), 1, "{changed:?}");
-    assert_eq!(changed[0].key, "spacing_pct");
-    assert_eq!(changed[0].name, "网格间距", "给人看的行要用中文名");
-    assert_eq!(changed[0].before.as_deref(), Some("0.01"));
-    assert_eq!(changed[0].after, "0.02");
+    assert_eq!(changed[0].key, "atr_mult");
+    assert_eq!(changed[0].name, "ATR 乘数", "给人看的行要用中文名");
+    assert_eq!(changed[0].before.as_deref(), Some("1.5"));
+    assert_eq!(changed[0].after, "2");
     assert!(changed[0].before_is_default, "没保存过时必须标明改前值只是默认值");
 
-    // ② 实例里保存过 0.01: before 就是**用户在跑的值**, 不再标默认。
+    // ② 实例里保存过 1.5: before 就是**用户在跑的值**, 不再标默认。
     let values = InstanceValues {
         pair: Some("BTCUSDT".to_string()),
         current: HashMap::from([
-            ("spacing_pct".to_string(), ConfigValue::Float(0.01)),
-            ("order_amount".to_string(), ConfigValue::Float(10.0)),
+            ("atr_mult".to_string(), ConfigValue::Float(1.5)),
+            ("fee_side".to_string(), ConfigValue::Float(0.0005)),
         ]),
     };
     let changed = diff_params(&kept, Some(&values), &manifest);
@@ -1845,7 +1860,7 @@ fn test_diff_params_reports_only_real_changes_with_source() {
     assert!(!changed[0].before_is_default, "保存过的值不是默认值");
 
     // ③ 建议值与**当前值**相同 → 一个键都不进对照表(整组值仍会回给表单)。
-    let same = HashMap::from([("spacing_pct".to_string(), ConfigValue::Float(0.01))]);
+    let same = HashMap::from([("atr_mult".to_string(), ConfigValue::Float(1.5))]);
     assert!(diff_params(&same, Some(&values), &manifest).is_empty());
 
     // ④ 清单里既没默认值、实例里也没存过的键(必填项) → before 为空(不编一个"0")。
@@ -1939,15 +1954,15 @@ async fn test_ai_assess_offline_guards() {
 
     let metric = serde_json::json!({"pair": "BTCUSDT", "interval": "1h", "days": 90,
         "equity_change_pct": 1.0, "max_drawdown_pct": 2.0, "total_trades": 3});
-    let changed = serde_json::json!([{"key": "spacing_pct", "name": "间距百分比",
-        "before": "0.01", "after": "0.02", "before_is_default": false}]);
+    let changed = serde_json::json!([{"key": "atr_mult", "name": "ATR 乘数",
+        "before": "1.5", "after": "2", "before_is_default": false}]);
 
     // 没有改动 → 400 nothing_changed(评估"什么都没改"没有意义)。
     let body = serde_json::json!({"changed": [], "base_metrics": metric, "new_metrics": metric});
     let res = raw(
         port,
         "POST",
-        "/api/strategies/paired_grid_futures_long/ai-assess?token=tok-ok",
+        "/api/strategies/shannon_grid_futures/ai-assess?token=tok-ok",
         Some(&body.to_string()),
     )
     .await;
@@ -1959,7 +1974,7 @@ async fn test_ai_assess_offline_guards() {
     let res = raw(
         port,
         "POST",
-        "/api/strategies/paired_grid_futures_long/ai-assess?token=tok-ok",
+        "/api/strategies/shannon_grid_futures/ai-assess?token=tok-ok",
         Some(&body.to_string()),
     )
     .await;
@@ -1982,7 +1997,7 @@ async fn test_ai_assess_offline_guards() {
     let res = raw(
         port,
         "POST",
-        "/api/strategies/paired_grid_futures_long/ai-assess?token=tok-ok",
+        "/api/strategies/shannon_grid_futures/ai-assess?token=tok-ok",
         Some(&body.to_string()),
     )
     .await;
@@ -1993,7 +2008,7 @@ async fn test_ai_assess_offline_guards() {
     let res = raw(
         port,
         "POST",
-        "/api/strategies/paired_grid_futures_long/ai-assess",
+        "/api/strategies/shannon_grid_futures/ai-assess",
         Some(&body.to_string()),
     )
     .await;
@@ -2031,7 +2046,7 @@ async fn test_ai_edit_params_accepts_history_field() {
     let res = raw(
         port,
         "POST",
-        "/api/strategies/paired_grid_futures_long/ai-edit?token=tok-ok",
+        "/api/strategies/shannon_grid_futures/ai-edit?token=tok-ok",
         Some(&body.to_string()),
     )
     .await;
