@@ -558,11 +558,11 @@ async function main() {
     "window.Ricow.api('/api/strategies/" +
       copyName +
       "').then(function (d) {" +
-      " var p = (d.params || []).filter(function (x) { return x.key === 'spacing_pct'; })[0];" +
+      " var p = (d.params || []).filter(function (x) { return x.key === 'min_spacing_pct'; })[0];" +
       " return p ? p.name : null; })"
   );
   check(
-    "副本清单里 spacing_pct 带着中文显示名",
+    "副本清单里 min_spacing_pct 带着中文显示名",
     typeof wantLabel === "string" && wantLabel.length > 0,
     String(wantLabel)
   );
@@ -585,7 +585,7 @@ async function main() {
   const beforeVal = await ev(
     "(() => { const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
       " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
-      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " return k && k.textContent === 'min_spacing_pct'; })[0];" +
       " if (!row) return 'no-row'; const ctl = row.querySelector('input, select');" +
       " if (!ctl) return 'no-input'; const v = ctl.value;" +
       " ctl.value = '0.05';" +
@@ -594,7 +594,7 @@ async function main() {
       " return v; })()"
   );
   check(
-    "053 改参数: 找到 spacing_pct 输入框并改了值",
+    "053 改参数: 找到 min_spacing_pct 输入框并改了值",
     typeof beforeVal === "string" && beforeVal !== "no-row" && beforeVal !== "no-input",
     String(beforeVal)
   );
@@ -626,7 +626,7 @@ async function main() {
   const inlineDiff = await ev(
     "(() => { const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
       " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
-      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " return k && k.textContent === 'min_spacing_pct'; })[0];" +
       " if (!row) return 'no-row'; const d = row.querySelector('.sg-param-diff');" +
       " return d ? (d.hidden ? 'hidden' : d.textContent) : 'no-diff'; })()"
   );
@@ -641,7 +641,7 @@ async function main() {
       " if (!b) return 'no-btn'; b.click();" +
       " const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
       " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
-      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " return k && k.textContent === 'min_spacing_pct'; })[0];" +
       " return row.querySelector('input, select').value; })()"
   );
   check("053 一键还原把值退回改前", reverted === beforeVal, String(reverted) + " 期望 " + beforeVal);
@@ -653,7 +653,7 @@ async function main() {
   await ev(
     "(() => { const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
       " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
-      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " return k && k.textContent === 'min_spacing_pct'; })[0];" +
       " const ctl = row.querySelector('input, select'); ctl.value = '0.07';" +
       " ctl.dispatchEvent(new Event('input', { bubbles: true })); return 'ok'; })()"
   );

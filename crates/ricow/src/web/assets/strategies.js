@@ -526,6 +526,7 @@
     sgMfDefaultPh: "留空 = 无默认",
     sgMfDescPh: "这个参数做什么",
     sgMfOptionsPh: "如 cash,equity",
+    sgMfGroupPh: "分组(可选)",
     sgSweep: "参数寻优",
     sgSweepParam: "参数键",
     sgSweepValues: "档位取值(逗号分隔, 2–10 个)",
@@ -891,6 +892,7 @@
     sgMfDefaultPh: "empty = no default",
     sgMfDescPh: "What this param does",
     sgMfOptionsPh: "e.g. cash,equity",
+    sgMfGroupPh: "Group (optional)",
     sgSweep: "Parameter sweep",
     sgSweepParam: "Param key",
     sgSweepValues: "Values (comma separated, 2–10)",
@@ -1509,12 +1511,17 @@
           R.api("/api/strategies/" + encodeURIComponent(id) + "/source"),
         ]);
         if (req !== tplReq) return;
+        R.normParams(detail);
         tpl = { id: id, market: detail.market, lua: source.lua, detail: detail };
         marketSel.value = detail.market;
         marketSel.disabled = true;
         // 参数表单: 清单 schema + 默认值预填(必填无默认的留空由用户填)。
+        let currentGroup;
         for (const p of detail.params || []) {
           if (RESERVED_PARAM_KEYS.includes(p.key)) continue; // 交易对/脚本键独立成字段
+          const grp = p.group || null;
+          if (grp && grp !== currentGroup) paramsBox.appendChild(h("div", "sg-group-head", grp));
+          currentGroup = grp;
           const built = p.ty === "string"
             ? stringRow(p, p.default !== undefined ? p.default : undefined)
             : paramRow(p, p.default !== undefined ? p.default : undefined);

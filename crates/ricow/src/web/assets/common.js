@@ -294,6 +294,18 @@
 
   // ---------- 纯工具 ----------
 
+  // 策略详情参数归一化: 清单 JSON 里类型字段名是 `type`(后端 serde rename), 而前端渲染链
+  // (`renderParams` / 清单编辑器 / 模板表单)统一读 `p.ty` —— 不补这一笔, string/bool/enum
+  // 会全部退化成数字输入框, 且清单编辑器保存时会把真实类型拍平成 f64。
+  // 就地补 `ty` 并返回 detail, 在每个 `/api/strategies/<id>` 取回点调用一次。
+  R.normParams = function (detail) {
+    if (!detail || !Array.isArray(detail.params)) return detail;
+    for (const p of detail.params) {
+      if (p && p.ty === undefined && typeof p.type === "string") p.ty = p.type;
+    }
+    return detail;
+  };
+
   // ---------- 主题(034 / D14) ----------
   // 两个概念要分清, 混起来就会出现"选了跟随系统, 关掉页面再打开又变回深色":
   //   · `R.theme` = **偏好**(落盘在 `ricow.toml` 的 `[ui].theme`): dark / light / red / **auto**;

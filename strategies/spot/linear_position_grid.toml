@@ -16,62 +16,7 @@ name = "交易对"
 type = "string"
 desc = "现货交易对(如 SOLUSDT)"
 required = true
-
-[[params]]
-key = "start_price"
-name = "开始价格"
-type = "f64"
-desc = "建仓触发价: 价格低于它才逐步建仓; 建仓目标总量 = T(start_price)(须落在区间内)"
-required = true
-
-[[params]]
-key = "p_low"
-name = "价格下限"
-type = "f64"
-desc = "线性仓位区间下限(此处仓位 = pos_low_pct)"
-required = true
-
-[[params]]
-key = "p_high"
-name = "价格上限"
-type = "f64"
-desc = "线性仓位区间上限(此处仓位 = pos_high_pct)"
-required = true
-
-[[params]]
-key = "pos_low_pct"
-name = "下限仓位占比"
-type = "f64"
-desc = "价格下限处仓位占比(币市值÷总权益, 0.7 = 70%)"
-default = 0.7
-
-[[params]]
-key = "pos_high_pct"
-name = "上限仓位占比"
-type = "f64"
-desc = "价格上限处仓位占比(币市值÷总权益, 0.3 = 30%; 0 = 涨到顶清仓)"
-default = 0.3
-
-[[params]]
-key = "invest_cash"
-name = "投入资金"
-type = "f64"
-desc = "投入资金 C0(初始总权益 = 建仓目标与止盈基准); 仓位落位不参与 C0 定格, 恒按当前总权益实时估值; 0 = 首次建仓时 quote 余额全额"
-default = 0
-
-[[params]]
-key = "build_steps"
-name = "建仓批数"
-type = "i64"
-desc = "逐步建仓分几批买入"
-default = 10
-
-[[params]]
-key = "build_interval_hours"
-name = "建仓间隔(小时)"
-type = "f64"
-desc = "相邻两批建仓的最小时间间隔(小时)"
-default = 1
+group = "基础配置"
 
 [[params]]
 key = "interval"
@@ -79,41 +24,15 @@ name = "主时钟"
 type = "string"
 desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
 default = "1m"
+group = "基础配置"
 
 [[params]]
-key = "atr_interval"
-name = "ATR K 线周期"
-type = "string"
-desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
-default = "1h"
-
-[[params]]
-key = "atr_period"
-name = "ATR 周期"
-type = "i64"
-desc = "ATR 回看根数"
-default = 14
-
-[[params]]
-key = "atr_mult"
-name = "ATR 乘数"
+key = "invest_cash"
+name = "投入资金"
 type = "f64"
-desc = "网格间距 = atr_mult × ATR"
-default = 1
-
-[[params]]
-key = "min_spacing_pct"
-name = "最小间距(价格占比)"
-type = "f64"
-desc = "间距下限(占价格比例, 0.004 = 0.4%); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损; 负数 = 禁用下限"
-default = 0.004
-
-[[params]]
-key = "min_notional"
-name = "单笔最小名义"
-type = "f64"
-desc = "单笔最小名义金额"
-default = 5
+desc = "投入资金 C0(初始总权益 = 建仓目标与止盈基准); 仓位落位不参与 C0 定格, 恒按当前总权益实时估值; 0 = 首次建仓时 quote 余额全额"
+default = 0
+group = "基础配置"
 
 [[params]]
 key = "fee_side"
@@ -121,6 +40,55 @@ name = "单边费率"
 type = "f64"
 desc = "单边手续费率(0.001 = 现货 0.1%/边)"
 default = 0.001
+group = "基础配置"
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额"
+default = 5
+group = "基础配置"
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "建仓触发价: 价格低于它才逐步建仓; 建仓目标总量 = T(start_price)(须落在区间内)"
+required = true
+group = "激活与区间"
+
+[[params]]
+key = "p_low"
+name = "价格下限"
+type = "f64"
+desc = "线性仓位区间下限(此处仓位 = pos_low_pct)"
+required = true
+group = "激活与区间"
+
+[[params]]
+key = "p_high"
+name = "价格上限"
+type = "f64"
+desc = "线性仓位区间上限(此处仓位 = pos_high_pct)"
+required = true
+group = "激活与区间"
+
+[[params]]
+key = "pos_low_pct"
+name = "下限仓位占比"
+type = "f64"
+desc = "价格下限处仓位占比(币市值÷总权益, 0.7 = 70%)"
+default = 0.7
+group = "激活与区间"
+
+[[params]]
+key = "pos_high_pct"
+name = "上限仓位占比"
+type = "f64"
+desc = "价格上限处仓位占比(币市值÷总权益, 0.3 = 30%; 0 = 涨到顶清仓)"
+default = 0.3
+group = "激活与区间"
 
 [[params]]
 key = "out_of_range"
@@ -129,6 +97,55 @@ type = "enum"
 desc = "exit = 价格出区间撤单停机(不清仓); wait = 暂停挂单等价格回界内"
 default = "exit"
 options = ["exit", "wait"]
+group = "激活与区间"
+
+[[params]]
+key = "build_steps"
+name = "建仓批数"
+type = "i64"
+desc = "逐步建仓分几批买入"
+default = 10
+group = "分批建仓"
+
+[[params]]
+key = "build_interval_hours"
+name = "建仓间隔(小时)"
+type = "f64"
+desc = "相邻两批建仓的最小时间间隔(小时)"
+default = 1
+group = "分批建仓"
+
+[[params]]
+key = "atr_interval"
+name = "ATR K 线周期"
+type = "string"
+desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
+default = "1h"
+group = "网格间距"
+
+[[params]]
+key = "atr_period"
+name = "ATR 周期"
+type = "i64"
+desc = "ATR 回看根数"
+default = 14
+group = "网格间距"
+
+[[params]]
+key = "atr_mult"
+name = "ATR 乘数"
+type = "f64"
+desc = "网格间距 = atr_mult × ATR"
+default = 1
+group = "网格间距"
+
+[[params]]
+key = "min_spacing_pct"
+name = "最小间距(价格占比)"
+type = "f64"
+desc = "间距下限(占价格比例, 0.004 = 0.4%); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损; 负数 = 禁用下限"
+default = 0.004
+group = "网格间距"
 
 [[params]]
 key = "tp_min_profit_pct"
@@ -136,6 +153,7 @@ name = "止盈最小盈利"
 type = "f64"
 desc = "动态止盈最小盈利比例(0.10 = 10%); 0 = 禁用止盈"
 default = 0.1
+group = "动态止盈"
 
 [[params]]
 key = "tp_dd_atr_mult"
@@ -143,3 +161,4 @@ name = "止盈回撤 ATR 倍数"
 type = "f64"
 desc = "最高点回撤 ≥ 该倍数 × ATR 且盈利达标时清仓止盈"
 default = 3
+group = "动态止盈"

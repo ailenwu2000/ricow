@@ -37,20 +37,7 @@ name = "合约对"
 type = "string"
 desc = "USDT-M 合约交易对(如 SOLUSDT)"
 required = true
-
-[[params]]
-key = "start_price"
-name = "开始价格"
-type = "f64"
-desc = "价格低于它才激活(必填; 回测请设为窗口起点价, 勿前视)"
-required = true
-
-[[params]]
-key = "invest_cash"
-name = "投入资金"
-type = "f64"
-desc = "投入资金(保证金, USDT); 总资金 = 投入 × 杠杆, 激活时用总资金一半市价开多。0 = 激活时 quote 余额全额"
-default = 0
+group = "基础配置"
 
 [[params]]
 key = "interval"
@@ -58,41 +45,15 @@ name = "主时钟"
 type = "string"
 desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
 default = "1h"
+group = "基础配置"
 
 [[params]]
-key = "atr_interval"
-name = "ATR K 线周期"
-type = "string"
-desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
-default = "1h"
-
-[[params]]
-key = "atr_period"
-name = "ATR 周期"
-type = "i64"
-desc = "ATR 回看根数"
-default = 14
-
-[[params]]
-key = "atr_mult"
-name = "ATR 乘数"
+key = "invest_cash"
+name = "投入资金"
 type = "f64"
-desc = "网格间距 = atr_mult × ATR"
-default = 1.5
-
-[[params]]
-key = "min_spacing_pct"
-name = "最小间距(价格占比)"
-type = "f64"
-desc = "间距下限(占价格比例, 0.002 = 0.2% = 4×合约费率; 负数 = 禁用下限); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损"
-default = 0.002
-
-[[params]]
-key = "min_notional"
-name = "单笔最小名义"
-type = "f64"
-desc = "单笔最小名义金额(合约 SOLUSDT fapi 最小名义 5)"
-default = 5
+desc = "投入资金(保证金, USDT); 总资金 = 投入 × 杠杆, 激活时用总资金一半市价开多。0 = 激活时 quote 余额全额"
+default = 0
+group = "基础配置"
 
 [[params]]
 key = "fee_side"
@@ -100,6 +61,55 @@ name = "单边费率"
 type = "f64"
 desc = "单边手续费率(0.0005 = 合约 taker 0.05%/边)"
 default = 0.0005
+group = "基础配置"
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔最小名义金额(合约 SOLUSDT fapi 最小名义 5)"
+default = 5
+group = "基础配置"
+
+[[params]]
+key = "start_price"
+name = "开始价格"
+type = "f64"
+desc = "价格低于它才激活(必填; 回测请设为窗口起点价, 勿前视)"
+required = true
+group = "激活"
+
+[[params]]
+key = "atr_interval"
+name = "ATR K 线周期"
+type = "string"
+desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
+default = "1h"
+group = "网格间距"
+
+[[params]]
+key = "atr_period"
+name = "ATR 周期"
+type = "i64"
+desc = "ATR 回看根数"
+default = 14
+group = "网格间距"
+
+[[params]]
+key = "atr_mult"
+name = "ATR 乘数"
+type = "f64"
+desc = "网格间距 = atr_mult × ATR"
+default = 1.5
+group = "网格间距"
+
+[[params]]
+key = "min_spacing_pct"
+name = "最小间距(价格占比)"
+type = "f64"
+desc = "间距下限(占价格比例, 0.002 = 0.2% = 4×合约费率; 负数 = 禁用下限); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损"
+default = 0.002
+group = "网格间距"
 
 [[params]]
 key = "flag_spacing_mult"
@@ -107,6 +117,7 @@ name = "间距放大系数"
 type = "f64"
 desc = "方向 flag 驱动的网格间距指数放大系数, 默认 1.2: flag = 网格卖笔数 − 买笔数(建仓与强平不计); |flag|≥2 时趋势侧间距 × 系数^(|flag|−1)(flag<0 净买→放大买单间距, flag>0 净卖→放大卖单间距, 另一侧不变), 买卖量随间距自动跟随保持 1:1; 1.0 = 禁用放大(<1 按 1 处理)"
 default = 1.2
+group = "网格间距"
 
 [[params]]
 key = "liq_warn_ratio"
@@ -114,6 +125,7 @@ name = "爆仓价告警阈值"
 type = "f64"
 desc = "小数(0.1=10%); 多头距爆仓价 < 该比例打 WARN(只告警不动作)。与引擎 014 的 liq_warn_pct(百分点)是两条通道"
 default = 0.1
+group = "爆仓监控"
 
 [backtest]
 # 全仓(cross): 投入资金整体作为该 pair 的清算缓冲 —— 网格留半仓补仓资金, 有效杠杆 = 名义/投入

@@ -1803,6 +1803,15 @@ body {
   font-size: 0.8rem;
   font-weight: 600;
 }
+/* 参数分组小节标题(清单 group 字段驱动): 加粗 + 上间距 + 下边框。 */
+.sg-group-head {
+  margin: 12px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
 
 /* 053: 改动对比 —— 参数行**行内**的「原 X → 改为 Y」。
    旧值用 muted + 删除线(它是要被换掉的那个), 新值用 warn(与「未保存」提示同色, 一眼连起来)。 */
@@ -2166,7 +2175,7 @@ body {
 }
 .sg-mf-line2 {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 2fr 1fr 1fr;
   gap: 6px;
   margin-top: 6px;
 }
