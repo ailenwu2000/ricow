@@ -579,10 +579,20 @@ impl Database {
         Ok(klines)
     }
 
-    /// 按 open_time 闭区间查询 K 线 (升序) —— 回测缓存命中判定用 (035)。
+    /// 按 open_time 查询 K 线 (升序) —— 回测缓存命中判定用 (035)。
     ///
-    /// `start_ms` / `end_ms` 为毫秒闭区间; `limit` 取区间内**最近**的若干根 (DESC 截断后反转升序),
-    /// 与 `get_klines` 的"最近 N 根"语义一致 —— 窗口宽度 = N×step 时正好覆盖整个窗口。
+    /// **窗口是半开区间 `[start_ms, end_ms)`** (2026-10-24 由闭区间改)。
+    ///
+    /// 为什么改: 调用方(`commands/backtest.rs`)拿到数据后会按 `open_time < window_end`
+    /// 裁掉窗口末根 —— 即**回测窗口本来就是半开的**。而本函数原来用闭区间
+    /// (`open_time <= end_ms`), 于是窗口根数比调用方以为的多一根; 再叠加
+    /// `ORDER BY open_time DESC LIMIT N`, **多出的那根把最早的一根挤掉** ——
+    /// 而那根正是预热段的第一根。后果: 缓存命中时 `available` 少一根,
+    /// 需要 aux 预热的策略(如 linear_position_grid)被判"预热段不足"而**硬报错**,
+    /// 同一个窗口直连交易所(分页取数会多取)却能跑通 —— 两条数据源路径行为不一致。
+    ///
+    /// `limit` 取区间内**最近**的若干根 (DESC 截断后反转升序), 与 `get_klines` 的
+    /// "最近 N 根"语义一致 —— 窗口宽度 = N×step 时正好覆盖整个窗口。
     pub async fn get_klines_range(
         &self,
         market: &str,
@@ -595,7 +605,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT open_time, open, high, low, close, volume, close_time
              FROM klines
-             WHERE market = ? AND pair = ? AND interval = ? AND open_time >= ? AND open_time <= ?
+             WHERE market = ? AND pair = ? AND interval = ? AND open_time >= ? AND open_time < ?
              ORDER BY open_time DESC LIMIT ?",
         )
         .bind(market)
@@ -1728,6 +1738,41 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 063 回归: 区间查询是**半开** `[start, end)` —— 窗口根数恰好等于 limit 时,
+    /// **最早的一根不能被挤掉**。
+    ///
+    /// 背景(2026-10-24 真撞): 原来用闭区间(`<= end`), 而调用方(回测取数)拿到数据后
+    /// 会按 `open_time < window_end` 裁掉末根 —— 即窗口本就是半开的。两个语义打架 →
+    /// 窗口根数比调用方以为的多一根 → `ORDER BY open_time DESC LIMIT N` 把**最早那根挤掉**,
+    /// 而那根正是预热段的第一根 → 缓存命中时判"预热段不足"硬报错, 同一窗口直连却能跑通。
+    ///
+    /// 这条断言钉的是"**半开**"这个语义本身: 端点那根**不算**在区间内。
+    #[tokio::test]
+    async fn test_get_klines_range_is_half_open_and_keeps_oldest_when_exact_fit() {
+        let db = Database::open_in_memory().await.unwrap();
+        const STEP: i64 = 60_000;
+        // 5 根: t0..t4
+        for i in 0..5 {
+            db.insert_kline("spot", "ETH", "1m", &sample_kline(1000 + i * STEP)).await.unwrap();
+        }
+        // 窗口 [t0, t4) 恰好装 4 根, limit=4 → **四根都要**(尤其最早那根 t0)。
+        let got = db.get_klines_range("spot", "ETH", "1m", 1000, 1000 + 4 * STEP, 4).await.unwrap();
+        assert_eq!(got.len(), 4, "窗口根数恰等于 limit 时不该丢根: {got:?}");
+        assert_eq!(
+            got[0].open_time.timestamp_millis(),
+            1000,
+            "最早的一根不能被 LIMIT 挤掉(它是预热段的第一根)"
+        );
+        // 端点本身**不在**半开区间内: end 那一根取不到。
+        let got2 =
+            db.get_klines_range("spot", "ETH", "1m", 1000, 1000 + 4 * STEP, 10).await.unwrap();
+        assert_eq!(got2.len(), 4, "end 端点那根不该算在区间内: {got2:?}");
+        assert!(
+            got2.iter().all(|k| k.open_time.timestamp_millis() < 1000 + 4 * STEP),
+            "半开区间: 右端点不含"
+        );
+    }
+
     /// 035: 区间查询取"最近 limit 根"并升序返回; kline_span 报告首尾。
     #[tokio::test]
     async fn test_get_klines_range_recent_ascending_and_span() {
@@ -1735,12 +1780,13 @@ mod tests {
         for i in 0..5 {
             db.insert_kline("spot", "ETH", "1m", &sample_kline(1000 + i * 60_000)).await.unwrap();
         }
-        // 区间含前 4 根, limit=3 → 取最近 3 根 (第 2/3/4 根), 升序。
+        // 区间**半开** [t0, t3) 含前 3 根, limit=3 → 取那 3 根, 升序。
+        // (063: 端点 t3 那根现在**不在**区间内 —— 区间语义见 get_klines_range 的注释。)
         let got =
             db.get_klines_range("spot", "ETH", "1m", 1000, 1000 + 3 * 60_000, 3).await.unwrap();
         assert_eq!(got.len(), 3);
-        assert_eq!(got[0].open_time.timestamp_millis(), 1000 + 60_000);
-        assert_eq!(got[2].open_time.timestamp_millis(), 1000 + 3 * 60_000);
+        assert_eq!(got[0].open_time.timestamp_millis(), 1000);
+        assert_eq!(got[2].open_time.timestamp_millis(), 1000 + 2 * 60_000);
         // 空区间 → 空。
         assert!(db.get_klines_range("spot", "ETH", "1m", 10, 20, 3).await.unwrap().is_empty());
         // 首尾跨度。

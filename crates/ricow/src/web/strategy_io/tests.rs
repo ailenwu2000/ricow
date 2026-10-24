@@ -2184,3 +2184,246 @@ fn test_save_request_writes_tier_cap_as_max_leverage_not_as_actual_leverage() {
         "生成路径**不得**传 leverage(实际杠杆): 它会一路走到交易所, 等于替用户开杠杆"
     );
 }
+
+// ── 063: `POST /api/strategies/{id}/instance` —— 只改参数与交易对, 不动代码 ──────────
+//
+// 这个端点是"新建实盘能设参数"的地基。三条纪律各有断言守着:
+// ① **未提及的字段不丢**(尤其 `live_enabled` —— 那是实盘门禁, 顺手清掉等于替用户解除授权);
+// ② **内置策略 409**(脚本编译期嵌入, 磁盘上没有可改的实例);
+// ③ **`script_path` 不被前端覆盖**(引擎装载细节, 让用户改只会让引擎找不到脚本)。
+
+/// 在临时 root 里落一个用户策略(走引擎同一份落盘内核), 返回 root。
+fn seed_user_strategy(root: &std::path::Path, id: &str, extra_toml: &str) {
+    let dir = root.join("strategies");
+    std::fs::create_dir_all(dir.join("spot")).expect("建策略目录");
+    let code = "function on_tick(ctx)\n    return {}\nend\n";
+    std::fs::write(dir.join("spot").join(format!("{id}.lua")), code).expect("写脚本");
+    let toml = format!(
+        "[strategy]\nname = \"{id}\"\ntype = \"lua\"\nenabled = true\nexchange = \"binance\"\n\
+         live_enabled = true\nmarket = \"spot\"\nposition_mode = \"one-way\"\n\
+         \n[strategy.params]\npair = \"BTCUSDT\"\nscript_path = \"spot/{id}.lua\"\n\
+         atr_mult = 1.5\nflag = false\n{extra_toml}"
+    );
+    std::fs::write(dir.join(format!("{id}.toml")), toml).expect("写实例 TOML");
+}
+
+/// 把全局 `RICOW_ROOT` 指向临时 root 并返回锁守卫。
+///
+/// 为什么要设: `catalog::all()` 扫的是**全局** `project_root()/strategies`
+/// (`commands::strategies_dir()`), 而端点读写用的是 `state.root`。
+/// 生产里两者同一份; 测试里必须让它们指到同一处, 否则 `catalog::find` 找不到
+/// 刚种下的用户策略(表现为 404 "没有策略 zz_inst")。
+///
+/// 必须持 `ENV_LOCK`: 并行测试会临时改这个环境变量, 不加锁会读到别家的值。
+fn use_root_env(root: &std::path::Path) -> std::sync::MutexGuard<'static, ()> {
+    let guard = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    std::env::set_var("RICOW_ROOT", root);
+    guard
+}
+
+/// 063: 改参数后, **未提及的字段原样保留** —— 尤其 `live_enabled`。
+// `RICOW_ROOT` 是**进程全局**的环境变量: 不持 ENV_LOCK 跨 await, 并行测试会读到
+// 彼此的 root(表现为"刚种下的策略 404")。持锁跨 await 在这里是**故意的** ——
+// 锁的作用范围必须覆盖整个测试体, 而测试体里全是 await。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_save_instance_keeps_unmentioned_fields() {
+    let root = tmp_root("inst-keep");
+    seed_user_strategy(&root, "zz_inst", "\n[backtest]\ninitial_cash = 5000.0\n");
+    let port = boot(root.clone()).await;
+
+    let _env = use_root_env(&root);
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/zz_inst/instance?token=tok-ok",
+        Some(r#"{"params":{"atr_mult":2.5}}"#),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "改参数应 200: {res}");
+
+    // 回读磁盘上的实例 TOML: 三件事都要成立。
+    let text = std::fs::read_to_string(root.join("strategies").join("zz_inst.toml"))
+        .expect("读回实例 TOML");
+    assert!(text.contains("atr_mult = 2.5"), "新值应落盘: {text}");
+    assert!(!text.contains("atr_mult = 1.5"), "旧值不该残留: {text}");
+    // ① 未提及的字段**没丢**。
+    assert!(text.contains("live_enabled = true"), "live_enabled 不该丢: {text}");
+    assert!(text.contains("market = \"spot\""), "market 不该丢: {text}");
+    assert!(text.contains("initial_cash = 5000"), "[backtest] 段不该丢: {text}");
+    // 未提及的另一个参数 flag 也保留。
+    assert!(text.contains("flag = false"), "未提及参数不该丢: {text}");
+    // 交易对没给 → 保持原值。
+    assert!(text.contains("pair = \"BTCUSDT\""), "交易对不该丢: {text}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 063: 实例落盘的**第一道防线**: 前端传来的 `script`/`script_path` 一律不采纳。
+///
+/// 为什么单独钉一条(而不是只靠"落盘后 script_path 没变"那条端到端断言):
+/// 落盘内核 [`ricow_engine::write_strategy_files`] 会**强制重设** `script_path`
+/// 并摘掉 `script` —— 那是**第二道防线**。只破第一道时, 端到端断言仍然绿,
+/// 于是"第一道防线没了"这件事**永远不会被发现**(直到第二道也出问题那天)。
+/// 故这里直接钉第一道防线的**存在性**。
+#[test]
+fn test_save_instance_skips_internal_keys_first_line_of_defense() {
+    let src = include_str!("mod.rs");
+    let body = src
+        .split("for (key, value) in incoming")
+        .nth(1)
+        .and_then(|s| s.split("config.params.insert(key, value);").next())
+        .expect("应有 incoming 循环");
+    assert!(
+        body.contains("key == \"script\"") && body.contains("key == \"script_path\""),
+        "第一道防线: 前端传来的 script/script_path 必须被跳过: {body}"
+    );
+}
+
+/// 063: 内置策略 → 409(内置脚本编译期嵌入, 磁盘上没有可改的实例)。
+// `RICOW_ROOT` 是**进程全局**的环境变量: 不持 ENV_LOCK 跨 await, 并行测试会读到
+// 彼此的 root(表现为"刚种下的策略 404")。持锁跨 await 在这里是**故意的** ——
+// 锁的作用范围必须覆盖整个测试体, 而测试体里全是 await。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_save_instance_rejects_builtin() {
+    let root = tmp_root("inst-builtin");
+    let port = boot(root.clone()).await;
+
+    let _env = use_root_env(&root);
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/linear_position_grid/instance?token=tok-ok",
+        Some(r#"{"params":{"atr_mult":2.0}}"#),
+    )
+    .await;
+    assert_eq!(status_of(&res), 409, "内置策略应 409: {res}");
+    assert!(body_of(&res).contains("builtin"), "错误码应是 builtin(前端据此提示先复制): {res}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 063: 前端传 `script`/`script_path` → **不采纳**(引擎装载细节)。
+// `RICOW_ROOT` 是**进程全局**的环境变量: 不持 ENV_LOCK 跨 await, 并行测试会读到
+// 彼此的 root(表现为"刚种下的策略 404")。持锁跨 await 在这里是**故意的** ——
+// 锁的作用范围必须覆盖整个测试体, 而测试体里全是 await。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_save_instance_ignores_script_override() {
+    let root = tmp_root("inst-script");
+    seed_user_strategy(&root, "zz_script", "");
+    let port = boot(root.clone()).await;
+
+    let _env = use_root_env(&root);
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/zz_script/instance?token=tok-ok",
+        Some(r#"{"params":{"script_path":"../../evil.lua","script":"evil()"}}"#),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "应 200: {res}");
+
+    let text = std::fs::read_to_string(root.join("strategies").join("zz_script.toml"))
+        .expect("读回实例 TOML");
+    assert!(
+        text.contains("script_path = \"spot/zz_script.lua\""),
+        "script_path 不该被前端覆盖: {text}"
+    );
+    assert!(!text.contains("evil"), "script 不该被前端写进去: {text}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 063: 改交易对 —— 只动 pair, 其余不动。
+// `RICOW_ROOT` 是**进程全局**的环境变量: 不持 ENV_LOCK 跨 await, 并行测试会读到
+// 彼此的 root(表现为"刚种下的策略 404")。持锁跨 await 在这里是**故意的** ——
+// 锁的作用范围必须覆盖整个测试体, 而测试体里全是 await。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_save_instance_updates_pair_only() {
+    let root = tmp_root("inst-pair");
+    seed_user_strategy(&root, "zz_pair", "");
+    let port = boot(root.clone()).await;
+
+    let _env = use_root_env(&root);
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/zz_pair/instance?token=tok-ok",
+        Some(r#"{"pair":"ETHUSDT"}"#),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "应 200: {res}");
+    let body = body_of(&res);
+    assert!(body.contains("ETHUSDT"), "回包应是落盘后的交易对: {body}");
+
+    let text = std::fs::read_to_string(root.join("strategies").join("zz_pair.toml"))
+        .expect("读回实例 TOML");
+    assert!(text.contains("pair = \"ETHUSDT\""), "交易对应落盘: {text}");
+    assert!(text.contains("live_enabled = true"), "其它字段不该丢: {text}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 063: 空交易对 → 400(空交易对会让引擎起不来, 别静默接受)。
+// `RICOW_ROOT` 是**进程全局**的环境变量: 不持 ENV_LOCK 跨 await, 并行测试会读到
+// 彼此的 root(表现为"刚种下的策略 404")。持锁跨 await 在这里是**故意的** ——
+// 锁的作用范围必须覆盖整个测试体, 而测试体里全是 await。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_save_instance_rejects_empty_pair() {
+    let root = tmp_root("inst-emptypair");
+    seed_user_strategy(&root, "zz_empty", "");
+    let port = boot(root.clone()).await;
+
+    let _env = use_root_env(&root);
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/zz_empty/instance?token=tok-ok",
+        Some(r#"{"pair":"   "}"#),
+    )
+    .await;
+    assert_eq!(status_of(&res), 400, "空交易对应 400: {res}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 063: 策略列表给**时间字段**, 且内置策略的时间是**空**(不编造)。
+// `RICOW_ROOT` 是**进程全局**的环境变量: 不持 ENV_LOCK 跨 await, 并行测试会读到
+// 彼此的 root(表现为"刚种下的策略 404")。持锁跨 await 在这里是**故意的** ——
+// 锁的作用范围必须覆盖整个测试体, 而测试体里全是 await。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_strategy_list_carries_time_fields_and_builtin_is_null() {
+    let root = tmp_root("list-time");
+    seed_user_strategy(&root, "zz_time", "");
+    let port = boot(root.clone()).await;
+    let _env = use_root_env(&root);
+
+    let res = raw(port, "GET", "/api/strategies?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 200, "应 200: {res}");
+
+    // 用 JSON 解析而不是字符串切分: 摘要里含 Lua 源码(`return {}` 里有花括号),
+    // 按 `}` 切会切出半截 JSON, 断言就成了"切到哪儿算哪儿"的假绿。
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(body_of(&res)).expect("列表应是合法 JSON");
+    let user = rows.iter().find(|r| r["id"] == "zz_time").expect("列表里应有 zz_time");
+    assert!(user["last_modified"].is_i64(), "用户策略应有 last_modified(Unix 秒): {user}");
+    assert!(user["created_at"].is_i64(), "用户策略应有 created_at(Unix 秒): {user}");
+    // 两个时间都不该是 0 或未来(0 = "读不到但填了 0", 那是不诚实)。
+    assert!(user["last_modified"].as_i64().unwrap() > 1_600_000_000, "{user}");
+    assert!(user["created_at"].as_i64().unwrap() > 1_600_000_000, "{user}");
+
+    // 内置策略: **没有**这两个字段(磁盘上无文件, 不编造时间)。
+    let builtin =
+        rows.iter().find(|r| r["id"] == "linear_position_grid").expect("列表里应有内置策略");
+    assert!(
+        builtin.get("last_modified").is_none() && builtin.get("created_at").is_none(),
+        "内置策略不该有时间字段(磁盘上无文件, 不编造): {builtin}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

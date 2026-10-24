@@ -125,6 +125,10 @@
     renderBadges(detail, source);
     renderDeclHint(detail);
     renderFit(detail);
+    // 063: 进详情时建好双 Tab 与 AI 快捷指令。
+    // 每次进详情都重建 —— Tab 是**按策略**的状态, 换策略时留在上一个的 Tab 上没道理。
+    S.renderTabs();
+    S.renderAiQuick();
 
     // 内置只读提示 + 编辑/AI 控件收起(回测保留)。
     const builtin = st.detailCtx.builtin;
@@ -247,6 +251,37 @@
   }
 
   // ---------- 参数表单 ----------
+
+  /// 063: 建一段**独立的参数表单**(给「新建实盘」弹窗用)。
+  ///
+  /// 刻意**复用**详情页那套 `paramRow`/`stringRow`, 而不是另写一套:
+  /// 参数的**类型/默认值/说明**必须与策略详情里看到的一致 —— 两处各画一套,
+  /// 用户会发现"同一个参数在两个页面长得不一样", 然后怀疑哪个是真的。
+  ///
+  /// opts: { params: ManifestParam[], current: { key: value }, onInput? }
+  /// 返回 { box, entries } —— `entries` 是 { key, name, ty, required, input } 列表,
+  /// 调用方用 `S.readParam`/`S.gatherParams` 收集值(与详情页同口径)。
+  function buildParamBlock(opts) {
+    const o = opts || {};
+    const box = h("div", "sg-params-block");
+    const entries = [];
+    const current = o.current || {};
+    for (const p of o.params || []) {
+      // 保留键跳过: `pair` 由调用方单独给(交易对是实盘配置的一项), `script`/`script_path`
+      // 指脚本本身 —— 再来一行就是被顶层值盖掉的死控件。
+      if (RESERVED_PARAM_KEYS.includes(p.key)) continue;
+      const val = current[p.key] !== undefined ? current[p.key] : p.default;
+      const built = p.ty === "string" ? stringRow(p, val) : paramRow(p, val);
+      box.appendChild(built.label);
+      entries.push(paramEntry(p.key, p.name, p.ty, p.required, built));
+    }
+    if (typeof o.onInput === "function") {
+      for (const e of entries) {
+        if (e.input) e.input.addEventListener("input", o.onInput);
+      }
+    }
+    return { box: box, entries: entries };
+  }
 
   function paramRow(spec, value) {
     const label = h("label", "sg-param");
@@ -1019,6 +1054,8 @@
   S.renderBadges = renderBadges;
   S.readParam = readParam;
   S.paramRow = paramRow;
+  // 063: 「新建实盘」弹窗用同一套参数行(类型/默认值/说明一致, 不另画一套)。
+  S.buildParamBlock = buildParamBlock;
   S.stringRow = stringRow;
   S.addManifestRow = addManifestRow;
   S.onSaveManifest = onSaveManifest;

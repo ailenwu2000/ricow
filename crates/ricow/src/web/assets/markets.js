@@ -837,15 +837,17 @@
       box.appendChild(h("div", "mk-empty mk-chart-empty", t("mkChartEmpty")));
       return;
     }
-    const border = themeColor("--border", "#2b333d");
+    const border = themeColor("--border", "#f0f0f0");
     const LWC = window.LightweightCharts;
-    // 涨跌配色 = 项目既有约定(涨红跌绿, 与指标卡/历史表一致): 涨 = --error, 跌 = --accent。
-    const upColor = themeColor("--error", "#f85149");
-    const downColor = themeColor("--accent", "#4dd4ac");
+    // 涨跌配色 = 项目既有约定(涨红跌绿, 与指标卡/历史表一致)。
+    // 062: 涨跌色已从 `--error`/`--accent` 拆到 `--up`/`--down` —— 主色是 fmz 的绿 #1CAF83,
+    // 若跌仍引 `--accent`, K 线跌势的绿与主色同色, 界面上分不出"这是跌势"还是"这是选中态"。
+    const upColor = themeColor("--up", "#f5222d");
+    const downColor = themeColor("--down", "#0d9b6c");
     chart = LWC.createChart(box, {
       // autoSize: v4 内置 ResizeObserver 自适应容器宽高, 无需手写 resize 监听。
       autoSize: true,
-      layout: { background: { color: "transparent" }, textColor: themeColor("--muted", "#9aa7b4") },
+      layout: { background: { color: "transparent" }, textColor: themeColor("--muted", "#5b6672") },
       grid: {
         vertLines: { color: border },
         horzLines: { color: border },

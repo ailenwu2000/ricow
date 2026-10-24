@@ -43,9 +43,25 @@ function sliceBraced(src, openIdx) {
   let inStr = null;
   for (let i = openIdx; i < src.length; i++) {
     const ch = src[i];
+    const nx = src[i + 1];
     if (inStr) {
       if (ch === "\\") i += 1;
       else if (ch === inStr) inStr = null;
+      continue;
+    }
+    // 2026-10-24 修: **注释也要跳过**。
+    // 旧实现只认字符串, 于是注释里的引号(`fmz's "new live" form`)会被当成字符串起始,
+    // 注释里的花括号(`{ id }`)会破坏配平 —— 两种情况都会让切出来的块**提前结束或截断**,
+    // 症状离病因很远(报的是"英文键缺失"), 而且只在**注释里带引号**的文件上出现,
+    // 很容易被当成"我刚加的文案漏了英文"而查错方向。
+    if (ch === "/" && nx === "/") {
+      while (i < src.length && src[i] !== "\n") i += 1;
+      continue;
+    }
+    if (ch === "/" && nx === "*") {
+      i += 2;
+      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i += 1;
+      i += 1;
       continue;
     }
     if (ch === '"' || ch === "'" || ch === "`") inStr = ch;
@@ -59,10 +75,13 @@ function sliceBraced(src, openIdx) {
 }
 
 function blankStrings(block) {
+  // 剥注释: 注释里的引号/撇号会让旧的字符串扫描把后面整段当成字符串 ——
+  // 症状是"英文块整段消失", 报的是文案缺失, 病根在解析(见 stripComments)。
+  const src = stripComments(block);
   let out = "";
   let inStr = null;
-  for (let i = 0; i < block.length; i++) {
-    const ch = block[i];
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
     if (inStr) {
       if (ch === "\\") i += 1;
       else if (ch === inStr) {

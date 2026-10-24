@@ -1218,7 +1218,7 @@
     try {
       R.applyTheme((await R.api("/api/theme")).theme); // 034: 与 CLI 共用 `[ui].theme`
     } catch (_) {
-      R.applyTheme("dark"); // 读不到(服务异常): 按深色兜底, 不影响其余功能
+      R.applyTheme("light"); // 读不到(服务异常): 按浅色兜底(062 起默认档), 不影响其余功能
     }
     try {
       // 术语表(A2): 取一次, 全站共享 —— 别的视图 `decorate` 也走这一个 promise。

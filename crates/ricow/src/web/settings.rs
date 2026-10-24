@@ -83,10 +83,10 @@ struct ThemeBody {
     theme: String,
 }
 
-/// 当前主题 = 配置里的 `[ui].theme`(缺省深色)。每次现读, 与配置文件永远一致。
+/// 当前主题 = 配置里的 `[ui].theme`(缺省浅色 —— 062 起默认档是 fmz 浅色)。每次现读, 与配置文件永远一致。
 async fn get_theme(State(state): State<WebState>) -> Result<Json<ThemeReply>, WebError> {
     let file = config_file::load(&state.root)?;
-    let theme = file.ui.theme.unwrap_or_else(|| "dark".to_string());
+    let theme = file.ui.theme.unwrap_or_else(|| "light".to_string());
     Ok(Json(ThemeReply { theme }))
 }
 
@@ -162,10 +162,10 @@ mod tests {
         let db = ricow_strategy::Database::open_in_memory().await.expect("开内存库");
         let port = serve_test(root.clone(), db).await;
 
-        // 缺省 = 深色(与前端兜底一致)。
+        // 缺省 = 浅色(062 起默认档是 fmz 浅色, 与前端兜底一致)。
         let res = get(port, "/api/theme?token=tok-ok").await;
         assert!(res.starts_with("HTTP/1.1 200"), "GET /api/theme 应 200, 实际: {res}");
-        assert!(body_of(&res).contains(r#""theme":"dark""#), "缺省主题应为 dark: {res}");
+        assert!(body_of(&res).contains(r#""theme":"light""#), "缺省主题应为 light: {res}");
 
         // 合法值: 200, 回读一致; ricow.toml 里真有 theme = "light"。
         let res = post(port, "/api/theme?token=tok-ok", r#"{"theme":"light"}"#).await;

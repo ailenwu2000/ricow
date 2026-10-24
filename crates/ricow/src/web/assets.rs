@@ -52,6 +52,10 @@ pub(super) const ASSETS: &[Asset] = &[
     },
     // 公共件(032 T002): TOKEN / api / TEXT 字典 / 通用 i18n 与纯工具。
     Asset { name: "common.js", ctype: CTYPE_JS, embedded: include_str!("assets/common.js") },
+    // 通用 UI 组件层(062): fmz.com 视觉语言的实现 —— 卡片 / 标签页 / 空态 / 面包屑 / 按钮 / 图标。
+    // **必须排在 router.js 之前**: 它不注册视图, 但要用 `R.t()` 取双语文案, 故须在 common.js 之后;
+    // 排在 router.js 之前是为了让"视图脚本 → router"的既有顺序契约不被插断(见末尾顺序测试)。
+    Asset { name: "ui.js", ctype: CTYPE_JS, embedded: include_str!("assets/ui.js") },
     // hash 路由与视图注册表(032 T003)。
     Asset { name: "router.js", ctype: CTYPE_JS, embedded: include_str!("assets/router.js") },
     // 受限 markdown 渲染器(044): AI 助手气泡的结构化渲染, 只产 DOM(chart.js 在 renderRich 里用)。
@@ -61,6 +65,8 @@ pub(super) const ASSETS: &[Asset] = &[
     Asset { name: "chat.js", ctype: CTYPE_JS, embedded: include_str!("assets/chat.js") },
     // 设置视图(032 US1): 市场视野开关; 密钥配置已迁至 033 密钥视图。
     Asset { name: "settings.js", ctype: CTYPE_JS, embedded: include_str!("assets/settings.js") },
+    // 概览视图(062): fmz 的 P1 仪表盘范式 —— 统计 / 快捷入口 / 运行状态 / 文档入口。
+    Asset { name: "dashboard.js", ctype: CTYPE_JS, embedded: include_str!("assets/dashboard.js") },
     // 密钥视图(033): 多套 AI / 币安密钥的别名条目。
     Asset { name: "keys.js", ctype: CTYPE_JS, embedded: include_str!("assets/keys.js") },
     // 市场视图(032 US2, 040 起含 SSE 实时): 交易对列表 / 订单簿 / K 线。
@@ -428,6 +434,7 @@ mod tests {
             "markets.js",
             "strategies.js",
             "runs.js",
+            "dashboard.js",
             "help.js",
             "palette.js",
             "app.js",
@@ -435,6 +442,14 @@ mod tests {
             assert!(common < idx(view), "common.js 必须排在所有视图脚本之前(缺 {view})");
             assert!(pos("common.js") < pos(view), "首页里 common.js 必须排在 {view} 之前");
         }
+        // 062: `ui.js`(通用 UI 组件层)必须在 `common.js` 之后(要用 `R.t()`),
+        // 且在 `router.js` 之前(不注册视图, 但不许插断"视图脚本 → router"这条既有契约)。
+        assert!(idx("common.js") < idx("ui.js"), "ui.js 必须排在 common.js 之后(它要用 R.t())");
+        assert!(idx("ui.js") < idx("router.js"), "ui.js 必须排在 router.js 之前(顺序即契约)");
+        assert!(
+            pos("common.js") < pos("ui.js") && pos("ui.js") < pos("router.js"),
+            "首页里 ui.js 必须排在 common.js 之后、router.js 之前"
+        );
     }
 
     /// SC-011(浏览器侧): 页面不往 `localStorage` / `sessionStorage` 写任何东西 —— 明文密钥与
@@ -544,10 +559,26 @@ mod tests {
                 "适用性渲染须读取清单字段 `detail.{field}`"
             );
         }
-        // 内置行的详情入口: 精确到这一行, 免得"用户策略本来就有 openDetail"把断言蒙过去。
+        // 内置策略的详情入口: 063 起列表行是 fmz 式**行内文字链接**,
+        // 入口文案从「详情」改成「编辑」(fmz 的操作项就叫这个)。
+        //
+        // 断言的**意图**没变: 内置策略的用户必须到得了那个只读详情页。
+        // 钉住的是「行内链接 + 它调 openDetail」这条路径, 而不是某个按钮标签 ——
+        // 标签会随换版改, 路径不会。
         assert!(
-            shell.contains(r#"h("button", "sg-btn sg-btn-mini", t("sgDetail"))"#),
-            "内置策略列表行须有「详情」入口按钮(否则用户到不了只读详情页)"
+            shell.contains(r#"R.ui.linkBtn({"#) && shell.contains(r#"label: t("sgEdit")"#),
+            "列表行的操作项须用行内文字链接(fmz 形态), 且含「编辑」项"
+        );
+        // 「编辑」链接必须调 openDetail —— 否则用户点了进不去(内置策略尤其重要:
+        // 它不能编辑代码, 只读详情页是它唯一能去的地方)。
+        let edit_link = shell
+            .split(r#"label: t("sgEdit")"#)
+            .nth(1)
+            .and_then(|s| s.split(");").next())
+            .expect("「编辑」链接后面应有一段构造代码");
+        assert!(
+            edit_link.contains("openDetail(s.id)"),
+            "「编辑」链接须调 openDetail(否则到不了详情页): {edit_link}"
         );
     }
 
@@ -706,10 +737,28 @@ mod tests {
         // 关闭只记内存: 一旦真配了密钥, 服务端事实会让它自己消失, 不需要第二处状态。
         assert!(help.contains("let onboardDismissed = false;"), "关闭须只记内存");
         // 探针失败不引导(注释与实现都要在, 免得后来者顺手改成"读不到也显示")。
-        assert!(
-            help.contains("catch (_) {\n      bar.hidden = true;\n      return;\n    }"),
-            "探针失败须闭嘴"
-        );
+        //
+        // ★ 062 修: 这条断言原来查的是**含精确换行的整段字符串**
+        // (`"catch (_) {\n      bar.hidden = true;\n      return;\n    }"`),
+        // 于是它**依赖文件��行尾符**。而本仓库 `core.autocrlf=true` —— 磁盘上是 **CRLF**,
+        // Rust 字面量里的 `\n` 是 **LF** —— 两者永远对不上, 这条测试在 Windows 上**长期是红的**
+        // (2026-10-23 才被发现: 整仓实跑时看到 1 failed, 一度以为是本轮引入的)。
+        //
+        // 现在改成**按空白切段、逐段顺序匹配**: 换 CRLF/LF 都过, 但仍能保证
+        // "catch 之后紧接着就是 bar.hidden = true" 这个**语义**没被改掉。
+        let probe_quiet = ["catch (_) {", "bar.hidden = true;", "return;", "}"];
+        let mut cursor = 0usize;
+        let mut probe_ok = true;
+        for part in probe_quiet {
+            match help[cursor..].find(part) {
+                Some(idx) => cursor += idx + part.len(),
+                None => {
+                    probe_ok = false;
+                    break;
+                }
+            }
+        }
+        assert!(probe_ok, "探针失败须闭嘴(catch 之后须藏起引导条并直接返回)");
         // 帮助层清空一律走 `removeChild`(`clear`), 不碰 innerHTML —— 与 palette.js 同一条纪律。
         assert!(
             !help.contains("innerHTML"),
@@ -738,6 +787,108 @@ mod tests {
         assert!(
             router.contains("if (hash === undefined) return parseHash();"),
             "R.parseHash 无参时须退回真实 location.hash, 别把生产路径测成另一条"
+        );
+    }
+
+    /// 063: 前端静态门 `scripts/web_frontend_check.mjs` 的 **`sliceBraced` 必须剥注释**。
+    ///
+    /// 背景(2026-10-24 实撞): 门禁报「71 个键缺英文」, 症状是**英文文案整块消失**,
+    /// 看着像"我刚加的文案漏了英文"。真因在解析: `sliceBraced` 配平花括号时只跳字符串、
+    /// **不跳注释** —— 于是一条注释里的英文撇号(`fmz's "new live" form`)被当成字符串起始,
+    /// 注释里的花括号又破坏配平, 切出来的块**提前结束**。
+    ///
+    /// 为什么必须钉住: 这个缺陷**只在注释里带引号的文件上出现**, 而且报的是
+    /// "文案缺失" —— 查错方向会一路跑到"是不是我漏翻译了", 真正的原因在几十行外的解析器里。
+    /// 修一次不够: 以后任何人写注释时带个撇号就会再撞一次。
+    #[test]
+    fn test_frontend_check_slice_braced_skips_comments() {
+        let script = include_str!("../../../../scripts/web_frontend_check.mjs");
+        let body = script.split("function sliceBraced(").nth(1).expect("脚本须有 sliceBraced");
+        let body = body.split("\nfunction ").next().unwrap_or(body);
+        // 注释里出现 // 或 /* 时必须被跳过 —— 否则注释里的引号会被当成字符串起始。
+        assert!(
+            body.contains("nx === \"/\""),
+            "sliceBraced 必须跳过注释(否则注释里的引号/花括号会切错块)"
+        );
+        assert!(body.contains("nx === \"*\""), "sliceBraced 必须跳过块注释");
+    }
+
+    /// 062: 导航项的 `data-zh`/`data-en` **必须挂在内层 `<span class="nav-text">` 上**,
+    /// 不能挂在 `<a>` 上。
+    ///
+    /// 原因: `common.js` 的 `applyLang` 是 `node.textContent = ...` 换语言, 而 **`textContent`
+    /// 赋值会清空该元素的全部子节点** —— 挂在 `<a>` 上, 注入在它内部的图标(`ui.js` 的
+    /// `decorateNav`)会被一起抹掉。实测: 装饰完 7 个图标, `applyLang` 跑完就变 0 个,
+    /// **而页面上看不出任何报错**(图标就是不见了, 布局还是对的)。
+    ///
+    /// 这条断言钉住"文案层与图标层分开", 免得以后有人"顺手"把 span 去掉 —— 去掉后
+    /// 图标会静默消失, 静态门四道全绿, 只有真机截图才看得出来。
+    #[test]
+    fn test_nav_labels_wrapped_so_apply_lang_keeps_icons() {
+        let html = INDEX_HTML;
+        let nav = html
+            .split("<nav id=\"nav\">")
+            .nth(1)
+            .expect("首页须有 #nav")
+            .split("</nav>")
+            .next()
+            .expect("nav 应有收尾");
+        // 每个导航 <a> 都必须含 .nav-text 且 data-zh 挂在 span 上。
+        for a in nav.split("<a ").skip(1) {
+            // 取**开标签本身**(第一个 `>` 之前), 不含其内容。
+            let tag = a.split(">").next().unwrap_or("");
+            assert!(
+                !tag.contains("data-zh"),
+                "导航项的 data-zh/data-en 不该挂在 <a> 上(会被 textContent 赋值清空子节点): {tag}"
+            );
+        }
+        // 每个 .nav-text 上必须有 data-zh/data-en(成对)。
+        let spans = nav.matches("<span class=\"nav-text\"").count();
+        assert!(spans >= 7, "导航项的文案应各有一层 .nav-text(至少 7 项), 实得 {spans}");
+        assert_eq!(
+            nav.matches("data-zh=").count(),
+            spans,
+            "data-zh 的个数应与 .nav-text 的个数一致(文案与图标分层, 别漏挂)"
+        );
+        // ui.js 的 decorateNav 要往 <a> 里插 .nav-ico —— 存在这个类名即可。
+        assert!(src_of("ui.js").contains("nav-ico"), "ui.js 须负责注入导航图标位(.nav-ico)");
+    }
+
+    /// 062: `R.navigate` 写完 hash **必须自己切一次视图** —— 不能只靠 `hashchange`。
+    ///
+    /// 原因(真机实测): `location.hash = ...` 在**首屏导航尚未提交**时(页面刚 load 完、
+    /// URL 还没有 fragment), Chromium 会把这次 fragment 变更**并入初始 URL**, **不触发
+    /// `hashchange`** —— 实测监听器一次都没被叫到, 而 `location.hash` 已经是目标值。
+    /// 后果: 用户打开页面后**第一次**用编程式跳转(命令面板 / 空态 CTA / 概览快捷入口)
+    /// "点了没反应"; 第二次起 hash 真的变了才正常 —— 症状是"只有第一次坏", 极难查。
+    ///
+    /// 这条断言钉住"写完 hash 后面跟着 applyRoute()"这个动作 —— 少了它, 上面的症状会复现,
+    /// 而**任何静态门都看不出来**(hashchange 到底触不触发, 只有真机知道)。
+    #[test]
+    fn test_navigate_switches_view_without_relying_on_hashchange() {
+        let router = src_of("router.js");
+        let nav =
+            router.split("R.navigate = function (hash)").nth(1).expect("router.js 须有 R.navigate");
+        let body = nav.split("};").next().expect("R.navigate 应有函数体");
+        assert!(
+            body.contains("location.hash = target;"),
+            "R.navigate 应写 location.hash(地址栏要跟着变)"
+        );
+        // 062 变异验证: 断言必须精确到"**写 hash 之后**的那次 applyRoute" ——
+        // 只判 `body.contains("applyRoute();")` 是**弱断言**: 函数体里还有一处
+        // `if (location.hash === target) { applyRoute(); }`(hash 没变时那次),
+        // 去掉"写完 hash 自己切"那次调用后, 断言**仍然全绿**(变异验证实测)。
+        // 故改成: 按**行**找"写 hash"那一行的位置, 再看它**之后**有没有 applyRoute 调用。
+        let lines: Vec<&str> = body.lines().collect();
+        let set_line = lines
+            .iter()
+            .position(|l| l.contains("location.hash = target;"))
+            .expect("须有写 hash 的那一行");
+        let after = lines[set_line + 1..].join("\n");
+        assert!(
+            after.contains("applyRoute()"),
+            "R.navigate 写完 hash 后**必须自己调 applyRoute()** —— hashchange 在首屏 fragment \
+             变更时不触发(Chromium 把它并入初始 URL), 只等 hashchange 会导致\"第一次点了没反应\""
         );
     }
 
@@ -779,6 +930,40 @@ mod tests {
             common.contains(r#"window.dispatchEvent(new CustomEvent("ricow:theme""#),
             "换色须继续广播 ricow:theme(图表要按新变量重取配色)"
         );
+    }
+
+    /// 062: 前端主题兜底须与后端**默认档一致**(都是 `light`)。
+    ///
+    /// 换默认档是**多处**改动: 后端 `defaults::UI_THEME` / `SUPPORTED_THEMES` 首项 /
+    /// `web::settings` 的缺省兜底 / 前端 `common.js` 的 `R.theme` 初值与 `applyTheme` 的
+    /// 非法值兜底 / 首页下拉首项。漏掉前端这两处, 症状是"新装打开是浅色, 切一次主题再刷新
+    /// 变回深色" —— 这类偏差**不会让任何别的测试变红**, 故在此钉住。
+    #[test]
+    fn test_default_theme_matches_backend() {
+        assert_eq!(
+            crate::commands::config_file::defaults::UI_THEME,
+            "light",
+            "后端默认档应是浅色(062)"
+        );
+        let common = src_of("common.js");
+        assert!(
+            common.contains(r#"R.theme = "light";"#),
+            "前端 R.theme 初值应是 light(与后端默认档一致): {common}"
+        );
+        assert!(
+            common.contains(r#"? theme : "light";"#),
+            "前端 applyTheme 的非法值兜底应是 light: {common}"
+        );
+        // 首页下拉首项 = 默认档(浅色)。首项即"用户打开就看到的那一档"。
+        let rest = INDEX_HTML.split(r#"id="theme-select""#).nth(1).expect("首页须有主题下拉");
+        let sel = &rest[..rest.find("</select>").expect("select 收尾")];
+        let first = sel
+            .split("<option")
+            .nth(1)
+            .and_then(|s| s.split(r#"value=""#).nth(1))
+            .and_then(|s| s.split('"').next())
+            .expect("下拉首项应可解析");
+        assert_eq!(first, "light", "主题下拉首项应是默认档(浅色): {sel}");
     }
 
     /// 帮助计划第 2 条: 空会话给一组**可点就填**的示例(解决"不知道怎么开口")。
@@ -982,5 +1167,252 @@ mod tests {
         // ③ 红线: 不落浏览器存储; 条目文本全走 textContent, 不拼 HTML。
         assert!(!p.contains("localStorage") && !p.contains("sessionStorage"), "禁浏览器存储");
         assert!(!p.contains("innerHTML") && !p.contains("insertAdjacentHTML"), "禁拼 HTML");
+    }
+
+    /// 063: 策略库是**一张表混排**, 不再按 现货/合约 × 内置/我的 分四组。
+    ///
+    /// 为什么钉住: fmz 的 `/m/strategies` 就是一张表(名称/最后修改/创建日期/操作项),
+    /// 内置模板另在 `/square`。分四组让用户先想"我的策略在哪一组" —— 那正是新用户最常卡的地方。
+    ///
+    /// 断言钉的是**形态**(有表格、没有分组容器), 不是某段具体文案 ——
+    /// 文案会随 fmz 措辞调整, 形态不会。
+    #[test]
+    fn test_strategy_library_is_one_mixed_table_not_four_groups() {
+        let shell = src_of("strategies.js");
+        // ① 有表格渲染路径。
+        assert!(shell.contains("R.ui.table("), "策略库须用表格渲染(fmz 形态)");
+        // ② **不再有**四组分区容器。
+        assert!(!shell.contains("sg-group-head"), "策略库不该再有四组分区(现货/合约 × 内置/我的)");
+        // ③ 表头是 fmz 的四列。
+        for col in ["sgColName", "sgColLastModified", "sgColCreated", "sgColOps"] {
+            assert!(
+                shell.contains(col),
+                "策略库表头须含 {col}(fmz 的列: 名称/最后修改/创建日期/操作项)"
+            );
+        }
+        // ④ 时间字段要真的从服务端响应里取 —— 不在前端自己编时间。
+        //
+        // 刻意**不只**查 `s.last_modified` 这个片段: 变异把值换成本地常量、
+        // 但仍保留一句 `void (s.last_modified)`, 片段就还在 —— 断言会绿。
+        // 故钉的是**取值表达式本身**: `fmtRelTime(s.last_modified)`。
+        assert!(
+            shell.contains("fmtRelTime(s.last_modified)"),
+            "「最后修改」须由 fmtRelTime(s.last_modified) 算出(不自己编)"
+        );
+        assert!(
+            shell.contains("fmtRelTime(s.created_at)"),
+            "「创建日期」须由 fmtRelTime(s.created_at) 算出(不自己编)"
+        );
+        // ⑤ 表头有几列, cells 就得填几列 —— 少一列会让内容整体错位
+        // (表头看着是对的, 不报错, 但「名称」会跑到「来源」列上)。
+        //
+        // 钉的是 `cells: { ... }` 这个**对象字面量里的键** —— 变异删掉一个键, 这里就红。
+        let cells_block = shell
+            .split("cells: {")
+            .nth(1)
+            .map(|s| s.split("}").next().unwrap_or(""))
+            .expect("rows.push 里应有 cells: { ... } 对象");
+        for cell in ["name:", "source:", "lastModified:", "created:", "ops:"] {
+            assert!(
+                cells_block.contains(cell),
+                "表格 cells 须填 {cell}(少一列内容就整体错位): {cells_block}"
+            );
+        }
+    }
+
+    /// 063: 编辑页是**双 Tab**(「策略编辑」/「模拟回测」), AI 助手在右列。
+    ///
+    /// 钉住三件事:
+    /// ① 两个 Tab 都在(缺一个就退回"全堆一页");
+    /// ② **切 Tab 只改 hidden, 不销毁 DOM** —— 销毁会丢掉未保存的代码与参数
+    ///    (053 的"参数未保存"提示与 059 的离开守卫都依赖那些节点还在);
+    /// ③ AI 卡带 `sg-ai-col`(右列)与快捷指令容器。
+    #[test]
+    fn test_strategy_editor_has_two_tabs_and_ai_side_panel() {
+        let shell = src_of("strategies.js");
+        assert!(shell.contains(r#"id="sg-tab-edit""#), "须有「策略编辑」Tab 容器");
+        assert!(shell.contains(r#"id="sg-tab-backtest""#), "须有「模拟回测」Tab 容器");
+        // 钉的是**Tab 项数组**本身 —— 只查 `sgTabBacktest` 这个文案键的话,
+        // 把 Tab 项的 key 改掉(那个 Tab 就不存在了)断言照样绿。
+        let items_block = shell
+            .split("const items = [")
+            .nth(1)
+            .map(|s| s.split("];").next().unwrap_or(""))
+            .expect("renderTabs 里应有 const items = [ ... ]");
+        for key in ["\"edit\"", "\"backtest\""] {
+            assert!(
+                items_block.contains(key),
+                "Tab 项数组须含 {key}(少一项就少一个 Tab): {items_block}"
+            );
+        }
+        assert!(shell.contains("sgTabEdit"), "须有「策略编辑」Tab 文案键");
+        assert!(shell.contains("sgTabBacktest"), "须有「模拟回测」Tab 文案键");
+        // ② 切换只改 hidden。
+        //
+        // 钉**整个 applyTab 的函数体**: 只查某一行的话, 在别处加一句
+        // `edit.innerHTML = ""` 断言照样绿 —— 而那正是"销毁 DOM"的做法。
+        let apply_tab = shell
+            .split("function applyTab() {")
+            .nth(1)
+            .map(|s| s.split("\n  }").next().unwrap_or(""))
+            .expect("须有 applyTab 函数");
+        assert!(
+            apply_tab.contains(r#"edit.hidden = st.tab !== "edit""#)
+                && apply_tab.contains(r#"bt.hidden = st.tab !== "backtest""#),
+            "切 Tab 只能改 hidden(销毁 DOM 会丢未保存的代码与参数): {apply_tab}"
+        );
+        assert!(
+            !apply_tab.contains("innerHTML") && !apply_tab.contains("remove()"),
+            "applyTab 里不许销毁 DOM(未保存的代码与参数还在里面): {apply_tab}"
+        );
+        // ③ AI 卡在右列 + 快捷指令。
+        assert!(
+            shell.contains(r#"class="sg-card sg-ai-col" id="sg-ai-card""#),
+            "AI 助手须在右列(fmz 形态)"
+        );
+        assert!(shell.contains(r#"id="sg-ai-quick""#), "须有 AI 快捷指令容器");
+    }
+
+    /// 063 回归: 新建实盘的**隐藏 select 必须真的有 option**。
+    ///
+    /// 背景(2026-10-24 真机撞到): 选策略时只做了 `sel.value = s.id`, 而那个 `<select>`
+    /// 从来没被填过 option —— 浏览器对"**不存在的 value**"会把 `select.value` 置成空串
+    /// (规范如此), 于是 `currentStrategy()` 取到 "", 提交时按"没选策略"提前返回,
+    /// **参数一个都没落盘**。症状极具迷惑性: 弹窗照常关闭、启动照常发生,
+    /// 只有"参数真的生效吗"这一条回读会红 —— 不回读就发现不了。
+    ///
+    /// 断言钉住"选中时要**补 option**", 而不是"要有 option"(初始化时一个都没有是正常的,
+    /// 因为列表是搜索出来的)。
+    #[test]
+    fn test_new_live_select_gets_a_real_option_before_assigning_value() {
+        let runs = src_of("runs.js");
+        // 选中分支里必须先补 option 再赋值 value。
+        let click_block = runs
+            .split("item.addEventListener(\"click\", () => {")
+            .nth(1)
+            .map(|s| s.split("\n        });").next().unwrap_or(""))
+            .expect("应有搜索结果的 click 处理");
+        assert!(
+            click_block.contains("sel.appendChild(opt)"),
+            "选中策略时必须往隐藏 select 里补 option(否则 select.value 会落空): {click_block}"
+        );
+        let opt_at = click_block.find("sel.appendChild(opt)").unwrap();
+        let val_at = click_block.find("sel.value = s.id").unwrap();
+        assert!(
+            opt_at < val_at,
+            "补 option 必须在赋值 value **之前**(浏览器对不存在的 value 会把 value 置空)"
+        );
+    }
+
+    /// 063 回归: 默认交易对**不能硬编码**成 `BTCUSDT`。
+    ///
+    /// 背景(2026-10-24 真机撞到): 默认配置 `[market].show_all_pairs = false` 时,
+    /// 交易对**视野里只有股票类**(bStock 美股代币现货 + 股票永续) —— `BTCUSDT` 不在其中。
+    /// 表单硬编码它当默认值 = 新装用户点「新建策略」/「复制」/「新建实盘」,
+    /// 一路保持默认提交, **必然撞上视野门禁**("交易对 BTCUSDT 不在当前视野")。
+    /// 门禁本身是对的(它如实拦住不该跑的对), 错的是表单给了一个自己都跑不起来的默认值。
+    ///
+    /// 断言钉的是"**取视野内的对**"这个行为:
+    /// ① 有一个从 `/api/markets` 取视野内现货对的助手;
+    /// ② 三处默认交易对都走它(不是硬编码);
+    /// ③ 异步回填**不覆盖用户已改的值**(否则晚到的结果抹掉用户输入)。
+    #[test]
+    fn test_default_pair_comes_from_market_scope_not_hardcoded() {
+        let shell = src_of("strategies.js");
+        // ① 助手存在, 且取的是 /api/markets(视野端点)。
+        assert!(
+            shell.contains("S.defaultPair = async function"),
+            "须有取视野内默认交易对的助手(不能硬编码)"
+        );
+        assert!(
+            shell.contains("R.api(\"/api/markets\")"),
+            "默认交易对须从 /api/markets 取(那是视野端点)"
+        );
+        // ② 三处默认交易对都走助手。
+        let helper_calls = shell.matches("S.fillDefaultPair(pairInput, DEFAULT_PAIR);").count();
+        assert_eq!(
+            helper_calls, 3,
+            "新建策略/复制/生成三处默认交易对都须走视野助手(实际 {helper_calls} 处)"
+        );
+        // 硬编码赋值不许残留。
+        assert!(
+            !shell.contains("pairInput.value = DEFAULT_PAIR;"),
+            "不许再硬编码默认交易对(会给出自己都跑不起来的默认值)"
+        );
+        // ③ 异步回填不覆盖用户输入。
+        let filler = shell
+            .split("S.fillDefaultPair = function (input, fallback) {")
+            .nth(1)
+            .map(|s| s.split("\n  };").next().unwrap_or(""))
+            .expect("应有 fillDefaultPair 实现");
+        assert!(
+            filler.contains("if (input.value !== wanted) return;"),
+            "异步回填须先确认用户没改过这个值(否则抹掉用户输入): {filler}"
+        );
+    }
+
+    /// 063: 新建实盘**选完策略后**要校验交易对视野。
+    ///
+    /// 策略自带的 pair 常是视野外的(复制内置策略时带过来的 `BTCUSDT`),
+    /// 不校验就是"提交后才被门禁拦", 用户得先知道"视野"是什么才知道改哪儿。
+    /// 期望行为: 换成视野内的对 + 给一句说明(原值 → 现值)。
+    #[test]
+    fn test_new_live_checks_pair_scope_after_selecting_strategy() {
+        let runs = src_of("runs.js");
+        assert!(runs.contains("syncPairScope"), "新建实盘须有交易对视野校验");
+        // 校验走视野端点, 且只在视野被过滤时才动手。
+        assert!(
+            runs.contains("if (!view || !view.filtered) return;"),
+            "视野没被过滤时不该改用户的交易对"
+        );
+        // 有"说明原值→现值"的文案。
+        assert!(runs.contains("rnLivePairOutOfScope"), "须有说明文案(告诉用户原值换成了什么)");
+        assert!(
+            runs.contains("replaceAll(\"{0}\", want).replaceAll(\"{1}\", fallback)"),
+            "文案占位符须**全部**替换(用 replaceAll): `String.replace` 只替换第一个匹配, \
+             文案里同一占位符出现两次时第二次会原样留在界面上"
+        );
+    }
+
+    /// 063: 「新建实盘」表单须能**选策略 + 设参数 + 设交易对**。
+    ///
+    /// 这是用户需求 1 的主体。三个断言分别钉住"选得到策略""填得了参数""设得了交易对",
+    /// 外加一条**顺序**断言: 先落参数、再启动 —— 顺序反了会先用旧参数起起来。
+    #[test]
+    fn test_new_live_form_picks_strategy_sets_params_and_pair() {
+        let runs = src_of("runs.js");
+        // ① 选策略: 可搜索下拉 + 真 select 承接值。
+        assert!(runs.contains("rn-strat-search"), "新建实盘须有可搜索的运行策略选择");
+        assert!(runs.contains("rnStratSearchPh"), "须有搜索框占位文案");
+        // ② 填参数: 复用详情页那套参数行(不新造一套 —— 否则两处长得不一样)。
+        assert!(
+            runs.contains("S.buildParamBlock({"),
+            "新建实盘须真的调用 S.buildParamBlock 复用详情页参数表单(同一套渲染)"
+        );
+        // ③ 设交易对。
+        assert!(runs.contains("rnLivePair"), "新建实盘须有交易对字段");
+        // ④ 顺序: 先 POST /instance 落参数, 再 POST /start 启动。
+        //
+        // 只在**非注释行**里找 —— 文件头的注释里也写了 `/api/strategies/{id}/start`,
+        // 按整段文本找位置会被注释里的那一处抢先, 断言就成了"注释顺序"而不是"代码顺序"。
+        //
+        // 锚点带**引号**: 查 `/instance` 会把 `/instanceZZZ` 也算命中(子串) ——
+        // 那样"把请求改名"这种变异就抓不住了。查 `"/instance"` 才精确。
+        let code_pos = |needle: &str| -> usize {
+            runs.lines()
+                .position(|l| !l.trim_start().starts_with("//") && l.contains(needle))
+                .unwrap_or_else(|| panic!("须有请求: {needle}"))
+        };
+        let inst_at = code_pos("\"/instance\"");
+        let start_at = code_pos("\"/start\"");
+        assert!(inst_at < start_at, "必须**先落参数再启动**(反了会先用旧参数跑起来)");
+        // ⑤ 落参数**要真的发出** —— 只查顺序的话, 把落参数那段整个删掉,
+        // 顺序也"对"(启动成了第一个请求), 断言会绿。
+        assert!(
+            runs.contains(
+                "await R.api(\"/api/strategies/\" + encodeURIComponent(name) + \"/instance\""
+            ),
+            "须真的调 /instance 落参数(不能只是顺序上排在前面)"
+        );
     }
 }

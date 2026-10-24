@@ -22,98 +22,161 @@
   </head>
   <body>
     <div id="app">
-      <!-- 左: 主导航 + 竖长会话列表 (032 导航 / FR-006 / FR-007) -->
-      <aside id="sidebar">
-        <div class="side-head">
-          <span class="brand">Ricow</span>
-          <button id="new-session" class="icon-btn" type="button" data-zh="+ 新建" data-en="+ New">
-            + 新建
-          </button>
-        </div>
-        <!-- 033: hex 导航增为六项(对话/市场/策略/运行/密钥/设置); 高亮由 router.js 同步。 -->
-        <nav id="nav">
-          <a href="#chat" data-zh="对话" data-en="Chat">对话</a>
-          <a href="#markets" data-zh="市场" data-en="Markets">市场</a>
-          <a href="#strategies" data-zh="策略" data-en="Strategies">策略</a>
-          <a href="#runs" data-zh="运行" data-en="Runs">运行</a>
-          <a href="#keys" data-zh="密钥" data-en="Keys">密钥</a>
-          <a href="#settings" data-zh="设置" data-en="Settings">设置</a>
-        </nav>
-        <!-- 会话列表始终显示(切到别的视图也保留在左栏)。 -->
-        <ul id="session-list"></ul>
-      </aside>
 
+      <!--
+        062: 骨架改成 fmz.com 的**三段式** ——
+          ① 顶栏(`#topbar`)全宽 64px 在**最上**(原来它在 `#main` 里, 侧栏在它左边);
+          ② `#shell` = 侧栏(160px) + 内容区, **同一行**;
+          ③ 内容区底色 #F4F6F7。
+        与 fmz 的差别只有一处(刻意): fmz 顶栏右端有"站内社区/消息/头像"一排, ricow 无账号体系,
+        那一排换成 ricow 自己的主题/语言/帮助/命令面板 —— **不放死链接占位**。
+      -->
+      <header id="topbar">
+      <!-- 062: 品牌标移到顶栏(fmz 的形态)—— 侧栏不再重复放品牌名。 -->
+      <span class="brand"><span class="brand-mark" aria-hidden="true">R</span>Ricow</span>
+      <!-- C12: 窄屏导航开合(≤900px 才显示)。宽屏下隐藏 —— 侧栏本就常驻, 不需要它。 -->
+      <button
+      id="side-toggle"
+      class="ghost-btn side-toggle"
+      type="button"
+      aria-label="导航 / Menu"
+      aria-expanded="false"
+      title="导航 / Menu"
+      >
+      ☰
+      </button>
+      <!--
+      059 UX-01: 顶栏原来只有 `#session-title`(会话名), 它**在六个视图下都显示** ——
+      切到市场/策略/运行/密钥/设置时顶栏仍写着「新会话」, 用户看不出自己在哪。
+      这里补一个**当前视图名**(由 router.js 写); 会话名则只在对话视图显示(见 style.css
+      的 `[data-view]` 规则)—— 它是"对话"这一视图的概念, 摆到密钥页没有意义。
+      -->
+      <span id="view-title" class="view-title"></span>
+      <!-- 062: 全局搜索框(fmz 顶栏有一枚)—— **本轮只做外观, 未接功能**:
+      输入框 disabled, title 明说"尚未开放", 不给用户"能搜却搜不出"的错觉。 -->
+      <div class="top-search" role="search" aria-disabled="true" title="全局搜索(尚未开放)">
+      <span class="top-search-ico" aria-hidden="true">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" />
+      </svg>
+      </span>
+      <input
+      class="top-search-input"
+      type="search"
+      disabled
+      placeholder="搜索策略 / 会话 / 术语"
+      data-zh-placeholder="搜索策略 / 会话 / 术语"
+      data-en-placeholder="Search strategies / sessions / terms"
+      />
+      </div>
+      <span id="session-title" class="muted"></span>
+      <span id="status" class="status"></span>
+      <!-- 034: 主题切换, 值存 ricow.toml 的 [ui].theme(与语言同一来源)。
+      D14: "跟随系统" 是**偏好**; 实际生效的配色由前端按 prefers-color-scheme 解出
+      (auto + 系统浅色 → light), 故 CSS 侧不需要第三份变量。 -->
+      <!-- 062: 右侧控件组(fmz 的图标区)—— 无账号体系, 放 ricow 自己的那几个。 -->
+
+      <div class="top-right">
+
+      <select id="theme-select" class="mini-select" title="主题 / Theme">
+      <option value="light" data-zh="浅色" data-en="Light">浅色</option>
+      <option value="dark" data-zh="深色" data-en="Dark">深色</option>
+      <option value="red" data-zh="红色" data-en="Red">红色</option>
+      <option value="auto" data-zh="跟随系统" data-en="Auto">跟随系统</option>
+      </select>
+      <button id="lang-toggle" class="ghost-btn" type="button" title="中 / EN">EN</button>
+      <!-- 帮助计划第 1 条: 常驻帮助入口。打开的是**按当前视图**组织的帮助(help.js)。 -->
+      <button
+      id="help-btn"
+      class="ghost-btn help-btn"
+      type="button"
+      title="帮助 / Help"
+      aria-label="帮助 / Help"
+      data-zh="帮助"
+      data-en="Help"
+      >
+      帮助
+      </button>
+      <!-- B7: 命令面板入口。键盘 Ctrl/⌘+K 同样能开 —— 这个按钮主要是**可发现性**
+      (不给提示的话, 没人会去试一个看不见的快捷键)。 -->
+      <button
+      id="palette-btn"
+      class="ghost-btn palette-btn"
+      type="button"
+      title="命令面板 (Ctrl/⌘ + K) / Command palette"
+      aria-label="命令面板 / Command palette"
+      aria-haspopup="dialog"
+      aria-expanded="false"
+      >
+      ⌘K
+      </button>
+      </div>
+
+      </header>
+
+      <!--
+        062: `#shell` 是 `#app`(column: 顶栏在上) 与"侧栏 | 内容区"(row) 之间的过渡 ——
+        少了它, 侧栏与内容区会**上下排列**(内容区被挤到侧栏下面), 整个布局就废了。
+      -->
+      <div id="shell">
       <!-- C12: 窄屏抽屉遮罩。侧栏是"盖上来"的一层, 点它以外的地方要能收起 -->
       <div id="side-scrim" class="side-scrim"></div>
+      <!--
+        062: 侧栏只放**导航**(fmz 的形态: 160px 白底, 菜单项 48px, 选中态绿底绿字)。
+        **会话列表搬走了** —— 它是"对话"这一个视图的概念, 摆在侧栏里会让策略/密钥页被聊天列表挤占
+        (059 UX-03 想解决的正是这个问题), 现已移入 `#view-chat` 内部。
+        `#new-session` 按钮随之一起搬走(它只对会话列表有意义)。
+      -->
+      <aside id="sidebar">
+        <!--
+          033: hex 导航增为六项(对话/市场/策略/运行/密钥/设置); 高亮由 router.js 同步。
+          062: 加"概览"为**首项**(fmz 的"控制中心"在侧栏置顶), 各项加图标位(由 ui.js 注入)。
+          文案包一层 span: applyLang 的 textContent 赋值会清空子节点, 挂在 <a> 上会抹掉图标。
+        -->
+        <nav id="nav">
+          <a href="#dashboard"><span class="nav-text" data-zh="概览" data-en="Dashboard">概览</span></a>
+          <a href="#markets"><span class="nav-text" data-zh="市场" data-en="Markets">市场</span></a>
+          <a href="#strategies"><span class="nav-text" data-zh="策略库" data-en="Strategies">策略库</span></a>
+          <a href="#runs"><span class="nav-text" data-zh="实盘" data-en="Live">实盘</span></a>
+          <a href="#keys"><span class="nav-text" data-zh="密钥" data-en="Keys">密钥</span></a>
+          <a href="#chat"><span class="nav-text" data-zh="对话" data-en="Chat">对话</span></a>
+          <a href="#settings"><span class="nav-text" data-zh="设置" data-en="Settings">设置</span></a>
+        </nav>
+      </aside>
 
-      <main id="main">
+        <main id="main">
         <!-- 全视图共享的顶栏: 语言切换钮在任何视图都可见可用(FR-029)。 -->
-        <header id="topbar">
-          <!-- C12: 窄屏导航开合(≤900px 才显示)。宽屏下隐藏 —— 侧栏本就常驻, 不需要它。 -->
-          <button
-            id="side-toggle"
-            class="ghost-btn side-toggle"
-            type="button"
-            aria-label="导航 / Menu"
-            aria-expanded="false"
-            title="导航 / Menu"
-          >
-            ☰
-          </button>
-          <!--
-            059 UX-01: 顶栏原来只有 `#session-title`(会话名), 它**在六个视图下都显示** ——
-            切到市场/策略/运行/密钥/设置时顶栏仍写着「新会话」, 用户看不出自己在哪。
-            这里补一个**当前视图名**(由 router.js 写); 会话名则只在对话视图显示(见 style.css
-            的 `[data-view]` 规则)—— 它是"对话"这一视图的概念, 摆到密钥页没有意义。
-          -->
-          <span id="view-title" class="view-title"></span>
-          <span id="session-title" class="muted"></span>
-          <span id="status" class="status"></span>
-          <!-- 034: 主题切换, 值存 ricow.toml 的 [ui].theme(与语言同一来源)。
-               D14: "跟随系统" 是**偏好**; 实际生效的配色由前端按 prefers-color-scheme 解出
-               (auto + 系统浅色 → light), 故 CSS 侧不需要第三份变量。 -->
-          <select id="theme-select" class="mini-select" title="主题 / Theme">
-            <option value="dark" data-zh="深色" data-en="Dark">深色</option>
-            <option value="light" data-zh="白色" data-en="Light">白色</option>
-            <option value="red" data-zh="红色" data-en="Red">红色</option>
-            <option value="auto" data-zh="跟随系统" data-en="Auto">跟随系统</option>
-          </select>
-          <button id="lang-toggle" class="ghost-btn" type="button" title="中 / EN">EN</button>
-          <!-- 帮助计划第 1 条: 常驻帮助入口。打开的是**按当前视图**组织的帮助(help.js)。 -->
-          <button
-            id="help-btn"
-            class="ghost-btn help-btn"
-            type="button"
-            title="帮助 / Help"
-            aria-label="帮助 / Help"
-            data-zh="帮助"
-            data-en="Help"
-          >
-            帮助
-          </button>
-          <!-- B7: 命令面板入口。键盘 Ctrl/⌘+K 同样能开 —— 这个按钮主要是**可发现性**
-               (不给提示的话, 没人会去试一个看不见的快捷键)。 -->
-          <button
-            id="palette-btn"
-            class="ghost-btn palette-btn"
-            type="button"
-            title="命令面板 (Ctrl/⌘ + K) / Command palette"
-            aria-label="命令面板 / Command palette"
-            aria-haspopup="dialog"
-            aria-expanded="false"
-          >
-            ⌘K
-          </button>
-        </header>
 
-        <!-- B5: 首次引导条。骨架常驻(默认 hidden); 出不出现、里面写什么, 全由 help.js 的探针按
-             **服务端事实**(零密钥 / 零会话 / 零自有策略 / 零实例)决定 —— 不写浏览器存储。 -->
-        <div id="onboard-bar" class="onboard" hidden></div>
+          <!-- B5: 首次引导条。骨架常驻(默认 hidden); 出不出现、里面写什么, 全由 help.js 的探针按
+               **服务端事实**(零密钥 / 零会话 / 零自有策略 / 零实例)决定 —— 不写浏览器存储。 -->
+          <div id="onboard-bar" class="onboard" hidden></div>
+          <!-- 062: 面包屑(内容由 router.js 统一写, 各视图不各画一份)。 -->
+          <nav id="crumbs" class="ui-crumbs" aria-label="面包屑 / Breadcrumb"></nav>
 
-        <!-- 032: 视图容器, 同一时间只有一个 .view.active(router.js 切换)。 -->
-
+          <!-- 032: 视图容器, 同一时间只有一个 .view.active(router.js 切换)。 -->
         <!-- 对话视图: 中栏(对话流 + 输入区)与右栏三面板整体迁入, DOM 结构与 id 不变。 -->
         <section id="view-chat" class="view active">
+          <!--
+            062: 会话列表从侧栏搬到这里(见上面 `#sidebar` 的说明)。
+            **id 不变**(`#session-list` / `#new-session`) —— chat.js 按 id 取元素, 换父节点不影响;
+            这样 JS 一行都不用改, 风险面最小。
+          -->
+          <div class="chat-sessions">
+            <div class="chat-sessions-head">
+              <span class="chat-sessions-title" data-zh="会话" data-en="Sessions">会话</span>
+              <button
+                id="new-session"
+                class="icon-btn"
+                type="button"
+                data-zh="+ 新建"
+                data-en="+ New"
+                title="新建会话 / New"
+              >
+                + 新建
+              </button>
+            </div>
+            <ul id="session-list"></ul>
+          </div>
           <div class="chat-col">
             <!-- 右上: 对话流 (用户与 AI 输出; 按级别着色 FR-013 / FR-023) -->
             <section id="stream" aria-live="polite"></section>
@@ -139,7 +202,6 @@
               </div>
             </form>
           </div>
-
           <!--
             右: 交易面板 + 日志面板 (026 FR-012 / FR-016)。两块都**只读** —— 页面上没有任何直连交易所的
             按钮; 撤单 / 平仓 / 停机仍然只能走上面的对话确认流程(D17 / FR-013)。
@@ -215,21 +277,24 @@
             </section>
           </aside>
         </section>
-
-        <!-- 032 阶段 1: 其余四个视图只有占位, 业务逻辑后续阶段接入。 -->
-        <section id="view-markets" class="view" hidden>
-          <h2 class="placeholder-title" data-zh="市场" data-en="Markets">市场</h2>
-        </section>
-        <!-- 策略管理(032 US3): 容器由 strategies.js 渲染(列表/详情/弹窗全部 JS 生成)。 -->
-        <section id="view-strategies" class="view" hidden></section>
-        <!-- 运行管理(032 US4): 容器由 runs.js 渲染(实例表/弹窗/日志面板全部 JS 生成)。 -->
-        <section id="view-runs" class="view" hidden></section>
-        <!-- 密钥环(033): 容器由 keys.js 渲染(条目列表/详情表单/生效摘要全部 JS 生成)。 -->
-        <section id="view-keys" class="view" hidden></section>
-        <section id="view-settings" class="view" hidden>
-          <h2 class="placeholder-title" data-zh="设置" data-en="Settings">设置</h2>
-        </section>
-      </main>
+          <!-- 032 阶段 1: 其余四个视图只有占位, 业务逻辑后续阶段接入。 -->
+          <!-- 概览(062 新增): fmz 的 P1 仪表盘范式 —— 容器由 dashboard.js 渲染。 -->
+          <section id="view-dashboard" class="view" hidden></section>
+          <!-- 032 阶段 1: 其余四个视图只有占位, 业务逻辑后续阶段接入。 -->
+          <section id="view-markets" class="view" hidden>
+            <h2 class="placeholder-title" data-zh="市场" data-en="Markets">市场</h2>
+          </section>
+          <!-- 策略管理(032 US3): 容器由 strategies.js 渲染(列表/详情/弹窗全部 JS 生成)。 -->
+          <section id="view-strategies" class="view" hidden></section>
+          <!-- 运行管理(032 US4): 容器由 runs.js 渲染(实例表/弹窗/日志面板全部 JS 生成)。 -->
+          <section id="view-runs" class="view" hidden></section>
+          <!-- 密钥环(033): 容器由 keys.js 渲染(条目列表/详情表单/生效摘要全部 JS 生成)。 -->
+          <section id="view-keys" class="view" hidden></section>
+          <section id="view-settings" class="view" hidden>
+            <h2 class="placeholder-title" data-zh="设置" data-en="Settings">设置</h2>
+          </section>
+        </main>
+      </div>
 
       <!--
         059 UX-09: **全站唯一的弹窗挂载点**。此前 `strategies.js` 与 `runs.js` 各自在视图骨架里
@@ -306,12 +371,17 @@
     <!-- 032: 脚本按依赖顺序加载, 全部走 token 查询串鉴权; common.js 必须先于视图文件。 -->
     <script src="/lightweight-charts.js?token=__RICOW_TOKEN__"></script>
     <script src="/common.js?token=__RICOW_TOKEN__"></script>
+    <!-- 062: 通用 UI 组件层(fmz 视觉语言: 卡片/标签页/空态/面包屑/按钮/图标)。
+         **必须排在 router.js 之前** —— 加载顺序即契约, 见 assets.rs 的顺序测试。 -->
+    <script src="/ui.js?token=__RICOW_TOKEN__"></script>
     <script src="/router.js?token=__RICOW_TOKEN__"></script>
     <!-- 044: 受限 markdown 渲染器 —— chat.js 在 renderRich 里用它(助手气泡), 故须先加载。 -->
     <script src="/markdown.js?token=__RICOW_TOKEN__"></script>
     <script src="/chat.js?token=__RICOW_TOKEN__"></script>
     <script src="/settings.js?token=__RICOW_TOKEN__"></script>
     <script src="/keys.js?token=__RICOW_TOKEN__"></script>
+    <!-- 062: 概览视图(fmz 的 P1 仪表盘范式)。 -->
+    <script src="/dashboard.js?token=__RICOW_TOKEN__"></script>
     <script src="/markets.js?token=__RICOW_TOKEN__"></script>
     <script src="/strategies.js?token=__RICOW_TOKEN__"></script>
     <!-- 042: 策略视图拆出的三份子文件 —— **必须紧跟 strategies.js**(外壳先建立 `R.sg`,

@@ -286,6 +286,16 @@ fn start_reject(e: CoreError) -> WebError {
 }
 
 /// `GET /api/runs` (FR-022): 实例运行态一览 + 各自最近 PnL。
+impl RunItem {
+    /// 这个实例当前**是否在运行**。
+    ///
+    /// 062: 概览页要"运行中的实例数" —— 但 `running` 字段是私有的, 故给一个只读方法,
+    /// 而不是把字段放成 `pub(super)`。
+    pub(super) fn is_running(&self) -> bool {
+        self.running
+    }
+}
+
 pub(super) async fn list_runs(
     State(state): State<WebState>,
 ) -> Result<Json<Vec<RunItem>>, WebError> {

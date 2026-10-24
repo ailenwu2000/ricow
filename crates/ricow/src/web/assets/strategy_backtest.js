@@ -438,18 +438,18 @@
     const div = h("div", "sg-bt-chart");
     wrap.appendChild(div);
     box.appendChild(wrap);
-    const border = themeColor("--border", "#2b333d");
+    const border = themeColor("--border", "#f0f0f0");
     const LWC = window.LightweightCharts;
     st.btChart = LWC.createChart(div, {
       autoSize: true,
-      layout: { background: { color: "transparent" }, textColor: themeColor("--muted", "#9aa7b4") },
+      layout: { background: { color: "transparent" }, textColor: themeColor("--muted", "#5b6672") },
       grid: { vertLines: { color: border }, horzLines: { color: border } },
       timeScale: { timeVisible: true, secondsVisible: false, borderColor: border },
     });
     const sec = (ms) => Math.floor(ms / 1000);
     // 价格线(muted 细线)。
     const price = st.btChart.addLineSeries({
-      color: themeColor("--muted", "#9aa7b4"),
+      color: themeColor("--muted", "#5b6672"),
       lineWidth: 1,
       priceLineVisible: false,
       lastValueVisible: false,
@@ -460,9 +460,9 @@
         .filter((d) => Number.isFinite(d.value) && Number.isFinite(d.time))
         .sort((a, b) => a.time - b.time)
     );
-    // 权益线(accent 粗线)。
+    // 权益线(主色粗线 —— 主色不是涨跌色, 故仍引 `--accent`)。
     const eq = st.btChart.addLineSeries({
-      color: themeColor("--accent", "#4dd4ac"),
+      color: themeColor("--accent", "#1caf83"),
       lineWidth: 2,
       priceLineVisible: false,
     });
@@ -477,7 +477,7 @@
     // 只喂 time(whitespace 点), 曲线自然从建仓那根开始, **不**画成 0。
     if (chart.benchmark && chart.benchmark.length) {
       const bench = st.btChart.addLineSeries({
-        color: themeColor("--warn", "#e3b341"),
+        color: themeColor("--warn", "#96660a"),
         lineWidth: 1,
         lineStyle: 2, // 虚线: 一眼区别于策略权益与标的价格
         priceLineVisible: false,
@@ -515,8 +515,9 @@
       );
     }
     // 买卖点(涨红跌绿: 买=红 上箭头, 卖=绿 下箭头)。
-    const buyColor = themeColor("--error", "#f85149");
-    const sellColor = themeColor("--accent", "#4dd4ac");
+    // 062: 涨跌色拆到 `--up`/`--down` —— 不再借 `--error`(危险语义)与 `--accent`(主色)。
+    const buyColor = themeColor("--up", "#f5222d");
+    const sellColor = themeColor("--down", "#0d9b6c");
     const markers = (chart.fills || [])
       .map((f) => ({
         time: sec(f.t),
@@ -1254,24 +1255,24 @@
     const div = h("div", "sg-bt-chart");
     wrap.appendChild(div);
     box.appendChild(wrap);
-    const border = themeColor("--border", "#2b333d");
+    const border = themeColor("--border", "#f0f0f0");
     const LWC = window.LightweightCharts;
     destroyValChart();
     st.valChart = LWC.createChart(div, {
       autoSize: true,
-      layout: { background: { color: "transparent" }, textColor: themeColor("--muted", "#9aa7b4") },
+      layout: { background: { color: "transparent" }, textColor: themeColor("--muted", "#5b6672") },
       grid: { vertLines: { color: border }, horzLines: { color: border } },
       timeScale: { timeVisible: true, secondsVisible: false, borderColor: border },
     });
     const a = st.valChart.addLineSeries({
-      color: themeColor("--accent", "#4dd4ac"),
+      color: themeColor("--accent", "#1caf83"),
       lineWidth: 2,
       priceLineVisible: false,
     });
     a.setData(ours);
     if (ok) {
       const b = st.valChart.addLineSeries({
-        color: themeColor("--warn", "#e3b341"),
+        color: themeColor("--warn", "#96660a"),
         lineWidth: 1,
         lineStyle: 2,
         priceLineVisible: false,

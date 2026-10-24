@@ -45,6 +45,17 @@
     // 无论首屏落在哪个 hash, 对话视图都照常后台初始化(SSE / 面板轮询与拆分前同节拍);
     // init 幂等, router 激活 #chat 时再调一次也不会重复启动。
     bindSideToggle();
+    // 062: 给左侧导航注入 fmz 形态的线性图标(由 `ui.js` 的 `R.ui.decorateNav` 负责)。
+    // 放在 `bindSideToggle` 之后、路由启动之前 —— 导航项是静态的, 何时注入都行,
+    // 但要在首次渲染前完成, 否则会看到"文字先出现、图标后补"的跳动。
+    try {
+      if (R.ui && R.ui.decorateNav) R.ui.decorateNav(document.getElementById("nav"));
+      document.documentElement.dataset.navIcons = String(
+        document.querySelectorAll("#nav .nav-ico").length
+      );
+    } catch (err) {
+      console.error("[ricow] 导航图标注入失败(不影响导航本身):", err);
+    }
     // 051 复核 B8: `chat.init()` 若抛错(资产没加载成功 / 符号缺失), 早先会连带把下面的
     // `startRouter()` 一起吞掉 —— 页面停在首屏、视图切不动、且**没有任何提示**。
     // chat 是"增强", 路由是"骨架": 前者失败不该让后者停摆。错误如实打印到控制台, 不静默。

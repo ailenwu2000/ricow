@@ -80,13 +80,13 @@ struct PresetView {
 }
 
 #[derive(Debug, Serialize)]
-struct AiGroup {
+pub(super) struct AiGroup {
     entries: Vec<AiEntryView>,
     current: AiCurrentView,
 }
 
 #[derive(Debug, Serialize)]
-struct ExchangeGroup {
+pub(super) struct ExchangeGroup {
     entries: Vec<ExchangeEntryView>,
     current: ExchangeCurrentView,
 }
@@ -194,6 +194,18 @@ fn vault_reply(f: &config_file::File) -> VaultReply {
 }
 
 /// `GET /api/keys`: 密钥环 + 生效状态 + 预设表, 全部脱敏。
+impl VaultReply {
+    /// 密钥环里一共有几条(AI 条目 + 交易所条目)。
+    ///
+    /// 062: 概览页要这个数 —— 但 `ai` / `exchange` 两个字段是私有的, 故给一个只读方法,
+    /// 而不是把字段放成 `pub(super)`(那样别的模块就能直接依赖它们的内部结构)。
+    /// **只数条目数, 不看是否填了值**: "我配了几把钥匙"是条目事实, "能不能用"是另一回事
+    /// (各视图另有生效摘要)。
+    pub(super) fn entry_count(&self) -> usize {
+        self.ai.entries.len().saturating_add(self.exchange.entries.len())
+    }
+}
+
 pub(super) async fn get_keys(State(state): State<WebState>) -> Result<Json<VaultReply>, WebError> {
     let f = config_file::load(&state.root)?;
     Ok(Json(vault_reply(&f)))

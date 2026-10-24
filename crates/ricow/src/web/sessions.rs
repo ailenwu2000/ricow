@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 
 /// 左侧列表一行(FR-007): 标题 + 最后活动时间。
 #[derive(serde::Serialize)]
-struct SessionRow {
+pub(super) struct SessionRow {
     id: String,
     title: String,
     created_at: i64,
@@ -42,7 +42,9 @@ struct MessageRow {
 }
 
 /// 会话列表, 按最后活动倒序。
-async fn list_sessions(State(state): State<WebState>) -> Result<Json<Vec<SessionRow>>, WebError> {
+pub(super) async fn list_sessions(
+    State(state): State<WebState>,
+) -> Result<Json<Vec<SessionRow>>, WebError> {
     let rows = state.store.list().await?;
     Ok(Json(
         rows.into_iter()

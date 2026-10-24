@@ -116,6 +116,46 @@
   S.BLANK_LUA = BLANK_LUA;
   S.CHART_MAX_POINTS = CHART_MAX_POINTS;
 
+  /// **视野内的默认交易对**(063 修: 默认交易对曾经硬编码 `BTCUSDT`)。
+  ///
+  /// 为什么必须动态取: 默认配置 `[market].show_all_pairs = false` 时, 视野里
+  /// **只有股票类**(bStock 美股代币现货 + 股票永续) —— `BTCUSDT` 不在其中。
+  /// 硬编码它当默认值 = 新装用户点「新建策略」/「复制」/「新建实盘」,
+  /// 一路保持默认提交, 必然撞上**视野门禁**("交易对 BTCUSDT 不在当前视野")。
+  /// 门禁本身是对的(它如实拦住不该跑的对), 错的是表单给了一个自己都跑不起来的默认值。
+  ///
+  /// 取法: `/api/markets` 返回的就是**当前视野内**的列表(`filtered` 标志说明视野被过滤过),
+  /// 取第一个现货对; 拉不到(网络/交易所快照不可用)才回落 `DEFAULT_PAIR`。
+  ///
+  /// **异步**: 调用方是同步构建表单的, 所以这里返回 Promise, 由调用方在
+  /// 表单建好后 `.then()` 回填 —— 用户改过输入框就**不覆盖**(回填只在值仍等于
+  /// 回落值时才做, 否则会抹掉用户已经输入的对)。
+  S.defaultPair = async function () {
+    try {
+      const view = await R.api("/api/markets");
+      const spot = (view && view.spot) || [];
+      if (spot.length) return spot[0];
+    } catch (err) {
+      // 拉不到就回落 —— 不能因为"拿不到视野"就让表单开不了。
+    }
+    return DEFAULT_PAIR;
+  };
+
+  /// 把 `input` 的默认值换成**视野内的第一个交易对**。
+  ///
+  /// 只在输入框仍是"没被动过"的状态下才回填: 用户已经自己填了/选了别的,
+  /// 晚到的异步结果不能把它盖掉(那是"异步结果覆盖用户输入"的经典坑)。
+  S.fillDefaultPair = function (input, fallback) {
+    const base = fallback || DEFAULT_PAIR;
+    input.value = base;
+    const wanted = base;
+    S.defaultPair().then((p) => {
+      if (!p || p === wanted) return;
+      if (input.value !== wanted) return;   // 用户改过了 → 不动
+      input.value = p;
+    });
+  };
+
   // ---------- 共享状态袋 (042 FR-4) ----------
   // 视图级可变状态全部收在这里, 三份子文件用同一个袋子 —— 尤其 `gen`(代际令牌):
   // 它的"作废在途响应"语义跨全部四份文件, 拆成多份绑定会让这条不变量静默失效。
@@ -133,6 +173,11 @@
     // 052: AI 卡当前模式 —— "params"(默认, 只填参数表单、不碰代码) / "code"(改写 Lua)。
     // 放状态袋而非只读 DOM, 是为了让"切语言 / 离开再回来"重建时仍保持同一模式。
     aiMode: "params",
+    // 063: 编辑页当前 Tab —— "edit"(策略编辑, 默认) / "backtest"(模拟回测)。
+    // 放状态袋: 切语言 / 离开再回来重建时保持同一 Tab。
+    // **切 Tab 不销毁 DOM** —— 只改 hidden, 否则未保存的代码与未保存的参数会丢
+    // (053 的"参数未保存"提示与 059 的离开守卫都依赖那些 DOM 还在)。
+    tab: "edit",
     // N3: AI 对话线程(**两个模式各一条**, 切换模式不互相污染: 一个聊的是"参数取值该多少",
     // 一个聊的是"代码逻辑怎么改", 混在一条历史里会把对方的上下文带错)。
     // 每条是 { role:"user"|"ai", text / advice / changed / warnings, ... } 的数组。
@@ -192,8 +237,9 @@
 
   // ---------- 双语文案(并入公共字典; 静态标签走 data-zh/data-en) ----------
   Object.assign(R.TEXT.zh, {
-    sgTitle: "策略",
-    sgNew: "+ 新建空白",
+    sgTitle: "策略库",
+    sgNew: "从空白开始",
+    sgNewDd: "新建策略 ▾",
     sgCopy: "复制",
     // N1 删除自定义策略。文案刻意把"保留什么"分开列 —— 删一个策略不该抹掉它的历史,
     // 但用户会以为"删干净了", 所以必须写在确认按钮之前。
@@ -207,18 +253,39 @@
     sgDeleteOk: "确认删除",
     sgDeleting: "删除中…",
     sgDeleteDone: "已删除",
-    sgOpen: "打开",
     sgBuiltin: "内置",
+    sgMine: "我的",
     sgUser: "我的",
     sgNoUserHint: "还没有自己的策略 —— 内置策略要先「复制」才能改; 也可以直接新建空白。",
     sgCopiedName: "已复制为 ",
     sgLoading: "加载中…",
     sgLoadFailed: "加载失败: ",
     sgRetry: "重试",
-    sgSpotBuiltin: "现货 · 内置",
-    sgSpotUser: "现货 · 我的",
-    sgFutBuiltin: "合约 · 内置",
-    sgFutUser: "合约 · 我的",
+    // 063: 策略库改 fmz 式**一张表混排**(不再按 现货/合约 × 内置/我的 分四组)。
+    sgColName: "名称",
+    sgColSource: "来源",
+    sgColLastModified: "最后修改",
+    sgColCreated: "创建日期",
+    sgColOps: "操作项",
+    sgEdit: "编辑",
+    // 059 UX-12: 描述被截断时的「展开/收起」。
+    sgExpand: "展开",
+    sgCollapse: "收起",
+    // 063: 编辑页双 Tab(fmz 的形态) + AI 快捷指令。
+    sgTabEdit: "策略编辑",
+    sgTabBacktest: "模拟回测",
+    sgAiQMa: "写一个均线交易策略",
+    sgAiQGrid: "写一个带止损止盈的网格策略",
+    sgAiQAnalyze: "分析我的代码有什么问题",
+    sgAiQComment: "给代码添加中文注释",
+    sgAiQRsi: "写一个 RSI 超买超卖策略",
+    sgAiQCross: "写一个双均线交叉策略",
+    sgJustNow: "刚刚",
+    sgMinAgo: "{n} 分钟前",
+    sgHourAgo: "{n} 小时前",
+    sgDayAgo: "{n} 天前",
+    sgMonthAgo: "{n} 个月前",
+    sgYearAgo: "{n} 年前",
     sgUndeclared: "参数未声明",
     sgUndeclaredShort: "未声明清单",
     sgDupOf: "与内置重复",
@@ -364,18 +431,14 @@
     // 059 UX-12: 列表卡片描述是**单行截断**(style.css .sg-row-summary 的 nowrap+ellipsis),
     // 而策略名对新手往往不够自解释 —— 此前要看到完整说明只能点进详情。
     // 这里在卡片内直接展开完整描述(不跳转), 按钮只在**真被截断**时才出现(见 renderRow)。
-    sgExpand: "展开",
-    sgCollapse: "收起",
     // 059 UX-06: 空分组此前是一个孤零零的「—」 —— 用户看完不知道这一组为什么空、
     // 也不知道该做什么(四条分组线各挂一个「—」, 像表格缺数据而不是"还没有")。
     // 换成统一空状态组件的一句话说明; 「我的」两组额外点明"内置要先复制才能改"。
-    sgGroupEmpty: "这一组暂时没有策略。",
-    sgGroupEmptyUser: "还没有自己的策略 —— 内置策略要先「复制」才能改, 也可以直接新建。",
+    sgGroupEmpty: "还没有策略 —— 点「新建策略」开始。",
     // 适用性卡片(帮助计划第 7 条): 清单里早就写好 适用/不适用 场景, 此前只在「清单编辑器」
     // (新建/复制时)可见, 只读详情页一个字都不显示 —— 8 个内置策略只能靠名字猜。
     // 这里把同一份数据在**只读**详情页展示出来, 数据源 = GET /api/strategies/{id} 的 manifest,
     // 后端零改动。
-    sgDetail: "详情",
     sgFit: "适用性",
     sgFitSummary: "一句话说明",
     sgFitDesc: "长说明",
@@ -590,7 +653,8 @@
   });
   Object.assign(R.TEXT.en, {
     sgTitle: "Strategies",
-    sgNew: "+ New blank",
+    sgNew: "Start from blank",
+    sgNewDd: "New strategy ▾",
     sgCopy: "Copy",
     sgDelete: "Delete",
     sgDeleteTitle: "Delete strategy",
@@ -602,8 +666,8 @@
     sgDeleteOk: "Delete",
     sgDeleting: "Deleting…",
     sgDeleteDone: "Deleted",
-    sgOpen: "Open",
     sgBuiltin: "Built-in",
+    sgMine: "Mine",
     sgUser: "Mine",
     sgNoUserHint:
       "No strategies of your own yet — copy a built-in to modify it, or start from a blank one.",
@@ -611,10 +675,31 @@
     sgLoading: "Loading…",
     sgLoadFailed: "Load failed: ",
     sgRetry: "Retry",
-    sgSpotBuiltin: "Spot · Built-in",
-    sgSpotUser: "Spot · Mine",
-    sgFutBuiltin: "Futures · Built-in",
-    sgFutUser: "Futures · Mine",
+    // 063: fmz-style single mixed table (no four market×source groups).
+    sgColName: "Name",
+    sgColSource: "Source",
+    sgColLastModified: "Last modified",
+    sgColCreated: "Created",
+    sgColOps: "Actions",
+    sgEdit: "Edit",
+    // 059 UX-12: expand/collapse for a truncated description.
+    sgExpand: "Expand",
+    sgCollapse: "Collapse",
+    // 063: editor tabs (fmz style) + AI quick commands.
+    sgTabEdit: "Strategy editor",
+    sgTabBacktest: "Backtest",
+    sgAiQMa: "Write a moving-average strategy",
+    sgAiQGrid: "Write a grid strategy with stop-loss and take-profit",
+    sgAiQAnalyze: "Analyze what is wrong with my code",
+    sgAiQComment: "Add Chinese comments to the code",
+    sgAiQRsi: "Write an RSI overbought/oversold strategy",
+    sgAiQCross: "Write a dual moving-average crossover strategy",
+    sgJustNow: "just now",
+    sgMinAgo: "{n} min ago",
+    sgHourAgo: "{n} h ago",
+    sgDayAgo: "{n} d ago",
+    sgMonthAgo: "{n} mo ago",
+    sgYearAgo: "{n} y ago",
     sgUndeclared: "Params undeclared",
     sgUndeclaredShort: "No manifest",
     sgDupOf: "Duplicates built-in",
@@ -737,12 +822,7 @@
     sgAiCompilePrefix: "AI draft failed the compile gate; the editor was not changed:",
     sgCompilePrefix: "Compile failed:",
     sgNoSummary: "—",
-    sgExpand: "Expand",
-    sgCollapse: "Collapse",
     sgGroupEmpty: "No strategies in this group yet.",
-    sgGroupEmptyUser:
-      "No strategies of your own yet — copy a built-in one to edit it, or create a blank one.",
-    sgDetail: "Details",
     sgFit: "Suitability",
     sgFitSummary: "Summary",
     sgFitDesc: "Description",
@@ -989,10 +1069,18 @@
       // ---- 列表态 ----
       '<div id="sg-listview" class="sg-listview">' +
       '<div class="sg-head"><h2 class="sg-title"' + bi("sgTitle") + ">" + R.TEXT.zh.sgTitle + "</h2>" +
-      '<span class="sg-head-actions"><button id="sg-ai-new" class="sg-btn" type="button"' +
+      '<span class="sg-head-actions">' +
+      // 063: fmz 的「新建策略 ∨」是一个**下拉**, 两项: AI 辅助编写 / 从空白开始。
+      // 此前是两个并排按钮 —— 用户看不出"AI 生成"和"新建空白"是同一件事的两种入口。
+      '<span class="sg-newdd">' +
+      '<button id="sg-new-dd" class="sg-btn sg-btn-primary" type="button" aria-haspopup="menu" ' +
+      'aria-expanded="false"' + bi("sgNewDd") + ">" + R.TEXT.zh.sgNewDd + "</button>" +
+      '<span id="sg-new-dd-menu" class="sg-newdd-menu" role="menu" hidden>' +
+      '<button id="sg-ai-new" class="sg-newdd-item" type="button" role="menuitem"' +
       bi("sgAiNew") + ">" + R.TEXT.zh.sgAiNew + "</button>" +
-      '<button id="sg-new" class="sg-btn sg-btn-primary" type="button"' + bi("sgNew") + ">" +
-      R.TEXT.zh.sgNew + "</button></span></div>" +
+      '<button id="sg-new" class="sg-newdd-item" type="button" role="menuitem"' +
+      bi("sgNew") + ">" + R.TEXT.zh.sgNew + "</button>" +
+      "</span></span></span></div>" +
       '<div id="sg-list-msg" class="sg-msg" aria-live="polite"></div>' +
       '<div id="sg-list-body" class="sg-groups"></div></div>' +
       // ---- 详情态 ----
@@ -1005,12 +1093,23 @@
       // 诚实性提示(2026-10-05): 未声明参数清单 / 与内置脚本逐字相同 —— 文案由 renderDeclHint 填。
       '<div id="sg-decl-hint" class="sg-hint" hidden></div>' +
       '<div id="sg-d-loadmsg"></div>' +
+      // 063: 双 Tab(fmz 的 `/m/add-strategy`: 「策略编辑」/「模拟回测」)。
+      // **两个 Tab 的内容都留在 DOM 里**, 切换只改 hidden —— 销毁 DOM 会丢掉
+      // 未保存的代码与未保存的参数(053 的未保存提示会跟着失效)。
+      '<div id="sg-tabs" class="sg-tabs"></div>' +
       // 适用性卡片(帮助计划第 7 条): 内容由 renderDetail → renderFit 填(数据取自 manifest);
       // 清单没写这几栏时整卡隐藏, 不占位。
+      // ---- Tab 1: 策略编辑(参数 + 代码 + AI 助手) ----
+      '<div id="sg-tab-edit" class="sg-tabpane">' +
+      // 063: 两层布局(fmz 的编辑器形态: **左代码 / 右 AI**, 参数与说明在上方通栏)。
+      //
+      // 原先是一个两列网格装下所有卡片 —— 适用性与参数被挤成左右两半,
+      // 参数表单(字段多、每项要带说明)被压到窄列里, 输入框和说明都折行。
+      // 拆成两层后: 上层通栏(说明/参数/清单), 下层左代码右 AI。
+      '<div class="sg-edit-top">' +
       '<section class="sg-card sg-fit-card" id="sg-fit-card" hidden>' +
       '<div class="sg-card-head"><span' + bi("sgFit") + ">" + R.TEXT.zh.sgFit + "</span></div>" +
       '<div class="sg-card-body" id="sg-fit-body"></div></section>' +
-      '<div class="sg-detail-grid">' +
       // 参数
       '<section class="sg-card"><div class="sg-card-head"><span' + bi("sgParams") + ">" +
       R.TEXT.zh.sgParams + "</span>" +
@@ -1062,6 +1161,9 @@
       bi("sgMfSave") + ">" + R.TEXT.zh.sgMfSave + "</button></div>" +
       '<div id="sg-mf-msg" class="sg-msg" aria-live="polite"></div></details></section>' +
       // Lua 编辑器
+      '</div>' +
+      // ---- 下层: 左代码 / 右 AI ----
+      '<div class="sg-detail-grid">' +
       '<section class="sg-card sg-code-card"><div class="sg-card-head"><span' + bi("sgCode") + ">" +
       R.TEXT.zh.sgCode + "</span>" +
       '<span id="sg-dirty" class="sg-dirty" hidden><span id="sg-dirty-text"></span>' +
@@ -1078,8 +1180,9 @@
       ' wrap="off"></textarea></div>' +
       '<div class="sg-row-right"><button id="sg-save" class="sg-btn sg-btn-primary" type="button"' +
       bi("sgSave") + ">" + R.TEXT.zh.sgSave + "</button></div></section>" +
-      // AI
-      '<section class="sg-card" id="sg-ai-card"><div class="sg-card-head"><span' + bi("sgAi") + ">" +
+      // 063: AI 助手移到**右列**(fmz 的形态: 右侧常驻面板)。
+      // 锚点 ID 一个字没改 —— 053 的未保存提示与 059 的离开守卫都挂在这张卡上。
+      '<section class="sg-card sg-ai-col" id="sg-ai-card"><div class="sg-card-head"><span' + bi("sgAi") + ">" +
       R.TEXT.zh.sgAi + "</span></div>" +
       // 052: AI 卡分两种模式 —— 「调参数」只填上面的参数表单(不碰代码)、「改代码逻辑」才动 Lua。
       // 默认停在「调参数」: 用户的困惑正是"不知道该配什么", 先给一条**不动代码**的路。
@@ -1091,6 +1194,9 @@
       '<button id="sg-ai-mode-code" class="sg-seg-btn" type="button"' +
       bi("sgAiModeCode") + ">" + R.TEXT.zh.sgAiModeCode + "</button></div>" +
       '<div id="sg-ai-mode-hint" class="sg-ai-hint"></div>' +
+      // 063: fmz 式**快捷指令**(fmz 的 AI 助手里是一排可点的建议)。
+      // 刻意**只预填指令框, 不自动执行** —— 执行会让 AI 改代码, 用户得先看清要改什么。
+      '<div id="sg-ai-quick" class="sg-ai-quick" role="group"></div>' +
       // N3: 对话线程(用户气泡 / AI 气泡 + 改动对照)。历史只在这个 DOM 里, 也只在内存里 ——
       // 服务端不存会话(见 strategy_editor.js 的说明), 所以下面那行提示必须如实写明"刷新即失"。
       '<div id="sg-ai-thread" class="sg-ai-thread"></div>' +
@@ -1110,6 +1216,11 @@
       // N3-B: 改动影响评估面板。默认收起 —— 只有"这次真的改了值"时才由
       // strategy_editor.js 展开(没改动却摆一个按钮, 用户点了只会得到 400)。
       '<div id="sg-ai-assess" class="sg-ai-assess" hidden></div></section>' +
+      // ---- Tab 1 收尾 ----
+      '</div></div>' +
+      // ---- Tab 2: 模拟回测(fmz 的第二个 Tab) ----
+      // 063: 回测/寻优/样本外/历史整块搬进这个 Tab。**只是位置变了**, 逻辑一行没改。
+      '<div id="sg-tab-backtest" class="sg-tabpane" hidden>' +
       // 回测
       '<section class="sg-card"><div class="sg-card-head"><span' + bi("sgBacktest") + ">" +
       R.TEXT.zh.sgBacktest + "</span></div><div class='sg-card-body'>" +
@@ -1192,6 +1303,48 @@
 
     $("sg-new").addEventListener("click", openNewModal);
     $("sg-ai-new").addEventListener("click", openAiGenModal);
+    // 063: 「新建策略 ∨」下拉的开关。点外面关闭, Esc 也关闭 —— 下拉开着时点别处
+    // 却没关掉, 用户会觉得界面卡住了。
+    const ddBtn = $("sg-new-dd");
+    const ddMenu = $("sg-new-dd-menu");
+    const closeDd = () => {
+      ddMenu.hidden = true;
+      ddBtn.setAttribute("aria-expanded", "false");
+    };
+    ddBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const open = ddMenu.hidden;
+      ddMenu.hidden = !open;
+      ddBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) {
+        // 展开后把焦点**移进菜单**的第一项 —— 键盘用户按↓能直接到第一项,
+        // 不必再 Tab 一路找。
+        const first = ddMenu.querySelector(".sg-newdd-item");
+        if (first) first.focus();
+      }
+    });
+    // **捕获阶段**接住菜单点击: 必须**早于**菜单项自己的 handler(它会开弹窗)。
+    //
+    // 为什么: 弹窗的 `restoreTo` 取的是"打开那一刻的 activeElement"。若那时焦点还在
+    // 菜单项上, 而菜单项随菜单一起隐藏, 关弹窗时回焦就落在一个**不可聚焦的元素**上 ——
+    // 焦点掉到 body, 键盘用户得从头 Tab 一遍(059 的"关掉后焦点回到触发按钮"就废了)。
+    // 故先把焦点交回**下拉触发器**(它不会被隐藏), 再让它去开弹窗。
+    ddMenu.addEventListener(
+      "click",
+      (ev) => {
+        const item = ev.target && ev.target.closest && ev.target.closest(".sg-newdd-item");
+        if (!item) return;
+        ddBtn.focus();
+        closeDd();
+      },
+      true
+    );
+    document.addEventListener("click", (ev) => {
+      if (!ddMenu.hidden && !ddMenu.contains(ev.target) && ev.target !== ddBtn) closeDd();
+    });
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && !ddMenu.hidden) closeDd();
+    });
     $("sg-back").addEventListener("click", () => R.navigate("strategies"));
     $("sg-code").addEventListener("keydown", onCodeKeydown);
     $("sg-code").addEventListener("input", () => {
@@ -1283,38 +1436,54 @@
     body.appendChild(box);
   }
 
-  /// 四组: 市场(现货/合约) × 来源(内置/我的), 组序固定。
+  /// 063: 策略库列表 —— **一张表混排**, 不再按 现货/合约 × 内置/我的 分四组。
+  ///
+  /// 为什么改: fmz 的 `/m/strategies` 就是一张表(名称/最后修改/创建日期/操作项),
+  /// 内置模板另在 `/square`。分四组让用户先想"我的策略在哪一组" —— 那正是新用户最常卡的地方。
+  ///
+  /// **来源仍然如实区分**(内置/我的徽章): 混排的是**呈现**, 不是**事实** ——
+  /// 内置策略不可编辑, 徽章是用户点「编辑」前就该知道的。
   function renderList(data) {
-    const defs = [
-      { labelKey: "sgSpotBuiltin", market: "spot", source: "builtin" },
-      { labelKey: "sgSpotUser", market: "spot", source: "user" },
-      { labelKey: "sgFutBuiltin", market: "futures", source: "builtin" },
-      { labelKey: "sgFutUser", market: "futures", source: "user" },
-    ];
     const body = $("sg-list-body");
     body.innerHTML = "";
-    for (const def of defs) {
-      const rows = data.filter((s) => s.market === def.market && s.source === def.source);
-      const sec = h("section", "sg-group");
-      const head = h("div", "sg-group-head");
-      head.appendChild(h("span", null, t(def.labelKey)));
-      head.appendChild(h("span", "sg-count", String(rows.length)));
-      sec.appendChild(head);
-      const box = h("div", "sg-rows");
-      if (!rows.length) {
-        // 059 UX-06: 统一空状态(原先是一个光秃秃的「—」)。「我的」两组多说一句
-        // "内置要先复制" —— 这正是新用户最常卡住的地方(见下方 sg-firststep 同因)。
-        box.appendChild(
-          R.emptyState(t(def.source === "user" ? "sgGroupEmptyUser" : "sgGroupEmpty"))
-        );
-      } else {
-        for (const row of rows) box.appendChild(renderRow(row));
-      }
-      sec.appendChild(box);
-      body.appendChild(sec);
+
+    if (!data.length) {
+      body.appendChild(R.emptyState(t("sgGroupEmpty")));
+      return;
     }
-    // B4: 一个自己的策略都没有时补一条"下一步"。四组里「内置」那两组**永远是满的**, 光看它们
-    // 会得出"反正都有了"的错觉 —— 而用户最常卡住的恰恰是"想改内置策略, 却不知道得先复制"。
+
+    const rows = [];
+    for (const s of data) {
+      // 063: 表头有五列, cells 就得**五列都填** —— 少一列的话, 表格会把
+      // 「名称」的内容顶到「来源」列上, 后面全错位(而表头看着是对的, 不报错)。
+      const lastMod = fmtRelTime(s.last_modified);
+      const created = fmtRelTime(s.created_at);
+      rows.push({
+        cells: {
+          name: buildRowCells(s),
+          source: buildSourceCell(s),
+          // 读不到时间 → null → 表格显示"—"(不编造时间)。
+          lastModified: lastMod,
+          created: created,
+          ops: buildRowActions(s),
+        },
+      });
+    }
+
+    const table = R.ui.table({
+      columns: [
+        { key: "name", title: t("sgColName") },
+        { key: "source", title: t("sgColSource") },
+        { key: "lastModified", title: t("sgColLastModified") },
+        { key: "created", title: t("sgColCreated") },
+        { key: "ops", title: t("sgColOps"), align: "right" },
+      ],
+      rows,
+    });
+    body.appendChild(table);
+
+    // B4: 一个自己的策略都没有时补一条"下一步"。混排后光看表会得出"反正都有了"的错觉 ——
+    // 而用户最常卡住的恰恰是"想改内置策略, 却不知道得先复制"。
     if (!data.some((s) => s.source === "user")) {
       const hint = h("div", "sg-firststep");
       hint.appendChild(h("span", "sg-firststep-t", t("sgNoUserHint")));
@@ -1326,19 +1495,132 @@
     }
   }
 
-  function renderRow(s) {
-    const row = h("div", "sg-row");
-    const main = h("button", "sg-row-main");
-    main.type = "button";
-    main.appendChild(h("span", "sg-row-name", s.name));
+  /// 063: 时间戳 → 「3 小时前」这类相对时间。
+  ///
+  /// 读不到(内置策略无磁盘文件)→ 返回 null, 表格如实显示"—", **不编造时间**。
+  function fmtRelTime(secs) {
+    if (typeof secs !== "number" || !Number.isFinite(secs) || secs <= 0) return null;
+    const now = Math.floor(Date.now() / 1000);
+    let diff = now - secs;
+    if (diff < 0) diff = 0; // 未来时间(时钟漂移)按"刚刚"处理, 不显示负数
+    if (diff < 60) return t("sgJustNow");
+    const min = Math.floor(diff / 60);
+    if (min < 60) return t("sgMinAgo").replace("{n}", String(min));
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return t("sgHourAgo").replace("{n}", String(hr));
+    const day = Math.floor(hr / 24);
+    if (day < 30) return t("sgDayAgo").replace("{n}", String(day));
+    const mon = Math.floor(day / 30);
+    if (mon < 12) return t("sgMonthAgo").replace("{n}", String(mon));
+    return t("sgYearAgo").replace("{n}", String(Math.floor(mon / 12)));
+  }
+
+  /// 063: 编辑页双 Tab(fmz 的 `/m/add-strategy`: 「策略编辑」/「模拟回测」)。
+  ///
+  /// **切换只改 hidden, 不销毁 DOM** —— 销毁会丢掉未保存的代码与未保存的参数
+  /// (053 的"参数未保存"提示与 059 的离开守卫都依赖那些节点还在)。
+  function renderTabs() {
+    const box = $("sg-tabs");
+    if (!box) return;
+    box.innerHTML = "";
+    const items = [
+      { key: "edit", label: t("sgTabEdit") },
+      { key: "backtest", label: t("sgTabBacktest") },
+    ];
+    for (const item of items) {
+      const tab = h("button", "sg-tab" + (st.tab === item.key ? " on" : ""));
+      tab.type = "button";
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", st.tab === item.key ? "true" : "false");
+      tab.appendChild(h("span", null, item.label));
+      tab.addEventListener("click", () => {
+        if (st.tab === item.key) return;
+        st.tab = item.key;
+        renderTabs();
+        applyTab();
+      });
+      box.appendChild(tab);
+    }
+    applyTab();
+  }
+
+  /// 063: 把当前 Tab 的内容显出来, 另一个藏起来。
+  function applyTab() {
+    const edit = $("sg-tab-edit");
+    const bt = $("sg-tab-backtest");
+    if (edit) edit.hidden = st.tab !== "edit";
+    if (bt) bt.hidden = st.tab !== "backtest";
+  }
+
+  /// 063: fmz 式 AI **快捷指令**按钮(fmz 的 AI 助手里是一排可点的建议)。
+  ///
+  /// 刻意**只预填指令框, 不自动执行** —— 执行会让 AI 改代码, 用户得先看清要改什么。
+  /// 短语取自 fmz 实测面板(见 specs/changes/063 的 spec §2.4)。
+  const AI_QUICK = [
+    "sgAiQMa",
+    "sgAiQGrid",
+    "sgAiQAnalyze",
+    "sgAiQComment",
+    "sgAiQRsi",
+    "sgAiQCross",
+  ];
+
+  function renderAiQuick() {
+    const box = $("sg-ai-quick");
+    if (!box) return;
+    box.innerHTML = "";
+    for (const key of AI_QUICK) {
+      const btn = h("button", "sg-ai-quick-btn", t(key));
+      btn.type = "button";
+      btn.addEventListener("click", () => {
+        const instr = $("sg-ai-instr");
+        if (!instr) return;
+        // 预填而非替换: 用户可能已经写了一半指令, 直接覆盖会丢内容。
+        const text = t(key);
+        instr.value = instr.value.trim() ? instr.value.trim() + "\n" + text : text;
+        instr.focus();
+      });
+      box.appendChild(btn);
+    }
+  }
+
+  /// 063: 一行的「来源」单元格 —— 内置 / 我的(市场也标一下, 内置分现货/合约)。
+  ///
+  /// 混排之后来源就成了**唯一的区分线索**, 必须显眼: 内置策略不可编辑,
+  /// 用户点「编辑」前就该知道。
+  function buildSourceCell(s) {
+    const box = h("div", "sg-tc-source");
+    const badge = h(
+      "span",
+      "sg-badge" + (s.source === "builtin" ? " sg-badge-builtin" : " sg-badge-user"),
+      s.source === "builtin" ? t("sgBuiltin") : t("sgMine")
+    );
+    box.appendChild(badge);
+    box.appendChild(
+      h("span", "sg-tc-market", s.market === "futures" ? t("futures") : t("spot"))
+    );
+    return box;
+  }
+
+  /// 一行的「名称」单元格: 名称 + 徽章 + 说明摘要(可展开)。
+  function buildRowCells(s) {
+    const box = h("div", "sg-tc-name");
+    const link = h("button", "sg-tc-link");
+    link.type = "button";
+    link.appendChild(h("span", "sg-tc-name-text", s.name));
+    box.appendChild(link);
+
     // 诚实性徽章(2026-10-05): 未声明参数清单 / 与内置脚本逐字相同 —— 列表里就能看出来,
     // 不用点进去才发现参数表单是空的。
     const flags = h("span", "sg-badges");
+    if (s.source === "builtin") {
+      flags.appendChild(h("span", "sg-badge", t("sgBuiltin")));
+    }
     if (s.declared === false) {
       flags.appendChild(h("span", "sg-badge sg-badge-warn", t("sgUndeclaredShort")));
     }
     // 054 D7: 「AI 生成」徽章 —— **只说来源, 不说验证**(D8: 验证状态由回测结果自己展示,
-    // 徽章不越界下结论, 也不写「已验证/未验证」)。判据是服务端读 TOML 注释的结果。
+    // D8: 徽章不越界下结论, 也不写「已验证/未验证」)。判据是服务端读 TOML 注释的结果。
     if (s.origin_ai) {
       flags.appendChild(h("span", "sg-badge sg-badge-ai", t("sgOriginAi")));
     }
@@ -1347,13 +1629,15 @@
       dup.title = s.duplicate_of; // 服务端数据只走 textContent / 属性赋值, 绝不拼 HTML
       flags.appendChild(dup);
     }
-    if (flags.childNodes.length) main.appendChild(flags);
-    // 059 UX-12: 描述节点留引用 —— 展开按钮要实测它是否真被截断, 并切换它的换行样式。
-    const sum = h("span", "sg-row-summary", s.summary ? s.summary : t("sgNoSummary"));
-    main.appendChild(sum);
-    // 展开/收起只在**有描述**时才存在(没描述就是「—」, 没什么可展开的)。
-    // 按钮放在 .sg-row-actions 里而不是 .sg-row-main 里 —— main 本身是个 <button>,
-    // HTML 不允许按钮套按钮, 套了点「展开」会连带触发进详情。
+    if (flags.childNodes.length) box.appendChild(flags);
+
+    // 说明摘要: 保留(059 UX-12 的展开/收起), 但**默认截断** —— fmz 的表格行是紧凑的。
+    //
+    // 「展开」钮**只在真被截断时才出现**: 不截断的行凭空多个按钮, 用户点了没反应
+    // (行高也不变) —— 那是个骗人的控件。截断判定要等元素进了文档才准,
+    // 故用 requestAnimationFrame 实测 scrollWidth/clientWidth。
+    const sum = h("span", "sg-tc-summary", s.summary ? s.summary : t("sgNoSummary"));
+    box.appendChild(sum);
     let more = null;
     if (s.summary) {
       more = h("button", "sg-btn sg-btn-mini sg-row-more", t("sgExpand"));
@@ -1365,48 +1649,48 @@
         more.textContent = t(open ? "sgCollapse" : "sgExpand");
         more.setAttribute("aria-expanded", open ? "true" : "false");
       });
+      box.appendChild(more);
     }
-    const act = h("div", "sg-row-actions");
-    if (s.source === "builtin") {
-      // 内置: 可看详情(适用性 + 参数 + 直接回测), 但**不能直接改** —— 改要先「复制」。
-      // 帮助计划第 7 条: 此前内置行只有「复制」一个入口, 详情页虽然后端早就支持
-      // (`#strategies/{id}`, 清单里的 description/suitable/unsuitable 都在里面), 但用户
-      // 根本走不进去 —— 列表主点击被绑成了"复制"。
-      const view = h("button", "sg-btn sg-btn-mini", t("sgDetail"));
-      view.type = "button";
-      view.addEventListener("click", () => openDetail(s.id));
-      act.appendChild(view);
-      const btn = h("button", "sg-btn sg-btn-mini", t("sgCopy"));
-      btn.type = "button";
-      btn.addEventListener("click", () => onCopy(s).catch(strategyErr));
-      act.appendChild(btn);
-      main.addEventListener("click", () => openDetail(s.id));
-    } else {
-      // 用户: 打开详情编辑。
-      const btn = h("button", "sg-btn sg-btn-mini", t("sgOpen"));
-      btn.type = "button";
-      btn.addEventListener("click", () => openDetail(s.id));
-      act.appendChild(btn);
-      // N1 自定义策略可删。内置行**没有**这个按钮 —— 服务端也会 409 reserved(双保险),
-      // 但入口本身就不该出现: 让人点了才知道不行, 是无谓的往返。
-      const del = h("button", "sg-btn sg-btn-mini sg-btn-danger", t("sgDelete"));
-      del.type = "button";
-      del.addEventListener("click", () => onDelete(s));
-      act.appendChild(del);
-      main.addEventListener("click", () => openDetail(s.id));
-    }
+    link.addEventListener("click", () => openDetail(s.id));
+    // 实测截断(元素进了文档才准; 视图未激活时 clientWidth 是 0 —— 那种情况保持隐藏)。
     if (more) {
-      // 实测截断要等元素进了文档才准(renderRow 返回时还没 append)。单行 ellipsis 下
-      // scrollWidth 被 clientWidth 卡住, 两者基本相等就说明这一行本来就放得下。
-      // 视图未激活时 clientWidth 是 0 —— 那种情况保持隐藏, 不做判断。
       requestAnimationFrame(() => {
         more.hidden = sum.scrollWidth <= sum.clientWidth + 1;
       });
-      act.insertBefore(more, act.firstChild);
     }
-    row.appendChild(main);
-    row.appendChild(act);
-    return row;
+    return box;
+  }
+
+  /// 一行的「操作项」单元格: fmz 形态的**行内文字链接**(编辑 / 复制 / 删除)。
+  function buildRowActions(s) {
+    const box = h("div", "sg-tc-ops");
+    const isBuiltin = s.source === "builtin";
+
+    // 「编辑」: 内置策略**不能直接改**(脚本编译期嵌入), 点了会白跑一趟。
+    // 诚实做法: 内置行的编辑按钮仍可点, 但进详情页是只读的 —— 详情页里有「复制为我的策略」。
+    const edit = R.ui.linkBtn({
+      label: t("sgEdit"),
+      onClick: () => openDetail(s.id),
+    });
+    box.appendChild(edit);
+
+    const copy = R.ui.linkBtn({
+      label: t("sgCopy"),
+      onClick: () => onCopy(s).catch(strategyErr),
+    });
+    box.appendChild(copy);
+
+    // 删除: 内置策略服务端会 409 reserved, **入口不该出现** ——
+    // 让人点了才知道不行, 是无谓的往返(059 UX-03 的既定纪律)。
+    if (!isBuiltin) {
+      const del = R.ui.linkBtn({
+        label: t("sgDelete"),
+        tone: "danger",
+        onClick: () => onDelete(s),
+      });
+      box.appendChild(del);
+    }
+    return box;
   }
 
   function strategyErr(err) {
@@ -1474,7 +1758,7 @@
     const pairInput = document.createElement("input");
     pairInput.className = "sg-input";
     pairInput.type = "text";
-    pairInput.value = DEFAULT_PAIR;
+    S.fillDefaultPair(pairInput, DEFAULT_PAIR);
     pairInput.autocomplete = "off";
     pairLabel.appendChild(pairInput);
     form.appendChild(pairLabel);
@@ -1615,7 +1899,7 @@
     const pairInput = document.createElement("input");
     pairInput.className = "sg-input";
     pairInput.type = "text";
-    pairInput.value = DEFAULT_PAIR;
+    S.fillDefaultPair(pairInput, DEFAULT_PAIR);
     pairInput.autocomplete = "off";
     const ivSel = document.createElement("select");
     ivSel.className = "sg-input";
@@ -2129,7 +2413,7 @@
     const pairInput = document.createElement("input");
     pairInput.className = "sg-input";
     pairInput.type = "text";
-    pairInput.value = DEFAULT_PAIR;
+    S.fillDefaultPair(pairInput, DEFAULT_PAIR);
     pairInput.autocomplete = "off";
     pairLabel.appendChild(pairInput);
     form.appendChild(pairLabel);
@@ -2344,4 +2628,9 @@
       R.modal.closeAll();
     },
   };
+
+  // 063: 双 Tab 与 AI 快捷指令的渲染入口 —— 给 strategy_form.js 的 renderDetail 调用。
+  // 放在**同一个闭包**里: Tab 状态(st.tab)与文案表(t)都在本文件, 别处拿不到。
+  S.renderTabs = renderTabs;
+  S.renderAiQuick = renderAiQuick;
 })();

@@ -317,7 +317,7 @@ async function main() {
       JSON.stringify(bareName) +
       ", market: 'spot'," +
       " pair: 'ETHUSDT', params: {}, code: 'local ctx = ...\\nfunction on_tick(ctx)\\n" +
-      "  local sp = ctx:config_f64(\"spacing_pct\")\\n  if sp > 0 then ctx:log(\"t\") end\\nend\\n' } })" +
+      "  local sp = ctx:config_f64(\"min_spacing_pct\")\\n  if sp > 0 then ctx:log(\"t\") end\\nend\\n' } })" +
       ".then(function () { return 'ok'; }).catch(function (e) { return 'ERR:' + (e && e.code); })"
   );
   await ev("location.hash = '#strategies/' + " + JSON.stringify(bareName));
@@ -486,7 +486,7 @@ async function main() {
     JSON.stringify(nameSplit)
   );
 
-  // 引导卡的「从脚本识别参数」真点一次: 必须从编辑器里的代码认出 `spacing_pct` 并把清单行填好。
+  // 引导卡的「从脚本识别参数」真点一次: 必须从编辑器里的代码认出 `min_spacing_pct` 并把清单行填好。
   const guideClicked = await ev(
     "(() => { const b = document.querySelector('#sg-params-guide .sg-guide-actions button');" +
       " if (!b) return false; b.click(); return true; })()"
@@ -498,8 +498,8 @@ async function main() {
       ".map(function (k) { return k.value; }))()"
   );
   check(
-    "识别后清单编辑器真的多出这个参数行(spacing_pct)",
-    Array.isArray(mfKeys) && mfKeys.indexOf("spacing_pct") >= 0,
+    "识别后清单编辑器真的多出这个参数行(min_spacing_pct)",
+    Array.isArray(mfKeys) && mfKeys.indexOf("min_spacing_pct") >= 0,
     JSON.stringify(mfKeys)
   );
   const mfTy = await ev(
@@ -524,12 +524,15 @@ async function main() {
   );
   check("取到 shannon_grid_futures 的显示名(供列表定位)", typeof pairName === "string" && pairName.length > 0, String(pairName));
   const copyClicked = await ev(
-    "(() => { const rows = Array.from(document.querySelectorAll('#sg-listview .sg-row'));" +
-      " const row = rows.filter(function (r) { const n = r.querySelector('.sg-row-name');" +
+    // 063: 列表改 fmz 式**表格**(tbody tr), 操作项是行内文字链接(.ui-linkbtn)。
+    // 按**文案**找「复制」那个链接 —— 按类名/位置挑会挑到别的按钮(探针最常见的假绿来源)。
+    "(() => { const rows = Array.from(document.querySelectorAll('#sg-listview table.ui-table tbody tr'));" +
+      " const row = rows.filter(function (r) { const n = r.querySelector('.sg-tc-name-text');" +
       " return n && n.textContent === " + JSON.stringify(pairName) + "; })[0];" +
       " if (!row) return 'no-row';" +
-      " const btns = Array.from(row.querySelectorAll('.sg-row-actions button'));" +
-      " const b = btns[btns.length - 1]; if (!b) return 'no-btn'; b.click(); return 'ok'; })()"
+      " const b = Array.from(row.querySelectorAll('.ui-linkbtn')).filter(function (x) {" +
+      " return x.textContent.trim() === '复制'; })[0];" +
+      " if (!b) return 'no-btn'; b.click(); return 'ok'; })()"
   );
   check("列表里内置行的「复制」可点", copyClicked === "ok", String(copyClicked));
   await sleep(800);
@@ -558,11 +561,11 @@ async function main() {
     "window.Ricow.api('/api/strategies/" +
       copyName +
       "').then(function (d) {" +
-      " var p = (d.params || []).filter(function (x) { return x.key === 'spacing_pct'; })[0];" +
+      " var p = (d.params || []).filter(function (x) { return x.key === 'min_spacing_pct'; })[0];" +
       " return p ? p.name : null; })"
   );
   check(
-    "副本清单里 spacing_pct 带着中文显示名",
+    "副本清单里 min_spacing_pct 带着中文显示名",
     typeof wantLabel === "string" && wantLabel.length > 0,
     String(wantLabel)
   );
@@ -585,7 +588,7 @@ async function main() {
   const beforeVal = await ev(
     "(() => { const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
       " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
-      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " return k && k.textContent === 'min_spacing_pct'; })[0];" +
       " if (!row) return 'no-row'; const ctl = row.querySelector('input, select');" +
       " if (!ctl) return 'no-input'; const v = ctl.value;" +
       " ctl.value = '0.05';" +
@@ -594,7 +597,7 @@ async function main() {
       " return v; })()"
   );
   check(
-    "053 改参数: 找到 spacing_pct 输入框并改了值",
+    "053 改参数: 找到 min_spacing_pct 输入框并改了值",
     typeof beforeVal === "string" && beforeVal !== "no-row" && beforeVal !== "no-input",
     String(beforeVal)
   );
@@ -626,7 +629,7 @@ async function main() {
   const inlineDiff = await ev(
     "(() => { const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
       " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
-      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " return k && k.textContent === 'min_spacing_pct'; })[0];" +
       " if (!row) return 'no-row'; const d = row.querySelector('.sg-param-diff');" +
       " return d ? (d.hidden ? 'hidden' : d.textContent) : 'no-diff'; })()"
   );
@@ -641,7 +644,7 @@ async function main() {
       " if (!b) return 'no-btn'; b.click();" +
       " const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
       " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
-      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " return k && k.textContent === 'min_spacing_pct'; })[0];" +
       " return row.querySelector('input, select').value; })()"
   );
   check("053 一键还原把值退回改前", reverted === beforeVal, String(reverted) + " 期望 " + beforeVal);
@@ -653,7 +656,7 @@ async function main() {
   await ev(
     "(() => { const rows = Array.from(document.querySelectorAll('#sg-params .sg-param'));" +
       " const row = rows.filter(function (r) { const k = r.querySelector('.sg-param-key');" +
-      " return k && k.textContent === 'spacing_pct'; })[0];" +
+      " return k && k.textContent === 'min_spacing_pct'; })[0];" +
       " const ctl = row.querySelector('input, select'); ctl.value = '0.07';" +
       " ctl.dispatchEvent(new Event('input', { bubbles: true })); return 'ok'; })()"
   );
@@ -984,8 +987,13 @@ async function main() {
   // 打开那一刻的 activeElement —— 不先 focus 就会把"关掉后焦点回原处"测成"回到 body",
   // 测的是脚本自己而不是产品。
   await ev(
-    "(() => { const b = document.getElementById('sg-new'); if (!b) return 'no-btn';" +
-      " b.focus(); b.click(); return 'ok'; })()"
+    // 063: 入口是下拉 —— 先展开 `新建策略 ∨`, 再点菜单项「从空白开始」。
+    // 真人点菜单项时浏览器会把焦点给它, 但菜单项随菜单隐藏 → 弹窗的 restoreTo
+    // 必须是**下拉触发器**(产品侧已处理: 捕获阶段先把焦点交回触发器)。
+    "(() => { const dd = document.getElementById('sg-new-dd'); if (!dd) return 'no-dd';" +
+      " dd.focus(); dd.click();" +
+      " const b = document.getElementById('sg-new'); if (!b) return 'no-btn';" +
+      " b.click(); return 'ok'; })()"
   );
   await sleep(350);
   const dlg = await ev(
@@ -1016,15 +1024,24 @@ async function main() {
       " focus: document.activeElement ? document.activeElement.id : null }))()"
   );
   check("059 Esc 能关掉弹窗", afterEsc.open === false, JSON.stringify(afterEsc));
-  check("059 关掉后焦点回到触发它的按钮(监听也一并摘掉)", afterEsc.focus === "sg-new", JSON.stringify(afterEsc));
+  // 063: 「新建」入口改成了 fmz 式的**下拉**(`新建策略 ∨` → 菜单项)。
+  // 弹窗的 `restoreTo` 记的是"打开那一刻的 activeElement" —— 菜单项会被隐藏,
+  // 所以焦点必须交回**下拉触发器**(`sg-new-dd`, 不会被隐藏)。
+  // 断言跟的是**意图**(焦点回到可聚焦的触发器), 不是某个具体标签。
+  check(
+    "059 关掉后焦点回到触发它的按钮(监听也一并摘掉)",
+    afterEsc.focus === "sg-new-dd",
+    String(afterEsc)
+  );
 
   // UX-12: 卡片描述**真被截断**时才给「展开」, 点了就地展开(不跳详情), 再点收回。
   // 两条一起验: 截断与按钮显隐必须一致(不截断的行不该凭空多一个按钮), 且展开真的变高。
   const ux12 = await ev(
-    "(() => { const rows = Array.from(document.querySelectorAll('.sg-row'));" +
+    // 063: 行容器改成 fmz 式表格的 tbody tr; 摘要节点类名改成 .sg-tc-summary。
+    "(() => { const rows = Array.from(document.querySelectorAll('#sg-listview table.ui-table tbody tr'));" +
       " let hit = null, mismatch = 0;" +
       " for (const row of rows) {" +
-      "  const sum = row.querySelector('.sg-row-summary');" +
+      "  const sum = row.querySelector('.sg-tc-summary');" +
       "  const btn = row.querySelector('.sg-row-more');" +
       "  if (!sum || !btn) continue;" +
       "  const trunc = sum.scrollWidth > sum.clientWidth + 1;" +

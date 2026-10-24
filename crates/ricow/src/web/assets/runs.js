@@ -15,7 +15,8 @@
 
   // ---------- 双语文案(并入公共字典; 静态标签走 data-zh/data-en) ----------
   Object.assign(R.TEXT.zh, {
-    rnTitle: "运行",
+    rnTitle: "实盘",
+    rnNewLive: "新建实盘",
     rnPollHint: "每 5 秒自动刷新;页面切到后台时暂停。",
     rnNoInstances: "暂无策略实例(到策略页保存实例配置后会出现在这里)。",
     rnNoStrategies: "还没有任何策略,先到策略页创建。",
@@ -27,7 +28,7 @@
     rnThMode: "模式",
     rnThStatus: "状态",
     rnThPair: "标的",
-    rnThNet: "净收益",
+    rnThNet: "盈利",
     rnThTrades: "成交数",
     rnThUptime: "运行时长",
     rnThSource: "来源",
@@ -41,8 +42,21 @@
     rnSrcDaemonTip: "守护进程在线,状态以它为准。",
     rnSrcLedgerTip: "守护进程不在线,显示台账最近一次记录,当前状态不可知。",
     rnSrcNoneTip: "仅有实例配置,从未运行或台账无记录。",
-    rnStartTitle: "启动策略",
-    rnStartStrategy: "策略",
+    rnStartTitle: "新建实盘",
+    rnStartStrategy: "运行策略",
+    // 063: fmz 的「新建实盘」字段(fmz 的 /m/add-robot)。
+    rnLiveName: "实盘名称",
+    rnLivePair: "交易对",
+    rnLivePairOutOfScope:
+      "策略自带的交易对 {0} 不在当前交易对视野里, 已换成 {1}(要跑原交易对请在设置里把交易对视野改为全部)。若策略有价格类参数, 请按新交易对的价格重新确认。",
+    rnLiveParams: "策略参数",
+    rnLiveParamsLoadFail: "读不到该策略的参数清单:",
+    rnLiveParamsUnavailable: "参数表单不可用(前端模块未加载)。",
+    rnLiveNoParams: "该策略没有声明参数 —— 只用默认值运行。",
+    rnLiveBuiltinNote: "内置策略的代码与参数随版本发布, 不能直接改; 请先在策略页「复制」成你自己的策略。",
+    rnLiveBuiltinBlock: "内置策略不能直接改参数 —— 请先在策略页「复制」成你自己的策略, 再新建实盘。",
+    rnStratSearchPh: "输入策略名搜索",
+    rnStratNoHit: "没有匹配的策略",
     rnStartMode: "模式",
     rnModeDryRun: "Dry Run(演练,不下单)",
     rnModeDemo: "Demo(币安测试网)",
@@ -55,7 +69,7 @@
     rnAckPhraseHint: "输入「确认风险」以确认已阅读: ",
     rnAckGo: "确认风险",
     rnAckOk: "风险确认已记录,请继续输入实盘确认短语。",
-    rnStartGo: "启动",
+    rnStartGo: "创建并启动",
     rnStarting: "启动中…",
     rnStartOk: "已启动: ",
     rnStopTitle: "停止策略",
@@ -80,7 +94,8 @@
     rnLogToggle: "点击展开/收起日志",
   });
   Object.assign(R.TEXT.en, {
-    rnTitle: "Runs",
+    rnTitle: "Live",
+    rnNewLive: "New live trading",
     rnPollHint: "Auto-refreshes every 5s; paused while the page is hidden.",
     rnNoInstances: "No strategy instances yet (save one in Strategies and it shows up here).",
     rnNoStrategies: "No strategies yet — create one in Strategies first.",
@@ -92,7 +107,7 @@
     rnThMode: "Mode",
     rnThStatus: "Status",
     rnThPair: "Pair",
-    rnThNet: "Net PnL",
+    rnThNet: "Profit",
     rnThTrades: "Fills",
     rnThUptime: "Uptime",
     rnThSource: "Source",
@@ -106,8 +121,21 @@
     rnSrcDaemonTip: "daemon is online; its view is authoritative.",
     rnSrcLedgerTip: "daemon is offline; the ledger's last record is shown — the current state is unknown.",
     rnSrcNoneTip: "Only an instance config exists — never run, or no ledger record.",
-    rnStartTitle: "Start strategy",
-    rnStartStrategy: "Strategy",
+    rnStartTitle: "New live trading",
+    rnStartStrategy: "Strategy to run",
+    // 063: fmz's "new live trading" fields (fmz /m/add-robot).
+    rnLiveName: "Live name",
+    rnLivePair: "Trading pair",
+    rnLivePairOutOfScope:
+      "This strategy's own pair {0} is outside the current pair scope, so {1} was used instead (to trade the original pair, widen the pair scope to all in Settings). If the strategy has price parameters, re-check them against the new pair's price.",
+    rnLiveParams: "Strategy parameters",
+    rnLiveParamsLoadFail: "Could not read this strategy's parameter manifest:",
+    rnLiveParamsUnavailable: "Parameter form unavailable (frontend module not loaded).",
+    rnLiveNoParams: "This strategy declares no parameters — it runs on defaults.",
+    rnLiveBuiltinNote: "Built-in strategy code and parameters ship with the release and cannot be edited here; copy it to your own strategy first.",
+    rnLiveBuiltinBlock: "Built-in strategies cannot have their parameters changed — copy it to your own strategy in the Strategies view first.",
+    rnStratSearchPh: "Search strategies by name",
+    rnStratNoHit: "No matching strategy",
     rnStartMode: "Mode",
     rnModeDryRun: "Dry Run (no real orders)",
     rnModeDemo: "Demo (Binance testnet)",
@@ -120,7 +148,7 @@
     rnAckPhraseHint: "Type 确认风险 to confirm you have read it: ",
     rnAckGo: "Acknowledge",
     rnAckOk: "Risk acknowledgement recorded. Now enter the live confirmation phrase.",
-    rnStartGo: "Start",
+    rnStartGo: "Create and start",
     rnStarting: "Starting…",
     rnStartOk: "Started: ",
     rnStopTitle: "Stop strategy",
@@ -205,6 +233,11 @@
       '<div class="sg-head"><h2 class="sg-title"' + bi("rnTitle") + ">" + R.TEXT.zh.rnTitle + "</h2>" +
       '<span id="rn-poll-hint" class="rn-poll-hint"' + bi("rnPollHint") + ">" +
       R.TEXT.zh.rnPollHint + "</span>" +
+      // 063: 「新建实盘」入口(fmz 的 /m/robots 表头就有这个按钮)。
+      // 此前只有**每行**的「启动」按钮 —— 没有实例时用户无处可点, 得先有个策略才能启动,
+      // 顺序反了(fmz 的顺序是"先建实盘, 再看它跑起来")。
+      '<button id="rn-new-live" class="sg-btn sg-btn-primary"' + bi("rnNewLive") + ">" +
+      R.TEXT.zh.rnNewLive + "</button>" +
       // 058: 「停止全部」挂在运行视图表头, 不进顶栏 —— 它是运行域的动作, 不是全局导航。
       '<button id="rn-kill-all" class="sg-btn sg-btn-danger rn-kill-all"' + bi("rnKillAll") + ">" +
       R.TEXT.zh.rnKillAll + "</button></div>" +
@@ -231,6 +264,12 @@
     // 所以这里**不能** .catch() —— 那会把同步函数的 undefined 当 Promise 而在运行期抛
     // TypeError(真机走查 058 抓到过; 静态门看不见这一类)。
     $("rn-kill-all").addEventListener("click", () => openKillModal());
+    // 063: 「新建实盘」入口(fmz 的 /m/robots 表头就有)。
+    // openStartModal 是 **async**(要先取策略清单), 所以这里要 .catch() ——
+    // 与上面的 openKillModal 不同(它是同步函数, **不能** .catch(), 见上方注释)。
+    $("rn-new-live").addEventListener("click", () =>
+      openStartModal().catch((e) => setListMsg((e && e.message) || String(e), "err"))
+    );
     mounted = true;
   }
 
@@ -569,27 +608,53 @@
 
     const form = h("div", "sg-modal-form");
 
-    // 策略下拉: 现货 / 合约两组(与策略页同口径)。
+    // 063: 字段序对齐 fmz 的「新建实盘」页(/m/add-robot):
+    //   实盘名称 → 运行策略(可搜索) → 策略参数 → 交易配置(交易对) → 模式。
+    //
+    // **实盘名称**: ricow 的实例名 = 策略 id(既有语义, 改它是另一个变更)。
+    // 所以这个字段**只读展示**策略名, 不让用户改 —— 给了能改的输入框却改不动,
+    // 比不给这个字段更让人困惑。
+    const nameLabel = h("label", "sg-field");
+    nameLabel.appendChild(h("span", null, t("rnLiveName")));
+    const nameView = h("div", "rn-live-name", "");
+    nameLabel.appendChild(nameView);
+    form.appendChild(nameLabel);
+
+    // 运行策略: **可搜索**下拉(fmz 形态)。一个输入框 + 一个结果列表 ——
+    // 原生 `<select>` 没法搜索, 策略一多就找不着。
     const stratLabel = h("label", "sg-field");
     stratLabel.appendChild(h("span", null, t("rnStartStrategy")));
+    const searchWrap = h("div", "rn-strat-search");
+    const searchInput = document.createElement("input");
+    searchInput.className = "sg-input";
+    searchInput.type = "search";
+    searchInput.autocomplete = "off";
+    searchInput.placeholder = t("rnStratSearchPh");
+    const resultBox = h("div", "rn-strat-results");
     const sel = document.createElement("select");
-    sel.className = "sg-input";
-    for (const market of ["spot", "futures"]) {
-      const group = list.filter((s) => s.market === market);
-      if (!group.length) continue;
-      const og = document.createElement("optgroup");
-      og.label = market === "spot" ? t("spot") : t("futures");
-      for (const s of group) {
-        const opt = document.createElement("option");
-        opt.value = s.id;
-        opt.textContent = s.name;
-        if (s.id === preselect) opt.selected = true;
-        og.appendChild(opt);
-      }
-      sel.appendChild(og);
-    }
-    stratLabel.appendChild(sel);
+    sel.className = "sg-input rn-strat-hidden";
+    sel.setAttribute("aria-hidden", "true");
+    searchWrap.appendChild(searchInput);
+    searchWrap.appendChild(resultBox);
+    searchWrap.appendChild(sel);
+    stratLabel.appendChild(searchWrap);
     form.appendChild(stratLabel);
+
+    // 选中策略后展开的参数区(fmz 的「策略参数」折叠区)。
+    const paramBox = h("div", "rn-live-params");
+    paramBox.hidden = true;
+    form.appendChild(paramBox);
+
+    // 交易配置(fmz 的「交易配置」段): 交易对。
+    const pairLabel = h("label", "sg-field");
+    pairLabel.appendChild(h("span", null, t("rnLivePair")));
+    const pairInput = document.createElement("input");
+    pairInput.className = "sg-input";
+    pairInput.type = "text";
+    pairInput.autocomplete = "off";
+    pairInput.value = "";
+    pairLabel.appendChild(pairInput);
+    form.appendChild(pairLabel);
 
     // 模式单选(dry_run 默认)。控件命名统一避开前端禁词扫描(见 web/mod.rs 扫描测试)。
     const modesLabel = h("label", "sg-field");
@@ -661,13 +726,180 @@
       return "dry_run";
     }
 
+    // ---- 063: 运行策略的可搜索选择 + 参数加载 ----
+    //
+    // fmz 的「运行策略」是一个**带搜索的下拉**: 选中后展开该策略的参数区。
+    // 原生 `<select>` 不能搜索, 策略一多就找不着 —— 故自己做一个搜索框 + 结果列表,
+    // 底下藏一个真 `<select>` 承接值(表单语义与既有代码都不必改)。
+
+    /// 当前选中的策略 id(藏在真 select 里)。
+    function currentStrategy() {
+      return sel.value;
+    }
+
+    /// 渲染搜索结果(按名称/关键词过滤; 空关键词时列全部)。
+    function renderResults() {
+      const kw = searchInput.value.trim().toLowerCase();
+      resultBox.innerHTML = "";
+      const hits = list.filter((s) => {
+        if (!kw) return true;
+        return (
+          (s.name || "").toLowerCase().includes(kw) ||
+          (s.id || "").toLowerCase().includes(kw) ||
+          (s.summary || "").toLowerCase().includes(kw)
+        );
+      });
+      if (!hits.length) {
+        resultBox.appendChild(h("div", "rn-strat-none", t("rnStratNoHit")));
+        return;
+      }
+      for (const s of hits) {
+        const item = h("button", "rn-strat-item");
+        item.type = "button";
+        item.appendChild(h("span", "rn-strat-item-name", s.name || s.id));
+        const src = h("span", "rn-strat-item-src", s.source === "builtin" ? t("sgBuiltin") : t("sgMine"));
+        item.appendChild(src);
+        item.addEventListener("click", () => {
+          // 隐藏 select 里**必须真的有匹配的 option** —— 浏览器对"不存在的 value"
+          // 会把 select.value 置成空串(规范如此), 于是后面 currentStrategy() 取到 "",
+          // 提交时按"没选策略"提前返回, **参数一个都没落盘**(症状: 弹窗关了但参数没生效)。
+          // 故先补 option 再赋值。
+          let opt = Array.prototype.slice.call(sel.options).find(function (o) {
+            return o.value === s.id;
+          });
+          if (!opt) {
+            opt = document.createElement("option");
+            opt.value = s.id;
+            opt.textContent = s.name || s.id;
+            sel.appendChild(opt);
+          }
+          sel.value = s.id;
+          nameView.textContent = s.name || s.id;
+          searchInput.value = "";
+          resultBox.innerHTML = "";
+          searchInput.placeholder = s.name || s.id;
+          syncBuiltinNote(s);
+          loadParams(s);
+          if (currentMode() === "live") syncLiveHint();
+        });
+        resultBox.appendChild(item);
+      }
+    }
+
+    /// 选中策略后拉它的清单与当前值, 画参数表单。
+    async function loadParams(s) {
+      paramBox.innerHTML = "";
+      paramBox.hidden = false;
+      const head = h("div", "rn-live-params-head", t("rnLiveParams"));
+      paramBox.appendChild(head);
+      let detail = null;
+      let current = {};
+      try {
+        detail = await R.api("/api/strategies/" + encodeURIComponent(s.id));
+        current = detail.current || {};
+        if (detail.pair) pairInput.value = detail.pair;
+        // 视野校验: 策略自带的交易对可能不在当前视野里(默认视野只有股票类)。
+        // **不 await** —— 它是"锦上添花"的替换, 不该拖慢参数区渲染;
+        // 拿不到视野时它什么都不做, 由服务端门禁如实报。
+        syncPairScope(s, detail);
+      } catch (err) {
+        // 拉不到清单也要让用户能继续 —— 参数区如实说明, 不静默空白。
+        const hint = h("div", "sg-hint", t("rnLiveParamsLoadFail") + " " + ((err && err.message) || String(err)));
+        paramBox.appendChild(hint);
+        return;
+      }
+      if (!alive || g !== gen) return;
+      const S = R.sg;
+      if (!S || !S.buildParamBlock) {
+        paramBox.appendChild(h("div", "sg-hint", t("rnLiveParamsUnavailable")));
+        return;
+      }
+      const built = S.buildParamBlock({ params: detail.params || [], current: current });
+      if (!built.entries.length) {
+        paramBox.appendChild(h("div", "sg-hint", t("rnLiveNoParams")));
+        return;
+      }
+      paramBox.appendChild(built.box);
+      // 收集器: 提交时从这些控件取值。
+      paramBox.__entries = built.entries;
+    }
+
+    /// 从参数表单收集值(与详情页同口径: `S.readParam`)。
+    function collectParams() {
+      const S = R.sg;
+      const entries = paramBox.__entries || [];
+      const out = {};
+      for (const e of entries) {
+        const v = S.readParam(e);
+        if (v !== undefined && v !== null) out[e.key] = v;
+      }
+      return out;
+    }
+
+    /// 内置策略的提示: 内置脚本编译期嵌入, 改不了 —— 新建实盘要**复制**成自己的。
+    function syncBuiltinNote(s) {
+      let note = paramBox.querySelector(".rn-live-builtin");
+      if (!s || s.source !== "builtin") {
+        if (note) note.remove();
+        return;
+      }
+      if (!note) {
+        note = h("div", "rn-live-builtin");
+        paramBox.appendChild(note);
+      }
+      note.textContent = t("rnLiveBuiltinNote");
+    }
+
+    /// 063: **交易对视野校验** —— 策略自带的交易对可能不在**当前视野**里。
+    ///
+    /// 背景: 默认配置 `[market].show_all_pairs = false` 时视野只有股票类,
+    /// 而策略的 pair 常是 `BTCUSDT`(复制内置策略时带过来的) —— 提交必然撞视野门禁。
+    ///
+    /// 为什么不干脆报错让用户自己改: 那是"提交 → 弹窗不关 → 一句门禁原文",
+    /// 用户得先知道"视野"是什么才知道该改哪儿。**直接换成视野内的对 + 说明一句**
+    /// 更省事, 也不丢事实(说明里写清"原值 → 现值")。
+    ///
+    /// 拿不到视野(离线/快照不可用)时**不动** —— 那时门禁自己会报, 不猜。
+    async function syncPairScope(s, detail) {
+      const want = detail && detail.pair;
+      if (!want) return;
+      let view = null;
+      try {
+        view = await R.api("/api/markets");
+      } catch (err) {
+        return;   // 拿不到视野就不猜, 交给门禁如实报
+      }
+      if (!view || !view.filtered) return;   // 视野没被过滤 → 什么都在范围内
+      const inScope =
+        (view.spot || []).some((x) => x === want) || (view.futures || []).some((x) => x === want);
+      if (inScope) return;
+      const fallback = (view.spot || [])[0] || (view.futures || [])[0];
+      if (!fallback) return;
+      pairInput.value = fallback;
+      // **replaceAll**: `String.replace` 只替换**第一个**匹配 —— 文案里同一个占位符
+      // 出现两次时第二次会原样留在界面上(2026-10-24 真机截图里就是这么发现的)。
+      const hint = h(
+        "div",
+        "sg-hint",
+        t("rnLivePairOutOfScope").replaceAll("{0}", want).replaceAll("{1}", fallback)
+      );
+      paramBox.appendChild(hint);
+    }
+
+    searchInput.addEventListener("input", renderResults);
+    searchInput.addEventListener("focus", renderResults);
+    // 点外面收起结果列表(不关弹窗)。
+    document.addEventListener("click", (ev) => {
+      if (!searchWrap.contains(ev.target)) resultBox.innerHTML = "";
+    });
+
     /// live 期望短语(与后端同串: `确认实盘 <策略 id>`, 逐字)。
     function expectedPhrase(id) {
       return "确认实盘 " + id;
     }
 
     function syncLiveHint() {
-      liveHint.textContent = t("rnPhraseHint") + expectedPhrase(sel.value);
+      liveHint.textContent = t("rnPhraseHint") + expectedPhrase(currentStrategy());
     }
 
     function onModeChange() {
@@ -722,7 +954,7 @@
     }
 
     async function submit() {
-      const name = sel.value;
+      const name = currentStrategy();
       if (!name) {
         setMsg(errLine, t("rnNoStrategies"), "err");
         return;
@@ -740,6 +972,35 @@
       primary.disabled = true;
       primary.textContent = t("rnStarting");
       setMsg(errLine, "", "");
+
+      // 063: **先落参数, 再启动** —— 这是"新建实盘能设参数"的落地顺序。
+      // 落盘端点只改 params 与 pair, 不碰代码; 内置策略会 409(它改不了),
+      // 那时如实提示"内置策略请先复制", 不静默跳过。
+      const picked = list.find((s) => s.id === name);
+      if (picked && picked.source === "builtin") {
+        primary.disabled = false;
+        primary.textContent = t("rnStartGo");
+        setMsg(errLine, t("rnLiveBuiltinBlock"), "err");
+        return;
+      }
+      try {
+        const params = collectParams();
+        const payload = { params: params };
+        const pair = pairInput.value.trim();
+        if (pair) payload.pair = pair;
+        await R.api("/api/strategies/" + encodeURIComponent(name) + "/instance", {
+          method: "POST",
+          body: payload,
+        });
+      } catch (err) {
+        if (!alive || g !== gen) return;
+        primary.disabled = false;
+        primary.textContent = t("rnStartGo");
+        setMsg(errLine, (err && err.message) || String(err), "err");
+        return;
+      }
+      if (!alive || g !== gen) return;
+
       let reply;
       try {
         reply = await R.api("/api/strategies/" + encodeURIComponent(name) + "/start", {
@@ -759,6 +1020,8 @@
           return;
         }
         // 短语空/错(400) / 已在运行(409) / 缺凭据 / live 未开关: 服务端中文原文, 不关窗。
+        // **资金不足也是这一类**: 引擎侧 `insufficient balance` 如实透出, 前端不拦
+        // (用户明说"实盘如果资金不够执行会报错")。
         setMsg(errLine, (err && err.message) || String(err), "err");
         return;
       }
@@ -803,6 +1066,20 @@
     sel.addEventListener("change", () => {
       if (currentMode() === "live") syncLiveHint();
     });
+
+    // 063: 进来时按 preselect 预选(从策略页点"运行"进来时带着策略 id),
+    // 并把它的参数与交易对载入 —— 用户改完就能直接启动, 不用再选一遍。
+    const initial = preselect ? list.find((s) => s.id === preselect) : null;
+    if (initial) {
+      sel.value = initial.id;
+      nameView.textContent = initial.name || initial.id;
+      searchInput.placeholder = initial.name || initial.id;
+      syncBuiltinNote(initial);
+      loadParams(initial).catch((e) => setMsg(errLine, (e && e.message) || String(e), "err"));
+    } else {
+      // 没预选: 直接把搜索结果摊开 —— 用户第一眼就知道这里能选什么。
+      renderResults();
+    }
   }
 
   // ---------- 停止全部(kill switch, 058) ----------

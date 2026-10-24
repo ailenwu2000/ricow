@@ -2723,5 +2723,144 @@ pub(super) async fn ai_generate_strategy(
     }))
 }
 
+// ---- 063: 实例配置落盘端点(只改参数与交易对, 不动代码) ----
+
+/// `POST /api/strategies/{id}/instance` 请求体。
+///
+/// 063: **只改参数与交易对**, 不带代码 —— 与 [`save_strategy`] 的语义严格分开:
+/// `save_strategy` 是"保存策略(含代码)", 那个端点要求前端把 Lua 一起传上来;
+/// 新建实盘场景下前端手上**没有**用户的代码改动, 硬传会覆盖用户代码。
+#[derive(Debug, Deserialize)]
+pub(super) struct InstanceRequest {
+    /// 交易对(如 `BTCUSDT`)。缺省 = 保持原值。
+    #[serde(default)]
+    pair: Option<String>,
+    /// 要写入的参数值(键 → 数字/字符串/布尔)。缺省 = 保持原值。
+    ///
+    /// 只会**覆盖**这里列出的键; 未列出的参数原样保留。
+    #[serde(default)]
+    params: HashMap<String, Value>,
+}
+
+/// `POST .../instance` 成功响应: **落盘后回读**的实际值(不是回显请求)。
+#[derive(Debug, Serialize)]
+pub(super) struct InstanceReply {
+    /// 生效的交易对。
+    pub(super) pair: Option<String>,
+    /// 生效的参数值(已剔除引擎内部键 `script`/`script_path`)。
+    pub(super) params: HashMap<String, ConfigValue>,
+    /// 备份文件路径(覆盖前自动备份, 可回滚); 无备份 = 首次落盘。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) backup: Option<String>,
+}
+
+/// `POST /api/strategies/{id}/instance` (063): **只改实例参数与交易对**。
+///
+/// 为什么要有这个端点(而不是复用 `POST /api/strategies`):
+/// - 新建实盘要能"选策略 + 设参数", 但**不该碰用户的代码**;
+/// - `save_strategy` 的语义是"保存策略(含代码)", 它要求前端把 Lua 传上来 ——
+///   新建实盘时前端手上没有代码改动, 硬传会把用户的代码覆盖成旧版本。
+///
+/// 落盘纪律:
+/// - **只改 `params` 与 `pair`**, 其余(`live_enabled`/`market`/`position_mode`/`[backtest]` 段)
+///   **原样保留** —— 尤其 `live_enabled`: 那是实盘门禁, 顺手清掉等于替用户解除实盘授权。
+/// - `script`/`script_path` 是引擎装载细节, **不接受前端覆盖**。
+/// - 走引擎同一份落盘内核(自动 `.bak` 备份), 落盘后**回读校验**。
+/// - 内置策略 → 409: 内置脚本编译期嵌入, 磁盘上没有可改的实例。
+pub(super) async fn save_instance(
+    State(state): State<WebState>,
+    UrlPath(id): UrlPath<String>,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<InstanceReply>, WebError> {
+    let Json(raw) =
+        payload.map_err(|e| WebError::bad_request(format!("请求体不是合法 JSON: {e}")))?;
+    let req: InstanceRequest = serde_json::from_value(raw)
+        .map_err(|e| WebError::bad_request(format!("请求体字段不符合要求: {e}")))?;
+
+    // ① 名字合法(防路径穿越; 与保存同口径)。
+    if ricow_strategy::validate_strategy_name(&id).is_err() {
+        return Err(WebError::not_found(format!("没有策略 {id}")));
+    }
+    // ② 目录审计(与回测/启动同口径): 未声明的冗余副本不许改 —— 它连跑都不许跑。
+    if let Some(why) = crate::strategies::catalog::run_block(&id) {
+        return Err(WebError::bad_request_code(why, "strategy_unavailable"));
+    }
+    // ③ 内置策略不可改(脚本编译期嵌入, 磁盘上不存在实例 TOML)。
+    let entry = catalog::find(&id).ok_or_else(|| WebError::not_found(format!("没有策略 {id}")))?;
+    if entry.source == Source::Builtin {
+        return Err(WebError::conflict(
+            format!(
+                "'{id}' 是内置策略, 代码与参数清单随版本发布, 不能直接改; \
+                 请先「复制」为你自己的策略, 再改它的参数"
+            ),
+            "builtin",
+        ));
+    }
+
+    // ④ 读现有实例配置。**不存在 → 404**: 用户策略理应有实例 TOML;
+    //    真没有说明文件被删了, 此时"新建实例"是另一件事(走 save_strategy), 不是本端点。
+    let Some(text) = read_instance_toml(&state.root, &id)? else {
+        return Err(WebError::not_found(format!(
+            "策略 {id} 还没有实例配置(找不到 strategies/{id}.toml); \
+             请先用「新建/复制」把它落盘, 再改参数"
+        )));
+    };
+    let mut config = ricow_strategy::StrategyConfig::from_toml(&text)
+        .map_err(|e| WebError::bad_request(format!("实例 TOML 解析失败: {e}")))?;
+
+    // ⑤ 应用参数覆盖。**保留引擎内部键**: `script`/`script_path` 是装载细节,
+    //    前端传了也不采纳 —— 让用户改它只会让引擎找不到脚本。
+    let incoming = config_values(&req.params).map_err(WebError::bad_request)?;
+    for (key, value) in incoming {
+        if key == "script" || key == "script_path" {
+            continue;
+        }
+        config.params.insert(key, value);
+    }
+    // ⑥ 交易对: 缺省保持原值; 给了空串 → 400(空交易对会让引擎起不来, 别静默接受)。
+    if let Some(pair) = req.pair {
+        let pair = pair.trim().to_string();
+        if pair.is_empty() {
+            return Err(WebError::bad_request("交易对不能为空"));
+        }
+        config.params.insert("pair".to_string(), ConfigValue::String(pair));
+    }
+
+    // ⑦ 落盘: 走引擎同一份内核(`write_strategy_files` 会先备份 .lua/.toml)。
+    //    它要求 params 里有 `script`(Lua 源码) —— 从磁盘把现有脚本读回来塞进去,
+    //    这样**代码原样重写**(内容不变), 不会动用户的代码。
+    let market = config.market.clone();
+    let lua_path = crate::commands::ensure_strategies_dir_in(&state.root)?
+        .join(&market)
+        .join(format!("{id}.lua"));
+    let code = std::fs::read_to_string(&lua_path).map_err(|e| {
+        WebError::from(CoreError::Exchange(format!(
+            "读策略脚本 {} 失败: {e}; 未改动任何文件",
+            lua_path.display()
+        )))
+    })?;
+    config.params.insert("script".to_string(), ConfigValue::String(code));
+
+    let dir = crate::commands::ensure_strategies_dir_in(&state.root)?;
+    let deployed =
+        ricow_engine::write_strategy_files(config, &dir, true).map_err(WebError::from)?;
+
+    // ⑧ 回读校验: 落盘的实际值(不是回显请求)。`script`/`script_path` 不进回包。
+    let after = read_instance_toml(&state.root, &id)?
+        .ok_or_else(|| WebError::from(CoreError::Exchange("落盘后读不到实例 TOML".to_string())))?;
+    let mut cfg = ricow_strategy::StrategyConfig::from_toml(&after)
+        .map_err(|e| WebError::from(CoreError::Parse(format!("落盘后回读解析失败: {e}"))))?;
+    cfg.params.remove("script");
+    cfg.params.remove("script_path");
+    let pair = cfg.params.get("pair").and_then(|v| v.as_str()).map(|s| s.to_string());
+    cfg.params.remove("pair");
+
+    Ok(Json(InstanceReply {
+        pair,
+        params: cfg.params,
+        backup: deployed.backup.map(|p| p.display().to_string()),
+    }))
+}
+
 #[cfg(test)]
 mod tests;

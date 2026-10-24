@@ -182,7 +182,15 @@
   };
 
   /// 当前视图 → 打开时高亮的那一段(帮助"先答你在哪")。
-  const CONTEXT = { strategies: "start", runs: "faq", chat: "talk", markets: "terms" };
+  /// 062: 加 `dashboard`(概览)→ 落在"术语"段(概览上的数字与链接多指向术语); `keys`/`settings`
+  /// 原本没有对应段, 保持"不高亮任何段"(不硬凑)。
+  const CONTEXT = {
+    strategies: "start",
+    runs: "faq",
+    chat: "talk",
+    markets: "terms",
+    dashboard: "terms",
+  };
 
   // ---------- DOM ----------
   const $ = (id) => document.getElementById(id);

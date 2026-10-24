@@ -1,89 +1,167 @@
-/* Ricow Web 前端样式 (025): 深色系沿用 `website/style.css` 的同一套 `:root` 变量 (FR-023)。
-   034: 主题变量化 —— `:root` = 深色(默认), `[data-theme="light"]` / `[data-theme="red"]`
-   各覆盖一份变量; 全部组件只准引用变量, 不准再写死颜色。 */
-:root {
-  color-scheme: dark;
-  --bg: #0e1116;
-  --panel: #161b22;
-  /* 面板之上再抬一层的表面: 会话悬停 / 用户气泡 / 输入行等。 */
-  --raised: #1d232b;
-  --border: #2b333d;
-  --fg: #e6edf3;
-  --muted: #9aa7b4;
-  --accent: #4dd4ac;
-  --accent-dim: #2f8f74;
+/* Ricow Web 前端样式 (025): 主题变量化 —— `:root` / `[data-theme="dark"]` / `[data-theme="red"]`
+   各覆盖一份变量; 全部组件只准引用变量, 不准再写死颜色。
+
+   062: 视觉基准换成 **fmz.com(发明者量化) 实测值**(2026-10-23 登录实站 CDP 量出来的, 不是抄印象) ——
+   主色 #1CAF83 / 内容底 #F4F6F7 / 卡片 #FFFFFF + 描边 #F0F0F0 / 表头 #FBFBFB / 字号 14px。
+
+   三块结构的分工(062 调整过, 别改回去):
+     · `:root` **与** `[data-theme="light"]` = **fmz 浅色** —— 新的**默认**档, 首屏不闪
+       (不设 data-theme 也长这样)。写成**一个选择器两条规则**, 故浅色变量只维护一份
+       (034 警告过"浅色那套维护两遍, 系统一换色两边迟早分叉")。
+     · `[data-theme="dark"]` = 深色
+     · `[data-theme="red"]`  = 红色
+   `auto` 解析出的 "light" 命中 `[data-theme="light"]`、"dark" 命中 `[data-theme="dark"]`
+   —— 两边都有定义, 不断链。
+
+   **主色与涨跌色必须分开**(062 Q3): fmz 的主色是**绿** #1CAF83, 而本项目按 A 股口径
+   "涨红跌绿", 跌也是绿 —— 若共用一个变量, 主色与跌势在界面上分不开。故:
+     · `--accent` = **只做主色**(选中项、主按钮、图标强调)
+     · `--up`     = 涨(红)  · `--down` = 跌(绿, 比主色暗一档, 两者可辨)
+   `--error` 保留为**危险/错误**语义(与 `--up` 同色系但不同名, 免得"错误=上涨"混读)。 */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6f7;
+  --panel: #ffffff;
+  /* 面板之上再抬一层的表面: 表头 / 次级面 / 悬停行。 */
+  --raised: #fafafa;
+  --border: #f0f0f0;
+  /* 描边加强档: 输入框 / 按钮描边(卡片描边太浅, 表单控件要能看清边界)。 */
+  --border-strong: #d9d9d9;
+  --fg: #333333;
+  --fg-2: rgba(51, 51, 51, 0.65);
+  --fg-3: rgba(51, 51, 51, 0.45);
+  --fg-4: rgba(51, 51, 51, 0.25);
+  /* `--muted` 是"次级文字"的老名字(全站引用点多), 保留别名指向 `--fg-2`。 */
+  --muted: #5b6672;
+  --accent: #1caf83;
+  --accent-dim: #17976f;
   /* 强调色之上的文字(主按钮文字)。 */
-  --on-accent: #06231b;
-  --accent-soft: rgba(77, 212, 172, 0.12);
-  --accent-soft-2: rgba(77, 212, 172, 0.1);
-  --warn: #e3b341;
-  --error: #f85149;
-  --danger-border: rgba(248, 81, 73, 0.5);
-  --overlay: rgba(0, 0, 0, 0.55);
-  --raise-1: rgba(255, 255, 255, 0.02);
-  --raise-2: rgba(255, 255, 255, 0.035);
+  --on-accent: #ffffff;
+  --accent-soft: #e8fcf7;
+  --accent-soft-2: rgba(28, 175, 131, 0.1);
+  /* 涨跌色(062): 与主色分开, 涨红跌绿(A 股口径)。跌绿比主色暗一档, 两者不撞。 */
+  --up: #f5222d;
+  --down: #0d9b6c;
+  /* 危险 / 错误语义(不是"涨")。 */
+  --error: #cf222e;
+  --danger-border: rgba(207, 34, 46, 0.45);
+  --warn: #96660a;
+  --overlay: rgba(15, 23, 32, 0.4);
+  --raise-1: rgba(15, 23, 32, 0.025);
+  --raise-2: rgba(15, 23, 32, 0.05);
+  /* 尺寸令牌(062): fmz 实测 —— 圆角 4px / 控件高 32px / 顶栏 64px / 侧栏 160px / 菜单项 48px。 */
+  --radius: 4px;
+  --radius-lg: 6px;
+  --control-h: 32px;
+  --topbar-h: 64px;
+  --sider-w: 160px;
+  --menu-item-h: 48px;
   --mono:
     "Cascadia Code", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
     "Liberation Mono", monospace;
   /* 039: K 线均线配色 (MA7/25/99) —— 与其它颜色一样, 只在这里定义, 组件一律引用变量。 */
-  --ma-7: #e3b341;
-  --ma-25: #58a6ff;
-  --ma-99: #bc8cff;
-  --ai-badge: #bc8cff;
-}
-
-/* 034 白色浅色主题: 背景白、面板浅灰, 强调色加深保证对比度(WCAG AA)。 */
-[data-theme="light"] {
-  color-scheme: light;
-  --bg: #ffffff;
-  --panel: #f5f7f9;
-  --raised: #eceff3;
-  --border: #d8dee5;
-  --fg: #1f2328;
-  --muted: #5b6672;
-  --accent: #0d9b6c;
-  --accent-dim: #0a7d57;
-  --on-accent: #ffffff;
-  --accent-soft: rgba(13, 155, 108, 0.12);
-  --accent-soft-2: rgba(13, 155, 108, 0.09);
-  --warn: #96660a;
-  --error: #cf222e;
-  --danger-border: rgba(207, 34, 46, 0.45);
-  --overlay: rgba(15, 23, 32, 0.4);
-  --raise-1: rgba(15, 23, 32, 0.025);
-  --raise-2: rgba(15, 23, 32, 0.05);
-  /* 039: 白底上要保证对比度, 均线用加深版。 */
   --ma-7: #9a6a00;
   --ma-25: #0969da;
   --ma-99: #8250df;
   --ai-badge: #8250df;
+  /* 代码高亮三色(062 收进变量): 浅底上对比度达 AA。 */
+  --hl-str: #a15c00;
+  --hl-num: #0550ae;
+  --hl-kw: #b32424;
+  /* 浮层阴影(062 收进变量): 浅色底上要更重一点才看得出"浮在上面"。 */
+  --shadow-pop: 0 8px 24px rgba(15, 23, 32, 0.14);
+  --shadow-panel: 0 12px 40px rgba(15, 23, 32, 0.16);
+  --shadow-modal: 0 18px 48px rgba(15, 23, 32, 0.18);
 }
 
-/* 034 红色主题: 深红褐面 + 珊瑚强调 —— 整体仍是暗色系, 红色为主色调。 */
+/* 深色主题(062: 原 `:root` 的深色内容搬到这里): 深红褐面 + 珊瑚强调 —— 整体仍是暗色系。 */
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0e1116;
+  --panel: #161b22;
+  --raised: #1d232b;
+  --border: #2b333d;
+  --border-strong: #3d444d;
+  --fg: #e6edf3;
+  --fg-2: #9aa7b4;
+  --fg-3: #7d8792;
+  --fg-4: #59626c;
+  --muted: #9aa7b4;
+  --accent: #35d0a5;
+  --accent-dim: #2a9d78;
+  --on-accent: #06231b;
+  --accent-soft: rgba(53, 208, 165, 0.14);
+  --accent-soft-2: rgba(53, 208, 165, 0.1);
+  --up: #f85149;
+  --down: #2a9d78;
+  --error: #f85149;
+  --danger-border: rgba(248, 81, 73, 0.5);
+  --warn: #e3b341;
+  --overlay: rgba(0, 0, 0, 0.55);
+  --raise-1: rgba(255, 255, 255, 0.02);
+  --raise-2: rgba(255, 255, 255, 0.035);
+  --radius: 4px;
+  --radius-lg: 6px;
+  --control-h: 32px;
+  --topbar-h: 64px;
+  --sider-w: 160px;
+  --menu-item-h: 48px;
+  --ma-7: #e3b341;
+  --ma-25: #58a6ff;
+  --ma-99: #bc8cff;
+  --ai-badge: #bc8cff;
+  --hl-str: #d29922;
+  --hl-num: #79b8ff;
+  --hl-kw: #ff7b72;
+  --shadow-pop: 0 8px 24px rgb(0 0 0 / 45%);
+  --shadow-panel: 0 12px 40px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 18px 48px rgba(0, 0, 0, 0.42);
+}
+
+/* 红色主题: 深红褐面 + 珊瑚强调 —— 整体仍是暗色系, 红色为主色调。 */
 [data-theme="red"] {
   color-scheme: dark;
   --bg: #221013;
   --panel: #2d151a;
   --raised: #3a1c21;
   --border: #56282f;
+  --border-strong: #6d343c;
   --fg: #f6e7e4;
+  --fg-2: #c19b97;
+  --fg-3: #a5807c;
+  --fg-4: #7a5c58;
   --muted: #c19b97;
   --accent: #ff8f7d;
   --accent-dim: #c9604f;
   --on-accent: #330f0e;
   --accent-soft: rgba(255, 143, 125, 0.14);
   --accent-soft-2: rgba(255, 143, 125, 0.1);
-  --warn: #e8b04b;
+  --up: #ff6b7a;
+  --down: #4a9e7c;
   --error: #ff8494;
   --danger-border: rgba(255, 132, 148, 0.5);
+  --warn: #e8b04b;
   --overlay: rgba(12, 4, 5, 0.65);
   --raise-1: rgba(255, 255, 255, 0.03);
   --raise-2: rgba(255, 255, 255, 0.05);
+  --radius: 4px;
+  --radius-lg: 6px;
+  --control-h: 32px;
+  --topbar-h: 64px;
+  --sider-w: 160px;
+  --menu-item-h: 48px;
   /* 039: 红褐底上的均线取更亮的一档, 保证可辨识。 */
   --ma-7: #f0c674;
   --ma-25: #7cc4ff;
   --ma-99: #d7b0ff;
   --ai-badge: #d7b0ff;
+  --hl-str: #e3b341;
+  --hl-num: #79b8ff;
+  --hl-kw: #ff7b72;
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-panel: 0 12px 40px rgba(0, 0, 0, 0.45);
+  --shadow-modal: 0 18px 48px rgba(0, 0, 0, 0.48);
 }
 * {
   box-sizing: border-box;
@@ -107,22 +185,34 @@ body {
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
+/* 062: 骨架三段式 —— 顶栏(全宽 64px) / 侧栏(160px) / 内容区。
+   旧结构是"侧栏 + (main 里含顶栏)"的左右两段, 顶栏被挤在内容区上方 —— 与 fmz 不一样。
+   `#app` 是 column(顶栏在上), `#shell` 才是 row(侧栏 | 内容区) —— 少这一层布局就废了。 */
 #app {
   display: flex;
+  flex-direction: column;
   height: 100vh;
+}
+/* 062: 侧栏与内容区**同一行**。`flex: 1` 让内容区吃掉剩余宽度, `min-width: 0` 防表格撑破。 */
+#shell {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
 }
 .muted {
   color: var(--muted);
 }
 
-/* ---- 左: 竖长会话列表 ---- */
+/* ---- 左: 侧栏(062: 只放导航; 会话列表已搬进 `#view-chat`) ---- */
 #sidebar {
-  flex: 0 0 250px;
-  width: 250px;
+  flex: 0 0 var(--sider-w);
+  width: var(--sider-w);
   display: flex;
   flex-direction: column;
   background: var(--panel);
   border-right: 1px solid var(--border);
+  overflow-y: auto;
 }
 .side-head {
   display: flex;
@@ -132,11 +222,27 @@ body {
   padding: 12px 14px;
   border-bottom: 1px solid var(--border);
 }
+/* 062: 品牌标移到顶栏, 侧栏不再放 —— 与 fmz 一致(侧栏纯菜单)。 */
 .brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 600;
   letter-spacing: 0.5px;
-  color: var(--accent);
+  color: var(--fg);
 }
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 700;
+  font-size: 14px;
+}
+/* 062: 会话列表搬进 `.chat-sessions`(对话视图内), 选中态对齐 fmz 菜单(绿底绿字, 无左边框)。 */
 #session-list {
   flex: 1;
   margin: 0;
@@ -146,19 +252,16 @@ body {
 }
 #session-list li {
   padding: 8px 10px;
-  border-radius: 8px;
-  border-left: 2px solid transparent;
-  color: var(--muted);
+  border-radius: var(--radius);
+  color: var(--fg);
   cursor: pointer;
 }
 #session-list li:hover {
   background: var(--raised);
-  color: var(--fg);
 }
 #session-list li.active {
-  background: var(--raised);
-  border-left-color: var(--accent);
-  color: var(--fg);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 #session-list li.plain {
   cursor: default;
@@ -201,28 +304,102 @@ body {
 }
 
 /* ---- 右上: 对话流 ---- */
+/* 062: `#main` 变成 fmz 的内容区 —— 底色 #F4F6F7(fmz 实测), 顶栏已提到 `#app` 顶层。
+   面包屑(`#crumbs`)与视图容器都放在这里, 靠 `#main` 的 padding 对齐 fmz 的 16px 左边距。 */
 #main {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
+  background: var(--bg);
+  overflow-y: auto;
+  padding: 0 16px;
 }
+/* 062: 面包屑行 —— 内容区顶部, 高度与 fmz 一致(12px 上边距 + 22px 行高)。 */
+#crumbs {
+  flex: 0 0 auto;
+  padding: 12px 0 10px;
+}
+/* 引导条通栏: 它是内容区顶部的横幅, 不该只占内容宽度 —— 故用负 margin 顶到两侧。 */
+#main > .onboard {
+  margin: 0 -16px;
+  padding-left: 16px;
+  padding-right: 16px;
+}
+/* 062: 顶栏全宽 64px(fmz 实测), 白底, 与侧栏/内容区同列。 */
 #topbar {
+  flex: 0 0 var(--topbar-h);
+  height: var(--topbar-h);
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 16px;
+  padding: 0 16px 0 20px;
+  background: var(--panel);
   border-bottom: 1px solid var(--border);
+}
+/* 062: 右侧控件组(fmz 的顶栏图标区)—— 靠右排。 */
+.top-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+/* 062: 顶栏全局搜索框(fmz 实测: 浅灰底、圆角、无边框)。**本轮只做外观, 输入框 disabled**。 */
+.top-search {
+  flex: 0 1 320px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: var(--radius-lg);
+  background: var(--bg);
+  color: var(--fg-3);
+}
+.top-search-ico {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+.top-search-ico svg {
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+.top-search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 14px;
+}
+/* disabled 的输入框: 浏览器默认会把文字变灰 —— 但我们要的是"占位提示"的灰, 不是"禁用"的灰。 */
+.top-search-input:disabled {
+  color: var(--fg-4);
+  -webkit-text-fill-color: var(--fg-4);
+  opacity: 1;
+  cursor: not-allowed;
 }
 /* 059 UX-01: 顶栏「当前视图名」。比会话名更醒目 —— 它是"我在哪一屏"的唯一答案,
    会话名(#session-title)是它的补充, 且只在对话视图出现(见下面 [data-view] 规则)。 */
 #view-title {
   flex: 0 0 auto;
   font-weight: 600;
-  color: var(--text);
+  /* 062 修: 原来写的是 `var(--text)` —— **这个变量从来没定义过**(全仓只有这一处引用)。
+     CSS 变量取不到值时该声明整体作废, 于是这一行等于没写 —— 顶栏视图名一直继承父级颜色。
+     正确写法是 `--fg`。 */
+  color: var(--fg);
 }
 #session-title {
-  flex: 1;
+  /* 062: 原为 `flex: 1`(占满剩余宽度) —— 那样会把右侧控件组推走, 会话名自己却贴着视图名,
+     视觉上像"顶栏中间悬着个名字"。fmz 的顶栏是「左: 品牌/搜索, 右: 图标区」,
+     会话名属于左侧信息, 紧跟视图名即可。 */
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
@@ -364,7 +541,7 @@ body {
   background: var(--panel);
   border: 1px solid var(--accent-dim);
   border-radius: 10px;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+  box-shadow: var(--shadow-pop);
 }
 .term-pop[hidden] {
   display: none;
@@ -764,30 +941,62 @@ body {
    032 阶段 1(纯追加, 上方既有规则一字未动): 左侧 hash 导航 + 多视图外壳。
    ============================================================ */
 
-/* ---- 左: 主导航(032): 纵向五项, active 高亮复用会话列表同一配色 ---- */
+/* ---- 左: 主导航(062 改成 fmz 形态) ----
+   fmz 实测: 菜单项高 48px、内边距 0 16px 0 24px、选中态 = 底 #E8FCF7 + 字 #1CAF83,
+   **无左边框、无圆角**(旧规则是"左边框 + 圆角 8px", 与 fmz 不一致)。 */
 #nav {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 8px;
-  border-bottom: 1px solid var(--border);
+  gap: 0;
+  padding: 8px 0;
 }
 #nav a {
-  padding: 7px 10px;
-  border-radius: 8px;
-  border-left: 2px solid transparent;
-  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--menu-item-h);
+  padding: 0 16px 0 24px;
+  color: var(--fg);
   text-decoration: none;
-  font-size: 0.86rem;
+  font-size: 14px;
 }
 #nav a:hover {
   background: var(--raised);
-  color: var(--fg);
 }
 #nav a.active {
-  background: var(--raised);
-  border-left-color: var(--accent);
-  color: var(--fg);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 500;
+}
+/* 062: 导航图标位(fmz 的线性图标)。SVG 由 `icons.js` 注入 —— 先占位, 没有图标时也不塌。 */
+#nav a .nav-ico {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+}
+/* 062: 导航文案层 —— `data-zh`/`data-en` 挂它而不是 `<a>`:
+   `common.js` 的 applyLang 是 `node.textContent = ...`, 而 textContent 赋值**清空全部子节点** ——
+   挂在 `<a>` 上会把注入的图标一起抹掉(实测: 装饰完 7 个 → applyLang 跑完 0 个)。 */
+#nav a .nav-text {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+#nav a .nav-ico svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.75;
+}
+#nav a.active .nav-ico svg {
+  opacity: 1;
 }
 
 /* ---- 视图容器: 同一时间只有一个 .view.active(router.js 切换) ---- */
@@ -800,10 +1009,39 @@ body {
   min-width: 0;
   min-height: 0;
 }
-/* 对话视图: 中栏 .chat-col(对话流 + 输入区) + 右栏 #panels,
-   复刻拆分前 #app 横向三区布局; stream/composer/panels 自身规则不变。 */
+/* 对话视图(062): 会话列表条 + 中栏对话流 + 右栏三面板 —— 三段, 与 fmz 的"内容区里多栏"一致。
+   旧的横向三区布局复刻的是拆分前 `#app` 的样子(会话列表在侧栏), 现在会话列表进了本视图,
+   故这里多一栏: 会话列表条(220px) + .chat-col + #panels。 */
 #view-chat {
   flex-direction: row;
+  /* 062: 对话视图是**工作台**(会话条 + 对话流 + 面板), 三栏要顶到内容区两侧 ——
+     用负 margin 抵消 `#main` 的 16px 内边距。面包屑仍留在 `#main` 里(那是导航, 不是内容)。 */
+  margin: 0 -16px;
+  padding-bottom: 16px;
+}
+/* 062: 会话列表条(从侧栏搬进对话视图)。窄屏隐藏 —— 侧栏抽屉里没有它, 故窄屏下会话列表
+   只能靠顶栏进入; 这与 059 的"窄屏抽屉"设计一致(会话列表不是全局概念)。 */
+.chat-sessions {
+  flex: 0 0 220px;
+  width: 220px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+.chat-sessions-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 12px 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.chat-sessions-title {
+  font-weight: 600;
+  font-size: 14px;
 }
 .chat-col {
   flex: 1;
@@ -812,13 +1050,15 @@ body {
   display: flex;
   flex-direction: column;
 }
-/* 四个占位视图(032 阶段 1 无业务, 只放一个标题; 后续阶段替换内容)。 */
+/* 五个占位视图(032 阶段 1 无业务, 只放一个标题; 后续阶段替换内容)。
+   062: 左右内边距由 `#main` 统一给(面包屑与视图要对齐同一列), 这里不再重复。 */
 #view-markets,
 #view-strategies,
 #view-runs,
-#view-settings {
+#view-settings,
+#view-dashboard {
   flex-direction: column;
-  padding: 18px 20px;
+  padding: 0 0 24px;
 }
 .placeholder-title {
   margin: 0;
@@ -1278,15 +1518,17 @@ body {
   font-weight: 600;
 }
 /* C10: 盘口买卖配色 —— **买红卖绿**(国内行情惯例, 与全站"红 = 多头力量"自洽)。
-   注: 这与部分国际经纪商(bid 绿 / ask 红)相反, 按本项目"中国用户 + 涨红跌绿"的口径统一。 */
+   注: 这与部分国际经纪商(bid 绿 / ask 红)相反, 按本项目"中国用户 + 涨红跌绿"的口径统一。
+   062: 买盘红引 `--up`、卖盘绿引 `--down` —— 不再借用 `--error`/`--accent`
+   (主色是 fmz 的绿 #1CAF83, 与"跌绿"共用一个变量就分不开了)。 */
 .mk-book-col.is-bid {
-  --book-side: var(--error);
+  --book-side: var(--up);
   /* 深度条的底色: 主题红的 18% 透明版。`color-mix` 不被支持时整体退化为无色条(不报错)。 */
-  --depth-color: color-mix(in srgb, var(--error) 18%, transparent);
+  --depth-color: color-mix(in srgb, var(--up) 18%, transparent);
 }
 .mk-book-col.is-ask {
-  --book-side: var(--accent);
-  --depth-color: color-mix(in srgb, var(--accent) 18%, transparent);
+  --book-side: var(--down);
+  --depth-color: color-mix(in srgb, var(--down) 18%, transparent);
 }
 .mk-book-col.is-bid .mk-book-subhead,
 .mk-book-col.is-ask .mk-book-subhead {
@@ -1391,10 +1633,13 @@ body {
   overflow-y: auto;
   padding: 4px 4px 24px;
 }
+/* 063: 详情/列表**通栏**(原先 1080px 上限)。
+   fmz 的策略库与编辑器都是通栏的 —— 表格挤在 1080px 里, 五列均分后
+   名称列(最长的一列)会折行。内容区本身已有 16px 边距, 不需要再限宽。 */
 .sg-listview,
 .sg-detail {
-  max-width: 1080px;
-  margin: 0 auto;
+  max-width: none;
+  margin: 0;
   width: 100%;
 }
 
@@ -1491,10 +1736,12 @@ body {
 }
 
 /* 列表态: 市场 × 来源 四组 */
+/* 063: 列表容器改**单列**。
+   原先是两列网格 —— 那是给"四组分区卡片"设计的(每个分区一列)。
+   063 起策略库是**一张表**, 塞进两列网格的第一列里, 表格只有半屏宽,
+   名称列被挤到折行。表格要通栏(fmz 的 `/m/strategies` 就是通栏的)。 */
 .sg-groups {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  display: block;
 }
 .sg-group {
   min-width: 0;
@@ -2345,11 +2592,12 @@ body {
 .sg-editor-wrap .sg-code::selection {
   background: var(--accent-soft-2);
 }
-/* token 配色: 取中间调, 深色底/浅色底都可读 */
+/* token 配色: 取中间调, 深色底/浅色底都可读。
+   062: 三处写死的色值收进变量(浅色底上原来的 #c98a00/#3572b0/#c0392b 对比度不够)。 */
 .hl-com { color: var(--muted); font-style: italic; }
-.hl-str { color: #c98a00; }
-.hl-num { color: #3572b0; }
-.hl-kw { color: #c0392b; }
+.hl-str { color: var(--hl-str); }
+.hl-num { color: var(--hl-num); }
+.hl-kw { color: var(--hl-kw); }
 .hl-api { color: var(--accent); font-weight: 600; }
 
 /* API 速查表(specs/lua-api 摘要) */
@@ -2389,7 +2637,7 @@ body {
   font-size: 0.8rem;
 }
 .sg-warnlist-title {
-  color: var(--warn, #d29922);
+  color: var(--warn);
   font-weight: 600;
 }
 .sg-warnlist-ul {
@@ -2433,8 +2681,8 @@ body {
   font-size: 1.05rem;
   font-weight: 600;
 }
-.sg-mcard-value.up { color: var(--error); }
-.sg-mcard-value.down { color: var(--accent); }
+.sg-mcard-value.up { color: var(--up); }
+.sg-mcard-value.down { color: var(--down); }
 .sg-mcard-value.flat { color: var(--fg); }
 .sg-mcard-sub {
   color: var(--muted);
@@ -2646,8 +2894,8 @@ body {
 .sg-hist-table td:first-child {
   text-align: left;
 }
-.sg-hist-table td.up { color: var(--error); }
-.sg-hist-table td.down { color: var(--accent); }
+.sg-hist-table td.up { color: var(--up); }
+.sg-hist-table td.down { color: var(--down); }
 .sg-hist-table tr.sg-best {
   background: var(--accent-soft);
 }
@@ -3618,7 +3866,7 @@ body.help-open {
   color: var(--fg);
   font-size: 0.82rem;
   line-height: 1.4;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  box-shadow: var(--shadow-pop);
   pointer-events: auto;
   cursor: pointer;
 }
@@ -3731,16 +3979,18 @@ body.help-open {
     display: inline-block;
     flex: none;
   }
+  /* 062: 顶栏已提到 `#app` 顶层(全宽), 抽屉侧栏必须从**顶栏下方**开始, 否则会盖住顶栏
+     (旧的 `top: 0` 是因为那时顶栏在 `#main` 里、与侧栏不同列)。 */
   #sidebar {
     position: fixed;
-    top: 0;
+    top: var(--topbar-h);
     bottom: 0;
     left: 0;
     z-index: 60;
     width: min(280px, 82vw);
     transform: translateX(-100%);
     transition: transform 0.18s ease;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+    box-shadow: var(--shadow-panel);
   }
   #app.side-open #sidebar {
     transform: translateX(0);
@@ -3748,14 +3998,23 @@ body.help-open {
   #app.side-open .side-scrim {
     display: block;
     position: fixed;
-    inset: 0;
+    inset: var(--topbar-h) 0 0 0;
     z-index: 55;
     background: var(--overlay);
   }
-  /* 顶栏在窄屏要挤下 ☰ + 标题 + 主题 + 语言 + 帮助: 收紧间距。 */
+  /* 顶栏在窄屏要挤下 ☰ + 品牌 + 标题 + 主题 + 语言 + 帮助: 收紧间距、藏掉品牌名。 */
   #topbar {
     gap: 8px;
-    padding: 8px 12px;
+    padding: 0 12px;
+  }
+  #topbar .brand {
+    font-size: 0;
+    gap: 0;
+  }
+  /* 062: 窄屏下会话列表条放不下(侧栏抽屉里没有它), 收起 —— 由 `.chat-sessions` 的
+     `display:none` 实现, 免得对话流被挤成一条缝。 */
+  .chat-sessions {
+    display: none;
   }
   /* 对话: 上下堆叠; 面板在下方, 高度封顶(内部仍各自可滚)。 */
   #view-chat {
@@ -3938,10 +4197,10 @@ body.help-open {
   color: var(--muted);
 }
 .sg-val-mval.up {
-  color: var(--error);
+  color: var(--up);
 }
 .sg-val-mval.down {
-  color: var(--accent);
+  color: var(--down);
 }
 
 /* ── B7: 命令面板(Ctrl/⌘+K) ──────────────────────────────────────────────────────
@@ -3965,7 +4224,7 @@ body.help-open {
   background: var(--raised);
   border: 1px solid var(--border);
   border-radius: 10px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+  box-shadow: var(--shadow-modal);
   overflow: hidden;
 }
 .palette-input {
@@ -4074,5 +4333,1162 @@ body.palette-open {
   }
   .palette-keys {
     display: none;
+  }
+}
+
+/* ============================================================
+   062: fmz.com 视觉语言的通用组件层(配合 assets/ui.js)。
+
+   数值全部取自 fmz 实测(2026-10-23 登录实站 CDP 量出):
+   卡片圆角 4px / 描边 #F0F0F0 / 按钮高 32px / 标签页高 50px / 选中底 #E8FCF7。
+   ============================================================ */
+
+/* ---- 卡片(fmz `.ant-card`) ---- */
+.ui-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.ui-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 24px;
+}
+.ui-card-title {
+  position: relative;
+  padding-left: 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+}
+/* 标题前的主色竖条(fmz 的卡片标题标记)。 */
+.ui-card-title::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 3px;
+  bottom: 3px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.ui-card-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ui-card-body {
+  padding: 16px 24px;
+}
+/* 有头部时, body 的上内边距收紧(fmz 的卡片头与 body 是连着的)。 */
+.ui-card-head + .ui-card-body {
+  padding-top: 0;
+}
+
+/* ---- 标签页(fmz `.ant-tabs`) ---- */
+.ui-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+}
+.ui-tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 50px;
+  padding: 0 18px;
+  color: var(--fg-2);
+  cursor: pointer;
+  user-select: none;
+}
+.ui-tab:hover {
+  color: var(--fg);
+}
+.ui-tab.on {
+  color: var(--accent);
+}
+.ui-tab.on::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+}
+.ui-tab-count {
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--raised);
+  color: var(--fg-3);
+  font-size: 12px;
+}
+.ui-tab.on .ui-tab-count {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ---- 空态(fmz `.ant-empty`) ---- */
+.ui-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 46px 16px;
+  text-align: center;
+}
+.ui-empty-art svg {
+  stroke: var(--fg-4);
+  fill: none;
+  stroke-width: 1.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ui-empty-text {
+  color: var(--fg-3);
+}
+.ui-empty-cta {
+  margin-top: 4px;
+}
+
+/* ---- 面包屑(fmz `.ant-breadcrumb`) ----
+   fmz 实测: 内容区顶部 12px 处, 字号 14px, 三级文字色, 格式「控制中心 / 策略库」。 */
+.ui-crumbs {
+  color: var(--fg-3);
+  font-size: 14px;
+  padding: 4px 0 14px;
+}
+.ui-crumb-sep {
+  margin: 0 6px;
+}
+.ui-crumb-link {
+  color: var(--fg-3);
+  text-decoration: none;
+}
+.ui-crumb-link:hover {
+  color: var(--accent);
+}
+.ui-crumb-current {
+  color: var(--fg-2);
+}
+
+/* ---- 按钮(fmz `.ant-btn`) ---- */
+.ui-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--control-h);
+  padding: 0 15px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--fg-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ui-btn-ico {
+  display: inline-grid;
+  place-items: center;
+}
+.ui-btn-ico svg {
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* primary = 实色主色(fmz 的主按钮) */
+.ui-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.ui-btn-primary:hover {
+  background: var(--accent-dim);
+  border-color: var(--accent-dim);
+}
+/* default = 描边主色(fmz 的次按钮) */
+.ui-btn-default {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.ui-btn-default:hover {
+  background: var(--accent-soft);
+}
+/* ghost = 中性描边(非主色, 用于次要动作) */
+.ui-btn-ghost {
+  border-color: var(--border-strong);
+  color: var(--fg-2);
+}
+.ui-btn-ghost:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+/* text = 无框主色字 */
+.ui-btn-text {
+  color: var(--accent);
+  padding: 0 8px;
+}
+.ui-btn-text:hover {
+  background: var(--accent-soft);
+}
+/* danger = 危险动作(红) */
+.ui-btn-danger {
+  border-color: var(--error);
+  color: var(--error);
+}
+.ui-btn-danger:hover {
+  background: var(--danger-border);
+}
+
+/* ---- 状态标签 ---- */
+.ui-tag {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--raised);
+  color: var(--fg-2);
+  font-size: 12px;
+}
+.ui-tag-on {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent);
+}
+.ui-tag-warn {
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
+  color: var(--warn);
+}
+
+/* ---- 统计块(fmz 仪表盘) ---- */
+.ui-stat {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 0;
+}
+.ui-stat-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.ui-stat-icon svg {
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ui-stat-value {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--fg);
+}
+.ui-stat-warn .ui-stat-value {
+  color: var(--warn);
+}
+.ui-stat-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--fg-3);
+}
+
+/* ---- 快捷入口(fmz 仪表盘六宫格) ---- */
+.ui-quick {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--fg-2);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.ui-quick svg {
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ui-quick:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ============================================================
+   062: 概览视图(fmz 的 P1 仪表盘范式)—— 配合 assets/dashboard.js。
+   布局: 左栏(统计 / 快捷入口 / 文档) + 右栏(运行状态)。
+   ============================================================ */
+.dash-layout {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 16px;
+  align-items: start;
+}
+.dash-col {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+/* 统计: 四项两列(fmz 的概览是四列, 但它六格里有两格是消息/账户 —— ricow 无账号,
+   剩下的四项两列比三列匀; 详见 dashboard.js 里 renderStats 的说明)。 */
+.dash-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 18px 24px;
+}
+/* 快捷入口六宫格。 */
+.dash-quick {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 12px;
+}
+/* 运行状态卡。 */
+.dash-running-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+.dash-running-num {
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+.dash-running-label {
+  font-size: 12px;
+  color: var(--fg-3);
+}
+.dash-running-empty {
+  margin-top: 12px;
+  color: var(--fg-3);
+  font-size: 13px;
+}
+/* 实例清单: 点一条进策略详情。 */
+.dash-run-list {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.dash-run-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 4px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.dash-run-item:last-child {
+  border-bottom: none;
+}
+.dash-run-item:hover {
+  background: var(--accent-soft);
+}
+.dash-run-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* 文档入口卡(fmz 的文档卡)。 */
+.dash-docs {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+.ui-doc-link {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ui-doc-link:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.ui-doc-text {
+  min-width: 0;
+}
+.ui-doc-title {
+  font-weight: 500;
+  color: var(--fg);
+}
+.ui-doc-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--fg-3);
+}
+.ui-doc-arrow {
+  margin-left: auto;
+  color: var(--fg-3);
+}
+.ui-doc-arrow svg {
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* 整页失败态: 如实给原因 + 重试, 不静默。 */
+.dash-error-msg {
+  color: var(--error);
+  font-size: 13px;
+  margin-bottom: 12px;
+  word-break: break-word;
+}
+@media (max-width: 1100px) {
+  .dash-layout {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 860px) {
+  .dash-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .dash-quick {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .dash-docs {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 560px) {
+  .dash-grid {
+    grid-template-columns: 1fr;
+  }
+  .dash-quick {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* ============================================================
+   062: 全站卡片/面板统一到 fmz 规范。
+
+   为什么要用**覆盖层**而不是改原规则: 卡片类散落在 30+ 处规则里(`.sg-card` /
+   `.mk-card` / `.keys-card` / `.settings-card` / `.sg-modal-card` / `.palette-panel` …),
+   圆角各写各的(12px / 10px / 8px / 6px 混用)。逐处改要动 30 多条规则、每条都要重新核
+   上下文 —— 覆盖层则是一处收口, 改错了删掉这段就回到原状。
+
+   fmz 实测: 卡片圆角 **4px**、描边 **#F0F0F0**、**无阴影**、body padding **16px 24px**。
+   ============================================================ */
+
+/* ---- 卡片: 圆角 4px + 描边 #F0F0F0 + 无阴影(fmz 的 `.ant-card`) ---- */
+.sg-card,
+.mk-card,
+.keys-card,
+.settings-card,
+.sg-code-card,
+.sg-fit-card,
+.sg-modal-card,
+.mk-chart-card,
+.sg-mcard,
+.panel,
+.help-panel,
+.palette-panel {
+  border-radius: var(--radius);
+  box-shadow: none;
+}
+/* 卡片 body 的内边距(fmz: 16px 24px)。 */
+.sg-card,
+.mk-card,
+.settings-card {
+  padding: 16px 24px;
+}
+.sg-card-body,
+.mk-card-body {
+  padding: 0;
+}
+
+/* ---- 分组标题: fmz 的主色竖条 + 深色标题(原先是"整行主色文字") ---- */
+.sg-card-head,
+.mk-card-head {
+  margin-bottom: 12px;
+  color: var(--fg);
+  font-size: 15px;
+}
+.sg-card-head::before,
+.mk-card-head::before {
+  content: "";
+  display: inline-block;
+  width: 3px;
+  height: 1em;
+  margin-right: 10px;
+  border-radius: 2px;
+  background: var(--accent);
+  vertical-align: -0.12em;
+}
+
+/* ---- 按钮: 统一到 fmz 的 `.ant-btn`(高 32px、圆角 4px、三档) ----
+   各视图原本各写一套(圆角 6/8/9px、内边距各不相同、高度 26~34px 不齐)。
+   这里统一**外观尺寸**, 各按钮的**语义档位**(主色/描边/中性/危险)保持原样 ——
+   换肤不该改行为, 只改长相。 */
+.sg-btn,
+.keys-btn,
+.settings-btn,
+.empty-cta-btn,
+.ghost-btn,
+.mini-btn {
+  min-height: var(--control-h);
+  padding: 0 15px;
+  border-radius: var(--radius);
+  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 描边档: 主色描边 + 主色字(fmz 的次按钮)。 */
+.sg-btn,
+.keys-btn,
+.settings-btn {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.sg-btn:hover,
+.keys-btn:hover,
+.settings-btn:hover {
+  background: var(--accent-soft);
+}
+/* 中性档(顶栏那排图标钮): 无框, 悬停才出底 —— fmz 的图标按钮形态。 */
+.ghost-btn {
+  border-color: transparent;
+  color: var(--fg-2);
+}
+.ghost-btn:hover {
+  background: var(--raised);
+  color: var(--accent);
+}
+/* 危险档: 红字红框(fmz 的删除按钮)。 */
+.sg-btn.danger,
+.keys-btn.danger {
+  border-color: var(--error);
+  color: var(--error);
+}
+.sg-btn.danger:hover,
+.keys-btn.danger:hover {
+  background: var(--danger-border);
+}
+/* 主按钮(fmz 的实色主按钮): 原本只有概览页与部分视图用 `.sg-btn-primary`。 */
+.sg-btn.sg-btn-primary,
+.keys-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.sg-btn.sg-btn-primary:hover,
+.keys-btn.primary:hover {
+  background: var(--accent-dim);
+  border-color: var(--accent-dim);
+}
+
+/* ---- 表单控件: fmz 的控件高 32px、圆角 4px、描边 #D9D9D9 ---- */
+.mini-select {
+  min-height: var(--control-h);
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-size: 14px;
+}
+
+/* ---- 密钥视图: 分组卡片(fmz 的 P2 形态) ----
+   密钥页原本是"标题 + 一块浅底框"的平铺结构, 没有卡片感。
+   这里把 `.keys-form`(每个通道一块)改成 fmz 的卡片: 白底 + #F0F0F0 描边 + 4px 圆角。 */
+.keys-form {
+  padding: 16px 24px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: none;
+}
+.keys-form-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--fg);
+  font-size: 15px;
+  font-weight: 600;
+}
+/* 主色竖条(fmz 的卡片标题标记)。 */
+.keys-form-title::before {
+  content: "";
+  display: inline-block;
+  width: 3px;
+  height: 1em;
+  border-radius: 2px;
+  background: var(--accent);
+}
+/* "当前生效"那一行: 原本是浅底条, 改成 fmz 的次级面。 */
+.keys-current {
+  border-radius: var(--radius);
+  border-color: var(--border);
+  background: var(--raised);
+}
+
+/* ---- 表格: fmz 的 `.ant-table` 形态 ----
+   fmz 实测: 表头底 **#FBFBFB**、字重 **600**、内边距 **12px 16px**、行高 50px;
+   单元格 padding **0 16px**; 行分隔线 #F0F0F0; 悬停行用主色浅底。 */
+.rn-table th,
+.sg-hist-table th,
+.sg-apiref-table th,
+.keys-list-head,
+.ui-table th {
+  padding: 12px 16px;
+  background: var(--raised);
+  color: var(--fg);
+  font-weight: 600;
+  font-size: 14px;
+  text-align: left;
+  white-space: nowrap;
+}
+.rn-table td,
+.sg-hist-table td,
+.sg-apiref-table td,
+.keys-list-head td {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 14px;
+}
+.rn-table tbody tr:hover td,
+.sg-hist-table tbody tr:hover td {
+  background: var(--accent-soft);
+}
+.rn-table th:last-child,
+.rn-table td:last-child {
+  text-align: right;
+}
+
+/* ---- 运行视图: 表格包进 fmz 的卡片 ----
+   fmz 的表格页是"一张白卡: 卡片头(操作按钮) + 表格"。原来运行页的表格是直接铺在内容区上,
+   没有卡片边界。这里给滚动容器加卡片底, 让它与 fmz 一致。 */
+.rn-table-scroll {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+.rn-table-scroll .rn-table th:first-child,
+.rn-table-scroll .rn-table td:first-child {
+  padding-left: 24px;
+}
+.rn-table-scroll .rn-table th:last-child,
+.rn-table-scroll .rn-table td:last-child {
+  padding-right: 24px;
+}
+/* 表头下边线去掉(卡片头与表头之间不该有双线)。 */
+.rn-table-scroll .rn-table th {
+  border-bottom: 1px solid var(--border);
+}
+
+/* ---- 对话视图右面板: fmz 的分组标题形态 ----
+   原 `.panel-head` 是"整行主色文字"; fmz 的卡片标题是「深色标题 + 主色竖条」。 */
+.panel-head {
+  padding: 12px 16px;
+  color: var(--fg);
+  font-size: 15px;
+}
+.panel-head::before {
+  content: "";
+  display: inline-block;
+  width: 3px;
+  height: 1em;
+  margin-right: 10px;
+  border-radius: 2px;
+  background: var(--accent);
+  vertical-align: -0.12em;
+}
+/* 面板内的分组小标题(现货/合约/合约·内置 那些)也用竖条, 与卡片标题一致。 */
+.sg-mcards-title,
+.settings-card-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--fg);
+  font-size: 15px;
+  font-weight: 600;
+}
+.sg-mcards-title::before,
+.settings-card-title::before {
+  content: "";
+  display: inline-block;
+  width: 3px;
+  height: 1em;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* ============================================================
+   062: 各视图**页面标题行**统一到 fmz 形态。
+   fmz 的页面头部: 左边大标题(约 20px 粗体), 右边一排操作按钮。
+   ============================================================ */
+.sg-title,
+.mk-title,
+.settings-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--fg);
+}
+/* 标题下方的说明文字(fmz 的副标题)。 */
+.settings-lead,
+.sg-lead,
+.mk-lead {
+  margin: 6px 0 0;
+  color: var(--fg-3);
+  font-size: 13px;
+  line-height: 1.7;
+}
+/* 页头行: 标题在左, 按钮组在右 —— 与 fmz 一致。 */
+.sg-head,
+.mk-head,
+.keys-head,
+.settings-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+/* 页头里的按钮组(fmz 的卡片头操作区)。 */
+.sg-head .sg-actions,
+.mk-head .mk-actions,
+.keys-actions,
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+/* ============================================================
+   063: 策略库改 fmz 式**一张表混排**(原先是四组分区 + 卡片行)。
+
+   为什么要改: fmz 的 `/m/strategies` 就是一张表(名称/最后修改/创建日期/操作项),
+   内置模板另在 `/square`。分四组让用户先想"我的策略在哪一组"—— 那正是新用户最常卡的地方。
+
+   **混排的是呈现, 不是事实**: 来源仍然用徽章标明(内置/我的), 内置策略仍然不可编辑。
+   ============================================================ */
+
+/* ---- 表格(fmz 的 `.ant-table`): 表头 #FBFBFB + 字重 600, 行分隔线 #F0F0F0 ---- */
+.ui-table-wrap {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+.ui-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+/* 列宽: 名称列吃剩下的, 其余按内容给固定宽 —— 不指定的话 `table-layout: fixed`
+   会五列均分, 名称(最长的一列)被挤到折行。 */
+.ui-table th:nth-child(1),
+.ui-table td:nth-child(1) {
+  width: auto;
+}
+.ui-table th:nth-child(2),
+.ui-table td:nth-child(2) {
+  width: 120px;
+}
+.ui-table th:nth-child(3),
+.ui-table td:nth-child(3),
+.ui-table th:nth-child(4),
+.ui-table td:nth-child(4) {
+  width: 130px;
+}
+.ui-table th:nth-child(5),
+.ui-table td:nth-child(5) {
+  width: 150px;
+}
+.ui-table th {
+  padding: 12px 16px;
+  background: var(--raised);
+  color: var(--fg);
+  font-weight: 600;
+  font-size: 14px;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+.ui-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 14px;
+  vertical-align: middle;
+}
+.ui-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.ui-table tbody tr:hover td {
+  background: var(--accent-soft);
+}
+/* 空单元格: 读不到显示"—", 不显示 0。 */
+.ui-cell-empty {
+  color: var(--fg-3);
+}
+/* 「操作项」列靠右(fmz 形态)。 */
+.ui-table th:last-child,
+.ui-table td:last-child {
+  text-align: right;
+}
+
+/* ---- 行内文字链接(fmz 表格「操作项」的形态: 主色字, 无框) ---- */
+.ui-linkbtn {
+  border: none;
+  background: none;
+  padding: 0 4px;
+  margin-left: 12px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--accent);
+  cursor: pointer;
+  line-height: 1.6;
+}
+.ui-linkbtn:hover {
+  text-decoration: underline;
+}
+.ui-linkbtn-danger {
+  color: var(--error);
+}
+.ui-linkbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---- 策略表行的「名称」单元格: 名称 + 徽章 + 摘要 ---- */
+.sg-tc-name {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.sg-tc-link {
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--fg);
+  cursor: pointer;
+  align-self: flex-start;
+}
+.sg-tc-link:hover {
+  color: var(--accent);
+}
+/* 摘要单行截断(fmz 的表格行是紧凑的; 点名称进详情看全文)。 */
+.sg-tc-summary {
+  color: var(--fg-3);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 059 UX-12: 展开态 —— 完整描述就地可见(不跳详情), 行高真的变大。 */
+.sg-tc-summary.sg-row-summary-open {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+/* 「展开」钮比摘要小一号, 贴在摘要下方。 */
+.sg-row-more {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 0 8px;
+  min-height: 22px;
+  font-size: 12px;
+}
+.sg-tc-ops {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+/* ---- 「新建策略 ∨」下拉(fmz 的形态: 一个主按钮 + 一串菜单项) ---- */
+.sg-newdd {
+  position: relative;
+  display: inline-block;
+}
+.sg-newdd-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  min-width: 180px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  z-index: 20;
+}
+.sg-newdd-menu[hidden] {
+  display: none;
+}
+.sg-newdd-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--fg);
+  border-radius: 2px;
+  cursor: pointer;
+}
+.sg-newdd-item:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ============================================================
+   063: 编辑页双 Tab(fmz 的 `/m/add-strategy`: 「策略编辑」/「模拟回测」)
+   + AI 助手右侧常驻 + 快捷指令按钮。
+   ============================================================ */
+
+/* ---- Tab 条(fmz 的 `.ant-tabs`: 高 50px, 选中项主色下划线) ---- */
+.sg-tabs {
+  display: flex;
+  gap: 24px;
+  margin: 4px 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+.sg-tab {
+  border: none;
+  background: none;
+  padding: 10px 0;
+  margin: 0;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--fg-3);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.sg-tab:hover {
+  color: var(--fg);
+}
+.sg-tab.on {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 500;
+}
+.sg-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* Tab 内容容器: 切走只是隐藏, **不销毁 DOM**(未保存的代码/参数还在里面)。 */
+.sg-tabpane[hidden] {
+  display: none;
+}
+
+/* ---- 编辑 Tab 的网格: 左列代码与参数, 右列 AI 助手(fmz 形态) ---- */
+#sg-tab-edit .sg-detail-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.42fr);
+  align-items: start;
+}
+/* AI 卡在右列常驻。宽屏时它跟着内容滚动, 不做 sticky —— 页面本身可滚,
+   粘住反而让编辑区被挤窄。 */
+.sg-ai-col {
+  position: sticky;
+  top: 0;
+}
+
+/* ---- AI 快捷指令按钮(fmz 的一排可点建议) ---- */
+.sg-ai-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.sg-ai-quick-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 3px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--fg-2);
+  cursor: pointer;
+  line-height: 1.6;
+}
+.sg-ai-quick-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.sg-ai-quick-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---- 新建实盘弹窗: 可搜索的运行策略 + 参数区(fmz 的 /m/add-robot 形态) ---- */
+.rn-live-name {
+  padding: 8px 12px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--fg);
+  font-size: 14px;
+}
+.rn-strat-search {
+  position: relative;
+}
+.rn-strat-results {
+  margin-top: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.rn-strat-results:empty {
+  display: none;
+}
+.rn-strat-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.rn-strat-item:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.rn-strat-item-src {
+  color: var(--fg-3);
+  font-size: 12px;
+}
+/* 藏起来的真 select: 承接选中值(表单语义 + 既有取值逻辑不变)。 */
+.rn-strat-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.rn-strat-none {
+  padding: 10px 12px;
+  color: var(--fg-3);
+  font-size: 13px;
+}
+/* 选中策略后的参数区(fmz 的「策略参数」折叠区)。 */
+.rn-live-params {
+  margin: 4px 0 8px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--raised);
+}
+.rn-live-params-head {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--fg);
+  margin-bottom: 8px;
+}
+.rn-live-builtin {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--warn, #faad14);
+  background: var(--panel);
+  color: var(--fg-2);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* ---- 策略表行的「来源」单元格(fmz 形态: 徽章 + 市场) ---- */
+.sg-tc-source {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.sg-tc-market {
+  color: var(--fg-3);
+  font-size: 13px;
+}
+.sg-badge-builtin {
+  border-color: var(--border-strong);
+  color: var(--fg-2);
+}
+.sg-badge-user {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---- 063: 编辑页两层布局 ----
+   上层通栏: 适用性 / 参数 / 清单(字段多、要带说明, 挤在窄列里会折行)
+   下层两列: 左代码 / 右 AI(fmz 的编辑器形态) */
+.sg-edit-top {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.sg-edit-top > .sg-card {
+  width: 100%;
+}
+/* 参数表单在上层通栏里时, 字段按两列排 —— 单列太长, 每个参数都要带说明。 */
+.sg-edit-top #sg-params {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 24px;
+}
+.sg-edit-top #sg-params > .sg-param {
+  margin: 0;
+}
+@media (max-width: 900px) {
+  .sg-edit-top #sg-params {
+    grid-template-columns: 1fr;
   }
 }

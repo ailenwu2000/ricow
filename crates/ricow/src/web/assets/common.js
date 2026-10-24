@@ -294,28 +294,35 @@
 
   // ---------- 纯工具 ----------
 
-  // ---------- 主题(034 / D14) ----------
+  // ---------- 主题(034 / D14 / 062) ----------
   // 两个概念要分清, 混起来就会出现"选了跟随系统, 关掉页面再打开又变回深色":
-  //   · `R.theme` = **偏好**(落盘在 `ricow.toml` 的 `[ui].theme`): dark / light / red / **auto**;
-  //   · `<html data-theme>` = **实际生效的配色**: dark / light / red —— `auto` 在这里按系统的
+  //   · `R.theme` = **偏好**(落盘在 `ricow.toml` 的 `[ui].theme`): light / dark / red / **auto**;
+  //   · `<html data-theme>` = **实际生效的配色**: light / dark / red —— `auto` 在这里按系统的
   //     `prefers-color-scheme` 解成 dark 或 light。
   //
   // 为什么不给 `auto` 单独写一份 CSS 变量: 那等于把浅色那套维护两遍, 系统一换色两边迟早分叉。
-  // 解成既有值之后, CSS 侧**一行都不用动**(`:root` 深色 + light / red 两个覆盖块照旧)。
+  // 解成既有值之后, CSS 侧**一行都不用动**。
+  //
+  // 062: CSS 侧的三块分工变了 —— `:root` = **fmz 浅色**(默认档, 不设 data-theme 也长这样,
+  // 故首屏不闪)、`[data-theme="dark"]` = 深色、`[data-theme="red"]` = 红色。
+  // `auto` 解出的 "light" 落回 `:root`、"dark" 命中 `[data-theme="dark"]` —— 两边都有定义, 不断链。
   const prefersLight =
     window.matchMedia && window.matchMedia("(prefers-color-scheme: light)");
 
   /// 偏好 → 实际生效的配色。
+  ///
+  /// 062: **默认档改成 `light`**(fmz 浅色)。`auto` 的解法不变 —— 跟随系统, 系统深就深、系统浅就浅。
   function resolveTheme(pref) {
-    if (pref === "light" || pref === "red") return pref;
+    if (pref === "light" || pref === "red" || pref === "dark") return pref;
     if (pref === "auto") return prefersLight && prefersLight.matches ? "light" : "dark";
-    return "dark";
+    return "light";
   }
 
-  R.theme = "dark"; // 偏好(单一来源: ricow.toml 的 [ui].theme)
+  R.theme = "light"; // 偏好(单一来源: ricow.toml 的 [ui].theme)
 
   R.applyTheme = function (theme) {
-    R.theme = theme === "light" || theme === "red" || theme === "auto" ? theme : "dark";
+    // 062: 兜底由 `dark` 改为 `light` —— 非法值不该把用户拽回旧默认档。
+    R.theme = theme === "light" || theme === "dark" || theme === "red" || theme === "auto" ? theme : "light";
     const applied = resolveTheme(R.theme);
     document.documentElement.dataset.theme = applied;
     const sel = document.getElementById("theme-select");

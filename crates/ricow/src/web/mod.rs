@@ -15,6 +15,7 @@ mod keys;
 mod logs;
 mod markets;
 mod metrics;
+mod overview;
 mod realtime;
 mod runs;
 mod sessions;
@@ -254,6 +255,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/ping", get(ping))
         // 会话端点族(FR-007 ~ FR-011): CRUD + 出入站通道。
         .merge(sessions::routes())
+        // 概览聚合(062): 概览页的四项计数 —— **一次请求**取全, 避开浏览器的连接池上限。
+        .merge(overview::routes())
         // 术语解释(FR-024): 静态内置数据, 只读。
         .route("/api/terms", get(list_terms))
         // 语言 / 主题读写(FR-029 / 034): 与 CLI 共用 `[ui].lang` / `[ui].theme`。
@@ -289,6 +292,11 @@ pub fn router(state: WebState) -> Router {
         // **回测历史与台账保留**, 前端确认框会如实写明。内置 409 reserved / 运行中 409 running。
         .route("/api/strategies/{id}", axum::routing::delete(strategy_io::delete_strategy))
         .route("/api/strategies/{id}/source", get(strategy_io::get_strategy_source))
+        // 063: 实例参数落盘(**只改参数与交易对, 不带代码**)。与上面的 `POST /api/strategies`
+        // 语义严格分开: 那个是"保存策略(含代码)", 这个是"改运行参数" ——
+        // 新建实盘时要设参数, 但前端手上没有用户的代码改动, 硬传会把代码覆盖掉。
+        // 只改 `params` 与 `pair`; `live_enabled`/`market`/`[backtest]` 等**原样保留**。
+        .route("/api/strategies/{id}/instance", axum::routing::post(strategy_io::save_instance))
         .route("/api/strategies/{id}/ai-edit", axum::routing::post(strategy_io::ai_edit_strategy))
         // 评估一组参数改动的**实际**影响(N3-B, 2026-10-12): 前端拿着同一窗口下改前/改后两次
         // 真实回测的指标来问, 后端只做"把两份实测指标讲成大白话"。**不接受任何回测请求参数** ——

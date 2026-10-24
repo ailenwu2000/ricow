@@ -70,7 +70,11 @@ pub mod defaults {
     /// 默认界面语言。
     pub const UI_LANG: &str = "zh";
     /// 默认 Web 主题(与前端兜底一致)。
-    pub const UI_THEME: &str = "dark";
+    ///
+    /// 062: 由 `dark` 改为 `light` —— 视觉基准换成 fmz.com 后, 浅色才是产品的默认样貌。
+    /// 改动要**四处一起**: 本常量、`config_file::SUPPORTED_THEMES` 的**首项**、
+    /// `web::settings::get_theme` 的缺省兜底、以及前端 `common.js` 的 `R.theme` 初值。
+    pub const UI_THEME: &str = "light";
 }
 
 /// 别名规范化 + 校验(033 FR-009), 返回去空白后的别名。
@@ -149,15 +153,18 @@ pub struct MarketSection {
 
 /// `[ui].theme` 的合法取值(**单一来源**): 解析校验、错误文案、以及 Web 侧
 /// `/api/theme` 的白名单都按它走 —— 各写一份的后果是"下拉里能选、写盘却被拒"。
-pub const SUPPORTED_THEMES: [&str; 4] = ["dark", "light", "red", "auto"];
+///
+/// 062: **首项 = 默认档**(`light`, fmz 浅色)。这个顺序不是随意的 —— 前端主题下拉的
+/// 第一个选项、首次生成配置时写入的 `[ui].theme`, 都取本数组的首项。
+pub const SUPPORTED_THEMES: [&str; 4] = ["light", "dark", "red", "auto"];
 
 /// 界面语言段(023): 对话宿主固定文案的语言。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UiSection {
     /// `None` = 尚未选择(首次向导会问一次); 仅接受 `"zh"` / `"en"`, 其它值硬失败。
     pub lang: Option<String>,
-    /// Web 界面主题(034 / D14): `None` = 未设置(前端按深色 `dark` 兜底);
-    /// 仅接受 `"dark"` / `"light"` / `"red"` / `"auto"`, 其它值硬失败 —— 与 `[ui].lang` 同一纪律。
+    /// Web 界面主题(034 / D14 / 062): `None` = 未设置(前端按浅色 `light` 兜底);
+    /// 仅接受 `"light"` / `"dark"` / `"red"` / `"auto"`, 其它值硬失败 —— 与 `[ui].lang` 同一纪律。
     /// `auto` = 跟随系统的深/浅色偏好(前端按 `prefers-color-scheme` 解成 dark/light, 故 CSS 不需要第四份变量)。
     pub theme: Option<String>,
 }
@@ -1609,6 +1616,21 @@ mod tests {
 
         let t: toml::Table = toml::from_str(&template_text()).expect("模板必须合法");
         assert!(t.contains_key("ui"), "模板含 [ui]");
+    }
+
+    /// 062: **默认档 = 浅色**(fmz 浅色), 且后端两处一致 ——
+    /// `defaults::UI_THEME` 与 `SUPPORTED_THEMES` 的首项。
+    ///
+    /// 为什么要有这条: 换默认档是**多处**改动, 漏一处就会出现"新装是浅色、老配置是深色"
+    /// 或"下拉首项与实际默认对不上"这类说不清的偏差 —— 而这些都不会让别的测试变红。
+    /// (前端 `common.js` 的两处兜底由 `web::assets` 的 `test_default_theme_matches_backend` 钉住。)
+    #[test]
+    fn test_default_theme_is_light_and_consistent() {
+        assert_eq!(defaults::UI_THEME, "light", "默认档应为浅色(062)");
+        assert_eq!(
+            SUPPORTED_THEMES[0], "light",
+            "白名单首项 = 默认档(下拉第一项 / 首次生成配置都取它)"
+        );
     }
 
     #[test]
