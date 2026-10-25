@@ -28,6 +28,10 @@
     rnThMode: "模式",
     rnThStatus: "状态",
     rnThPair: "标的",
+    rnThMarket: "市场",
+    rnMarketAll: "全部",
+    rnMarketSpot: "现货",
+    rnMarketFutures: "合约",
     rnThNet: "盈利",
     rnThTrades: "成交数",
     rnThUptime: "运行时长",
@@ -50,6 +54,9 @@
     rnLivePairOutOfScope:
       "策略自带的交易对 {0} 不在当前交易对视野里, 已换成 {1}(要跑原交易对请在设置里把交易对视野改为全部)。若策略有价格类参数, 请按新交易对的价格重新确认。",
     rnLiveParams: "策略参数",
+    rnLiveReset: "重置参数",
+    rnResetDone: "已把 {n} 个参数恢复成清单默认值。",
+    rnResetNothing: "没有可恢复的参数 —— 这个策略的参数都没写默认值(必填项就是这样), 改动需要你自己调整。",
     rnLiveParamsLoadFail: "读不到该策略的参数清单:",
     rnLiveParamsUnavailable: "参数表单不可用(前端模块未加载)。",
     rnLiveNoParams: "该策略没有声明参数 —— 只用默认值运行。",
@@ -107,6 +114,10 @@
     rnThMode: "Mode",
     rnThStatus: "Status",
     rnThPair: "Pair",
+    rnThMarket: "Market",
+    rnMarketAll: "All",
+    rnMarketSpot: "Spot",
+    rnMarketFutures: "Perps",
     rnThNet: "Profit",
     rnThTrades: "Fills",
     rnThUptime: "Uptime",
@@ -129,6 +140,9 @@
     rnLivePairOutOfScope:
       "This strategy's own pair {0} is outside the current pair scope, so {1} was used instead (to trade the original pair, widen the pair scope to all in Settings). If the strategy has price parameters, re-check them against the new pair's price.",
     rnLiveParams: "Strategy parameters",
+    rnLiveReset: "Reset parameters",
+    rnResetDone: "Restored {n} parameters to their manifest defaults.",
+    rnResetNothing: "Nothing to restore — none of this strategy's parameters declare a default (required ones don't), so the change is yours to make.",
     rnLiveParamsLoadFail: "Could not read this strategy's parameter manifest:",
     rnLiveParamsUnavailable: "Parameter form unavailable (frontend module not loaded).",
     rnLiveNoParams: "This strategy declares no parameters — it runs on defaults.",
@@ -251,6 +265,22 @@
       "<th" + bi("rnThTrades") + ">" + R.TEXT.zh.rnThTrades + "</th>" +
       "<th" + bi("rnThUptime") + ">" + R.TEXT.zh.rnThUptime + "</th>" +
       "<th" + bi("rnThSource") + ">" + R.TEXT.zh.rnThSource + "</th>" +
+      // 064: 「市场」列 —— **列头本身就是筛选**(fmz 的"全部种类"形态)。
+      // 放在"标的"后: 市场是标的的限定语, 读序自然; 也不与"操作"挤在一起误点。
+      //
+      // **`data-zh` 必须挂内层 `<span>`, 不能挂 `<th>`**: `applyLang` 换语言用的是
+      // `node.textContent = ...`, 而 textContent 赋值会**清空全部子节点** ——
+      // 挂在 `<th>` 上的话, 切一次语言这个 `<select>` 就被抹掉(2026-10-25 实测:
+      // 首屏就是"已应用过一次语言"的状态, 于是 select 从头到尾不存在)。
+      // 这与侧栏导航项 `data-zh` 要挂 `.nav-text` 是同一个坑(见项目记忆)。
+      '<th class="rn-th-market"><span class="rn-th-market-label"' + bi("rnThMarket") + ">" +
+      R.TEXT.zh.rnThMarket + "</span>" +
+      '<select id="rn-market-filter" class="rn-market-filter" ' +
+      'aria-label="' + R.TEXT.zh.rnThMarket + '">' +
+      "<option value=\"all\">" + R.TEXT.zh.rnMarketAll + "</option>" +
+      "<option value=\"spot\">" + R.TEXT.zh.rnMarketSpot + "</option>" +
+      "<option value=\"futures\">" + R.TEXT.zh.rnMarketFutures + "</option>" +
+      "</select></th>" +
       "<th" + bi("rnThAction") + ">" + R.TEXT.zh.rnThAction + "</th>" +
       "</tr></thead>" +
       '<tbody id="rn-tbody"></tbody></table></div>' +
@@ -270,6 +300,22 @@
     $("rn-new-live").addEventListener("click", () =>
       openStartModal().catch((e) => setListMsg((e && e.message) || String(e), "err"))
     );
+    // 064: 市场筛选(列头那个 select)。**只做前端过滤** ——
+    // 实例数本来就不多(单机程序), 为筛选加一个后端参数不值得; 而且前端过滤
+    // 能立刻响应, 不用等一轮轮询。
+    const mkFilter = $("rn-market-filter");
+    if (mkFilter) {
+      mkFilter.addEventListener("change", () => {
+        const want = mkFilter.value;
+        const tbody = $("rn-tbody");
+        if (!tbody) return;
+        for (const tr of tbody.querySelectorAll("tr.rn-row")) {
+          const badge = tr.querySelector("[data-market]");
+          const mk = badge ? badge.dataset.market : "";
+          tr.hidden = want !== "all" && mk !== want;
+        }
+      });
+    }
     mounted = true;
   }
 
@@ -401,6 +447,19 @@
     statusTd.appendChild(h("span", "rn-dot" + (item.running ? " on" : "")));
     statusTd.appendChild(h("span", null, statusLabel(item)));
     tr.appendChild(statusTd);
+
+    // 064: 市场徽章(现货/合约)。**读不到就不画徽章, 显示 "--"** ——
+    // 猜一个市场比不显示更糟: 用户会按猜的那个去配交易所参数。
+    const marketTd = h("td");
+    const mk = (item.market || "").trim().toLowerCase();
+    if (mk === "spot" || mk === "futures") {
+      const badge = h("span", "sg-badge rn-market-" + mk, mk === "spot" ? t("rnMarketSpot") : t("rnMarketFutures"));
+      badge.dataset.market = mk;
+      marketTd.appendChild(badge);
+    } else {
+      marketTd.appendChild(h("span", "rn-muted", "--"));
+    }
+    tr.appendChild(marketTd);
 
     // 标的 / 净收益 / 成交数: 缺失一律 "--", 不伪造(PnL 走服务端字符串, 避免精度失真)。
     tr.appendChild(h("td", null, item.pair || "--"));
@@ -790,7 +849,41 @@
     async function loadParams(s) {
       paramBox.innerHTML = "";
       paramBox.hidden = false;
-      const head = h("div", "rn-live-params-head", t("rnLiveParams"));
+      const head = h("div", "rn-live-params-head");
+      head.appendChild(h("span", "rn-live-params-title", t("rnLiveParams")));
+      // 064: 「重置参数」(fmz 的新建实盘页底部有这两个入口之一)。
+      //
+      // **只回清单默认值, 不清空用户填的必填项**: 没有默认值的必填参数清空后,
+      // 用户面对的是一个空表单 + 一句"必填"—— 那不如不重置。故规则是
+      // "有默认值 → 回默认值; 无默认值 → 保持原值不动"(清空只在用户主动清时发生)。
+      const reset = h("button", "sg-btn sg-btn-mini");
+      reset.type = "button";
+      reset.id = "rn-live-reset";
+      reset.appendChild(h("span", null, t("rnLiveReset")));
+      reset.addEventListener("click", () => {
+        const S = R.sg;
+        const entries = paramBox.__entries || [];
+        // 只收**有默认值**的那些键: 无默认值的保持原值(见上面的说明)。
+        const want = {};
+        for (const e of entries) {
+          if (e.def === undefined || e.def === null) continue;
+          want[e.key] = e.def;
+        }
+        const n = S && typeof S.writeParamEntries === "function" ? S.writeParamEntries(entries, want) : 0;
+        // **给一句反馈**: "恢复了几个" / "没有可恢复的"。
+        // 不说的后果: 用户改的是一个**无默认值**的必填参数(如 start_price),
+        // 点重置发现什么都没发生, 会以为按钮坏了(064 专项走查实测踩到这个误解)。
+        const tip = h("div", "sg-hint");
+        tip.textContent = n > 0
+          ? (t("rnResetDone") || "").replace("{n}", String(n))
+          : t("rnResetNothing");
+        // 上一次的反馈先撤掉, 否则连点会摞一串。
+        const old = paramBox.querySelector(".rn-live-reset-tip");
+        if (old) old.remove();
+        tip.classList.add("rn-live-reset-tip");
+        paramBox.appendChild(tip);
+      });
+      head.appendChild(reset);
       paramBox.appendChild(head);
       let detail = null;
       let current = {};

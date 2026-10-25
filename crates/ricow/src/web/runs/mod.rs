@@ -79,6 +79,9 @@ pub(super) struct RunItem {
     pid: Option<u32>,
     uptime_secs: Option<u64>,
     pair: Option<String>,
+    /// 064: 市场(`spot` / `futures`)。`None` = 读不到(老台账/未起过的实例)。
+    /// 前端据此画市场徽章 + 筛选 —— 实例多了以后"哪些是合约"一眼看不清。
+    market: Option<String>,
     source: &'static str,
     pnl: Option<PnlSummary>,
     /// 056 FR-4: 该实例是否**已声明参数清单**。`false` = 裸 `.lua`, 用户看不到自己跑的是
@@ -180,6 +183,7 @@ fn build_run_item(daemon_online: bool, v: &InstanceView, pnl: Option<PnlSummary>
         pid: v.pid,
         uptime_secs: v.uptime_secs,
         pair: v.pair.clone(),
+        market: v.market.clone(),
         source: source_of(daemon_online, true),
         pnl,
         declared: audit.0,

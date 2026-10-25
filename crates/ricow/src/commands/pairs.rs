@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 use ricow_core::{CoreError, CoreResult, Market};
-use ricow_engine::{build_view, filter_view, PairsView};
+use ricow_engine::{build_view_with, filter_view, PairsView};
 
 /// 免 key 市场数据的进程内缓存时长(CLI 每次进程独立, 缓存主要服务对话/工具连续调用)。
 pub const CACHE_TTL: Duration = Duration::from_secs(600);
@@ -63,6 +63,10 @@ struct Snapshot {
     futures: Vec<Market>,
     /// fapi EQUITY 池 base(美股代币识别锚点)。
     equity_bases: Vec<String>,
+    /// 066: 现货那一半**取到了没有**。
+    spot_ok: bool,
+    /// 066: 合约那一半**取到了没有**。
+    futures_ok: bool,
     fetched_at: Instant,
 }
 
@@ -78,15 +82,95 @@ fn cache() -> MutexGuard<'static, Option<Arc<Snapshot>>> {
     CACHE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 066: 视野快照取数的**整体超时**。
+///
+/// 为什么要有: 它是**列表页的冷启动必经路径**(市场视图、策略表单的默认交易对、
+/// 概览的覆盖卡都走它)。而币安客户端自身超时 30 秒 + 重试 4 次 + 退避 ⇒ 最坏 ~42 秒。
+/// 前端 `markets.js` 的 `LIST_TIMEOUT_MS` 只有 10 秒 —— **后端比前端还慢 4 倍**,
+/// 用户必然先看到"加载中…"超时, 却永远看不到真正的原因。
+///
+/// **25 秒**的取舍(第一版写 8 秒, 实测太紧, 已改):
+/// - 主网 exchangeInfo 正常 1~2 秒, 25 秒远够;
+/// - 但**大响应 + 慢链路**是真实的: 经代理拉币安官方公共镜像的 exchangeInfo
+///   实测 **52 秒**(17 MB) —— 8 秒会把**正常传输**判成超时, 那比慢更糟
+///   (把"慢"误报成"挂")。
+/// - 原来最坏 ~42 秒(30 秒客户端超时 × 重试 + 退避) → 现在**上限 25 秒**, 明显更快,
+///   且失败时说的是"超时"而不是让用户干等。
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// 给单个取数套上 [`SNAPSHOT_TIMEOUT`], 超时转成"这一半取不到"的错误。
+///
+/// 为什么单独一个函数: 三份取数的**体量差别极大**(现货 exchangeInfo 17 MB,
+/// 合约 EQUITY 白名单只是一段 JSON), 一个整体超时会把"慢的那半"误判成"挂了的那半"。
+async fn with_timeout<T>(
+    fut: impl std::future::Future<Output = CoreResult<T>>,
+    what: &str,
+) -> CoreResult<T> {
+    tokio::time::timeout(SNAPSHOT_TIMEOUT, fut).await.map_err(|_| {
+        CoreError::Network(format!(
+            "{what} 取数超时(>{} 秒) —— 检查网络/代理, 或用 RICOW_BN_BASE_URL 指向备用数据域名",
+            SNAPSHOT_TIMEOUT.as_secs()
+        ))
+    })?
+}
+
+/// 拉一次市场快照(066: **三份各自成败**, 不互相拖垮)。
+///
+/// 066 之前用的是 `tokio::try_join!` —— 任一失败则**整体失败**, 于是合约端点不可达时
+/// **整个市场视图 500**(哪怕现货是通的), 且要等 ~42 秒。
+/// 这与同文件 `ensure_pair_in_scope` 的约定直接冲突("一次 exchangeInfo 抖动
+/// 不该升级成主功能不可用"), 是**漏了一处**。
+///
+/// 现在: 现货与合约**各自**成败, 失败的那半记为"取不到"(如实说, 不假装是 0)。
+/// 客户端构造失败(白名单拦下非法域名等)仍整体失败 —— 那不是网络抖动, 是配置错误,
+/// **必须硬失败**: 静默降级会让用户以为自己在用合法域名。
 async fn fetch() -> CoreResult<Snapshot> {
-    let spot = ricow_binance::BinanceClient::new()?;
-    let fapi = ricow_binance::FuturesDataClient::new()?;
-    let (spots, futures, equity_bases) = tokio::try_join!(
-        spot.get_exchange_info(),
-        fapi.get_perp_markets(),
-        fapi.get_equity_pool()
-    )?;
-    Ok(Snapshot { spots, futures, equity_bases, fetched_at: Instant::now() })
+    let spot_client = ricow_binance::BinanceClient::new()?;
+    let fapi_client = ricow_binance::FuturesDataClient::new()?;
+
+    // 三份并发拉, 但**各自**吞掉错误(记 ok/fail), 不让一份失败连累另两份。
+    //
+    // **每一半各自套超时**(不是整体套一个): 现货 exchangeInfo 有 17 MB,
+    // 经慢链路实测要 50 秒+; 若整体套超时, 现货一慢就把**能通的合约那半**一起拖死。
+    let (spots_res, futures_res, equity_res) = tokio::join!(
+        with_timeout(spot_client.get_exchange_info(), "现货 exchangeInfo"),
+        with_timeout(fapi_client.get_perp_markets(), "合约 exchangeInfo"),
+        with_timeout(fapi_client.get_equity_pool(), "合约 EQUITY 白名单")
+    );
+
+    // 现货失败 → 现货那半不可用; 合约失败 → 合约那半不可用(**含 EQUITY 白名单**:
+    // 默认视野下的 bStock 现货池靠它识别, 拿不到就认不出股票类)。
+    //
+    // 顺序要紧: `Result` 不是 `Copy`, **先把错误文本取出来**再消费掉它 ——
+    // 否则 move 之后再想看错误就编译不过(踩过一次)。
+    let spot_ok = spots_res.is_ok();
+    let futures_ok = futures_res.is_ok() && equity_res.is_ok();
+    let spot_err = spots_res.as_ref().err().map(|e| e.to_string());
+    let futures_err = futures_res.as_ref().err().map(|e| e.to_string());
+    let spots = spots_res.unwrap_or_default();
+    let futures = futures_res.unwrap_or_default();
+    let equity_bases = equity_res.unwrap_or_default();
+
+    // **两半都取不到**才算这次快照完全失败(此时报原错, 附上两半的原因)。
+    if !spot_ok && !futures_ok {
+        let why = spot_err.unwrap_or_else(|| "未知".to_string());
+        let why_fut = futures_err.unwrap_or_else(|| "未知".to_string());
+        return Err(CoreError::Network(format!(
+            "现货与合约的交易所快照都取不到(现货: {why}; 合约: {why_fut})"
+        )));
+    }
+
+    // 半边挂掉时记一条 warn —— 不是静默降级(用户要知道视野不完整)。
+    if !spot_ok || !futures_ok {
+        tracing::warn!(
+            target: "pairs",
+            spot_ok,
+            futures_ok,
+            "交易所快照部分取不到(降级返回): 现货={spot_ok} 合约={futures_ok}"
+        );
+    }
+
+    Ok(Snapshot { spots, futures, equity_bases, spot_ok, futures_ok, fetched_at: Instant::now() })
 }
 
 /// 取市场快照(命中未过期缓存则复用)。
@@ -103,7 +187,15 @@ async fn snapshot() -> CoreResult<Arc<Snapshot>> {
 pub async fn current_view(root: &Path, force_all: bool) -> CoreResult<PairsView> {
     let show_all = force_all || crate::commands::config_file::load(root)?.market.show_all_pairs;
     let snap = snapshot().await?;
-    Ok(build_view(&snap.spots, &snap.futures, &snap.equity_bases, show_all))
+    // 066: 把两半的可用性一起带出去(前端据此显示「—」而不是 0)。
+    Ok(build_view_with(
+        &snap.spots,
+        &snap.futures,
+        &snap.equity_bases,
+        show_all,
+        Some(snap.spot_ok),
+        Some(snap.futures_ok),
+    ))
 }
 
 /// 视野 + 市场/子串检索(AI 工具与 CLI 共用入口)。
@@ -130,7 +222,33 @@ pub async fn ensure_pair_in_scope(root: &Path, pair: &str, market: &str) -> Core
         }
     };
     let show_all = crate::commands::config_file::load(root)?.market.show_all_pairs;
-    let view = build_view(&snap.spots, &snap.futures, &snap.equity_bases, show_all);
+    let view = build_view_with(
+        &snap.spots,
+        &snap.futures,
+        &snap.equity_bases,
+        show_all,
+        Some(snap.spot_ok),
+        Some(snap.futures_ok),
+    );
+    // 066: **要查的那一半取不到 ⇒ 不判越界, 放行**(与"快照完全失败"同一处置)。
+    //
+    // 为什么: 降级后现货那半可能是**空的**(合约挂了 → EQUITY 白名单拿不到 →
+    // 认不出股票类)。若照常判, **任何**交易对都会被误判"越界", 用户会被引导去改
+    // `show_all_pairs` —— 而真正原因是网络挂了, 改了也修不好。
+    // 这与本函数原有的"快照失败→放行"是同一条纪律, 只是触发点从"整体失败"扩到"半边失败"。
+    let target_unreadable = match market.trim().to_ascii_lowercase().as_str() {
+        "spot" => view.spot_ok == Some(false),
+        "futures" => view.futures_ok == Some(false),
+        // 不限定市场: 两半**都**不可读才放行(有一半能读就照常用它判)。
+        _ => view.spot_ok == Some(false) && view.futures_ok == Some(false),
+    };
+    if target_unreadable {
+        tracing::warn!(
+            target: "pairs", pair = %pair, market = %market,
+            "要校验的那一半交易对视野取不到, 放行交由后续调用如实报错"
+        );
+        return Ok(());
+    }
     let in_scope = match market.trim().to_ascii_lowercase().as_str() {
         "spot" => view.spot.iter().any(|s| s.eq_ignore_ascii_case(pair)),
         "futures" => view.futures.iter().any(|s| s.eq_ignore_ascii_case(pair)),
@@ -195,6 +313,9 @@ pub fn scope_text(filtered: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 066: `build_view` 现在只被测试用(生产代码走 `build_view_with` 带可用性),
+    // 故在测试作用域里导入 —— 放在顶层会报 unused_import。
+    use ricow_engine::build_view;
 
     #[test]
     fn test_normalize_market_accepts_known_and_rejects_typo() {
@@ -221,6 +342,9 @@ mod tests {
             spot: vec!["AAPLBUSDT".into(), "TSLABUSDT".into()],
             futures: vec!["AAPLUSDT".into()],
             filtered: true,
+            // 066: 可用性字段(老数据 = 没这个信息 = None)。
+            spot_ok: None,
+            futures_ok: None,
         };
         let text = render(&view, Some("aapl"));
         assert!(text.contains("仅股票类"), "{text}");
@@ -229,7 +353,14 @@ mod tests {
         assert!(text.contains("--all"), "过滤视野要给全量出口: {text}");
         assert!(text.contains("AAPLBUSDT") && text.contains("AAPLUSDT"), "{text}");
 
-        let all = PairsView { spot: vec![], futures: vec![], filtered: false };
+        let all = PairsView {
+            spot: vec![],
+            futures: vec![],
+            filtered: false,
+            // 066: 可用性字段(老数据 = 没这个信息 = None)。
+            spot_ok: None,
+            futures_ok: None,
+        };
         let text = render(&all, None);
         assert!(text.contains("全部交易对"), "{text}");
         assert!(text.contains("[现货] (无)"), "{text}");

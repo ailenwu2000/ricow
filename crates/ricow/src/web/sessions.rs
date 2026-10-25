@@ -15,10 +15,12 @@ use tokio::sync::broadcast;
 /// 左侧列表一行(FR-007): 标题 + 最后活动时间。
 #[derive(serde::Serialize)]
 pub(super) struct SessionRow {
-    id: String,
-    title: String,
-    created_at: i64,
-    updated_at: i64,
+    // 064: 概览页的「最近操作」卡要读这三个字段(在 overview 子模块里排序/取标题)。
+    // 不放 pub 是因为它们只该在 web 模块内被读 —— 序列化出去的键名由 serde 管, 与可见性无关。
+    pub(super) id: String,
+    pub(super) title: String,
+    pub(super) created_at: i64,
+    pub(super) updated_at: i64,
 }
 
 #[derive(serde::Serialize)]

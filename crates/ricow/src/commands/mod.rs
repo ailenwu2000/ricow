@@ -147,10 +147,62 @@ pub(crate) fn bn_signed_exchange_mode(
 ///
 /// 现货与合约的 demo 服务器时间不同步(实测差 1.5~1.9s), 必须按市场取数, 否则校准白做。
 /// 前台 `run` 与 `start` 的实盘预检 (019 R4) 共用这一份实现。
+///
+/// **多次采样, 取 RTT 最小的那组**: 单次测量的误差**只来自往返不对称** `(B-A)/2`,
+/// 而本机到交易所的 RTT 抖动可达秒级 (实测 demo 端点 1.6~3.6s), 单发偶发把真实
+/// ±500ms 的钟差读成 **+3375ms** → 把时钟完全正常的机器误拒 (2026-10-25 实测事故)。
+/// 两组采样一致 (差 ≤ `CLOCK_SAMPLE_AGREE_MS`) 即提前收手, 不拖慢启动。
 pub(crate) async fn fetch_clock_skew(market: &str, mode: Mode) -> CoreResult<i64> {
+    const MAX_SAMPLES: usize = 3;
+    let mut samples: Vec<ricow_engine::ClockSample> = Vec::new();
+    let mut last_err: Option<CoreError> = None;
+    for _ in 0..MAX_SAMPLES {
+        let t0 = chrono::Utc::now();
+        let server = fetch_server_time(market, mode).await;
+        let t1 = chrono::Utc::now();
+        match server {
+            Ok(server) => {
+                let rtt_ms = (t1 - t0).num_milliseconds();
+                // RTT 补偿: 用请求前后本地时刻的中点与服务器时刻比较, 去掉传输延迟造成的假偏移。
+                let mid = t0 + chrono::Duration::milliseconds(rtt_ms / 2);
+                let skew = ricow_engine::skew_ms(mid, server);
+                samples.push((rtt_ms, skew));
+                // 前两组已一致 → 够用了, 不必再采 (省一次往返)
+                if samples.len() >= 2 {
+                    let prev = samples[samples.len() - 2].1;
+                    let last = samples[samples.len() - 1].1;
+                    if ricow_engine::clock_samples_agree(
+                        prev,
+                        last,
+                        ricow_engine::CLOCK_SAMPLE_AGREE_MS,
+                    ) {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+    if samples.is_empty() {
+        return Err(last_err.unwrap_or_else(|| {
+            CoreError::Network("时钟预检失败: 无法读取交易所服务器时间".into())
+        }));
+    }
+    tracing::info!(
+        target: "engine",
+        rtts_ms = ?samples.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        skews_ms = ?samples.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+        "时钟预检采样 (取 RTT 最小者)"
+    );
+    Ok(ricow_engine::pick_clock_sample(&samples).unwrap_or_default())
+}
+
+/// 读该市场自己的服务器时间 (demo 走 demo 端点)。免 key 公共端点。
+async fn fetch_server_time(market: &str, mode: Mode) -> CoreResult<chrono::DateTime<chrono::Utc>> {
     let demo = mode == Mode::Demo;
-    let server = if market.eq_ignore_ascii_case("futures") {
-        // 公开端点: 无需凭据
+    if market.eq_ignore_ascii_case("futures") {
         let c = ricow_binance::FuturesClient::new()?;
         let c = if demo { c.with_base_url(DEMO_FAPI_URL)? } else { c };
         c.server_time().await
@@ -163,8 +215,7 @@ pub(crate) async fn fetch_clock_skew(market: &str, mode: Mode) -> CoreResult<i64
         CoreError::Network(format!(
             "时钟预检失败: 读取交易所服务器时间失败 ({e}); 网络不通时无法安全启动实盘"
         ))
-    })?;
-    Ok(ricow_engine::skew_ms(chrono::Utc::now(), server))
+    })
 }
 
 /// API 凭据 (签名请求必需)。

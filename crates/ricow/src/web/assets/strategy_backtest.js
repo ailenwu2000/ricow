@@ -160,6 +160,44 @@
     }, POLL_MS);
   }
 
+  /// 065: 判定一个作业错误**是不是网络问题**。
+  ///
+  /// 判据要**窄**: 只认 `network error` / `K 线…拉取失败` 这两个形态 ——
+  /// 参数错、门禁拦、策略语法错**都不该**提示网络方向(那是噪音, 且会把人引向
+  /// 错误的排查方向)。后端 `CoreError::Network` 的 Display 前缀就是 `network error`,
+  /// 这里直接认它, **不改后端错误契约**。
+  function isNetworkError(err) {
+    if (!err) return false;
+    const s = String(err);
+    return s.indexOf("network error") >= 0 || s.indexOf("拉取失败") >= 0;
+  }
+
+  /// 065: 网络失败时给一条**可照着做**的指引(只读提示, 不改任何配置)。
+  ///
+  /// 为什么要有: 此前界面上只有一行裸 "network error: K 线第 0 片拉取失败" ——
+  /// 用户既不知道该查网络还是查自己的代码, 也不知道产品**已经有**可用的备用域名开关
+  /// (`RICOW_BN_BASE_URL`)。产品自己的 AI 提示词里早就写明了这件事, 但那是给 AI 看的,
+  /// 用户看不到。
+  ///
+  /// 措辞纪律: ① 明说"不是策略写错了"(用户第一反应是怀疑自己);
+  /// ② 明说备用域名**只影响行情与回测、下单仍走主网** —— 不说这句,
+  /// 用户会拿它去实盘, 然后被签名接口拒掉, 比原来更困惑。
+  function networkGuidance(err) {
+    if (!isNetworkError(err)) return null;
+    const box = h("div", "sg-net-guide");
+    box.appendChild(h("div", "sg-net-guide-title", t("sgBtNetTitle")));
+    box.appendChild(h("div", "sg-net-guide-line", t("sgBtNetProxy")));
+    box.appendChild(h("div", "sg-net-guide-line", t("sgBtNetBase")));
+    box.appendChild(h("div", "sg-net-guide-line", t("sgBtNetFapi")));
+    return box;
+  }
+
+  /// 065: 在作业级错误后面追加网络指引(非网络错误**不追加**)。
+  function appendNetGuidance(box, err) {
+    const g = networkGuidance(err);
+    if (g) box.appendChild(g);
+  }
+
   /// 三态渲染: running 转圈 / done 指标卡+权益曲线+可折叠文本报告 / error 原因+重试。
   /// 寻优作业另走对比表渲染 (`kind==="sweep"` 单参数 / `"optimize"` 多维)。
   function renderJob(job) {
@@ -239,6 +277,7 @@
     // error
     box.appendChild(h("div", "sg-job-head sg-err", t("sgBtError")));
     box.appendChild(h("div", "sg-msg err", job.error || ""));
+    appendNetGuidance(box, job.error);
     const retry = h("button", "sg-btn sg-btn-mini", t("sgBtRetry"));
     retry.type = "button";
     retry.addEventListener("click", () => rerunJob(job).catch((e) => setMsg($("sg-bt-msg"), e.message, "err")));
@@ -851,6 +890,7 @@
     }
     if (job.status === "error") {
       box.appendChild(h("div", "sg-msg err", job.error || ""));
+      appendNetGuidance(box, job.error);
       return;
     }
     let rows = [];
@@ -1094,6 +1134,7 @@
     }
     if (job.status === "error") {
       box.appendChild(h("div", "sg-msg err", job.error || ""));
+      appendNetGuidance(box, job.error);
       return;
     }
     try {
@@ -1305,6 +1346,7 @@
     }
     if (job.status === "error") {
       box.appendChild(h("div", "sg-msg err", job.error || ""));
+      appendNetGuidance(box, job.error);
       return;
     }
     const v = job.validate;

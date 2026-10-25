@@ -476,6 +476,11 @@
   function syncAssessPanel() {
     const box = $("sg-ai-assess");
     if (!box) return;
+    // 064: 顺手刷新「模拟回测」Tab 里的 AI 解读入口 —— 它的显示条件就是
+    // "当前有没有参数改动", 与本函数同一个判据(paramDiffs)。参数每次变动都会走到
+    // 这里, 所以入口能跟着变; **不在这里刷**的话, 用户在编辑 Tab 改完参数不切走,
+    // 回测 Tab 的入口还是旧的(显示"没有改动"), 那是过期状态。
+    if (typeof S.refreshAssessEntry === "function") S.refreshAssessEntry();
     const diffs = paramDiffs();
     const sig = diffs.map((d) => d.key + "=" + d.after).join("|");
     if (st.aiMode !== "params" || !diffs.length || !st.detailCtx) {

@@ -274,6 +274,10 @@
     // 063: 编辑页双 Tab(fmz 的形态) + AI 快捷指令。
     sgTabEdit: "策略编辑",
     sgTabBacktest: "模拟回测",
+    // 064: 回测 Tab 里的 AI 解读入口(063 遗留项)。
+    sgBtAssess: "让 AI 解读这次改动的影响",
+    sgBtAssessHint: "会先跑改前、再跑改后两次回测, 然后让 AI 对比两份实测指标",
+    sgBtAssessNoDiff: "先把参数改动保存(或至少改一个参数), 才有改动可解读。",
     sgAiQMa: "写一个均线交易策略",
     sgAiQGrid: "写一个带止损止盈的网格策略",
     sgAiQAnalyze: "分析我的代码有什么问题",
@@ -405,6 +409,15 @@
     sgBtError: "回测失败",
     sgBtRetry: "重试",
     sgBtExpired: "作业已过期或不存在(结果只保留 5 分钟)。",
+    // 065: 回测/作业因**网络**失败时的可操作指引(只读提示, 不改任何配置)。
+    // 为什么要有: 此前界面上只有一行裸 "network error: K 线第 0 片拉取失败",
+    // 用户既不知道该查网络还是查自己的代码, 也不知道产品**已经有**可用的备用域名开关。
+    // 措辞纪律: ① 明说"不是你的策略写错了"(他最先怀疑的是自己); ② 明说镜像域
+    // **只影响行情与回测、下单仍走主网** —— 不说这句, 用户会拿它去实盘然后被拒。
+    sgBtNetTitle: "这是网络/代理问题, 不是策略写错了。",
+    sgBtNetProxy: "检查代理: 设置 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY 后重试。",
+    sgBtNetBase: "或用备用数据域名(只影响行情与回测, 下单仍走主网): RICOW_BN_BASE_URL=https://data-api.binance.vision",
+    sgBtNetFapi: "合约同理: RICOW_FAPI_BASE_URL=https://testnet.binancefuture.com",
     sgBusy: "同一策略已有回测在运行,请等它结束后再发起。",
     sgModalNew: "新建空白策略",
     sgModalCopy: "复制为我的策略",
@@ -688,6 +701,10 @@
     // 063: editor tabs (fmz style) + AI quick commands.
     sgTabEdit: "Strategy editor",
     sgTabBacktest: "Backtest",
+    // 064: AI assessment entry in the backtest tab (063 leftover).
+    sgBtAssess: "Ask AI to read the impact of this change",
+    sgBtAssessHint: "Runs a before-backtest and an after-backtest, then lets AI compare the two measured metric sets",
+    sgBtAssessNoDiff: "Save a parameter change (or change at least one parameter) first — otherwise there is nothing to read.",
     sgAiQMa: "Write a moving-average strategy",
     sgAiQGrid: "Write a grid strategy with stop-loss and take-profit",
     sgAiQAnalyze: "Analyze what is wrong with my code",
@@ -799,6 +816,14 @@
     sgBtError: "Backtest failed",
     sgBtRetry: "Retry",
     sgBtExpired: "Job expired or unknown (results are kept for only 5 minutes).",
+    // 065: actionable guidance when a job fails for **network** reasons (read-only hint).
+    // Wording discipline: say it is NOT the user's strategy, and say the mirror domain
+    // covers **market data / backtest only** — without that, users point live trading at it
+    // and get rejected.
+    sgBtNetTitle: "This is a network/proxy problem, not a broken strategy.",
+    sgBtNetProxy: "Check the proxy: set HTTPS_PROXY / HTTP_PROXY / ALL_PROXY, then retry.",
+    sgBtNetBase: "Or use an alternate data domain (market data / backtest only — live orders still go to the main site): RICOW_BN_BASE_URL=https://data-api.binance.vision",
+    sgBtNetFapi: "Same for futures: RICOW_FAPI_BASE_URL=https://testnet.binancefuture.com",
     sgBusy: "A backtest of this strategy is already running. Wait for it to finish.",
     sgModalNew: "New blank strategy",
     sgModalCopy: "Copy as my strategy",
@@ -1245,6 +1270,11 @@
       bi("sgStartBt") + ">" + R.TEXT.zh.sgStartBt + "</button></div>" +
       '<div id="sg-bt-msg" class="sg-msg" aria-live="polite"></div>' +
       '<div id="sg-bt-result"></div>' +
+      // 064: 「AI 解读改动影响」入口 —— 063 遗留项。评估逻辑(跑改前 → 跑改后 →
+      // ai-assess 三步)完整实现在**右栏 AI 面板**的 #sg-ai-assess 里, 这里只做**跳转**:
+      // 切到「策略编辑」Tab 并滚到 AI 面板。**不把结果搬两处渲染** ——
+      // 同一份状态在两个地方各显示一份, 必然有一份是过期的。
+      '<div id="sg-bt-assess-entry" class="sg-bt-assess-entry" hidden></div>' +
       // 参数寻优(P2-7)与历史对比(P1-6)。
       '<details class="sg-advanced sg-sweep-box" id="sg-sweep-box"><summary' + bi("sgSweep") + ">" +
       R.TEXT.zh.sgSweep + "</summary><div class='sg-bt-grid'>" +
@@ -1550,6 +1580,47 @@
     const bt = $("sg-tab-backtest");
     if (edit) edit.hidden = st.tab !== "edit";
     if (bt) bt.hidden = st.tab !== "backtest";
+    // 064: 切 Tab 时刷新 AI 解读入口(它的显示条件依赖"当前有没有参数改动",
+    // 而参数改动在另一个 Tab 里发生)。
+    renderAssessEntry();
+  }
+
+  /// 064: 画「模拟回测」Tab 里的 **AI 解读入口**(063 遗留项)。
+  ///
+  /// 为什么是"跳转"而不是"在这里也放一份评估": 评估的三步(跑改前 → 跑改后 →
+  /// `ai-assess`)与结果显示完整实现在右栏 AI 面板的 `#sg-ai-assess` 里
+  /// (`strategy_editor.js::syncAssessPanel`)。在这里再渲染一份按钮 + 结果区,
+  /// 等于**同一份状态两处显示** —— 必然有一份是过期的, 用户点哪份都会困惑。
+  /// 故这里只负责"带用户过去"。
+  ///
+  /// 显示条件: **当前有参数改动**(`paramDiffs()` 非空)。没改动时不给入口,
+  /// 但给一句说明"改什么才能解读" —— 藏起来会让用户以为功能不存在。
+  function renderAssessEntry() {
+    const box = $("sg-bt-assess-entry");
+    if (!box) return;
+    box.innerHTML = "";
+    const S = window.Ricow && window.Ricow.sg;
+    const hasDiff = S && typeof S.paramDiffs === "function" && S.paramDiffs().length > 0;
+    if (!hasDiff) {
+      box.hidden = false;
+      box.appendChild(h("div", "sg-hint", t("sgBtAssessNoDiff")));
+      return;
+    }
+    box.hidden = false;
+    // 用 sg-btn(页面既有按钮形态)而不是 R.ui.button —— 同一张卡片里混两种按钮
+    // 样式会显得像两个产品。**次要动作用 sg-btn(无主色)**: 它不产出结果, 只是带路。
+    const btn = h("button", "sg-btn");
+    btn.type = "button";
+    btn.appendChild(h("span", null, t("sgBtAssess")));
+    btn.addEventListener("click", () => {
+      // 切回「策略编辑」Tab(AI 面板在那一列的右栏), 再滚到 AI 面板。
+      st.tab = "edit";
+      renderTabs();
+      const ai = $("sg-ai-card");
+      if (ai && ai.scrollIntoView) ai.scrollIntoView({ block: "start" });
+    });
+    box.appendChild(btn);
+    box.appendChild(h("div", "sg-hint", t("sgBtAssessHint")));
   }
 
   /// 063: fmz 式 AI **快捷指令**按钮(fmz 的 AI 助手里是一排可点的建议)。
@@ -2633,4 +2704,10 @@
   // 放在**同一个闭包**里: Tab 状态(st.tab)与文案表(t)都在本文件, 别处拿不到。
   S.renderTabs = renderTabs;
   S.renderAiQuick = renderAiQuick;
+  // 064: 相对时间格式化 —— 概览页的「最近操作」卡要用(同一口径, 不另写一份;
+  // 两处各写一套必然漂移, 而时间显示漂移是很难看出来的那种错)。
+  S.fmtRelTime = fmtRelTime;
+  // 064: 「模拟回测」Tab 的 AI 解读入口。给 strategy_editor.js 的 syncAssessPanel 调 ——
+  // 参数每次变动都会走那儿, 入口跟着刷新才不会停在过期状态。
+  S.refreshAssessEntry = renderAssessEntry;
 })();

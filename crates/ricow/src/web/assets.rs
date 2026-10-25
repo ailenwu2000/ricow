@@ -1169,6 +1169,332 @@ mod tests {
         assert!(!p.contains("innerHTML") && !p.contains("insertAdjacentHTML"), "禁拼 HTML");
     }
 
+    /// 064: 概览须有「**最近操作**」卡, 且数据走聚合端点。
+    ///
+    /// 为什么钉"走聚合端点": 概览页常驻会话 SSE + 每 5 秒三路轮询, 浏览器同源连接
+    /// 上限只有 6 —— 前端再并发一个 `/api/sessions` 就会**排队等**(062 实测: 四格一起
+    /// 显示「—」而 curl 毫秒级返回)。所以"不许前端另发请求"是一条**性能红线**, 不是风格问题。
+    ///
+    /// 为什么钉"用会话当数据源": ricow 本地真正持久化的"人最近干了什么"只有会话
+    /// (`web_sessions.updated_at`)。回测作业只留 5 分钟且不落库 —— 拿它当"最近操作",
+    /// 用户 5 分钟后回来看就是一张空卡, 那是个会骗人的卡。
+    #[test]
+    fn test_dashboard_has_recent_activity_from_aggregate_endpoint() {
+        let dash = src_of("dashboard.js");
+        assert!(
+            dash.contains("recent_sessions"),
+            "最近操作须读 /api/overview 的 recent_sessions(聚合端点)"
+        );
+        // 不许另发请求(连接池红线)。
+        assert!(
+            !dash.contains("\"/api/sessions\""),
+            "概览页不许再发 /api/sessions(浏览器同源连接上限 6, 本页常驻 SSE+三路轮询)"
+        );
+        // 标题为空 → 明说未命名, 不拿 id 冒充标题。
+        assert!(dash.contains("dashRecentUntitled"), "会话无标题时须显示未命名(不拿 id 冒充标题)");
+        // 一句口径说明: 告诉用户为什么只有会话(免得以为回测记录丢了)。
+        assert!(dash.contains("dashRecentHint"), "须说明为什么最近操作只有会话(回测只留 5 分钟)");
+    }
+
+    /// 064: 概览统计格**每格都要能点**(fmz 的六格每格都是链接)。
+    ///
+    /// 钉的是"包一层 button"而不是"给 div 设 type": 后者没有语义、键盘也到不了。
+    #[test]
+    fn test_dashboard_stat_cells_are_all_clickable() {
+        let dash = src_of("dashboard.js");
+        assert!(dash.contains("dash-stat-link"), "统计格须整格可点(fmz 六格每格都是链接)");
+        assert!(
+            dash.contains("h(\"button\", \"dash-stat-link\")"),
+            "须包一层 button(给 div 设 type 没有语义, 键盘也到不了)"
+        );
+        for go in ["go: \"#strategies\"", "go: \"#runs\"", "go: \"#keys\"", "go: \"#chat\""] {
+            assert!(dash.contains(go), "统计格都要有点击目标: {go}");
+        }
+    }
+
+    /// 064: 概览须有「**告警**」格, 且数据源是真实的(N1 冗余副本门禁)。
+    ///
+    /// 不许造假告警: 数据源 = `catalog::all()` 里 `blocks_run()` 为真的条目
+    /// (未声明清单且与内置逐字相同) —— 那是 ricow 本地**真的跑不起来**的东西。
+    #[test]
+    fn test_dashboard_has_alert_cell_from_real_gate() {
+        // overview.rs 不在 `ASSETS` 里(它是 Rust 不是前端资产), 故用 include_str! 读源码。
+        let ov = include_str!("overview.rs");
+        assert!(ov.contains("AlertItem"), "overview 须有告警条目结构");
+        assert!(
+            ov.contains("blocks_run()"),
+            "告警须取 blocks_run() 判据(N1 冗余副本门禁), 不凭空造告警"
+        );
+        let dash = src_of("dashboard.js");
+        // 0 条也要说一句话(只说 0 不说"没事", 用户不知道这是好事还是没查到)。
+        assert!(dash.contains("dashAlertNone"), "0 条告警时须说明没有要处理的");
+        assert!(dash.contains("dashAlertBlocked"), "告警明细须说明为什么被拦");
+    }
+
+    /// 064 回归: 带 `data-zh` 的标签**不许内嵌子元素**(applyLang 会清空它们)。
+    ///
+    /// 背景(2026-10-25 真机撞到): 「市场」列的 `<select>`(筛选控件)挂在带 `data-zh` 的
+    /// `<th>` 上 —— `applyLang` 换语言用的是 `node.textContent = ...`, 而 textContent 赋值
+    /// **清空全部子节点**。首屏就是"已应用过一次语言"的状态, 于是那个 select 从头到尾
+    /// 不存在(症状: 表头看得见「市场」二字, 但没有筛选框, 且**不报错**)。
+    ///
+    /// 这与侧栏导航项 `data-zh` 要挂内层 `.nav-text`(不能挂 `<a>`)是同一个坑。
+    /// 这里做一条**通用**扫描: 任何 `bi("...")` 所在的标签里不许再出现 `<select`/`<button`/
+    /// `<input` —— 那些都是会被抹掉的交互子元素。
+    #[test]
+    fn test_no_data_zh_on_elements_with_interactive_children() {
+        for (name, src) in all_js() {
+            // 逐行看: `bi("key")` 之后、同一个字符串拼接段里出现交互子元素即可疑。
+            // 只扫 runs.js 就够了(那是唯一在字符串拼串里放交互控件的地方), 但扫全部更稳。
+            if name != "runs.js" {
+                continue;
+            }
+            for (i, line) in src.lines().enumerate() {
+                if !line.contains("bi(") {
+                    continue;
+                }
+                let rest = line.split("bi(").nth(1).unwrap_or("");
+                for tag in ["<select", "<button", "<input", "<textarea"] {
+                    assert!(
+                        !rest.contains(tag),
+                        "{}:{} —— data-zh 挂在有交互子元素的标签上, applyLang 会清空它们: {}",
+                        name,
+                        i + 1,
+                        line.trim()
+                    );
+                }
+            }
+        }
+    }
+
+    /// 064: 概览页须有**美股代币覆盖**卡(bStock 优势), 且数字来自视野端点。
+    ///
+    /// 背景: 币安官方的机器人功能只开放少数几个 stock, 而 ricow 的视野判据走
+    /// fapi EQUITY base 白名单的全量枚举 —— 这是 ricow 对 fmz 的**差异化卖点**,
+    /// 但此前界面上没有任何一处告诉用户"你能跑多少个"。
+    ///
+    /// 三条纪律各有断言:
+    /// ① 数字来自 `/api/overview` 的 `scope`(与 `/api/markets` **同源**) —— 不写死;
+    /// ② 取不到显示"—"不显示 0(0 = 真的一个都没有, 与"没数到"是两件事);
+    /// ③ 入口只**带路**到市场视图, **不偷偷改用户的 ricow.toml**(放宽视野是配置变更)。
+    #[test]
+    fn test_dashboard_shows_bstock_coverage_from_scope_endpoint() {
+        let dash = src_of("dashboard.js");
+        // ① scope 字段被读取。
+        assert!(dash.contains("d.scope"), "概览须读 /api/overview 的 scope 字段(视野规模)");
+        assert!(
+            dash.contains("dashBstockSpot") && dash.contains("dashBstockFutures"),
+            "须分别展示现货/合约两个数"
+        );
+        // ② 取不到 → 说明文案, 不显示 0。
+        assert!(
+            dash.contains("dashBstockUnknown"),
+            "scope 取不到时须说明原因(不显示 0 —— 0 是另一个意思)"
+        );
+        assert!(dash.contains("if (!c.scope) {"), "须区分「取不到」与「0 个」两条路");
+        // ③ 入口只导航, 不改配置。
+        assert!(
+            dash.contains("R.navigate(\"#markets\")"),
+            "入口只带去市场视图(不偷偷改 show_all_pairs)"
+        );
+        assert!(
+            !dash.contains("show_all_pairs"),
+            "概览页不许写配置(放宽视野要用户自己在市场视图显式确认)"
+        );
+        // 口径徽章: 同一份视野在 all=true 下数字差一个量级, 不标口径用户会以为数字在跳。
+        assert!(
+            dash.contains("dashBstockScopeStock") && dash.contains("dashBstockScopeAll"),
+            "须标明当前口径(股票类视野 / 全部交易对)"
+        );
+    }
+
+    /// 064: 「模拟回测」Tab 须有 **AI 解读**入口(063 遗留项)。
+    ///
+    /// 设计要点: 评估三步(跑改前 → 跑改后 → ai-assess)完整实现在右栏 AI 面板,
+    /// 这里只做**跳转** —— 同一份状态在两处各渲染一份, 必然有一份是过期的。
+    /// 故断言钉的是"有入口 + 有显示条件 + 是跳转", 而不是"这里也有一套评估"。
+    /// 066: 概览的 bStock 覆盖卡也要带**可用性**, 不可用的一侧显示「—」。
+    ///
+    /// 为什么这条不能漏: 066 给 `/api/markets` 加了降级, 但概览的 `scope`
+    /// 也走同一个 `current_view` —— 若 overview 只取 `.spot.len()`, 降级时
+    /// 那一半是**空列表** ⇒ 会显示成"0 个"(假信息)。
+    #[test]
+    fn test_overview_scope_carries_availability_flags() {
+        let ov = include_str!("overview.rs");
+        assert!(ov.contains("pub spot_ok: Option<bool>"), "scope 须带现货那半的可用性");
+        assert!(ov.contains("pub futures_ok: Option<bool>"), "scope 须带合约那半的可用性");
+        // 组装时**真的**把可用性传出去(不是只声明字段)。
+        assert!(
+            ov.contains("spot_ok: v.spot_ok") && ov.contains("futures_ok: v.futures_ok"),
+            "组装 scope 时须把两半的可用性传出去"
+        );
+        let dash = src_of("dashboard.js");
+        assert!(
+            dash.contains("c.scope.spot_ok") && dash.contains("c.scope.futures_ok"),
+            "bStock 卡须读 scope 的可用性标志"
+        );
+        assert!(
+            dash.contains(r#"it.ok === false ? "—" : String(it.value)"#),
+            "不可用的一侧须显示「—」而不是 0"
+        );
+    }
+
+    /// 066: 市场视图某一侧**取不到**时, 前端须显示「—」+ 说明, **不显示 0**。
+    ///
+    /// 钉的纪律: "取不到 ≠ 0"(062/063 的口径)。把"没数到"说成"0 个交易对"是假信息 ——
+    /// 用户会以为这个市场真的没有交易对, 而不是网络没通。
+    #[test]
+    fn test_markets_view_shows_dash_not_zero_when_side_unreadable() {
+        let mk = src_of("markets.js");
+        // 数量取值走 countOf(不可用 → 「—」)。
+        assert!(mk.contains("function countOf"), "须有按侧取值量的函数");
+        assert!(
+            mk.contains(r#"if (ok === false) return "—";"#),
+            "取不到的一侧须显示「—」, 不显示 0"
+        );
+        // renderScope 走 countOf(不能直接用 .length)。
+        assert!(
+            mk.contains(r#"countOf(d, "spot")"#) && mk.contains(r#"countOf(d, "futures")"#),
+            "顶部口径行须走 countOf(不能直接打 .length)"
+        );
+        // 不可读的一侧: 显示说明, **不给**"看全部交易对"的空态(那按钮在网络故障时是误导)。
+        assert!(mk.contains("mkUnreadable"), "须有不可读说明文案");
+        assert!(mk.contains("mk-unreadable"), "须有不可读样式类");
+        assert!(mk.contains(r#"if (!readable) {"#), "renderGroup 须先判不可读分支");
+    }
+
+    /// 066: `PairsView` 的可用性字段是 `Option<bool>` —— 老调用点不填时行为不变。
+    ///
+    /// 为什么钉住"Option 而不是 bool": 若改成 `bool`, 老数据/老调用点会被当成
+    /// "false"(取不到) ⇒ 凭空多出一片「—」, 行为与改动前不一致。
+    #[test]
+    fn test_pairs_view_availability_is_optional_bool() {
+        let mc = include_str!("../../../ricow_engine/src/market_class.rs");
+        assert!(
+            mc.contains("pub spot_ok: Option<bool>,"),
+            "现货可用性须是 Option<bool>(None = 没这个信息)"
+        );
+        assert!(mc.contains("pub futures_ok: Option<bool>"), "合约可用性须是 Option<bool>");
+        // 序列化时 None 不出现(老响应形状不变)。
+        assert!(
+            mc.contains(r#"#[serde(skip_serializing_if = "Option::is_none")]"#),
+            "None 时不该序列化出该键(老响应形状不变)"
+        );
+    }
+
+    /// 065: 回测/作业**网络失败**时, 界面上须有一条可照着做的指引。
+    ///
+    /// 为什么钉这条: 此前界面上只有一行裸 `network error: K 线第 0 片拉取失败` ——
+    /// 用户既不知道该查网络还是查自己的代码, 也不知道产品**已经有**可用的备用域名开关
+    /// (`RICOW_BN_BASE_URL`)。产品自己的 AI 提示词里早写明了这件事, 但那是给 AI 看的,
+    /// 用户看不到(2026-10-25 实测发现)。
+    ///
+    /// 钉的**判据要窄**: 只认 `network error` / `拉取失败` —— 参数错、门禁拦、策略语法错
+    /// 都不该提示网络方向(那是噪音, 且会把人引向错误的排查方向)。
+    #[test]
+    fn test_backtest_network_error_shows_actionable_guidance() {
+        let bt = src_of("strategy_backtest.js");
+        // 判别函数存在, 且**只**认这两个形态。
+        assert!(bt.contains("function isNetworkError"), "须有网络错误判别函数");
+        assert!(
+            bt.contains(r#"indexOf("network error")"#) && bt.contains(r#"indexOf("拉取失败")"#),
+            "网络判据须认 network error 与 拉取失败 两个形态"
+        );
+        // 指引块: 标题 + 三条可操作动作。
+        assert!(bt.contains("sg-net-guide"), "须有指引块");
+        assert!(bt.contains("sgBtNetTitle"), "须有指引标题");
+        assert!(bt.contains("sgBtNetProxy"), "须提示代理 env");
+        assert!(bt.contains("sgBtNetBase"), "须提示现货备用域名");
+        assert!(bt.contains("sgBtNetFapi"), "须提示合约备用域名");
+        // **四个作业级 error 渲染点都要挂** —— 漏一个就有一个入口看不到指引。
+        // (回测 / 寻优 / 多维优化 / 验证 —— 形态不同, 但都是"整个作业失败"。)
+        assert_eq!(
+            bt.matches("appendNetGuidance(box, job.error)").count(),
+            4,
+            "四个作业级 error 渲染点都要追加网络指引(回测/寻优/优化/验证)"
+        );
+        // 文案必须说清"镜像域只影响行情与回测、下单仍走主网" ——
+        // 不说这句, 用户会拿它去实盘然后被签名接口拒掉, 比原来更困惑。
+        // **两份字典都要有那句限定** —— 这里用"与"不是"或":
+        // 写成 `zh || en` 时, 变异掉中文那份而英文还在 → 断言仍绿(实测踩到:
+        // 5 条变异只抓住 4 条)。中英是**两份独立文案**, 少一份就是少一份限定。
+        let shell = src_of("strategies.js");
+        assert!(
+            shell.contains("只影响行情与回测, 下单仍走主网"),
+            "中文指引须说明备用域名只覆盖行情与回测(否则会误导用户拿它去实盘)"
+        );
+        assert!(
+            shell.contains("market data / backtest only"),
+            "英文指引同样须说明限定(两份文案是独立的, 少一份就少一份限定)"
+        );
+    }
+
+    #[test]
+    fn test_backtest_tab_has_ai_assess_entry_that_jumps() {
+        let shell = src_of("strategies.js");
+        assert!(shell.contains(r#"id="sg-bt-assess-entry""#), "回测 Tab 须有 AI 解读入口容器");
+        assert!(
+            shell.contains("sgBtAssess") && shell.contains("sgBtAssessNoDiff"),
+            "须有入口文案 + 没有改动时的说明(藏起来会让用户以为功能不存在)"
+        );
+        // 显示条件: 当前有参数改动(paramDiffs 非空)。
+        assert!(shell.contains("S.paramDiffs()"), "入口的显示条件须是「当前有参数改动」");
+        // 是跳转: 切回编辑 Tab + 滚到 AI 面板, 不在本地重复渲染结果。
+        assert!(
+            shell.contains(r#"st.tab = "edit";"#) && shell.contains(r#"$("sg-ai-card")"#),
+            "入口须切回编辑 Tab 并滚到 AI 面板(不在本地重复一份评估结果)"
+        );
+        // 参数变动时要刷新入口(否则用户在编辑 Tab 改完不切走, 入口停在过期状态)。
+        assert!(
+            shell.contains("S.refreshAssessEntry"),
+            "参数每次变动都要刷新入口(applyTab 只在切 Tab 时跑)"
+        );
+    }
+
+    /// 064: 新建实盘须有**重置参数**, 且只回清单默认值。
+    ///
+    /// 为什么钉"只回有默认值的": 无默认值的必填参数若被清空, 用户面对的是空表单
+    /// + 一句"必填" —— 那不如不重置。而"填 0"更是编造: 0 对仓位占比/价格都是
+    ///   一个**有意义但错**的值。
+    #[test]
+    fn test_new_live_reset_only_restores_manifest_defaults() {
+        let runs = src_of("runs.js");
+        assert!(runs.contains("rn-live-reset"), "参数区须有重置按钮");
+        assert!(
+            runs.contains("if (e.def === undefined || e.def === null) continue;"),
+            "重置只回**有默认值**的键(无默认值保持原值, 不清空也不填 0)"
+        );
+        // 写入走通用入口(三种控件类型分别处理), 不在这里各写一套。
+        assert!(
+            runs.contains("S.writeParamEntries"),
+            "写入须走 strategy_form 的通用入口(bool/string/enum 分别处理)"
+        );
+    }
+
+    /// 064: 实盘列表须有**市场列**(列头即筛选)。
+    ///
+    /// 实例多了以后"哪些是合约"一眼看不清; 且市场读不到时**不许猜** ——
+    /// 猜一个市场比不显示更糟: 用户会按猜的那个去配交易所参数。
+    #[test]
+    fn test_runs_table_has_market_column_and_filter() {
+        let runs = src_of("runs.js");
+        assert!(runs.contains(r#"id="rn-market-filter""#), "须有市场筛选控件");
+        assert!(
+            runs.contains(r#"tr.hidden = want !== "all" && mk !== want;"#),
+            "筛选须真的隐藏不匹配的行"
+        );
+        // 市场徽章带 data-market(筛选靠它取口径, 不靠解析文字)。
+        assert!(
+            runs.contains("badge.dataset.market = mk;"),
+            "市场徽章须带 data-market(筛选按数据属性取, 不解析显示文字)"
+        );
+        // 读不到不猜: 显示 --。
+        assert!(
+            runs.contains(r#"h("span", "rn-muted", "--")"#),
+            "市场读不到时显示 -- , 不许猜一个"
+        );
+    }
+
     /// 063: 策略库是**一张表混排**, 不再按 现货/合约 × 内置/我的 分四组。
     ///
     /// 为什么钉住: fmz 的 `/m/strategies` 就是一张表(名称/最后修改/创建日期/操作项),

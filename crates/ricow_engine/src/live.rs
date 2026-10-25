@@ -71,6 +71,32 @@ pub fn check_clock_skew(skew_ms: i64) -> ClockVerdict {
     ClockVerdict::Ok { skew_ms }
 }
 
+/// 时钟预检采样组: `(往返耗时 ms, 偏差 ms)`。
+///
+/// 偏差的测量误差**只来自往返不对称** `(B-A)/2` (A = 请求腿耗时, B = 响应腿耗时),
+/// 其量级 ≤ 往返耗时 ⇒ **RTT 最小的那组噪声最小**。
+///
+/// 实测教训 (2026-10-25): 本机到 demo 端点的 RTT 在 1.6~3.6s 间剧烈波动, 单次采样
+/// 偶发把真实 ±500ms 的钟差读成 **+3375ms**, 把时钟完全正常的机器误拒。
+/// 故: 采多组, 取 RTT 最小者。
+pub type ClockSample = (i64, i64);
+
+/// 两组采样的偏差差 ≤ 此值即认为"够一致", 可提前收手 (省一次往返, 不拖慢启动)。
+pub const CLOCK_SAMPLE_AGREE_MS: i64 = 500;
+
+/// 从多组采样里挑噪声最小的一组 (RTT 最小) 的偏差值。
+///
+/// 判据是 **RTT 最小**, 不是"偏差看起来最合理" —— 后者会把一个恰好接近 0 的坏样本选中。
+/// 纯函数, 便于单测。空输入 → `None` (调用方据此报"取不到", 不许回退默认值)。
+pub fn pick_clock_sample(samples: &[ClockSample]) -> Option<i64> {
+    samples.iter().min_by_key(|(rtt_ms, _)| *rtt_ms).map(|(_, skew_ms)| *skew_ms)
+}
+
+/// 两组采样的偏差是否够一致 (差 ≤ `tol_ms`)。
+pub fn clock_samples_agree(a_ms: i64, b_ms: i64, tol_ms: i64) -> bool {
+    (a_ms - b_ms).abs() <= tol_ms
+}
+
 // ---- 实盘启用门禁 (FR-013 / D2) ----
 
 /// 实盘门禁结论: 双条件 (配置声明 + 命令行显式) 缺一即按 Dry Run 运行。
@@ -583,6 +609,39 @@ mod tests {
         let ahead = skew_ms(t0 + chrono::Duration::milliseconds(1500), t0);
         assert_eq!(ahead, 1500);
         assert!(!check_clock_skew(ahead).is_ok(), "本机超前 1500ms 应被预检拒绝");
+    }
+
+    #[test]
+    fn test_pick_clock_sample_takes_min_rtt_not_prettiest_skew() {
+        // 真实事故形状: 一组高 RTT 的坏样本把偏差读成 +3375ms (会被误拒),
+        // 另一组低 RTT 的样本给出真实钟差。判据必须是 RTT, 不能是"偏差看起来最合理"。
+        let samples: Vec<ClockSample> = vec![(3356, 3375), (1800, -420), (2100, -500)];
+        assert_eq!(pick_clock_sample(&samples), Some(-420));
+    }
+
+    #[test]
+    fn test_pick_clock_sample_ignores_skew_magnitude() {
+        // RTT 最小者即使偏差绝对值不是最小, 也必须选它 (误差 ∝ 不对称 ≤ RTT)
+        let samples: Vec<ClockSample> = vec![(900, -30), (3000, -400)];
+        assert_eq!(pick_clock_sample(&samples), Some(-30));
+    }
+
+    #[test]
+    fn test_pick_clock_sample_empty_is_none() {
+        // 取不到 ≠ 0: 空输入必须 None, 调用方据此报错, 不许回退默认值
+        assert_eq!(pick_clock_sample(&[]), None);
+    }
+
+    #[test]
+    fn test_pick_clock_sample_single() {
+        assert_eq!(pick_clock_sample(&[(1800, -500)]), Some(-500));
+    }
+
+    #[test]
+    fn test_clock_samples_agree() {
+        assert!(clock_samples_agree(-500, -520, CLOCK_SAMPLE_AGREE_MS));
+        assert!(clock_samples_agree(-500, -1000, 500), "边界: 差 500 视为一致");
+        assert!(!clock_samples_agree(-500, 3375, CLOCK_SAMPLE_AGREE_MS));
     }
 
     #[test]

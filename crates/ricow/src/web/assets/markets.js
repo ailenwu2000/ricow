@@ -25,6 +25,9 @@
     mkRetry: "重试",
     mkEmpty: "无",
     mkEmptySymbols: "当前视野里没有交易对。",
+    // 066: 某一侧取不到时的说明(与"取不到 ≠ 0"同纪律: 不显示 0, 也不显示空列表)。
+    mkUnreadable: "这一侧的交易对暂时读不到(交易所快照没拉到)。",
+    mkUnreadableHint: "检查网络/代理后重试; 或用 RICOW_BN_BASE_URL 指向备用数据域名(只影响行情, 下单仍走主网)。",
     mkBack: "‹ 返回市场",
     mkLastPrice: "现价(买卖盘中间价)",
     mkNoBook: "暂无盘口",
@@ -59,6 +62,9 @@
     mkRetry: "Retry",
     mkEmpty: "None",
     mkEmptySymbols: "No pairs in the current view.",
+    // 066: shown when one side of the view could not be read (never show 0 for it).
+    mkUnreadable: "This side of the view could not be read (exchange snapshot unavailable).",
+    mkUnreadableHint: "Check the network/proxy and retry; or point RICOW_BN_BASE_URL at an alternate data domain (market data only — live orders still go to the main site).",
     mkBack: "‹ Back to markets",
     mkLastPrice: "Last price (order-book mid)",
     mkNoBook: "Order book unavailable",
@@ -258,10 +264,19 @@
     }
   }
 
+  /// 066: 一侧的数量。**取不到显示「—」, 不显示 0** ——
+  /// 把"没数到"说成"0 个"是假绿(062/063 的纪律)。
+  function countOf(d, market) {
+    const ok = market === "spot" ? d.spot_ok : d.futures_ok;
+    if (ok === false) return "—";
+    return String((market === "spot" ? d.spot : d.futures).length);
+  }
+
   function renderScope(d) {
     const scope = d.filtered ? t("mkViewFiltered") : t("mkViewAll");
     $("mk-scope").textContent =
-      scope + " · " + t("spot") + " " + d.spot.length + " · " + t("futures") + " " + d.futures.length;
+      scope + " · " + t("spot") + " " + countOf(d, "spot") + " · " +
+      t("futures") + " " + countOf(d, "futures");
   }
 
   function renderList() {
@@ -270,19 +285,26 @@
     renderScope(d);
     const body = $("mk-list-body");
     body.innerHTML = "";
-    body.appendChild(renderGroup("mk-spot", t("spot"), d.spot, "spot"));
-    body.appendChild(renderGroup("mk-futures", t("futures"), d.futures, "futures"));
+    body.appendChild(renderGroup("mk-spot", t("spot"), d.spot, "spot", d.spot_ok !== false));
+    body.appendChild(renderGroup("mk-futures", t("futures"), d.futures, "futures", d.futures_ok !== false));
   }
 
   /// 一组(现货 / 合约)可点行; 点击记下所属市场后跳详情。
-  function renderGroup(id, label, symbols, market) {
+  function renderGroup(id, label, symbols, market, readable) {
     const sec = h("section", "mk-col");
     const head = h("div", "mk-col-head");
     head.appendChild(h("span", null, label));
-    head.appendChild(h("span", "mk-count", String(symbols.length)));
+    // 066: 取不到的一侧, 数量显示「—」而不是 0。
+    head.appendChild(h("span", "mk-count", readable ? String(symbols.length) : "—"));
     sec.appendChild(head);
     const rows = h("div", "mk-symrows");
-    if (!symbols.length) {
+    if (!readable) {
+      // 066: **取不到 ≠ 没有**。这里绝不能显示"看全部交易对"的空态 ——
+      // 网络挂了时改成全量视野也没用, 那按钮会把人引向错误的排查方向。
+      // 也不显示空列表: 空列表会被读成"这个市场没有交易对"(假信息)。
+      rows.appendChild(h("div", "mk-unreadable", t("mkUnreadable")));
+      rows.appendChild(h("div", "mk-unreadable-hint", t("mkUnreadableHint")));
+    } else if (!symbols.length) {
       // B4: "无" 太干 —— 视野里没东西时, 下一步就是"看全部交易对"(与顶部开关同一动作)。
       rows.appendChild(
         R.emptyState(t("mkEmptySymbols"), {

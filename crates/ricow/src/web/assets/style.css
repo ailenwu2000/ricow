@@ -5492,3 +5492,296 @@ body.palette-open {
     grid-template-columns: 1fr;
   }
 }
+
+/* ============================================================
+   064: 概览页「美股代币覆盖」卡 —— ricow 对 fmz 的差异化卖点。
+   币安官方机器人只开放少数 stock, ricow 覆盖全部美股代币。
+   ============================================================ */
+.dash-bstock {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.dash-bstock-grid {
+  display: flex;
+  gap: 24px;
+}
+.dash-bstock-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* 数字用主色 + 大号: 这是本卡的主角(概览要"扫一眼就看到能跑多少")。 */
+.dash-bstock-num {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.dash-bstock-label {
+  font-size: 13px;
+  color: var(--fg-3);
+}
+/* 口径徽章: 未过滤(全部交易对)用主色实底, 过滤中(仅股票类)用描边 ——
+   一眼能看出"现在看到的是不是全部"。 */
+.dash-bstock-badge {
+  align-self: flex-start;
+  padding: 2px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  font-size: 12px;
+  color: var(--fg-2);
+  background: var(--panel);
+}
+.dash-bstock-badge.is-filtered {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.dash-bstock-edge {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--fg-2);
+}
+.dash-bstock-unknown {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--fg-3);
+}
+
+/* ---- 064: 实盘列表的「市场」列(列头即筛选) ---- */
+.rn-th-market {
+  width: 108px;
+}
+.rn-market-filter {
+  width: 100%;
+  padding: 3px 6px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+}
+.rn-muted {
+  color: var(--fg-3);
+}
+.rn-market-spot {
+  border-color: var(--border-strong);
+  color: var(--fg-2);
+}
+.rn-market-futures {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---- 064: 回测 Tab 的 AI 解读入口 ---- */
+.sg-bt-assess-entry {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 10px 0 4px;
+}
+
+/* ---- 064: 新建实盘参数区标题行(标题 + 重置按钮) ---- */
+.rn-live-params-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.rn-live-params-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+/* ---- 064: 概览统计格**整格可点**(fmz 的六格每格都是链接) ---- */
+.dash-stat-link {
+  display: block;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+.dash-stat-link:hover .ui-stat {
+  background: var(--accent-soft);
+}
+.dash-stat-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- 064: 「最近操作」卡 ---- */
+.dash-recent {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.dash-recent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.dash-recent-link {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 7px 8px;
+  margin: 0;
+  font: inherit;
+  text-align: left;
+  color: var(--fg);
+  cursor: pointer;
+  border-radius: 2px;
+}
+.dash-recent-link:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.dash-recent-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.dash-recent-title {
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+/* 时间靠右、不参与弹性压缩(fmz 的列表时间形态)。 */
+.dash-recent-time {
+  flex: none;
+  font-size: 12px;
+  color: var(--fg-3);
+  font-variant-numeric: tabular-nums;
+}
+.dash-recent-empty,
+.dash-recent-hint {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--fg-3);
+}
+
+/* ---- 064: 概览「告警」格(数字 + 明细行) ---- */
+.dash-alert-none {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--fg-3);
+}
+.dash-alert-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+.dash-alert-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  border: none;
+  background: none;
+  padding: 6px 8px;
+  margin: 0;
+  font: inherit;
+  text-align: left;
+  color: var(--fg);
+  cursor: pointer;
+  border-radius: 2px;
+}
+.dash-alert-row:hover {
+  background: var(--accent-soft);
+}
+.dash-alert-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.dash-alert-row-txt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.dash-alert-row-id {
+  color: var(--fg);
+}
+/* 「← 复制的谁」用弱色: 它是补充信息, 不是主词。 */
+.dash-alert-row-of {
+  color: var(--fg-3);
+}
+.dash-alert-row-why {
+  flex: none;
+  font-size: 12px;
+  color: var(--warn, #faad14);
+}
+
+/* ---- 065: 网络失败的可操作指引(只读提示, 不改任何配置) ---- */
+.sg-net-guide {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  /* 用 `--bg`(内容底)而不是 `--panel`(卡片底): 指引块在**卡片内部**,
+     与卡片同色就看不出层次了。`--bg` 三档主题都有定义, 不吃兜底值。 */
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sg-net-guide-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.sg-net-guide-line {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--fg-2);
+  word-break: break-all;
+}
+
+/* ---- 066: 某一侧交易对取不到(显示「—」+ 说明, 不显示 0/空列表) ---- */
+.mk-unreadable {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--fg-2);
+}
+.mk-unreadable-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--fg-3, var(--fg-2));
+  word-break: break-all;
+}
+
+/* ---- 066: 概览 bStock 覆盖卡 —— 某一侧读不到(显示「—」+ 说明) ---- */
+.dash-bstock-num.is-unreadable {
+  color: var(--fg-3, var(--fg-2));
+}
+.dash-bstock-partial {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--fg-3, var(--fg-2));
+}

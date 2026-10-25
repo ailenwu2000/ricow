@@ -30,15 +30,18 @@ pub use exposure::{
 };
 pub use latency::{summarize as summarize_latency, LatencyStats};
 pub use live::{
-    check_clock_skew, clock_align_guidance, dry_run_gate, dry_run_initial_cash,
-    liquidation_distance, live_gate, must_refuse_start, orphan_query_refuse_message,
-    orphan_refuse_message, plan_cleanup, residual_owned, risk_gate, skew_ms, split_owned,
-    CleanupOutcome, CleanupPlan, ClockVerdict, LiveGate, OnceGate, RiskGate, DEFAULT_DRY_RUN_CASH,
+    check_clock_skew, clock_align_guidance, clock_samples_agree, dry_run_gate,
+    dry_run_initial_cash, liquidation_distance, live_gate, must_refuse_start,
+    orphan_query_refuse_message, orphan_refuse_message, pick_clock_sample, plan_cleanup,
+    residual_owned, risk_gate, skew_ms, split_owned, CleanupOutcome, CleanupPlan, ClockSample,
+    ClockVerdict, LiveGate, OnceGate, RiskGate, CLOCK_SAMPLE_AGREE_MS, DEFAULT_DRY_RUN_CASH,
     DEFAULT_MIN_DRY_RUN_HOURS, RISK_DISCLOSURE,
 };
 pub use loader::load_strategy;
 pub use market::{fetch_orderbook, subscribe_orderbook, to_orderbook};
-pub use market_class::{bstock_spot_pool, build_view, filter_view, is_bstock_base, PairsView};
+pub use market_class::{
+    bstock_spot_pool, build_view, build_view_with, filter_view, is_bstock_base, PairsView,
+};
 pub use nasdaq::{parse_historical, NasdaqClient};
 pub use notify::{EventKind, Notifier, NotifyConfig, NotifyEvent};
 /// 会话内订单登记 (037 P0-B): 引擎视角的订单生命周期账目。

@@ -273,7 +273,7 @@
       const val = current[p.key] !== undefined ? current[p.key] : p.default;
       const built = p.ty === "string" ? stringRow(p, val) : paramRow(p, val);
       box.appendChild(built.label);
-      entries.push(paramEntry(p.key, p.name, p.ty, p.required, built));
+      entries.push(paramEntry(p.key, p.name, p.ty, p.required, built, p.default));
     }
     if (typeof o.onInput === "function") {
       for (const e of entries) {
@@ -352,13 +352,16 @@
   ///   - `base`: 基线值(渲染时的字符串), 与当前值比才知道"改没改";
   ///   - `diff`: 行内「原 X → 改为 Y」的容器, 挂在 label 末尾, 未改动时 hidden。
   /// 监听绑 `input` 与 `change` 两个事件: 文本框/数字框两个都发, 下拉与复选框只发 `change`。
-  function paramEntry(key, name, ty, required, built) {
+  // 064: `def` = 清单声明的默认值(`undefined` = 这个参数没有默认值)。
+  // 「重置参数」要用它把控件恢复成"清单说的那样" —— 没有默认值的**清空**而不是填 0
+  // (填 0 是编造一个值)。
+  function paramEntry(key, name, ty, required, built, def) {
     const diff = h("div", "sg-param-diff");
     diff.hidden = true;
     built.label.appendChild(diff);
     built.input.addEventListener("input", onParamInput);
     built.input.addEventListener("change", onParamInput);
-    const entry = { key: key, name: name || key, ty: ty, required: !!required, input: built.input, diff: diff, base: "" };
+    const entry = { key: key, name: name || key, ty: ty, required: !!required, input: built.input, diff: diff, base: "", def: def };
     entry.base = paramTextOf(entry);
     return entry;
   }
@@ -1048,6 +1051,26 @@
     }
     return out;
   }
+
+  /// 064: 把一组值写进**给定的参数控件表**(`buildParamBlock` 返回的 entries)。
+  ///
+  /// 为什么要有这个(而不是复用 editor 的 `fillParamInputs`): 后者读的是
+  /// `st.paramInputs` —— **详情页**那张表单的注册表。新建实盘弹窗的参数区是
+  /// `buildParamBlock` 现建的, 不在那张表里。两处表单共用一套**写入语义**才对:
+  /// ① 按类型分别处理(bool 是 checked, enum/string 是 value);
+  /// ② `null`/`undefined` → **空串**(不是 "null"/"undefined" 字样)。
+  S.writeParamEntries = function (entries, values) {
+    let n = 0;
+    for (const e of entries || []) {
+      if (!Object.prototype.hasOwnProperty.call(values, e.key)) continue;
+      const v = values[e.key];
+      if (!e.input) continue;
+      if (e.ty === "bool") e.input.checked = !!v;
+      else e.input.value = v === null || v === undefined ? "" : String(v);
+      n += 1;
+    }
+    return n;
+  };
 
   // ---------- 对外(外壳与其它子文件调用) ----------
   S.enterDetail = enterDetail;

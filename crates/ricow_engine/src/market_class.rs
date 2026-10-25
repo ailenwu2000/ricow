@@ -57,6 +57,17 @@ pub struct PairsView {
     pub futures: Vec<String>,
     /// true = 默认过滤视野(仅 bStock 现货 + 美股永续); false = 全量。
     pub filtered: bool,
+    /// 066: 现货那一半**是否取到**。
+    ///
+    /// 用 `Option<bool>` 而不是 `bool`: `None` = **没这个信息**(老调用点/老数据),
+    /// 前端按改动前的行为显示(不凭空多出一个「—」); `Some(true)` = 取到了;
+    /// `Some(false)` = **取不到** —— 前端显示「—」并说明原因, **不显示 0**
+    /// (延续 062/063 的"取不到 ≠ 0"纪律: 把"没数到"说成"0 个"是假绿)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spot_ok: Option<bool>,
+    /// 066: 合约那一半**是否取到**。语义同 [`PairsView::spot_ok`]。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub futures_ok: Option<bool>,
 }
 
 impl PairsView {
@@ -79,11 +90,49 @@ pub fn build_view(
     equity_bases: &[String],
     show_all: bool,
 ) -> PairsView {
+    build_view_with(spots, futures, equity_bases, show_all, None, None)
+}
+
+/// 066: [`build_view`] + **两半各自的可用性**。
+///
+/// `spot_ok` / `futures_ok`: `None` = 没这个信息(默认, 行为与改动前完全一致);
+/// `Some(false)` = 那一半**取不到**。
+///
+/// **关键的依赖关系**(别把它简化掉): 默认视野(仅股票类)下, bStock 现货池
+/// 要靠 **fapi EQUITY 白名单**识别(`is_bstock_base` 拿 base 去尾 B 去比白名单)。
+/// 合约那一半挂掉 ⇒ EQUITY 白名单拿不到 ⇒ **现货那一半也算不出来** ——
+/// 此时若照样给出现货列表, 就是把非股票现货当股票(crypto 假阳性:
+/// ARBUSDT / STXBUSDT / QNTBUSDT 的 base 都以 B 结尾)。
+///
+/// 所以: 默认视野下合约不可用 ⇒ **现货那半也标不可读**;
+/// 全量视野(`show_all = true`)下现货与合约互不依赖, 现货**照常给真数据**。
+pub fn build_view_with(
+    spots: &[Market],
+    futures: &[Market],
+    equity_bases: &[String],
+    show_all: bool,
+    spot_ok: Option<bool>,
+    futures_ok: Option<bool>,
+) -> PairsView {
+    // 默认视野依赖合约白名单 → 合约不可用时, 现货那半也算不出来。
+    //
+    // 写成 `if` 而不是 `match`: `match` 那个 `other => other` 分支带守卫
+    // (`Some(false) if !show_all`), clippy 的 needless_match 建议会把它当成恒等
+    // 而**丢掉守卫** —— 那样全量视野下也会误标现货不可读。故用 `if` 写死条件。
+    // 现货那半的可用性 = **它自己的**可用性 ∩ (默认视野下还依赖合约白名单)。
+    //
+    // 注意这里必须用 `spot_ok`(参数本身), **不能**用 `futures_ok` —— 否则
+    // "现货失败 + 合约成功"时会把现货错标成可用(实测踩到: 全量视野下现货明明
+    // 取不到, 却因合约正常而显示为可读)。
+    let spot_readable = if futures_ok == Some(false) && !show_all { Some(false) } else { spot_ok };
     if show_all {
         return PairsView {
             spot: symbols_where(spots, |_| true),
             futures: symbols_where(futures, |_| true),
             filtered: false,
+            // 全量视野: 现货用 `spot_readable`(= 它自己的可用性; 合约不可用**不连累**它)。
+            spot_ok: spot_readable,
+            futures_ok,
         };
     }
     let spot_bases = bstock_spot_pool(spots, equity_bases);
@@ -93,6 +142,9 @@ pub fn build_view(
             equity_bases.iter().any(|e| e.eq_ignore_ascii_case(&m.base_asset))
         }),
         filtered: true,
+        // 现货那半: 合约不可用 ⇒ 股票池识别不了 ⇒ 也标不可读(不给假的"0 个股票现货")。
+        spot_ok: spot_readable,
+        futures_ok,
     }
 }
 
@@ -118,6 +170,10 @@ pub fn filter_view(view: &PairsView, market: Option<&str>, q: Option<&str>) -> P
         spot: if want_spot { pick(&view.spot) } else { Vec::new() },
         futures: if want_futures { pick(&view.futures) } else { Vec::new() },
         filtered: view.filtered,
+        // 066: 可用性原样透传(**不被过滤条件改写**) —— "这半取不到"是取数的事实,
+        // 与"这次查的是哪个市场"无关。按现货查时合约那半仍不可用, 如实说。
+        spot_ok: view.spot_ok,
+        futures_ok: view.futures_ok,
     }
 }
 
@@ -219,6 +275,85 @@ mod tests {
         assert!(!v.filtered);
         assert_eq!(v.spot, vec!["AAPLBUSDT", "BTCUSDT", "TSLABUSDT"]);
         assert_eq!(v.futures, vec!["AAPLUSDT", "BTCUSDT", "TSLAUSDT"]);
+    }
+
+    /// 066: **全量视野**下, 合约那半不可用**不连累**现货那半 ——
+    /// 现货与合约是两个独立端点, 全量视野下互不依赖。
+    ///
+    /// **这条断言必须钉"全量视野"下的 `spot_ok == Some(true)`**:
+    /// 只钉默认视野那条不够 —— 默认视野下两种实现都给出 `Some(false)`
+    /// (现货跟着合约一起不可读), 所以**区分不开**。
+    /// 实测(变异 M1): 把 `spot_readable` 简写成 `futures_ok` 后,
+    /// 默认视野那条断言**仍然绿**(结果恰好相同) —— 靠这条才抓住。
+    #[test]
+    fn test_build_view_all_keeps_spot_readable_when_futures_unavailable() {
+        let (spots, futures, equity) = sample();
+        let v = build_view_with(&spots, &futures, &equity, true, Some(true), Some(false));
+        // 现货照常给**真数据**(不是空、不是 0)。
+        assert_eq!(v.spot_ok, Some(true), "全量视野下现货与合约互不依赖, 合约不可用不该连累现货");
+        assert_eq!(v.spot.len(), 3, "全量视野的现货应照常给全量 TRADING");
+        // 合约那半如实标不可用。
+        assert_eq!(v.futures_ok, Some(false));
+    }
+
+    /// 066: **默认视野**(仅股票类)下, 合约那半不可用 ⇒ **现货那半也算不出来**。
+    ///
+    /// 为什么: bStock 现货池要靠 fapi EQUITY 白名单识别(`is_bstock_base`),
+    /// 白名单拿不到就认不出股票类。此时若照样给出现货列表 = 把 crypto
+    /// (ARBUSDT/STXBUSDT/QNTBUSDT 的 base 都以 B 结尾)当股票 ⇒ **假信息**。
+    #[test]
+    fn test_build_view_filtered_marks_spot_unreadable_when_futures_unavailable() {
+        let (spots, futures, equity) = sample();
+        let v = build_view_with(&spots, &futures, &equity, false, Some(true), Some(false));
+        // 现货那半也标不可读(**不能**给假的"0 个股票现货")。
+        assert_eq!(v.spot_ok, Some(false), "默认视野的现货依赖合约白名单, 合约挂了就该标不可读");
+        assert_eq!(v.futures_ok, Some(false));
+    }
+
+    /// 066: 老调用点(不传可用性)⇒ 行为与改动前**完全一致**(字段为 None)。
+    #[test]
+    fn test_build_view_without_availability_keeps_legacy_behavior() {
+        let (spots, futures, equity) = sample();
+        let v = build_view(&spots, &futures, &equity, false);
+        assert_eq!(v.spot_ok, None);
+        assert_eq!(v.futures_ok, None);
+        assert_eq!(v.spot.len(), 2);
+        assert_eq!(v.futures.len(), 2);
+        // 过滤后可用性**原样透传**(不被"查哪个市场"改写)。
+        let only_spot = filter_view(&v, Some("spot"), None);
+        assert_eq!(only_spot.spot_ok, None);
+        assert_eq!(only_spot.futures_ok, None);
+    }
+
+    /// 066: 现货那半取不到时, 合约那半**照常**给(对称成立),
+    /// 且**现货那半必须如实标不可用**。
+    ///
+    /// 这条断言钉的是"现货自己的可用性不被合约的状态覆盖" ——
+    /// 实现里若把 `spot_ok` 写成 `futures_ok`(取错字段), 现货明明取不到
+    /// 却因合约正常而显示为可读(实测踩到过一次)。
+    #[test]
+    fn test_build_view_all_keeps_futures_readable_when_spot_unavailable() {
+        let (spots, futures, equity) = sample();
+        let v = build_view_with(&spots, &futures, &equity, true, Some(false), Some(true));
+        assert_eq!(v.spot_ok, Some(false), "现货取不到就该标不可用(不能被合约的状态覆盖)");
+        assert_eq!(v.futures_ok, Some(true));
+        assert_eq!(v.futures.len(), 3);
+    }
+
+    /// 066: 默认视野 + **合约不可用** ⇒ 现货那半也标不可读。
+    ///
+    /// 这条与"全量视野"那条是一对: 全量视野下现货**独立**(合约挂不影响它),
+    /// 默认视野下现货**依赖**合约白名单(合约挂 ⇒ 认不出股票类 ⇒ 也读不了)。
+    /// 只钉其中一条都区分不开实现 —— 必须成对。
+    #[test]
+    fn test_build_view_filtered_spot_follows_futures_unavailability() {
+        let (spots, futures, equity) = sample();
+        // 合约不可用 + 默认视野 → 现货跟着不可读。
+        let v = build_view_with(&spots, &futures, &equity, false, Some(true), Some(false));
+        assert_eq!(v.spot_ok, Some(false));
+        // 反向: 合约可用 + 现货可用 → 现货可读。
+        let v2 = build_view_with(&spots, &futures, &equity, false, Some(true), Some(true));
+        assert_eq!(v2.spot_ok, Some(true), "合约可用时现货不该被误标不可读");
     }
 
     #[test]
