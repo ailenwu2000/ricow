@@ -388,6 +388,12 @@ TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝�
 改文件不重编译不生效), 按市场分目录 `strategies/spot/`(现货)与 `strategies/futures/`(合约),
 每策略 = `<id>.lua`(逻辑) + `<id>.toml`(清单: 中文名/说明/参数 schema); 与用户策略同目录, 复制即自定义:
 
+清单 `[[params]]` 字段: `key`/`name`/`type`(`f64|i64|string|bool|enum`)/`desc`/`default`/`required`/`options`,
+外加可选 `group`(分组名)。**分组是表现层数据, 引擎不读**: Web 参数表单按组渲染小节标题, 声明顺序即表单顺序,
+同名分组应连续声明。**分层约定**: 第一个分组固定为 `基础配置` = 运行环境/资金/成本项(`interval`/`invest_cash`/
+`fee_side`/`min_notional` 等; `pair` 是保留键, 表单里独立成交易对字段), 其后各分组为策略语义参数
+—— 即 FMZ 的「配置参数 vs 策略参数」= 「基础配置组 vs 其余组」。
+
 **现货 `strategies/spot/`(2 个)**
 
 - `linear_position_grid` — 现货线性仓位网格(仓位 = 币市值÷总权益随价格线性分布, 逐步建仓 + 事件模型限价网格 + 动态止盈, 落位恒按当前总权益实时计算; 原现货 `paired_grid` / `shannon_grid` / `shannon_virtual_grid` 已于 2026-10-09 删除)

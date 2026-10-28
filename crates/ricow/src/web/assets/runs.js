@@ -888,7 +888,7 @@
       let detail = null;
       let current = {};
       try {
-        detail = await R.api("/api/strategies/" + encodeURIComponent(s.id));
+        detail = R.normParams(await R.api("/api/strategies/" + encodeURIComponent(s.id)));
         current = detail.current || {};
         if (detail.pair) pairInput.value = detail.pair;
         // 视野校验: 策略自带的交易对可能不在当前视野里(默认视野只有股票类)。

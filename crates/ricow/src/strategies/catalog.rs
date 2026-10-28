@@ -47,6 +47,10 @@ pub struct ManifestParam {
     /// 枚举项(仅 ty == Enum)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
+    /// 分组名(可选, 表现层数据): UI 表单按组渲染小节标题。
+    /// 声明顺序即表单顺序, 分组按首次出现顺序排列; 同名分组应连续声明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// 一份策略清单。
@@ -88,7 +92,7 @@ pub struct StrategyManifest {
 impl StrategyManifest {
     /// 解析清单 TOML 并做基础校验(id 非空 / market 合法 / 参数 key 非空)。
     pub fn parse(toml_str: &str) -> Result<Self, String> {
-        let m: StrategyManifest =
+        let mut m: StrategyManifest =
             toml::from_str(toml_str).map_err(|e| format!("清单解析失败: {e}"))?;
         if m.id.is_empty() {
             return Err("清单缺 id".to_string());
@@ -103,6 +107,17 @@ impl StrategyManifest {
         // 他知道自己要调什么, 但不知道作者把那个旋钮叫什么, 不该被逼着起名。
         // 留空时表现层回退显示键名(后端 `web::strategy_io::one_param_line`, 前端 `renderParams`)。
         // 这里若继续拦截, "识别参数 → 保存清单" 就永远是 400, AI 调参数功能根本进不去。
+        // 分组名不校验内容, 但统一 trim 归一(与 `web::strategy_io::non_empty_opt` 同口径):
+        // 空白组名按 None 处理(空组名没有表现层意义), 非空组名写回 trim 值,
+        // 免得「名字」与「名字␣」被表单当成两个分组。
+        for p in &mut m.params {
+            if let Some(g) = p.group.take() {
+                let t = g.trim();
+                if !t.is_empty() {
+                    p.group = Some(t.to_string());
+                }
+            }
+        }
         Ok(m)
     }
 
@@ -546,6 +561,31 @@ default_leverage = 2.0
         let p = m.params.iter().find(|p| p.key == "start_price").unwrap();
         assert!(p.name.is_empty(), "空中文名应原样保留, 不得被填上假数据");
         assert!(p.desc.is_empty());
+    }
+
+    /// 分组是表现层数据: 声明了能解析、缺省为 None、空白组名按 None; TOML 序列化可 round-trip。
+    #[test]
+    fn parse_group_field_round_trip() {
+        let with = MANIFEST
+            .replace("key = \"spacing_pct\"", "key = \"spacing_pct\"\ngroup = \"网格间距\"");
+        let m = StrategyManifest::parse(&with).unwrap();
+        assert_eq!(m.params[0].group, None, "未声明 group 的参数应为 None");
+        assert_eq!(m.params[1].group.as_deref(), Some("网格间距"));
+
+        let s = toml::to_string(&m).expect("带 group 的清单应可序列化");
+        let m2 = StrategyManifest::parse(&s).expect("序列化结果应可回读");
+        assert_eq!(m2.params[1].group.as_deref(), Some("网格间距"));
+
+        let blank =
+            MANIFEST.replace("key = \"start_price\"", "key = \"start_price\"\ngroup = \"  \"");
+        let m = StrategyManifest::parse(&blank).unwrap();
+        assert_eq!(m.params[0].group, None, "空白组名按 None 处理");
+
+        // 非空组名写回 trim 值(与 Web 保存路径 non_empty_opt 同口径)。
+        let padded = MANIFEST
+            .replace("key = \"spacing_pct\"", "key = \"spacing_pct\"\ngroup = \"  网格间距  \"");
+        let m = StrategyManifest::parse(&padded).unwrap();
+        assert_eq!(m.params[1].group.as_deref(), Some("网格间距"), "带空格组名应 trim 保留");
     }
 
     #[test]

@@ -400,6 +400,9 @@ fn one_param_line(p: &ManifestParam) -> String {
             line.push_str(&format!("; 默认: {j}"));
         }
     }
+    if let Some(group) = &p.group {
+        line.push_str(&format!("; 分组: {group}"));
+    }
     line
 }
 
@@ -612,6 +615,11 @@ fn non_empty(s: String) -> Option<String> {
     }
 }
 
+/// `Option<String>` 同口径收拾(trim 后空 → `None`), 供可选字段(如分组名)透传用。
+fn non_empty_opt(s: Option<String>) -> Option<String> {
+    s.and_then(non_empty)
+}
+
 /// 默认值按声明类型归一 (纯函数): JSON 数字是无类型的, `serde` 会把 `14` 解成 `Float(14.0)`,
 /// 直接落盘会写成 `default = 14.0`(与内置清单的 `default = 14` 风格不一致)。这里:
 /// - f64 → `Float`(整数也接受, 转成浮点);
@@ -706,7 +714,28 @@ pub(super) fn build_manifest(
             default,
             required: p.required,
             options: p.options,
+            group: non_empty_opt(p.group),
         });
+    }
+    // 清单约定(specs/lua-api.md): 同名分组必须连续声明 —— 表单按声明顺序渲染,
+    // 标题只在"组名与上一行不同"时出现; X,Y,X 交替会把「X」小节重复画两遍。
+    // 保存路径在此把关(内置清单另有回归测试锚定同一约定)。
+    {
+        let mut seen_groups: HashSet<String> = HashSet::new();
+        let mut last_group: Option<String> = None;
+        for p in &params {
+            let grp = p.group.clone();
+            if grp != last_group {
+                if let Some(g) = &grp {
+                    if !seen_groups.insert(g.clone()) {
+                        return Err(format!(
+                            "分组「{g}」不连续声明: 同名分组的参数必须相邻(分组按首次出现顺序排列)"
+                        ));
+                    }
+                }
+                last_group = grp;
+            }
+        }
     }
     Ok(StrategyManifest {
         id: id.to_string(),
@@ -1066,6 +1095,8 @@ pub(super) fn merge_manifest_params(
             default: h.default,
             required: false,
             options: None,
+            // 分组无法从代码静态得知, 只存在于清单 TOML —— 识别结果一律留空。
+            group: None,
         });
     }
     out

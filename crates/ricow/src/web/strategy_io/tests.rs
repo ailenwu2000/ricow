@@ -425,6 +425,45 @@ fn test_manifest_summary_renders_schema() {
     );
 }
 
+/// AI 调参上下文要能看到分层事实: 有分组 → 行尾 `; 分组: X`, 无分组 → 不出现该后缀。
+#[test]
+fn test_one_param_line_group_suffix() {
+    let mut p = ManifestParam {
+        key: "atr_mult".into(),
+        name: "ATR 乘数".into(),
+        ty: ParamType::Float,
+        desc: "网格间距".into(),
+        default: Some(ConfigValue::Float(1.5)),
+        required: false,
+        options: None,
+        group: Some("网格间距".into()),
+    };
+    let line = one_param_line(&p);
+    assert!(line.contains("; 分组: 网格间距"), "{line}");
+    assert!(line.contains("; 默认: 1.5"), "{line}");
+    p.group = None;
+    assert!(!one_param_line(&p).contains("分组"), "无分组不得出现后缀");
+}
+
+/// 内置清单已全部分组, 且同名分组连续声明(清单约定: 分组按首次出现顺序排列)。
+#[test]
+fn test_builtin_manifests_grouped_contiguous() {
+    for e in catalog::all().into_iter().filter(|e| e.source == catalog::Source::Builtin) {
+        let mut last: Option<&str> = None;
+        let mut seen: HashSet<&str> = HashSet::new();
+        for p in &e.manifest.params {
+            let g = p
+                .group
+                .as_deref()
+                .unwrap_or_else(|| panic!("内置 {} 参数 {} 未分组", e.manifest.id, p.key));
+            if Some(g) != last {
+                assert!(seen.insert(g), "内置 {} 分组「{g}」不连续声明", e.manifest.id);
+                last = Some(g);
+            }
+        }
+    }
+}
+
 /// AI 改 Lua 离线路径: 空指令 400 / 未知 id 404 / 未配 AI 密钥 403 need_keys(在联网前失败)。
 ///
 /// 成功的 LLM 往返与编译门禁的"AI 产物编译失败"分支需要真实上游, 按任务约定不进单测;
@@ -990,6 +1029,23 @@ fn test_build_manifest_validation() {
             serde_json::json!([{"key": "n", "name": "n", "type": "i64", "desc": "d", "default": 1.5}]),
             "默认值类型",
         ),
+        // 同名分组不连续(X,Y,X 或 X,无组,X): 表单会把「X」小节重复画两遍, 保存路径把关。
+        (
+            serde_json::json!([
+                {"key": "a", "name": "n", "type": "f64", "desc": "d", "group": "X"},
+                {"key": "b", "name": "n", "type": "f64", "desc": "d", "group": "Y"},
+                {"key": "c", "name": "n", "type": "f64", "desc": "d", "group": "X"}
+            ]),
+            "不连续",
+        ),
+        (
+            serde_json::json!([
+                {"key": "a", "name": "n", "type": "f64", "desc": "d", "group": "X"},
+                {"key": "b", "name": "n", "type": "f64", "desc": "d"},
+                {"key": "c", "name": "n", "type": "f64", "desc": "d", "group": "X"}
+            ]),
+            "不连续",
+        ),
     ];
     for (params, needle) in cases {
         let err = build_manifest("my-grid", "spot", ok(params)).unwrap_err();
@@ -1017,6 +1073,34 @@ fn test_build_manifest_validation() {
     let m_blank =
         build_manifest("my-grid", "spot", blank_name).expect("策略中文名留空必须能保存(N2)");
     assert!(m_blank.name.is_empty());
+
+    // 分组透传: 非空 trim 后保留, 空白串与缺省都归 None(与 non_empty_opt 同口径)。
+    let grouped = build_manifest(
+        "my-grid",
+        "spot",
+        ok(serde_json::json!([
+            {"key": "a", "name": "n", "type": "f64", "desc": "d", "group": "  网格间距  "},
+            {"key": "b", "name": "n", "type": "f64", "desc": "d", "group": "   "},
+            {"key": "c", "name": "n", "type": "f64", "desc": "d"}
+        ])),
+    )
+    .unwrap();
+    assert_eq!(grouped.params[0].group.as_deref(), Some("网格间距"));
+    assert_eq!(grouped.params[1].group, None, "空白组名归 None");
+    assert_eq!(grouped.params[2].group, None, "未声明组名缺省 None");
+
+    // 正向: 同名分组连续 + 多组顺序声明必须能保存。
+    let multi = build_manifest(
+        "my-grid",
+        "spot",
+        ok(serde_json::json!([
+            {"key": "a", "name": "n", "type": "f64", "desc": "d", "group": "X"},
+            {"key": "b", "name": "n", "type": "f64", "desc": "d", "group": "X"},
+            {"key": "c", "name": "n", "type": "f64", "desc": "d", "group": "Y"}
+        ])),
+    )
+    .expect("同名分组连续声明必须能保存");
+    assert_eq!(multi.params[2].group.as_deref(), Some("Y"));
 }
 
 /// 清单保存 (P2-8) 端到端: 落盘 strategies/{market}/{id}.toml → 详情 params 点亮;
@@ -1699,6 +1783,7 @@ fn test_keep_manifest_params_filters_and_warns() {
         default: None,
         required: false,
         options: Some(vec!["u".into(), "coin".into()]),
+        group: None,
     });
     let (kept, _warns) = keep_manifest_params(
         HashMap::from([("accumulate_mode".to_string(), ConfigValue::String("coin".into()))]),

@@ -86,6 +86,7 @@
         R.api("/api/strategies/" + encodeURIComponent(id)),
         R.api("/api/strategies/" + encodeURIComponent(id) + "/source"),
       ]);
+      R.normParams(detail);
       return { detail, source };
     }
 
@@ -497,12 +498,17 @@
 
     const current = detail.current || {};
     const known = new Set();
+    // 分组小节标题: 组名值变化即换标题(同名分组约定连续声明); 无分组的参数不画标题。
+    let currentGroup;
 
     for (const p of detail.params || []) {
       // 保留键跳过: `pair` 上面已独立成 `#sg-pair` 字段, `script`/`script_path` 指脚本本身 ——
       // 再来一行就是被顶层值盖掉的死控件(2026-10-05 修)。
       if (RESERVED_PARAM_KEYS.includes(p.key)) continue;
       known.add(p.key);
+      const grp = p.group || null;
+      if (grp && grp !== currentGroup) box.appendChild(h("div", "sg-param-group-head", grp));
+      currentGroup = grp;
       const built = p.ty === "string" ? stringRow(p, current[p.key] !== undefined ? current[p.key] : p.default)
         : paramRow(p, current[p.key] !== undefined ? current[p.key] : p.default);
       box.appendChild(built.label);
@@ -824,8 +830,9 @@
 
     const desc = mfInput("sg-mf-d", spec.desc || "", t("sgMfDescPh"));
     const opts = mfInput("sg-mf-o", (spec.options || []).join(","), t("sgMfOptionsPh"));
+    const grp = mfInput("sg-mf-grp", spec.group || "", t("sgMfGroupPh"));
     const line2 = h("div", "sg-mf-line2");
-    line2.append(desc, opts);
+    line2.append(desc, opts, grp);
 
     const syncOpts = () => {
       opts.style.display = ty.value === "enum" ? "" : "none";
@@ -839,7 +846,7 @@
     });
 
     row.append(line1, line2);
-    st.manifestRows.push({ row: row, key: key, name: name, ty: ty, desc: desc, def: def, req: req, opts: opts });
+    st.manifestRows.push({ row: row, key: key, name: name, ty: ty, desc: desc, def: def, req: req, opts: opts, grp: grp });
     $("sg-mf-params").appendChild(row);
     return row;
   }
@@ -866,6 +873,8 @@
           .map((s) => s.trim())
           .filter((s) => s);
       }
+      const grp = r.grp.value.trim();
+      if (grp) p.group = grp;
       params.push(p);
     }
     return {
@@ -905,7 +914,7 @@
   async function refreshSchema(g) {
     const id = st.detailCtx && st.detailCtx.id;
     if (!id) return;
-    const detail = await R.api("/api/strategies/" + encodeURIComponent(id));
+    const detail = R.normParams(await R.api("/api/strategies/" + encodeURIComponent(id)));
     if (g !== st.gen || !st.detailCtx || st.detailCtx.id !== id) return;
     st.detailCtx.detail = detail;
     renderParams(detail);

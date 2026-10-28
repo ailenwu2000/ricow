@@ -15,76 +15,7 @@ name = "主交易对"
 type = "string"
 desc = "引擎通道键, 取 universe 首项(视野/取数兼容用)"
 required = true
-
-[[params]]
-key = "universe"
-name = "组合标的"
-type = "string"
-desc = "逗号分隔现货交易对(如 BTCUSDT,ETHUSDT,TSLABUSDT,NVDABUSDT); 缺省 = 用 pair 单标的"
-default = "BTCUSDT,ETHUSDT,TSLABUSDT,NVDABUSDT"
-
-[[params]]
-key = "weights"
-name = "各币权重"
-type = "string"
-desc = "逗号分隔小数, 与 universe 一一对应(如 0.4,0.3,0.2,0.1); 每项∈[0,1] 且合计≈1, 缺省 = 等权"
-default = ""
-
-[[params]]
-key = "target_pct"
-name = "币腿合计目标占比"
-type = "f64"
-desc = "全部币腿合计目标市值占总权益比例(0.5 = 50%; 0~1); 单币目标 = target_pct × 该币权重"
-default = 0.5
-
-[[params]]
-key = "cycle_days"
-name = "运行周期(天)"
-type = "f64"
-desc = "每隔几天执行一次调仓检查(默认 1 天一次)"
-default = 1
-
-[[params]]
-key = "rebalance_threshold_pct"
-name = "调仓阈值(百分点)"
-type = "f64"
-desc = "现占比与目标偏离超过该百分点数才调仓(默认 2; 带宽须显著大于手续费漂移以避循环调仓)"
-default = 2
-
-[[params]]
-key = "earn_enabled"
-name = "理财开关"
-type = "f64"
-desc = "1 = 闲置现金腿自动申购 Simple Earn 活期理财(默认); 0 = 关闭理财仅调仓"
-default = 1
-
-[[params]]
-key = "earn_buffer_pct"
-name = "现金缓冲(权益占比%)"
-type = "f64"
-desc = "现货现金腿保留缓冲(占权益百分比, 0.5 = 0.5%); 超出部分才申购理财"
-default = 0.5
-
-[[params]]
-key = "earn_apr"
-name = "理财年化估算"
-type = "f64"
-desc = "利息估算年化(0.02 = 2%; 仅用于停机报告 stat_earn_interest_est, 不入账)"
-default = 0.02
-
-[[params]]
-key = "min_notional"
-name = "单笔最小名义"
-type = "f64"
-desc = "单笔调仓最小名义金额(USDT); 低于它跳过该笔(防碎单磨损)"
-default = 5
-
-[[params]]
-key = "fee_side"
-name = "单边费率"
-type = "f64"
-desc = "单边手续费率(0.001 = 现货 0.1%/边; 调仓量含费修正用)"
-default = 0.001
+group = "基础配置"
 
 [[params]]
 key = "interval"
@@ -92,3 +23,84 @@ name = "主时钟"
 type = "string"
 desc = "决策主时钟周期(默认 1h; 时间闸按 cycle_days 控制实际执行频率)"
 default = "1h"
+group = "基础配置"
+
+[[params]]
+key = "fee_side"
+name = "单边费率"
+type = "f64"
+desc = "单边手续费率(0.001 = 现货 0.1%/边; 调仓量含费修正用)"
+default = 0.001
+group = "基础配置"
+
+[[params]]
+key = "min_notional"
+name = "单笔最小名义"
+type = "f64"
+desc = "单笔调仓最小名义金额(USDT); 低于它跳过该笔(防碎单磨损)"
+default = 5
+group = "基础配置"
+
+[[params]]
+key = "universe"
+name = "组合标的"
+type = "string"
+desc = "逗号分隔现货交易对(如 BTCUSDT,ETHUSDT,TSLABUSDT,NVDABUSDT); 缺省 = 用 pair 单标的"
+default = "BTCUSDT,ETHUSDT,TSLABUSDT,NVDABUSDT"
+group = "组合配置"
+
+[[params]]
+key = "weights"
+name = "各币权重"
+type = "string"
+desc = "逗号分隔小数, 与 universe 一一对应(如 0.4,0.3,0.2,0.1); 每项∈[0,1] 且合计≈1, 缺省 = 等权"
+default = ""
+group = "组合配置"
+
+[[params]]
+key = "target_pct"
+name = "币腿合计目标占比"
+type = "f64"
+desc = "全部币腿合计目标市值占总权益比例(0.5 = 50%; 0~1); 单币目标 = target_pct × 该币权重"
+default = 0.5
+group = "组合配置"
+
+[[params]]
+key = "cycle_days"
+name = "运行周期(天)"
+type = "f64"
+desc = "每隔几天执行一次调仓检查(默认 1 天一次)"
+default = 1
+group = "调仓节奏"
+
+[[params]]
+key = "rebalance_threshold_pct"
+name = "调仓阈值(百分点)"
+type = "f64"
+desc = "现占比与目标偏离超过该百分点数才调仓(默认 2; 带宽须显著大于手续费漂移以避循环调仓)"
+default = 2
+group = "调仓节奏"
+
+[[params]]
+key = "earn_enabled"
+name = "理财开关"
+type = "f64"
+desc = "1 = 闲置现金腿自动申购 Simple Earn 活期理财(默认); 0 = 关闭理财仅调仓"
+default = 1
+group = "现金理财"
+
+[[params]]
+key = "earn_buffer_pct"
+name = "现金缓冲(权益占比%)"
+type = "f64"
+desc = "现货现金腿保留缓冲(占权益百分比, 0.5 = 0.5%); 超出部分才申购理财"
+default = 0.5
+group = "现金理财"
+
+[[params]]
+key = "earn_apr"
+name = "理财年化估算"
+type = "f64"
+desc = "利息估算年化(0.02 = 2%; 仅用于停机报告 stat_earn_interest_est, 不入账)"
+default = 0.02
+group = "现金理财"
