@@ -1,10 +1,15 @@
 # 策略清单(manifest): 展示元数据 + 参数 schema。仅供 UI/CLI/AI, 引擎不读(架构铁律)。
 id = "smart_position"
 name = "现货智能持仓"
+name_en = "Smart Position Portfolio"
 market = "spot"
-summary = "多标的组合按权重维持各币目标占比: 每隔 cycle_days 检查一次, 逐币偏离超阈值才市价调仓; 闲置 USDT 现金腿自动申购币安 Simple Earn 活期理财吃利息(不支持理财的资产静默跳过), 调仓缺现金时先提赎回申请、下一周期再调"
+summary = "多标的组合按自定义权重维持各币目标占比：周期性检查，偏离超阈值才调仓；闲置 USDT 现金自动申购活期理财吃利息，调仓缺钱先赎回、下周期再调"
+summary_en = "Maintains target shares across a multi-asset basket: periodic checks, rebalancing only beyond a deviation threshold; idle USDT cash auto-subscribes to flexible savings, and redemptions fund the next cycle when rebalancing runs short"
 description = """
-智能持仓组合(参考币安智能持仓机器人 + 理财联动改进): 多交易对篮子(universe), 每币目标市值占比 = target_pct × weights_i(缺省等权)。每个运行周期(cycle_days 天)执行一次: ① 估值权益 = 现货现金 + Σ各币持仓市值 + 理财市值; ② 逐币独立阈值闸——某币现占比偏离其目标不足 rebalance_threshold_pct 个百分点则该币不调(带宽远大于手续费漂移, 防循环调仓), 只调越界的币; ③ 超阈值需买入但现货现金不足 → 向理财提交赎回申请(差额), 本周期跳过该币, 下一周期资金就绪后再调; ④ 调仓用市价单, 本周期先卖后买、卖出所得滚动进买腿预算, 名义不足 min_notional 跳过; ⑤ 理财管理: 仅 USDT 现金腿超出权益 earn_buffer_pct 缓冲的部分自动申购活期理财(各币持仓留现货待卖腿; bStock 等无赚息功能的资产不触碰理财、不报错)。weights 校验: 个数与 universe 一致、每项∈[0,1]、合计≈1, 违反即停机(不自动归一)。理财利息不入账、按 earn_apr 参数在停机报告估算。
+把资金组成一篮子标的（可含美股代币），每个标的的目标占比 = 币腿合计目标 × 该标的权重。每个运行周期检查一次：偏离不足阈值不动，避免手续费磨损与来回调仓；需要买入但现金不足时，先向理财提交赎回，下一周期资金到位再调。调仓用市价单，本周期先卖后买。只有 USDT 现金腿进理财生息，各币持仓保留现货随时可卖；不支持理财的资产自动跳过、不报错。利息不入账，仅在结束报告中估算。
+"""
+description_en = """
+Allocates capital across a basket of assets (US stock tokens included); each asset's target share = total coin-leg target × its weight. Checked once per cycle: assets within the deviation threshold are left alone, avoiding fee churn and flip-flopping; when a buy leg lacks cash, a redemption is requested from savings first and that asset is rebalanced next cycle once funds land. Rebalancing uses market orders, sells before buys within the cycle. Only the USDT cash leg earns interest; coin holdings stay in spot, ready to sell; assets without savings support are skipped silently, no errors. Interest is not booked — it is only estimated in the final report.
 """
 suitable = "中长期持有多币/多资产篮子(含 bStock 美股代币)、希望按自定义权重维持固定仓位占比、闲置现金吃理财利息的稳健配置"
 unsuitable = "高频交易与趋势博弈(周期调仓反应慢)、需要持仓币也生息的场景(现金腿才入理财)"
@@ -12,95 +17,119 @@ unsuitable = "高频交易与趋势博弈(周期调仓反应慢)、需要持仓�
 [[params]]
 key = "pair"
 name = "主交易对"
+name_en = "Primary Pair"
 type = "string"
 desc = "引擎通道键, 取 universe 首项(视野/取数兼容用)"
+desc_en = "Engine channel key, set to the first asset in the universe (for visibility/data compatibility)"
 required = true
 group = "基础配置"
 
 [[params]]
 key = "interval"
 name = "主时钟"
+name_en = "Primary Clock"
 type = "string"
 desc = "决策主时钟周期(默认 1h; 时间闸按 cycle_days 控制实际执行频率)"
+desc_en = "Decision clock interval (default 1h; actual cadence is gated by the rebalance-cycle setting)"
 default = "1h"
 group = "基础配置"
 
 [[params]]
 key = "fee_side"
 name = "单边费率"
+name_en = "Fee per Side"
 type = "f64"
 desc = "单边手续费率(0.001 = 现货 0.1%/边; 调仓量含费修正用)"
+desc_en = "Commission rate per side (0.001 = 0.1% per side; used for fee-adjusted rebalancing sizes)"
 default = 0.001
 group = "基础配置"
 
 [[params]]
 key = "min_notional"
 name = "单笔最小名义"
+name_en = "Min Order Notional"
 type = "f64"
 desc = "单笔调仓最小名义金额(USDT); 低于它跳过该笔(防碎单磨损)"
+desc_en = "Minimum notional per rebalancing order (USDT); smaller orders are skipped to avoid dust churn"
 default = 5
 group = "基础配置"
 
 [[params]]
 key = "universe"
 name = "组合标的"
+name_en = "Asset Universe"
 type = "string"
 desc = "逗号分隔现货交易对(如 BTCUSDT,ETHUSDT,TSLABUSDT,NVDABUSDT); 缺省 = 用 pair 单标的"
+desc_en = "Comma-separated spot pairs (e.g. BTCUSDT,ETHUSDT,TSLABUSDT,NVDABUSDT); default = single asset from the primary pair"
 default = "BTCUSDT,ETHUSDT,TSLABUSDT,NVDABUSDT"
 group = "组合配置"
 
 [[params]]
 key = "weights"
 name = "各币权重"
+name_en = "Asset Weights"
 type = "string"
 desc = "逗号分隔小数, 与 universe 一一对应(如 0.4,0.3,0.2,0.1); 每项∈[0,1] 且合计≈1, 缺省 = 等权"
+desc_en = "Comma-separated weights matching the asset universe one-to-one (e.g. 0.4,0.3,0.2,0.1); each between 0 and 1, summing to about 1; default = equal weight"
 default = ""
 group = "组合配置"
 
 [[params]]
 key = "target_pct"
 name = "币腿合计目标占比"
+name_en = "Total Coin Target Share"
 type = "f64"
 desc = "全部币腿合计目标市值占总权益比例(0.5 = 50%; 0~1); 单币目标 = target_pct × 该币权重"
+desc_en = "Combined target value of all coin legs as a share of total equity (0.5 = 50%); each asset's target = this share × its weight"
 default = 0.5
 group = "组合配置"
 
 [[params]]
 key = "cycle_days"
 name = "运行周期(天)"
+name_en = "Rebalance Cycle (Days)"
 type = "f64"
 desc = "每隔几天执行一次调仓检查(默认 1 天一次)"
+desc_en = "Days between rebalancing checks (default: once a day)"
 default = 1
 group = "调仓节奏"
 
 [[params]]
 key = "rebalance_threshold_pct"
 name = "调仓阈值(百分点)"
+name_en = "Rebalance Threshold (pp)"
 type = "f64"
 desc = "现占比与目标偏离超过该百分点数才调仓(默认 2; 带宽须显著大于手续费漂移以避循环调仓)"
+desc_en = "Only rebalance once an asset's share deviates from its target by more than this many percentage points (default 2; keep it well above fee drift to avoid churn)"
 default = 2
 group = "调仓节奏"
 
 [[params]]
 key = "earn_enabled"
 name = "理财开关"
+name_en = "Savings Toggle"
 type = "f64"
 desc = "1 = 闲置现金腿自动申购 Simple Earn 活期理财(默认); 0 = 关闭理财仅调仓"
+desc_en = "1 = idle cash auto-subscribes to flexible savings (default); 0 = rebalancing only"
 default = 1
 group = "现金理财"
 
 [[params]]
 key = "earn_buffer_pct"
 name = "现金缓冲(权益占比%)"
+name_en = "Cash Buffer (Equity %)"
 type = "f64"
 desc = "现货现金腿保留缓冲(占权益百分比, 0.5 = 0.5%); 超出部分才申购理财"
+desc_en = "Spot cash buffer kept out of savings (share of equity, 0.5 = 0.5%); only the excess is subscribed"
 default = 0.5
 group = "现金理财"
 
 [[params]]
 key = "earn_apr"
 name = "理财年化估算"
+name_en = "Savings APR Estimate"
 type = "f64"
 desc = "利息估算年化(0.02 = 2%; 仅用于停机报告 stat_earn_interest_est, 不入账)"
+desc_en = "Annualized rate used to estimate savings interest (0.02 = 2%); report-only estimate, never booked"
 default = 0.02
 group = "现金理财"

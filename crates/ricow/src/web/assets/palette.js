@@ -157,9 +157,9 @@
     const mine = R.TEXT[R.lang].sgUser || "";
     return stratCache.map((s) => ({
       group: "strategy",
-      label: s.name || s.id,
+      label: R.pickL(s.name, s.name_en) || s.id,
       hint: (s.source === "builtin" ? builtin : mine) + " · " + t("cmdHintStrategy"),
-      keys: s.id + " " + (s.summary || ""),
+      keys: s.id + " " + (s.name_en || "") + " " + (s.summary || "") + " " + (s.summary_en || ""),
       run: () => R.navigate("strategies/" + encodeURIComponent(s.id)),
     }));
   }

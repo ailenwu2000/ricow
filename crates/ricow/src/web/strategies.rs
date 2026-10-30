@@ -18,8 +18,14 @@ use super::WebState;
 pub(super) struct StrategyRow {
     id: String,
     name: String,
+    /// 英文名(可选, 英文 UI 优先展示; 缺省前端回退中文名)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name_en: Option<String>,
     market: String,
     summary: String,
+    /// 英文一句话说明(可选, 回退规则同 `name_en`)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_en: Option<String>,
     source: String,
     param_count: usize,
     /// 参数清单是否已由磁盘清单 TOML 声明(裸 `.lua` = false → 表单只有交易对)。
@@ -103,8 +109,10 @@ pub(super) async fn list_strategies(State(state): State<WebState>) -> Json<Vec<S
                 origin_ai: is_user && strategy_io::strategy_origin_ai(&state.root, &e.manifest.id),
                 id: e.manifest.id,
                 name: e.manifest.name,
+                name_en: e.manifest.name_en,
                 market: e.manifest.market,
                 summary: e.manifest.summary,
+                summary_en: e.manifest.summary_en,
                 source: match e.source {
                     crate::strategies::catalog::Source::Builtin => "builtin".to_string(),
                     crate::strategies::catalog::Source::User => "user".to_string(),

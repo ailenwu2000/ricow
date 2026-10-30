@@ -30,13 +30,19 @@ pub enum ParamType {
 pub struct ManifestParam {
     /// 参数键名(与 Lua `config_*`/`num`/`cfg_str` 读取键一致)。
     pub key: String,
-    /// 中文名。
+    /// 中文名(默认语言)。
     pub name: String,
+    /// 英文名(可选): UI 英文态优先展示, 缺省回退中文名(与清单顶层 `name_en` 同规则)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_en: Option<String>,
     /// 类型。
     #[serde(rename = "type")]
     pub ty: ParamType,
-    /// 说明。
+    /// 说明(默认语言)。
     pub desc: String,
+    /// 英文说明(可选, 同 `name_en` 回退规则)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc_en: Option<String>,
     /// 默认值(UI 预填; 与 Lua 兜底默认一致, 由一致性单测兜底)。
     /// `skip_serializing_if`: 无默认值时不出现在序列化结果里 (TOML 无 null; JSON 也保持精简)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,13 +66,22 @@ pub struct StrategyManifest {
     pub id: String,
     /// 中文名(UI 标题)。
     pub name: String,
+    /// 英文名(可选): UI 英文态优先展示, 缺省回退中文名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_en: Option<String>,
     /// 市场: "spot" | "futures"。
     pub market: String,
     /// 一句话说明。
     pub summary: String,
+    /// 英文一句话说明(可选, 同 `name_en` 回退规则)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_en: Option<String>,
     /// 长说明(可选)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 英文长说明(可选, 同 `name_en` 回退规则)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_en: Option<String>,
     /// 适用场景(可选)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suitable: Option<String>,
@@ -378,9 +393,12 @@ fn scan_user_in(strategies_dir: &std::path::Path) -> (Vec<CatalogEntry>, Vec<(St
                 manifest: StrategyManifest {
                     id: stem,
                     name: path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string(),
+                    name_en: None,
                     market: market.to_string(),
                     summary: String::new(),
+                    summary_en: None,
                     description: None,
+                    description_en: None,
                     suitable: None,
                     unsuitable: None,
                     params: Vec::new(),

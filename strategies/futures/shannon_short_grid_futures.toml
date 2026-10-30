@@ -5,10 +5,12 @@
 
 id = "shannon_short_grid_futures"
 name = "合约做空香农网格"
+name_en = "Short Shannon Grid (Futures)"
 market = "futures"
 position_mode = "hedge"
 default_leverage = 2
 summary = "USDT-M 合约纯做空香农网格(杠杆默认 2, 只下 SHORT 侧): 用虚拟香农网格做多的方式管理实际空头 —— 总资金=投入×杠杆, 启动即按现价市价卖出做空一半资金(成交价=第一平衡价), 虚拟账本恒 1:1 计算挂单量, 平衡价 − 平空间距挂平空限价单 / + 开空间距挂开空限价单(基础间距 = atr_mult×ATR 与下限取大), 任一成交后立即更新平衡价并全撤重挂两侧; 方向 flag 驱动趋势侧间距指数放大(flag_spacing_mult, 默认 1.2); 爆仓价实时监控"
+summary_en = "USDT-M short-only Shannon grid (default 2x leverage, SHORT side only): a real short managed like a virtual long Shannon grid - total capital = invested x leverage; at start it market-sells half the capital to open the short (the fill is the first balance price); the virtual ledger stays 1:1 for sizing, close-short limits hang below and open-short limits above the balance price (base spacing = the larger of the ATR-based spacing and a floor), and any fill updates the balance price and re-hangs both sides; a direction flag exponentially widens the trend-side spacing (default 1.2); liquidation price monitored in real time"
 description = """
 合约做空版香农网格(hedge 模式只下 SHORT 侧, 杠杆默认 2 倍、1~5 可配): 用虚拟香农网格做多的方式管理实际的做空。
 虚拟账本(虚拟现金 v_cash + 虚拟仓位 v_pos)恒 1:1 价值平衡是决策引擎, 代表"镜像多头"; 实际交易反向执行:
@@ -42,94 +44,124 @@ cross 下单侧爆仓价无定义(pos_liq 返回 nil, 策略侧告警通道自�
 
 ⚠ 合约做空: 单边上涨行情持续开空加仓将逼近爆仓价, 请关注 stat_liq_dist_min 告警。
 """
+description_en = """Futures short version of the Shannon grid (hedge mode, SHORT side only, default 2x leverage, configurable 1-5x): a real short is managed the way a virtual long Shannon grid would be.
+The virtual ledger (virtual cash + virtual position) staying in 1:1 value balance is the decision engine, representing a "mirror long"; real trading runs in the opposite direction: a virtual buy = buying to close the short, a virtual sell = selling to open the short. Total capital = invested capital x leverage.
+Immediate entry: on the first ready bar after the backtest starts it market-sells half the capital at the current price to open the short (no signal is waited for); the fill becomes the first balance price, and the virtual position is set 1:1 at that price for the total capital (virtual position = total capital / (2 x entry price), virtual cash = half the total).
+Ordering: buy-to-close limits hang below the balance price, sell-to-open limits above it (base spacing = the larger of the ATR-based spacing and a minimum floor), each order sized so that after a fill the virtual cash and position value return exactly to 1:1 (with a fee correction); any fill immediately sets the balance price to the trade price, cancels all orders, and re-hangs both sides. The virtual ledger advances with each real fill; the real short ledger tracks every fill in sync and is cross-checked against the engine at stop (error < 0.01).
+Grid spacing flexes with volatility (ATR candle interval and multiplier configurable; default 1h candle, period 14, multiplier 1, minimum spacing 0.2% - negative disables the floor). A direction flag (open-short count minus close-short count, entry and liquidation excluded) drives exponential widening of the trend-side spacing: once its magnitude reaches 2, net closing widens close spacing and net opening widens open spacing, the other side unchanged (factor default 1.2, 1.0 disables). In a one-way trend, trend-side fills thin out automatically while counter-trend harvesting is unchanged; a counter-trend fill rolls the flag back and the widening shrinks on its own. Trade sizes follow the asymmetric prices automatically and still return to 1:1.
+Funding constraints: close volume is capped to the real short position (it never flips to a long); when open-short notional exceeds the truly deployable amount (isolated = cash x leverage, cross = equity x leverage - net notional) it is logged as underfunded while the limit still hangs normally. Drift correction: when a gap fill makes the ledger drift and one side's order size goes negative, the balance price re-anchors to cash / position (the 1:1 identity price) to prevent a one-side deadlock.
+Liquidation price is monitored in real time (a warning fires when the short's distance to liquidation drops below a threshold; advisory only) and the closest-ever moment is recorded; a real liquidation (engine forced-close fill) halts trading, with the loss reported separately. Default cross liquidation: cash is the account balance with no static margin transfer, the deployable open-short amount = combined equity x leverage - net notional, profits are automatically redeployed, and the invested capital serves as the whole liquidation buffer (distance follows effective leverage). Isolated mode (switch via parameter) transfers wallet margin per notional / leverage, and idle cash does not join liquidation. Under cross a one-side liquidation price is undefined (returns nil, its alert silenced); the engine judges forced closure by combined equity.
+Warning: shorting with leverage - a one-way rally keeps adding to the short and approaches the liquidation price; watch the liquidation-distance warnings."""
 suitable = "震荡偏空或宽幅波动市场; 希望用网格高频收割波动、同时保持净空头敞口的合约交易者"
 unsuitable = "单边急涨(空头套牢且逼近爆仓价)、极低波动(间距低于成本门槛自动停机)"
 
 [[params]]
 key = "pair"
 name = "合约对"
+name_en = "Contract Pair"
 type = "string"
 desc = "USDT-M 合约交易对(如 SOLUSDT)"
+desc_en = "USDT-M perpetual pair (e.g. SOLUSDT)"
 required = true
 group = "基础配置"
 
 [[params]]
 key = "interval"
 name = "主时钟"
+name_en = "Primary Clock"
 type = "string"
 desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
+desc_en = "Main clock interval (1m recommended in backtests for finer matching)"
 default = "1h"
 group = "基础配置"
 
 [[params]]
 key = "invest_cash"
 name = "投入资金"
+name_en = "Invested Capital"
 type = "f64"
 desc = "投入资金(保证金, USDT); 总资金 = 投入 × 杠杆(默认 2)。0 = 启动时 quote 余额全额"
+desc_en = "Margin in USDT; total capital = invested x leverage (default 2). 0 = full quote balance at start"
 default = 0
 group = "基础配置"
 
 [[params]]
 key = "fee_side"
 name = "单边费率"
+name_en = "Fee per Side"
 type = "f64"
 desc = "单边手续费率(0.0005 = 合约 taker 0.05%/边)"
+desc_en = "Commission rate per side (0.0005 = 0.05% taker per side)"
 default = 0.0005
 group = "基础配置"
 
 [[params]]
 key = "min_notional"
 name = "单笔最小名义"
+name_en = "Min Order Notional"
 type = "f64"
 desc = "单笔最小名义金额(合约 SOLUSDT fapi 最小名义 5)"
+desc_en = "Minimum notional per order (the SOLUSDT futures floor is 5)"
 default = 5
 group = "基础配置"
 
 [[params]]
 key = "atr_interval"
 name = "ATR K 线周期"
+name_en = "ATR Candle Interval"
 type = "string"
 desc = "用哪根 K 线算 ATR(默认 1h, 可配 4h/1d)"
+desc_en = "Which candle interval ATR is computed on (default 1h, e.g. 4h/1d)"
 default = "1h"
 group = "网格间距"
 
 [[params]]
 key = "atr_period"
 name = "ATR 周期"
+name_en = "ATR Period"
 type = "i64"
 desc = "ATR 回看根数"
+desc_en = "Number of candles ATR looks back over"
 default = 14
 group = "网格间距"
 
 [[params]]
 key = "atr_mult"
 name = "ATR 乘数"
+name_en = "ATR Multiplier"
 type = "f64"
 desc = "网格间距 = atr_mult × ATR, 默认 1"
+desc_en = "Grid spacing scales with volatility (ATR; default 1)"
 default = 1
 group = "网格间距"
 
 [[params]]
 key = "min_spacing_pct"
 name = "最小间距(价格占比)"
+name_en = "Min Spacing (Price %)"
 type = "f64"
 desc = "间距下限(占价格比例, 0.002 = 0.2% = 4×合约费率); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损; 负数 = 禁用下限"
+desc_en = "Spacing floor as a share of price (0.002 = 0.2%, about 4x the futures fee); guards against fee churn when volatility is too low; negative disables the floor"
 default = 0.002
 group = "网格间距"
 
 [[params]]
 key = "flag_spacing_mult"
 name = "间距放大系数"
+name_en = "Spacing Widening Factor"
 type = "f64"
 desc = "方向 flag 驱动的网格间距指数放大系数, 默认 1.2: flag = 开空笔数 − 平空笔数(建仓与强平不计); |flag|≥2 时趋势侧间距 × 系数^(|flag|−1)(flag<0 净平空→放大平空间距, flag>0 净开空→放大开空间距, 另一侧不变), 买卖量随间距自动跟随保持 1:1; 1.0 = 禁用放大(<1 按 1 处理)"
+desc_en = "Exponential widening of the trend-side grid spacing driven by a direction flag (default 1.2): the flag is open-short count minus close-short count (entry and liquidation excluded); once its magnitude reaches 2 the trend-side spacing grows by factor^(|flag|-1) - net closing widens close spacing, net opening widens open spacing, the other side unchanged - while trade sizes follow automatically to keep 1:1; 1.0 disables it (below 1 treated as 1)"
 default = 1.2
 group = "网格间距"
 
 [[params]]
 key = "liq_warn_ratio"
 name = "爆仓价告警阈值"
+name_en = "Liquidation Warning Threshold"
 type = "f64"
 desc = "小数(0.1=10%); 空头距爆仓价 < 该比例打 WARN(只告警不动作)"
+desc_en = "Fraction (0.1 = 10%); warns when the short's distance to its liquidation price drops below it (advisory only)"
 default = 0.1
 group = "爆仓监控"
 

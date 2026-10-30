@@ -1,11 +1,15 @@
 # 策略清单(manifest): 展示元数据 + 参数 schema。仅供 UI/CLI/AI, 引擎不读(架构铁律)。
 id = "linear_position_grid"
 name = "现货线性仓位网格"
+name_en = "Linear Position Grid"
 market = "spot"
-summary = "价格区间内仓位占比(币市值÷总权益)随价格线性分布(低价 70%、高价 30%): 分批逐步建仓 → 成交价上下 1×ATR 全撤重挂限价网格 → 现金收益即时再部署; 出界可退出或等待, 可选动态止盈"
+summary = "价格区间内仓位随价线性调节：越跌仓位越重、越涨仓位越轻。先分批建仓，再以波动率自适应的双边限价网格反复收割差价；可选动态止盈，出界可停机或暂停等待"
+summary_en = "Position scales linearly with price inside a range: heavier on dips, lighter on rallies. Builds up in batches, then harvests volatility with a two-sided limit grid at adaptive spacing; optional dynamic take-profit, configurable behavior when price leaves the range"
 description = """
-线性仓位网格: 在 [p_low, p_high] 区间内, 仓位占比 = 币市值 ÷ 总权益(币市值+现金) 随价格线性变化(p_low 处 pos_low_pct、p_high 处 pos_high_pct)。**每次买卖成交后, 按成交价实算仓位精确等于理论 w(成交价) —— 什么价格就是什么仓位**(含费修正落位公式: 买 q=(w·E−Q·p)/(p(1+wf)), 卖 q=(Q·p−w·E)/(p(1−wf)), E=Q·p+现金按腿价估值)。w<1 时成交后现金恒 =(1−w)·E>0, 价格不到 p_low 现金绝不耗尽。三阶段运行: ①逐步建仓 —— 目标总量 T(start_price) 均分 build_steps 批, 价格低于 start_price 且距上批 ≥ build_interval_hours 小时才市价买入一批, 建仓期间不挂网格单; ②网格 —— 建仓完成后在成交价上下 atr_mult×ATR 两侧挂限价单(买卖价钳在区间内), 任一成交即全撤重挂; 现价偏离 ref 超一个间距时重锚 ref := 现价并重挂(防单边死锁); ③动态止盈(可选) —— 网格阶段追踪最高价, 回撤 ≥ tp_dd_atr_mult×ATR 且盈利 ≥ tp_min_profit_pct 时清仓停机。总权益随交易盈利增长, 落位恒按当前总权益实时计算, 现金收益即时参与后续仓位计算, 无沉淀资金。出界处理 out_of_range: exit(默认, 撤单停机不清仓)/wait(暂停等回界内)。
-⚠ 启用动态止盈后, 单边上涨行情中首次回撤即触发清仓离场, 可能"提前下车"错过后续涨幅 —— 止盈以落袋为安换取趋势延续收益。
+把总资金分成持仓与现金两部分，仓位占比随价格在区间内线性变化：区间下沿仓位最重、上沿最轻（可设涨到顶清仓）。每次成交后按成交价精确落位——什么价格就该有什么仓位；交易赚到的差价即时变成现金，直接参与后续仓位计算，没有沉淀资金。运行分三阶段：① 分批逐步建仓，价格低于开始价才买入下一批，建仓期间不挂网格；② 建仓完成后在成交价上下按波动率自适应间距挂双边限价单，任一成交即全撤重挂，价格单边远离时自动重锚防死锁；③ 可选动态止盈：盈利达标后从最高点回撤一定幅度即清仓离场。价格出区间按设置处理：撤单停机保留持仓，或暂停等待回界。注意：启用止盈后单边上涨行情可能提前下车；跌出下沿时仓位接近打满。
+"""
+description_en = """
+Splits total capital between the position and cash, with the position ratio varying linearly with price inside a range: heaviest at the lower bound, lightest at the upper bound (selling out at the top is configurable). After every fill the position lands exactly on the theoretical ratio for the fill price — whatever the price, that is the position; gains turn into cash immediately and take part in later sizing, with no idle funds. Three phases: 1) staged entry in batches — the next batch is bought only when price is below the start price, and no grid orders sit during build-up; 2) after build-up, two-sided limit orders hang around the fill price at volatility-adaptive spacing; any fill cancels and re-hangs all orders, and the anchor re-centers when price drifts one way, preventing deadlock; 3) optional dynamic take-profit: once profit clears the threshold, a pullback from the high liquidates and stops. When price leaves the range, the grid either cancels and stops (keeping the position) or pauses until price returns. Note: with take-profit enabled, a one-way rally may exit early; below the lower bound the position is nearly fully invested.
 """
 suitable = "区间震荡市(线性仓位随价摆动自动加减仓)、希望分批入场摊平成本、需要落袋止盈的稳健网格"
 unsuitable = "单边急跌(出界 exit 满仓套牢或持续接刀)、单边急涨(动态止盈提前下车跑输持有)、极低波动(间距低于成本门槛自动停机)"
@@ -13,88 +17,110 @@ unsuitable = "单边急跌(出界 exit 满仓套牢或持续接刀)、单边急�
 [[params]]
 key = "pair"
 name = "交易对"
+name_en = "Trading Pair"
 type = "string"
 desc = "现货交易对(如 SOLUSDT)"
+desc_en = "Spot trading pair (e.g. SOLUSDT)"
 required = true
 group = "基础配置"
 
 [[params]]
 key = "interval"
 name = "主时钟"
+name_en = "Primary Clock"
 type = "string"
 desc = "主时钟周期(回测建议 1m 数据提升撮合粒度)"
+desc_en = "Main clock interval (1m recommended in backtests for finer matching)"
 default = "1m"
 group = "基础配置"
 
 [[params]]
 key = "invest_cash"
 name = "投入资金"
+name_en = "Invested Capital"
 type = "f64"
 desc = "投入资金 C0(初始总权益 = 建仓目标与止盈基准); 仓位落位不参与 C0 定格, 恒按当前总权益实时估值; 0 = 首次建仓时 quote 余额全额"
+desc_en = "Initial capital C0 (starting equity; the basis for entry target and take-profit). Position sizing always values current total equity in real time, not frozen at C0. 0 = full quote balance at first entry"
 default = 0
 group = "基础配置"
 
 [[params]]
 key = "fee_side"
 name = "单边费率"
+name_en = "Fee per Side"
 type = "f64"
 desc = "单边手续费率(0.001 = 现货 0.1%/边)"
+desc_en = "Commission rate per side (0.001 = 0.1% per side)"
 default = 0.001
 group = "基础配置"
 
 [[params]]
 key = "min_notional"
 name = "单笔最小名义"
+name_en = "Min Order Notional"
 type = "f64"
 desc = "单笔最小名义金额"
+desc_en = "Minimum notional per order"
 default = 5
 group = "基础配置"
 
 [[params]]
 key = "start_price"
 name = "开始价格"
+name_en = "Start Price"
 type = "f64"
 desc = "建仓触发价: 价格低于它才逐步建仓; 建仓目标总量 = T(start_price)(须落在区间内)"
+desc_en = "Entry trigger price: staged buying starts only below it. The total entry target must fall within the range"
 required = true
 group = "激活与区间"
 
 [[params]]
 key = "p_low"
 name = "价格下限"
+name_en = "Lower Price Bound"
 type = "f64"
 desc = "线性仓位区间下限(此处仓位 = pos_low_pct)"
+desc_en = "Lower bound of the position range (the position ratio here equals the lower-bound setting)"
 required = true
 group = "激活与区间"
 
 [[params]]
 key = "p_high"
 name = "价格上限"
+name_en = "Upper Price Bound"
 type = "f64"
 desc = "线性仓位区间上限(此处仓位 = pos_high_pct)"
+desc_en = "Upper bound of the position range (the position ratio here equals the upper-bound setting)"
 required = true
 group = "激活与区间"
 
 [[params]]
 key = "pos_low_pct"
 name = "下限仓位占比"
+name_en = "Position at Lower Bound"
 type = "f64"
 desc = "价格下限处仓位占比(币市值÷总权益, 0.7 = 70%)"
+desc_en = "Position ratio at the lower bound (coin value ÷ total equity, 0.7 = 70%)"
 default = 0.7
 group = "激活与区间"
 
 [[params]]
 key = "pos_high_pct"
 name = "上限仓位占比"
+name_en = "Position at Upper Bound"
 type = "f64"
 desc = "价格上限处仓位占比(币市值÷总权益, 0.3 = 30%; 0 = 涨到顶清仓)"
+desc_en = "Position ratio at the upper bound (coin value ÷ total equity, 0.3 = 30%; 0 = sell out at the top)"
 default = 0.3
 group = "激活与区间"
 
 [[params]]
 key = "out_of_range"
 name = "出界处理"
+name_en = "Out-of-Range Action"
 type = "enum"
 desc = "exit = 价格出区间撤单停机(不清仓); wait = 暂停挂单等价格回界内"
+desc_en = "exit = cancel orders and stop when price leaves the range (keeps the position); wait = pause and resume when price returns"
 default = "exit"
 options = ["exit", "wait"]
 group = "激活与区间"
@@ -102,63 +128,79 @@ group = "激活与区间"
 [[params]]
 key = "build_steps"
 name = "建仓批数"
+name_en = "Entry Batches"
 type = "i64"
 desc = "逐步建仓分几批买入"
+desc_en = "Number of batches for the staged entry"
 default = 10
 group = "分批建仓"
 
 [[params]]
 key = "build_interval_hours"
 name = "建仓间隔(小时)"
+name_en = "Entry Interval (Hours)"
 type = "f64"
 desc = "相邻两批建仓的最小时间间隔(小时)"
+desc_en = "Minimum time between consecutive entry batches (hours)"
 default = 1
 group = "分批建仓"
 
 [[params]]
 key = "atr_interval"
 name = "ATR K 线周期"
+name_en = "ATR Candle Interval"
 type = "string"
 desc = "用哪根 K 线算 ATR(如 1h/4h/1d)"
+desc_en = "Which candle interval ATR is computed on (e.g. 1h/4h/1d)"
 default = "1h"
 group = "网格间距"
 
 [[params]]
 key = "atr_period"
 name = "ATR 周期"
+name_en = "ATR Period"
 type = "i64"
 desc = "ATR 回看根数"
+desc_en = "Number of candles ATR looks back over"
 default = 14
 group = "网格间距"
 
 [[params]]
 key = "atr_mult"
 name = "ATR 乘数"
+name_en = "ATR Multiplier"
 type = "f64"
 desc = "网格间距 = atr_mult × ATR"
+desc_en = "Grid spacing scales with volatility (ATR)"
 default = 1
 group = "网格间距"
 
 [[params]]
 key = "min_spacing_pct"
 name = "最小间距(价格占比)"
+name_en = "Min Spacing (Price %)"
 type = "f64"
 desc = "间距下限(占价格比例, 0.004 = 0.4%); 生效间距 = max(atr_mult×ATR, 该下限×价格), 防 ATR 过窄被手续费磨损; 负数 = 禁用下限"
+desc_en = "Spacing floor as a share of price (0.004 = 0.4%); guards against fee churn when volatility is too low; negative disables the floor"
 default = 0.004
 group = "网格间距"
 
 [[params]]
 key = "tp_min_profit_pct"
 name = "止盈最小盈利"
+name_en = "Take-Profit Min Profit"
 type = "f64"
 desc = "动态止盈最小盈利比例(0.10 = 10%); 0 = 禁用止盈"
+desc_en = "Minimum profit that arms dynamic take-profit (0.10 = 10%); 0 disables it"
 default = 0.1
 group = "动态止盈"
 
 [[params]]
 key = "tp_dd_atr_mult"
 name = "止盈回撤 ATR 倍数"
+name_en = "Take-Profit Pullback (ATR ×)"
 type = "f64"
 desc = "最高点回撤 ≥ 该倍数 × ATR 且盈利达标时清仓止盈"
+desc_en = "Liquidates once price retraces from its high by this multiple of volatility and profit is in range"
 default = 3
 group = "动态止盈"

@@ -583,12 +583,16 @@
     sgManifestHint:
       "声明本策略有哪些参数(键名/类型/默认值/说明)。保存后上方「参数」表单、回测与寻优都会按它渲染 —— 只影响展示与表单, 不改动 Lua 代码。",
     sgMfName: "策略中文名",
+    sgMfNameEn: "策略英文名",
     sgMfSummary: "一句话说明",
+    sgMfSummaryEn: "一句话说明(英文)",
     sgMfSuitable: "适用场景",
     sgMfUnsuitable: "不适用场景",
     sgMfDesc: "长说明",
+    sgMfDescEn: "长说明(英文)",
     sgMfKey: "键名",
     sgMfNameCol: "中文名",
+    sgMfNameEnCol: "英文名",
     sgMfType: "类型",
     sgMfDefault: "默认值",
     sgMfRequired: "必填",
@@ -599,8 +603,10 @@
     sgMfDel: "删除",
     sgMfKeyPh: "如 grid_step_pct",
     sgMfNamePh: "如 网格间距倍数",
+    sgMfNameEnPh: "英文名(可选)",
     sgMfDefaultPh: "留空 = 无默认",
     sgMfDescPh: "这个参数做什么",
+    sgMfDescEnPh: "英文说明(可选)",
     sgMfOptionsPh: "如 cash,equity",
     sgMfGroupPh: "分组(可选)",
     sgSweep: "参数寻优",
@@ -978,12 +984,16 @@
     sgManifestHint:
       "Declare this strategy's params (key / type / default / desc). After saving, the Params form, backtest and sweep all render from it — it affects display and forms only, never your Lua code.",
     sgMfName: "Display name",
+    sgMfNameEn: "English name",
     sgMfSummary: "One-line summary",
+    sgMfSummaryEn: "One-line summary (English)",
     sgMfSuitable: "Suitable for",
     sgMfUnsuitable: "Not suitable for",
     sgMfDesc: "Long description",
+    sgMfDescEn: "Long description (English)",
     sgMfKey: "Key",
     sgMfNameCol: "Name",
+    sgMfNameEnCol: "English name",
     sgMfType: "Type",
     sgMfDefault: "Default",
     sgMfRequired: "Required",
@@ -994,8 +1004,10 @@
     sgMfDel: "Remove",
     sgMfKeyPh: "e.g. grid_step_pct",
     sgMfNamePh: "e.g. Grid step multiplier",
+    sgMfNameEnPh: "English name (optional)",
     sgMfDefaultPh: "empty = no default",
     sgMfDescPh: "What this param does",
+    sgMfDescEnPh: "Description in English (optional)",
     sgMfOptionsPh: "e.g. cash,equity",
     sgMfGroupPh: "Group (optional)",
     sgSweep: "Parameter sweep",
@@ -1160,16 +1172,23 @@
       '<div class="sg-hint"' + bi("sgManifestHint") + ">" + R.TEXT.zh.sgManifestHint + "</div>" +
       "<label class='sg-field'><span" + bi("sgMfName") + ">" + R.TEXT.zh.sgMfName + "</span>" +
       '<input id="sg-mf-name" class="sg-input" type="text" autocomplete="off" /></label>' +
+      "<label class='sg-field'><span" + bi("sgMfNameEn") + ">" + R.TEXT.zh.sgMfNameEn + "</span>" +
+      '<input id="sg-mf-name-en" class="sg-input" type="text" autocomplete="off" /></label>' +
       "<label class='sg-field'><span" + bi("sgMfSummary") + ">" + R.TEXT.zh.sgMfSummary + "</span>" +
       '<input id="sg-mf-summary" class="sg-input" type="text" autocomplete="off" /></label>' +
+      "<label class='sg-field'><span" + bi("sgMfSummaryEn") + ">" + R.TEXT.zh.sgMfSummaryEn + "</span>" +
+      '<input id="sg-mf-summary-en" class="sg-input" type="text" autocomplete="off" /></label>' +
       "<label class='sg-field'><span" + bi("sgMfSuitable") + ">" + R.TEXT.zh.sgMfSuitable +
       "</span><input id='sg-mf-suitable' class='sg-input' type='text' autocomplete='off' /></label>" +
       "<label class='sg-field'><span" + bi("sgMfUnsuitable") + ">" + R.TEXT.zh.sgMfUnsuitable +
       "</span><input id='sg-mf-unsuitable' class='sg-input' type='text' autocomplete='off' /></label>" +
       "<label class='sg-field'><span" + bi("sgMfDesc") + ">" + R.TEXT.zh.sgMfDesc +
       "</span><textarea id='sg-mf-desc' class='sg-input' rows='2'></textarea></label>" +
+      "<label class='sg-field'><span" + bi("sgMfDescEn") + ">" + R.TEXT.zh.sgMfDescEn +
+      "</span><textarea id='sg-mf-desc-en' class='sg-input' rows='2'></textarea></label>" +
       '<div class="sg-mf-head"><span' + bi("sgMfKey") + ">" + R.TEXT.zh.sgMfKey +
       "</span><span" + bi("sgMfNameCol") + ">" + R.TEXT.zh.sgMfNameCol +
+      "</span><span" + bi("sgMfNameEnCol") + ">" + R.TEXT.zh.sgMfNameEnCol +
       "</span><span" + bi("sgMfType") + ">" + R.TEXT.zh.sgMfType +
       "</span><span" + bi("sgMfDefault") + ">" + R.TEXT.zh.sgMfDefault + "</span>" +
       "<span" + bi("sgMfRequired") + ">" + R.TEXT.zh.sgMfRequired + "</span><span></span></div>" +
@@ -1680,7 +1699,7 @@
     const box = h("div", "sg-tc-name");
     const link = h("button", "sg-tc-link");
     link.type = "button";
-    link.appendChild(h("span", "sg-tc-name-text", s.name));
+    link.appendChild(h("span", "sg-tc-name-text", R.pickL(s.name, s.name_en)));
     box.appendChild(link);
 
     // 诚实性徽章(2026-10-05): 未声明参数清单 / 与内置脚本逐字相同 —— 列表里就能看出来,
@@ -1709,7 +1728,8 @@
     // 「展开」钮**只在真被截断时才出现**: 不截断的行凭空多个按钮, 用户点了没反应
     // (行高也不变) —— 那是个骗人的控件。截断判定要等元素进了文档才准,
     // 故用 requestAnimationFrame 实测 scrollWidth/clientWidth。
-    const sum = h("span", "sg-tc-summary", s.summary ? s.summary : t("sgNoSummary"));
+    const sumText = R.pickL(s.summary, s.summary_en);
+    const sum = h("span", "sg-tc-summary", sumText ? sumText : t("sgNoSummary"));
     box.appendChild(sum);
     let more = null;
     if (s.summary) {
@@ -1795,7 +1815,7 @@
     for (const s of builtins) {
       const opt = document.createElement("option");
       opt.value = s.id;
-      opt.textContent = s.name + " (" + s.market + " · " + s.id + ")";
+      opt.textContent = R.pickL(s.name, s.name_en) + " (" + s.market + " · " + s.id + ")";
       tplSel.appendChild(opt);
     }
     tplLabel.appendChild(tplSel);
@@ -2409,7 +2429,7 @@
     form.appendChild(h("div", "sg-modal-hint", t("sgDeleteBody")));
     const which = h("div", "sg-copy-from");
     which.appendChild(h("span", "sg-muted", t("sgDeleteWhich")));
-    which.appendChild(h("span", null, s.name)); // 服务端数据只走 textContent, 绝不拼 HTML
+    which.appendChild(h("span", null, R.pickL(s.name, s.name_en))); // 服务端数据只走 textContent, 绝不拼 HTML
     form.appendChild(which);
     form.appendChild(h("div", "sg-muted", t("sgDeleteKeep")));
     const keep = h("ul", "sg-del-keep");
@@ -2472,7 +2492,7 @@
 
     const from = h("div", "sg-copy-from");
     from.appendChild(h("span", "sg-muted", t("sgCopyOf") + ": "));
-    from.appendChild(h("span", null, s.name));
+    from.appendChild(h("span", null, R.pickL(s.name, s.name_en)));
     form.appendChild(from);
 
     const nameLabel = h("label", "sg-field");

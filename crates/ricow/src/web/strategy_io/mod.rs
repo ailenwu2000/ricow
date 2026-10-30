@@ -562,10 +562,19 @@ const RESERVED_PARAM_KEYS: &[&str] = &["script", "script_path"];
 pub(super) struct ManifestRequest {
     /// 中文名(必填)。
     name: String,
+    /// 英文名(可选): UI 英文态优先展示, 缺省回退中文名。
+    #[serde(default)]
+    name_en: String,
     #[serde(default)]
     summary: String,
+    /// 英文一句话说明(可选)。
+    #[serde(default)]
+    summary_en: String,
     #[serde(default)]
     description: String,
+    /// 英文长说明(可选)。
+    #[serde(default)]
+    description_en: String,
     #[serde(default)]
     suitable: String,
     #[serde(default)]
@@ -709,8 +718,11 @@ pub(super) fn build_manifest(
         params.push(ManifestParam {
             key,
             name: pname.to_string(),
+            // 英文字段与顶层同口径: 前端留空(空串)= 不写该字段, 回退中文。
+            name_en: non_empty_opt(p.name_en),
             ty: p.ty,
             desc: desc.to_string(),
+            desc_en: non_empty_opt(p.desc_en),
             default,
             required: p.required,
             options: p.options,
@@ -740,9 +752,12 @@ pub(super) fn build_manifest(
     Ok(StrategyManifest {
         id: id.to_string(),
         name: name.to_string(),
+        name_en: non_empty(req.name_en),
         market: market.to_string(),
         summary: req.summary.trim().to_string(),
+        summary_en: non_empty(req.summary_en),
         description: non_empty(req.description),
+        description_en: non_empty(req.description_en),
         suitable: non_empty(req.suitable),
         unsuitable: non_empty(req.unsuitable),
         params,
@@ -1090,8 +1105,11 @@ pub(super) fn merge_manifest_params(
         out.push(ManifestParam {
             key: h.key,
             name,
+            // AI 命名只产中文(本轮不扩英文 prompt)。
+            name_en: None,
             ty: h.ty,
             desc,
+            desc_en: None,
             default: h.default,
             required: false,
             options: None,

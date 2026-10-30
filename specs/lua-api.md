@@ -386,13 +386,18 @@ TOML 的 `params` 里用 `script_path` 引用脚本(相对 `strategies/` 或绝�
 
 内置策略**共 5 个**(清单 = `crates/ricow/src/strategies/catalog.rs` 的 `BUILTIN`, 编译期 `include_str!` 嵌入,
 改文件不重编译不生效), 按市场分目录 `strategies/spot/`(现货)与 `strategies/futures/`(合约),
-每策略 = `<id>.lua`(逻辑) + `<id>.toml`(清单: 中文名/说明/参数 schema); 与用户策略同目录, 复制即自定义:
+每策略 = `<id>.lua`(逻辑) + `<id>.toml`(清单: 中英文名称/说明/参数 schema); 与用户策略同目录, 复制即自定义:
 
 清单 `[[params]]` 字段: `key`/`name`/`type`(`f64|i64|string|bool|enum`)/`desc`/`default`/`required`/`options`,
-外加可选 `group`(分组名)。**分组是表现层数据, 引擎不读**: Web 参数表单按组渲染小节标题, 声明顺序即表单顺序,
+外加可选 `group`(分组名)与可选英文字段 `name_en`/`desc_en`(与 `name`/`desc` 同语义)。**分组是表现层数据, 引擎不读**: Web 参数表单按组渲染小节标题, 声明顺序即表单顺序,
 同名分组应连续声明。**分层约定**: 第一个分组固定为 `基础配置` = 运行环境/资金/成本项(`interval`/`invest_cash`/
 `fee_side`/`min_notional` 等; `pair` 是保留键, 表单里独立成交易对字段), 其后各分组为策略语义参数
 —— 即 FMZ 的「配置参数 vs 策略参数」= 「基础配置组 vs 其余组」。
+
+清单顶层支持可选英文字段 `name_en`/`summary_en`/`description_en`, 参数级支持 `name_en`/`desc_en`
+(均与对应中文字段同语义)。Web/CLI 在英文界面态择优展示英文字段, 缺省回退中文; 旧清单无英文字段照常工作。
+**文案纪律**: `summary`/`description`(中英)只写用户向简洁说明, 不出现参数键名与公式;
+键名与默认值只存在于 `[[params]]`, 实现细节只存在于 lua 行内注释。
 
 **现货 `strategies/spot/`(2 个)**
 

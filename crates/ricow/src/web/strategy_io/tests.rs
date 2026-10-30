@@ -431,8 +431,10 @@ fn test_one_param_line_group_suffix() {
     let mut p = ManifestParam {
         key: "atr_mult".into(),
         name: "ATR 乘数".into(),
+        name_en: None,
         ty: ParamType::Float,
         desc: "网格间距".into(),
+        desc_en: None,
         default: Some(ConfigValue::Float(1.5)),
         required: false,
         options: None,
@@ -462,6 +464,184 @@ fn test_builtin_manifests_grouped_contiguous() {
             }
         }
     }
+}
+
+/// 067 锚点: 两个内置现货清单必须带齐英文三字段(名称/一句话/长说明), 且非空白。
+/// 合约清单暂不强制(英文文案未铺), 现货是本轮交付范围。
+#[test]
+fn test_spot_builtin_manifests_have_english_fields() {
+    let mut n = 0;
+    for e in catalog::all()
+        .into_iter()
+        .filter(|e| e.source == catalog::Source::Builtin && e.manifest.market == "spot")
+    {
+        let m = &e.manifest;
+        for (field, v) in [
+            ("name_en", &m.name_en),
+            ("summary_en", &m.summary_en),
+            ("description_en", &m.description_en),
+        ] {
+            let s = v.as_deref().unwrap_or_else(|| panic!("现货内置 {} 缺 {field}", m.id));
+            assert!(!s.trim().is_empty(), "现货内置 {} 的 {field} 为空白", m.id);
+        }
+        n += 1;
+    }
+    assert!(n >= 2, "现货内置清单应至少 2 个, 实得 {n}");
+}
+
+/// ASCII 标识符整词匹配: 键两侧不得紧邻 ASCII 字母/数字/下划线。
+/// (中文/标点/空格都算边界 —— "the pair价格" 里的 pair 是独立单词, 要抓到;
+///  "comparison" 里的 "pari" 不是任何键, 天然不误报。)
+fn text_contains_word(text: &str, word: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(i) = text[from..].find(word) {
+        let start = from + i;
+        let end = start + word.len();
+        let prev_ok = text[..start].chars().next_back().map_or(true, |c| !is_ident(c));
+        let next_ok = text[end..].chars().next().map_or(true, |c| !is_ident(c));
+        if prev_ok && next_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// 067 文案纪律: 现货内置清单的 summary/description(中英)不得出现任何参数键名。
+/// 键名与默认值只活在 `[[params]]`; 用户向文案里混进 `start_price` 这类键名即违规。
+#[test]
+fn test_spot_builtin_copy_discipline_no_param_keys() {
+    for e in catalog::all()
+        .into_iter()
+        .filter(|e| e.source == catalog::Source::Builtin && e.manifest.market == "spot")
+    {
+        let m = &e.manifest;
+        let texts: [(&str, &Option<String>); 4] = [
+            ("summary", &Some(m.summary.clone())),
+            ("summary_en", &m.summary_en),
+            ("description", &m.description),
+            ("description_en", &m.description_en),
+        ];
+        for p in &m.params {
+            for (field, t) in &texts {
+                if let Some(t) = t {
+                    assert!(
+                        !text_contains_word(t, &p.key),
+                        "现货内置 {} 的 {field} 出现参数键名 `{}`: {}",
+                        m.id,
+                        p.key,
+                        t
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 067 向后兼容: 旧清单 TOML(无英文三字段)照常解析, 英文字段为 None;
+/// 序列化回写也不凭空多出英文键(TOML 无 null, skip_serializing_if 保证)。
+#[test]
+fn test_manifest_toml_without_english_fields_roundtrips() {
+    let toml_text = r#"
+id = "legacy-grid"
+name = "旧清单"
+market = "spot"
+summary = "没有英文字段的清单"
+
+[[params]]
+key = "atr_mult"
+name = "间距倍数"
+type = "f64"
+desc = "ATR 乘数"
+"#;
+    let m: catalog::StrategyManifest =
+        toml::from_str(toml_text).expect("旧清单(无英文字段)应能解析");
+    assert!(m.name_en.is_none() && m.summary_en.is_none() && m.description_en.is_none());
+    let out = toml::to_string_pretty(&m).unwrap();
+    assert!(!out.contains("name_en") && !out.contains("summary_en"), "{out}");
+}
+
+/// 068 锚点: 五个内置清单的**每个参数**必须带齐 name_en/desc_en 且非空白
+/// (英文界面态参数表单/清单编辑器择优展示的数据源, 缺一即回退中文、双语承诺落空)。
+#[test]
+fn test_builtin_manifest_params_have_english_fields() {
+    let mut n = 0;
+    for e in catalog::all().into_iter().filter(|e| e.source == catalog::Source::Builtin) {
+        let m = &e.manifest;
+        assert!(!m.params.is_empty(), "内置 {} 无参数声明", m.id);
+        for p in &m.params {
+            let ne = p
+                .name_en
+                .as_deref()
+                .unwrap_or_else(|| panic!("内置 {} 参数 {} 缺 name_en", m.id, p.key));
+            assert!(!ne.trim().is_empty(), "内置 {} 参数 {} 的 name_en 为空白", m.id, p.key);
+            let de = p
+                .desc_en
+                .as_deref()
+                .unwrap_or_else(|| panic!("内置 {} 参数 {} 缺 desc_en", m.id, p.key));
+            assert!(!de.trim().is_empty(), "内置 {} 参数 {} 的 desc_en 为空白", m.id, p.key);
+            n += 1;
+        }
+    }
+    assert!(n >= 60, "内置清单参数总数应不少于 60, 实得 {n}");
+}
+
+/// 068 向后兼容: 旧参数行(无 name_en/desc_en)照常解析为 None, 序列化回写不凭空多出英文键。
+#[test]
+fn test_manifest_param_toml_without_english_fields_roundtrips() {
+    let toml_text = r#"
+id = "legacy-grid"
+name = "旧清单"
+market = "spot"
+summary = "没有英文参数的清单"
+
+[[params]]
+key = "atr_mult"
+name = "间距倍数"
+type = "f64"
+desc = "ATR 乘数"
+"#;
+    let m: catalog::StrategyManifest =
+        toml::from_str(toml_text).expect("旧参数行(无英文字段)应能解析");
+    let p = &m.params[0];
+    assert!(p.name_en.is_none() && p.desc_en.is_none());
+    let out = toml::to_string_pretty(&m).unwrap();
+    assert!(!out.contains("name_en") && !out.contains("desc_en"), "{out}");
+}
+
+/// 068 保存归一: 前端交来的空白英文名/英文说明(空串/纯空格)一律收成 None,
+/// 落盘 TOML 不出现 name_en/desc_en 键(缺省 = 界面回退中文)。
+#[test]
+fn test_build_manifest_normalizes_blank_param_english_fields() {
+    let req = ManifestRequest {
+        name: "测试策略".into(),
+        name_en: "".into(),
+        summary: "".into(),
+        summary_en: " ".into(),
+        description: "".into(),
+        description_en: "".into(),
+        suitable: "".into(),
+        unsuitable: "".into(),
+        params: vec![ManifestParam {
+            key: "atr_mult".into(),
+            name: "ATR 乘数".into(),
+            name_en: Some("".into()),
+            ty: ParamType::Float,
+            desc: "网格间距".into(),
+            desc_en: Some("   ".into()),
+            default: Some(ConfigValue::Float(1.5)),
+            required: false,
+            options: None,
+            group: None,
+        }],
+    };
+    let m = build_manifest("test-blank-en", "spot", req).expect("应通过构造");
+    assert!(m.name_en.is_none() && m.summary_en.is_none() && m.description_en.is_none());
+    let p = &m.params[0];
+    assert!(p.name_en.is_none() && p.desc_en.is_none(), "空白英文字段应归一为 None");
+    let out = toml::to_string_pretty(&m).unwrap();
+    assert!(!out.contains("name_en") && !out.contains("desc_en"), "{out}");
 }
 
 /// AI 改 Lua 离线路径: 空指令 400 / 未知 id 404 / 未配 AI 密钥 403 need_keys(在联网前失败)。
@@ -974,8 +1154,11 @@ fn test_origin_marker_is_idempotent_and_defaults_to_user() {
 fn test_build_manifest_validation() {
     let ok = |params: serde_json::Value| ManifestRequest {
         name: "我的策略".into(),
+        name_en: String::new(),
         summary: "说明".into(),
+        summary_en: String::new(),
         description: String::new(),
+        description_en: String::new(),
         suitable: String::new(),
         unsuitable: String::new(),
         params: serde_json::from_value(params).unwrap(),
@@ -1213,6 +1396,72 @@ async fn test_manifest_save_roundtrip_and_guards() {
     assert_eq!(status_of(&res), 400, "{res}");
     assert!(body_of(&res).contains("9bad key"), "{res}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "校验失败不得改写清单");
+
+    std::env::remove_var("RICOW_ROOT");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 067 保存往返: 清单带英文三字段 → 落盘 TOML 保留 → 详情 JSON 透传(前端择优展示的数据源)。
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn test_manifest_save_roundtrip_preserves_english_fields() {
+    let _g = crate::commands::test_util::ENV_LOCK.lock().unwrap();
+    let root = tmp_root("manifest-en");
+    std::env::set_var("RICOW_ROOT", &root);
+    let port = boot(root.clone()).await;
+
+    let code = "function on_tick(ctx)\n    return {}\nend\n";
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies?token=tok-ok",
+        Some(
+            &serde_json::json!({"name": "en-user", "market": "spot", "pair": "ETHUSDT", "code": code})
+                .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "{res}");
+
+    let manifest = serde_json::json!({
+        "name": "英文测试清单",
+        "name_en": "English Test Manifest",
+        "summary": "一句话",
+        "summary_en": "One-line summary",
+        "description": "长说明",
+        "description_en": "Long description in English",
+        "params": [{"key": "atr_mult", "name": "间距倍数", "type": "f64", "desc": "ATR 乘数", "default": 1.0}]
+    });
+    let res = raw(
+        port,
+        "POST",
+        "/api/strategies/en-user/manifest?token=tok-ok",
+        Some(&manifest.to_string()),
+    )
+    .await;
+    assert_eq!(status_of(&res), 200, "{res}");
+
+    // 落盘 TOML 保留英文字段。
+    let text = std::fs::read_to_string(root.join("strategies").join("spot").join("en-user.toml"))
+        .expect("清单落盘");
+    assert!(text.contains(r#"name_en = "English Test Manifest""#), "{text}");
+    assert!(text.contains(r#"summary_en = "One-line summary""#), "{text}");
+    assert!(text.contains(r#"description_en = "Long description in English""#), "{text}");
+
+    // 详情 JSON 透传(StrategyDetailReply 扁平化 manifest)。
+    let res = raw(port, "GET", "/api/strategies/en-user?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    let body = body_of(&res);
+    assert!(body.contains("English Test Manifest"), "详情应带英文名: {body}");
+    assert!(body.contains("One-line summary"), "详情应带英文一句话: {body}");
+    assert!(body.contains("Long description in English"), "详情应带英文长说明: {body}");
+
+    // 列表行也带 name_en/summary_en(卡片标题/摘要择优的数据源)。
+    let res = raw(port, "GET", "/api/strategies?token=tok-ok", None).await;
+    assert_eq!(status_of(&res), 200, "{res}");
+    let body = body_of(&res);
+    assert!(body.contains("English Test Manifest"), "列表应带 name_en: {body}");
+    assert!(body.contains("One-line summary"), "列表应带 summary_en: {body}");
 
     std::env::remove_var("RICOW_ROOT");
     let _ = std::fs::remove_dir_all(&root);
@@ -1701,8 +1950,11 @@ fn test_merge_manifest_params_keeps_code_facts_and_prefers_comment_desc() {
     // 合并结果必须能直接过 `build_manifest` 的校验(键合法、不重复)。
     let req = ManifestRequest {
         name: String::new(),
+        name_en: String::new(),
         summary: "s".to_string(),
+        summary_en: String::new(),
         description: String::new(),
+        description_en: String::new(),
         suitable: String::new(),
         unsuitable: String::new(),
         params: got,
@@ -1778,8 +2030,10 @@ fn test_keep_manifest_params_filters_and_warns() {
     enum_manifest.params.push(ManifestParam {
         key: "accumulate_mode".into(),
         name: "积累模式".into(),
+        name_en: None,
         ty: ParamType::Enum,
         desc: String::new(),
+        desc_en: None,
         default: None,
         required: false,
         options: Some(vec!["u".into(), "coin".into()]),

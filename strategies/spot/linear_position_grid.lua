@@ -1,63 +1,5 @@
 -- 现货线性仓位网格 (linear_position_grid)
---
--- ═══ 一句话 ═══
---   在 [p_low, p_high] 区间内, 仓位占比 = 币市值 ÷ 总权益(币市值+现金) 随价格**线性分布**(低价高仓位、高价低仓位);
---   分三阶段运行: 逐步建仓 → 线性网格(成交即全撤、在成交价上下 1×ATR 两侧挂限价单) → 可选动态止盈。
---   反复买卖把波动差价转化为现金收益。
---
--- ═══ 策略含义(逐条) ═══
---   1) 线性仓位(用户口径 2026-10-09, 唯一定义): 仓位 = Q×p / (Q×p + 现金)。
---      w(p) = pos_low_pct + (pos_high_pct − pos_low_pct)×(p − p_low)/(p_high − p_low), 钳制 [pos_high_pct, pos_low_pct]。
---      **每次买卖成交后, 按成交价 p 精确满足 Q×p/(Q×p+现金) = w(p) —— 什么价格就是什么仓位。**
---      含费修正(成交后权益 E′ = E − 费): 买 q = (w·E − Q·p) / (p·(1+w·f)); 卖 q = (Q·p − w·E) / (p·(1−w·f)),
---      其中 E = Q×p + 现金(按腿价估值的当前总权益), f = fee_side。w<1 时现金恒 = (1−w)×E > 0, 永不被买干。
---   2) 逐步建仓(独立阶段): 目标总量 = T(start_price) 均分 build_steps 份币量; 价格**低于 start_price** 且
---      距上次建仓 ≥ build_interval_hours 小时才市价买入一份(高价到点顺延, 不烧步数)。建仓期间不挂任何网格单。
---      建满 build_steps 份 → 进入网格, 参考价 ref := 最后一笔建仓成交价, 最高价 peak := ref。
---   3) 网格: ref − Δ 挂买单、ref + Δ 挂卖单(Δ = atr_mult×ATR, 下限 min_spacing_pct×价格; 买卖价钳在区间内)。
---      买量/卖量按第 1 条落位公式在**腿价**上计算 → 该腿成交后仓位精确 = w(成交价)。
---   4) 成交(全撤重挂, 事件模型): 任一腿成交 → ref := 成交价 → 撤光两侧 → 在新 ref 上下重挂。
---      链内新限价单由引擎次 bar 生效(防乒乓链)。现价偏离 ref 超过一个间距时同步重锚 ref := 现价
---      并重挂(防单边/跳空行情下另一腿被穿越守卫长期抑制 → 死锁零成交)。
---   5) 实时估值: 落位目标恒按"当前总权益×w"计算, 交易赚取的差价即时进入现金侧, 直接参与后续仓位计算 —— 无沉淀资金。
---   6) 出界处理 out_of_range: "exit"(默认)= 价格出区间即撤光挂单停机、**不清仓**;"wait"= 暂停挂单, 等价格
---      回到区间再恢复(ref 重锚现价)。
---   7) 动态止盈(可选, tp_min_profit_pct=0 关闭): 网格阶段追踪价格最高值 peak; 当 peak − 现价 ≥
---      tp_dd_atr_mult×ATR **且** (权益 − C0)/C0 ≥ tp_min_profit_pct 时, 撤光 + 市价清仓 + 停机。
---      ⚠ 启用后单边上涨行情会在首次回撤即清仓离场, 可能"提前下车"错过后续涨幅。
---
--- ═══ 参数(全部可配, 默认值可直接回测) ═══
---   pair                 必填, 现货交易对
---   start_price          必填, 开始价格(低于它才逐步建仓)
---   p_low / p_high       必填, 线性仓位价格区间(须满足 p_low < start_price < p_high)
---   pos_low_pct          p_low 处仓位占比, 默认 0.7
---   pos_high_pct         p_high 处仓位占比, 默认 0.3(直读, 0 = 顶部清仓合法)
---   invest_cash          投入资金 C0, 默认 0(= 首次建仓时 quote 余额全额)
---   build_steps          分几批建仓, 默认 10
---   build_interval_hours 每批最小间隔(小时), 默认 1
---   interval             主时钟, 默认 1h(回测建议 1m)
---   atr_interval         算 ATR 的 K 线周期, 默认 1h
---   atr_period           ATR 周期, 默认 14
---   atr_mult             网格间距 = atr_mult × ATR, 默认 1
---   min_spacing_pct      间距下限(占价格比例), 默认 0.004; 负数 = 禁用下限
---   min_notional         单笔最小名义, 默认 5
---   fee_side             单边费率, 默认 0.001
---   out_of_range         出界处理, "exit"(默认)/"wait"
---   tp_min_profit_pct    动态止盈最小盈利比例, 默认 0.10(直读, 0 = 禁用)
---   tp_dd_atr_mult       动态止盈最高点回撤 ATR 倍数, 默认 3
---
--- ═══ 守卫与可观测性 ═══
---   参数越界 → [FATAL] 停机; ATR 未就绪 → 不挂单不猜值(计数); 买量现金兜底(预扣费+滑点); 卖量持仓兜底(1e-9);
---   挂腿穿越市价 → 抑制该腿(防恢复/钳边时被动扫仓); 成本门槛: 生效间距 < 4×fee_side×价格 → [FATAL];
---   连续 ≥1 天无任何挂单 → WARN(停摆); 策略账本(m_cash/m_pos)停机时与引擎交叉核对(误差 > 0.01 → WARN);
---   每次成交后落位误差追踪(stat_pos_err_max)。
---
--- ═══ 用法 ═══
---   ricow backtest --strategy linear_position_grid --pair SOLUSDT --interval 1m --days 365 --cash 10000 \
---     --param start_price=<窗口起点价> --param p_low=<起点×0.7> --param p_high=<起点×1.4> \
---     --param invest_cash=10000 --param build_steps=10 --param build_interval_hours=1
---   TOML: type = "linear_position_grid" + [strategy.params] 填上面参数表。
---
+-- 用户向说明见同名清单 strategies/spot/linear_position_grid.toml; 参数含义见其 [[params]]
 quote_asset = ""  -- 计价资产, on_init 里 detect_quote(pair) 动态检测
 
 -- 线性仓位与投入
@@ -358,6 +300,7 @@ end
 -- 全撤重挂(共享决策出口, 事件模型): 撤旧单 + 下方买单 + 上方卖单。
 -- 量按落位公式在腿价上计算; 买卖价钳在区间内; 穿越市价的腿抑制(防被动扫仓);
 -- 现价偏离 ref 超一个间距时先重锚 ref := 现价(防单边/跳空死锁)。
+-- on_fill 链内返回的新限价单由引擎次 bar 生效(defer_new_limits, 防乒乓链)。
 function do_rehang(ctx)
     local pair = ctx:config_str("pair")
     local price = ctx:price(pair)

@@ -122,7 +122,7 @@
     // 注: 内置判定以 source 响应的 instance_toml=null 为准(用户策略理论上恒有实例文件)。
     st.detailCtx.builtin = source.instance_toml === null;
 
-    $("sg-d-name").textContent = detail.name || id;
+    $("sg-d-name").textContent = R.pickL(detail.name, detail.name_en) || id;
     renderBadges(detail, source);
     renderDeclHint(detail);
     renderFit(detail);
@@ -219,16 +219,17 @@
   /// 8 个内置策略只能靠名字猜该选哪个。这里把同一份数据原样展示在只读详情页, **只展示不编辑**
   /// (编辑仍在清单编辑器, 仅用户策略可用)。
   ///
-  /// 数据源 = `GET /api/strategies/{id}` 的 manifest, 后端零改动。清单文本是**作者中文原文**
-  /// (随策略 TOML 发布), 不随界面语言翻译 —— 与列表里的 `summary` 同一口径, 不另立第二套。
+  /// 数据源 = `GET /api/strategies/{id}` 的 manifest。清单带英文字段时随界面语言择优
+  /// (R.pickL), 无英文回退中文原文 —— 与列表里的 `summary` 同一口径, 不另立第二套。
   /// 四栏全空时整卡隐藏(不给一张空壳卡)。
   function renderFit(detail) {
     const card = $("sg-fit-card");
     const body = $("sg-fit-body");
     body.innerHTML = "";
     const rows = [];
-    if (detail.summary) rows.push({ k: "sgFitSummary", v: detail.summary });
-    if (detail.description) rows.push({ k: "sgFitDesc", v: detail.description });
+    if (detail.summary) rows.push({ k: "sgFitSummary", v: R.pickL(detail.summary, detail.summary_en) });
+    if (detail.description)
+      rows.push({ k: "sgFitDesc", v: R.pickL(detail.description, detail.description_en) });
     if (detail.suitable) rows.push({ k: "sgFitSuitable", v: detail.suitable, kind: "fit-good" });
     if (detail.unsuitable) {
       rows.push({ k: "sgFitUnsuitable", v: detail.unsuitable, kind: "fit-bad" });
@@ -274,7 +275,7 @@
       const val = current[p.key] !== undefined ? current[p.key] : p.default;
       const built = p.ty === "string" ? stringRow(p, val) : paramRow(p, val);
       box.appendChild(built.label);
-      entries.push(paramEntry(p.key, p.name, p.ty, p.required, built, p.default));
+      entries.push(paramEntry(p.key, R.pickL(p.name, p.name_en), p.ty, p.required, built, p.default));
     }
     if (typeof o.onInput === "function") {
       for (const e of entries) {
@@ -287,7 +288,7 @@
   function paramRow(spec, value) {
     const label = h("label", "sg-param");
     const head = h("span", "sg-param-head");
-    head.appendChild(h("span", "sg-param-name", spec.name || spec.key));
+    head.appendChild(h("span", "sg-param-name", R.pickL(spec.name, spec.name_en) || spec.key));
     head.appendChild(h("span", "sg-param-key", spec.key));
     if (spec.required) head.appendChild(h("span", "sg-req", "* " + t("sgRequired")));
     label.appendChild(head);
@@ -326,7 +327,8 @@
       if (value !== undefined && value !== null) ctl.value = String(value);
       label.appendChild(ctl);
     }
-    if (spec.desc) label.appendChild(h("div", "sg-param-desc", spec.desc));
+    const descL = R.pickL(spec.desc, spec.desc_en);
+    if (descL) label.appendChild(h("div", "sg-param-desc", descL));
     return { label: label, input: ctl };
   }
 
@@ -334,7 +336,7 @@
   function stringRow(spec, value) {
     const label = h("label", "sg-param");
     const head = h("span", "sg-param-head");
-    head.appendChild(h("span", "sg-param-name", spec.name || spec.key));
+    head.appendChild(h("span", "sg-param-name", R.pickL(spec.name, spec.name_en) || spec.key));
     head.appendChild(h("span", "sg-param-key", spec.key));
     if (spec.required) head.appendChild(h("span", "sg-req", "* " + t("sgRequired")));
     label.appendChild(head);
@@ -344,7 +346,8 @@
     ctl.autocomplete = "off";
     if (value !== undefined && value !== null) ctl.value = String(value);
     label.appendChild(ctl);
-    if (spec.desc) label.appendChild(h("div", "sg-param-desc", spec.desc));
+    const descL = R.pickL(spec.desc, spec.desc_en);
+    if (descL) label.appendChild(h("div", "sg-param-desc", descL));
     return { label: label, input: ctl };
   }
 
@@ -512,7 +515,7 @@
       const built = p.ty === "string" ? stringRow(p, current[p.key] !== undefined ? current[p.key] : p.default)
         : paramRow(p, current[p.key] !== undefined ? current[p.key] : p.default);
       box.appendChild(built.label);
-      st.paramInputs.push(paramEntry(p.key, p.name, p.ty, p.required, built));
+      st.paramInputs.push(paramEntry(p.key, R.pickL(p.name, p.name_en), p.ty, p.required, built));
     }
 
     // 实例里存在但清单没声明的键(网页保存的 lua 策略没有清单): 也给可编辑行, 避免保存时黑箱丢失
@@ -650,10 +653,13 @@
     }
     card.hidden = false;
     $("sg-mf-name").value = detail.name || "";
+    $("sg-mf-name-en").value = detail.name_en || "";
     $("sg-mf-summary").value = detail.summary || "";
+    $("sg-mf-summary-en").value = detail.summary_en || "";
     $("sg-mf-suitable").value = detail.suitable || "";
     $("sg-mf-unsuitable").value = detail.unsuitable || "";
     $("sg-mf-desc").value = detail.description || "";
+    $("sg-mf-desc-en").value = detail.description_en || "";
     const box = $("sg-mf-params");
     box.innerHTML = "";
     st.manifestRows = [];
@@ -802,6 +808,7 @@
 
     const key = mfInput("sg-mf-k", spec.key || "", t("sgMfKeyPh"));
     const name = mfInput("sg-mf-n", spec.name || "", t("sgMfNamePh"));
+    const nameEn = mfInput("sg-mf-n-en", spec.name_en || "", t("sgMfNameEnPh"));
     const ty = document.createElement("select");
     ty.className = "sg-input sg-mf-ty";
     for (const v of ["f64", "i64", "string", "bool", "enum"]) {
@@ -826,13 +833,14 @@
     del.type = "button";
 
     const line1 = h("div", "sg-mf-line");
-    line1.append(key, name, ty, def, reqWrap, del);
+    line1.append(key, name, nameEn, ty, def, reqWrap, del);
 
     const desc = mfInput("sg-mf-d", spec.desc || "", t("sgMfDescPh"));
+    const descEn = mfInput("sg-mf-d-en", spec.desc_en || "", t("sgMfDescEnPh"));
     const opts = mfInput("sg-mf-o", (spec.options || []).join(","), t("sgMfOptionsPh"));
     const grp = mfInput("sg-mf-grp", spec.group || "", t("sgMfGroupPh"));
     const line2 = h("div", "sg-mf-line2");
-    line2.append(desc, opts, grp);
+    line2.append(desc, descEn, opts, grp);
 
     const syncOpts = () => {
       opts.style.display = ty.value === "enum" ? "" : "none";
@@ -846,7 +854,7 @@
     });
 
     row.append(line1, line2);
-    st.manifestRows.push({ row: row, key: key, name: name, ty: ty, desc: desc, def: def, req: req, opts: opts, grp: grp });
+    st.manifestRows.push({ row: row, key: key, name: name, nameEn: nameEn, ty: ty, desc: desc, descEn: descEn, def: def, req: req, opts: opts, grp: grp });
     $("sg-mf-params").appendChild(row);
     return row;
   }
@@ -860,6 +868,11 @@
       if (!key && !name) continue;
       const ty = r.ty.value;
       const p = { key: key, name: name, type: ty, desc: r.desc.value.trim(), required: r.req.checked };
+      // 英文字段可选: 留空不发送(后端空串同样归一为缺省, 这里保持载荷干净)。
+      const nameEn = r.nameEn.value.trim();
+      if (nameEn) p.name_en = nameEn;
+      const descEn = r.descEn.value.trim();
+      if (descEn) p.desc_en = descEn;
       const raw = r.def.value.trim();
       if (raw !== "") {
         if (ty === "f64") p.default = Number(raw);
@@ -879,8 +892,11 @@
     }
     return {
       name: $("sg-mf-name").value.trim(),
+      name_en: $("sg-mf-name-en").value.trim(),
       summary: $("sg-mf-summary").value.trim(),
+      summary_en: $("sg-mf-summary-en").value.trim(),
       description: $("sg-mf-desc").value.trim(),
+      description_en: $("sg-mf-desc-en").value.trim(),
       suitable: $("sg-mf-suitable").value.trim(),
       unsuitable: $("sg-mf-unsuitable").value.trim(),
       params: params,

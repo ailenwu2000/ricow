@@ -1,49 +1,5 @@
 -- 现货智能持仓 (smart_position) — 多标的组合
---
--- ═══ 一句话 ═══
---   多交易对组合 (universe), 按权重维持各币目标市值占比: 每隔 cycle_days 天检查一次,
---   逐币偏离超阈值才市价调仓; 闲置 USDT 现金腿自动申购 Simple Earn 活期理财吃利息,
---   调仓缺现金时先提赎回申请、下一周期资金就绪再调。理财不支持的资产静默跳过、不报错。
---
--- ═══ 策略含义(逐条) ═══
---   1) 权益口径: equity = 现货现金 + Σ 各币持仓市值(数量×现价) + 理财市值(现金腿按面值)。
---      币 i 现占比 cur_i = 持仓市值_i ÷ equity。
---   2) 权重: weights 与 universe 一一对应, 个数一致、每项 ∈[0,1]、合计≈1, 违反即停机;
---      缺省 = 等权。币 i 目标占比 = target_pct × w_i (target_pct 为全部币腿合计占比)。
---   3) 时间闸: 距上次执行满 cycle_days 天才动作(首 tick 立即执行一次), 其余 tick 只累计理财计时。
---   4) 阈值闸(逐币独立): |cur_i − target_pct×w_i|×100 < rebalance_threshold_pct(百分点)
---      → 该币不调仓; 只调越界的币, 其余币不动。带宽远大于手续费漂移, 与时间闸、
---      min_notional 共同防止循环调仓; 理财管理照跑。
---   5) 资金池共享: 卖出所得进 USDT 现金, 本周期内先卖后买、买腿预算按卖出回笼滚动。
---   6) 资金就绪: 币 i 需买入但现金不足 → 向理财提交赎回差额申请, **本周期跳过该币**,
---      下一周期再试(赎回可能不即时到账); 理财也不够 → 按现货现金兜底部分到位。
---   7) 调仓: 市价单一次买卖到位。含费修正: 买 q = Δ/(p×(1+f)), 卖 q = Δ/(p×(1−f));
---      名义 < min_notional 跳过该笔。
---   8) 理财管理: 仅 USDT 现金腿入理财(各币持仓留现货待卖腿)。现货现金超出
---      equity×earn_buffer_pct/100 缓冲的部分申购活期; 本周期提交过赎回或已发出买/卖单时
---      不申购(超额到账部分下周期自动回理财, 自愈)。
---   9) 理财不支持: ctx:earn_balance 返回 nil(该资产无赚息功能/端点不可用) →
---      理财功能静默关闭, 不报错、不刷日志, 交易腿照常跑。
---   10) 利息不入账: 按 earn_apr 与在理财时长估算, 仅停机报告导出 stat_earn_interest_est。
---
--- ═══ 参数(全部可配, 默认值可直接回测) ═══
---   universe                 必填, 逗号分隔现货交易对(如 BTCUSDT,ETHUSDT,TSLABUSDT,NVDABUSDT)
---   weights                  逗号分隔小数, 与 universe 一一对应; 缺省 = 等权
---   target_pct               全部币腿合计目标市值占比(0~1), 默认 0.5
---   cycle_days               运行周期(天), 默认 1
---   rebalance_threshold_pct  逐币调仓阈值(百分点), 默认 2
---   earn_enabled             理财开关(1/0), 默认 1
---   earn_buffer_pct          现金腿缓冲(占权益%), 默认 0.5
---   earn_apr                 利息估算年化, 默认 0.02
---   min_notional             单笔调仓最小名义, 默认 5
---   fee_side                 单边费率, 默认 0.001
---   interval                 主时钟, 默认 1h
---
--- ═══ 用法 ═══
---   ricow backtest --strategy smart_position --pair BTCUSDT --interval 1h --days 365 --cash 10000 \
---     --param universe=BTCUSDT,ETHUSDT --param weights=0.6,0.4
---   TOML: type = "smart_position" + [strategy.params] 填上面参数表。
-
+-- 用户向说明见同名清单 strategies/spot/smart_position.toml; 参数含义见其 [[params]]
 quote_asset = ""
 
 -- 参数生效值(on_init 定格)
@@ -351,6 +307,7 @@ function on_tick(ctx)
     local any_redeem = false
     local sell_emitted = false
     -- 卖腿优先: 卖出所得滚动进本周期买腿预算(引擎按下单序即时撮合, 先卖后买)。
+    -- 市价单含费修正: 卖 size = Δ/(p×(1−f)), 成交净额 ≈ Δ 到位。
     for _, s in ipairs(sells) do
         local size = (-s.delta) / (s.price * (1 - FEE))
         local cap = poss[s.pair] * (1 - 1e-9)
@@ -368,6 +325,7 @@ function on_tick(ctx)
         end
     end
     -- 买腿: 按滚动现金预算; 不足 → 赎回差额申请、本周期跳过该币(下周期再试)。
+    -- 含费修正: 买 size = Δ/(p×(1+f)), 总支出(本金+费) ≈ Δ。
     for _, b in ipairs(buys) do
         local size = b.delta / (b.price * (1 + FEE))
         local cost = size * b.price

@@ -24,8 +24,14 @@ pub fn list_text() -> String {
             catalog::Source::Builtin => "内置",
             catalog::Source::User => "用户",
         };
+        let name_en = e
+            .manifest
+            .name_en
+            .as_deref()
+            .map(|n| format!(" / {n}"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "【{}·{src}】{} — {}{}\n",
+            "【{}·{src}】{}{name_en} — {}{}\n",
             e.manifest.id,
             e.manifest.name,
             e.manifest.summary,
@@ -74,15 +80,33 @@ pub fn render_read(e: &CatalogEntry) -> String {
     if let Some(d) = &e.manifest.description {
         out.push_str(&format!("说明: {d}\n"));
     }
+    if let Some(d) = &e.manifest.description_en {
+        out.push_str(&format!("English: {d}\n"));
+    }
     out.push_str("可直接作为 preview_strategy 的 script(把参数按用户回答填好, 不要留空)。\n");
     out.push_str("\nLua 原文:\n");
     out.push_str(&e.code);
     out
 }
 
-/// 参数键摘要, 如 `pair, order_size`。
+/// 参数键摘要, 如 `pair(交易对 / Trading Pair), order_size(下单金额)`。
+/// 名字回退与顶层列表同口径: 无中文名只显示键名, 有英文名以 ` / ` 追加。
 fn params_text(e: &CatalogEntry) -> String {
-    e.manifest.params.iter().map(|p| p.key.as_str()).collect::<Vec<_>>().join(", ")
+    e.manifest
+        .params
+        .iter()
+        .map(|p| {
+            let zh = p.name.trim();
+            if zh.is_empty() {
+                return p.key.clone();
+            }
+            match p.name_en.as_deref().map(str::trim) {
+                Some(en) if !en.is_empty() => format!("{}({} / {})", p.key, zh, en),
+                _ => format!("{}({})", p.key, zh),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -95,6 +119,14 @@ mod tests {
         for must in ["linear_position_grid", "shannon_grid_futures", "现货线性仓位网格"] {
             assert!(text.contains(must), "清单缺少: {must}");
         }
+    }
+
+    /// 068: 内置清单参数已全量带英文名, 参数摘要应为 `键(中文名 / English)` 格式。
+    #[test]
+    fn params_text_appends_english_names() {
+        let grid = find("linear_position_grid").unwrap();
+        let text = params_text(&grid);
+        assert!(text.contains(" / "), "参数摘要缺英文名: {text}");
     }
 
     #[test]

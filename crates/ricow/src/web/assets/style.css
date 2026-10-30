@@ -2403,11 +2403,11 @@ body {
   color: var(--error);
   font-weight: 600;
 }
-/* 参数清单编辑器 (P2-8): 表头与参数行共用同一套 6 列网格, 保证对齐。 */
+/* 参数清单编辑器 (P2-8): 表头与参数行共用同一套 7 列网格, 保证对齐。 */
 .sg-mf-head,
 .sg-mf-line {
   display: grid;
-  grid-template-columns: 1.1fr 1.1fr 0.7fr 0.9fr auto auto;
+  grid-template-columns: 1.1fr 1.1fr 1.1fr 0.7fr 0.9fr auto auto;
   gap: 6px;
   align-items: center;
 }
@@ -2422,7 +2422,7 @@ body {
 }
 .sg-mf-line2 {
   display: grid;
-  grid-template-columns: 2fr 1fr 1fr;
+  grid-template-columns: 2fr 1.2fr 1fr 1fr;
   gap: 6px;
   margin-top: 6px;
 }
